@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Longbow: focused regressions for the vendored scalar alias configuration hook.
 
 use super::*;

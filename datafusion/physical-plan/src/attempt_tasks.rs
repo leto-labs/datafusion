@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 //! Attempt-owned descendant registration and joined destruction (ADR 0041).
 //!
 //! Tickets cover destruction of the captured future, not resources transferred

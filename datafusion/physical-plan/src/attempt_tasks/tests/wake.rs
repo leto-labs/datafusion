@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 //! A real drain waiter must be woken, not merely succeed when repolled manually.
 
 use std::future::{Future, pending};

@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 //! Observe the release itself: retained arrays must precede returned credits.
 use super::*;
 use datafusion_execution::memory_pool::{FairSpillPool, MemoryPool};

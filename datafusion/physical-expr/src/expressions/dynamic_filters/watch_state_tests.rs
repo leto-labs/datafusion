@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 //! The latest watch value must survive periods without subscribers.
 use super::*;
 use crate::expressions::lit;

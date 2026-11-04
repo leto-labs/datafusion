@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 use super::*;
 use arrow::array::StringViewArray;
 use datafusion_common::utils::memory::get_record_batch_memory_size;

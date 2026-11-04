@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 //! Bounded rank emission. No full peer-set materialization or output queue.
 use super::*;
 use rank_memory::{add, mul};

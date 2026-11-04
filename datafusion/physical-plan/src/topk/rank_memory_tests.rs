@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 //! Retained rank peers must remain charged through paused emission and drop.
 use super::*;
 use arrow::array::{BinaryArray, Int64Array, StringArray};

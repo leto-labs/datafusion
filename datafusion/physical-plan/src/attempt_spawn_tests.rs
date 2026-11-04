@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 //! Real native producer families must register before their consumer returns.
 
 use std::sync::Arc;

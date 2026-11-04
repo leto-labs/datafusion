@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 //! Conservative, checked working bounds for the opt-in native rank path.
 use super::*;
 use arrow::datatypes::DataType;
