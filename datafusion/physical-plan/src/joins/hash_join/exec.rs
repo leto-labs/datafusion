@@ -2400,11 +2400,35 @@ async fn collect_left_input(
             (Map::HashMap(hashmap), batch, left_values)
         };
 
+    // Longbow patch: with Longbow's build option, a single-future build also
+    // compacts string-view columns that concatenation left with too many data
+    // buffers (`shared_build::compact_views`); the parallel build compacts
+    // per batch group.
+    let (batch, left_values) = if parallel.is_some() && !parallel_built {
+        match shared_build::compact_views(batch, &copies)? {
+            (batch, true) => {
+                let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+                (batch, left_values)
+            }
+            (batch, false) => (batch, left_values),
+        }
+    } else {
+        (batch, left_values)
+    };
+
+    // Preserve the historical build peak while returning discarded input
+    // capacity to the pool. Computed keys can retain separate allocations.
+    metrics.build_mem_used.set_max(reservation.size());
+    build_memory::reconcile(batches, input_bytes, &batch, &left_values, &reservation)?;
+    drop(copies);
+    drop(parallel_copies);
+    metrics.build_mem_used.set_max(reservation.size());
+
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
         let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
         reservation.try_grow(bitmap_size)?;
-        metrics.build_mem_used.add(bitmap_size);
+        metrics.build_mem_used.set_max(reservation.size());
 
         let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
         bitmap_buffer.append_n(num_rows, false);
@@ -7310,3 +7334,17 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "build_memory_tests.rs"]
+mod build_memory_tests;
+
+#[path = "build_memory.rs"]
+mod build_memory;
+
+#[path = "shared_build.rs"]
+mod shared_build;
+
+#[cfg(test)]
+#[path = "shared_build_tests.rs"]
+mod shared_build_tests;
