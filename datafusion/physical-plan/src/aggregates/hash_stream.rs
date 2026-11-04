@@ -151,6 +151,10 @@ pub(crate) struct PartialHashAggregateStream {
     /// Memory reservation for group keys and accumulators.
     reservation: MemoryReservation,
 
+    /// Reserve the initial table footprint before starting input so early
+    /// emission needs no new loan for empty metadata.
+    fixed_reservation: MemoryReservation,
+
     /// Execution metrics shared with the aggregate plan node.
     baseline_metrics: BaselineMetrics,
 
@@ -435,7 +439,6 @@ impl PartialHashAggregateStream {
         debug_assert_eq!(agg.input_order_mode, InputOrderMode::Linear);
 
         let schema = Arc::clone(&agg.schema);
-        let input = agg.input.execute(partition, Arc::clone(context))?;
         let batch_size = context.session_config().batch_size();
         let baseline_metrics = BaselineMetrics::new(&agg.metrics, partition);
 
@@ -494,6 +497,12 @@ impl PartialHashAggregateStream {
     fn close_input(&mut self) {
         let input_schema = self.input.schema();
         self.input = Box::pin(EmptyRecordBatchStream::new(input_schema));
+    }
+
+    /// Charge table growth above the conservatively retained initial footprint.
+    fn resize_table(&self, table_bytes: usize) -> Result<()> {
+        self.reservation
+            .try_resize(table_bytes.saturating_sub(self.fixed_reservation.size()))
     }
 
     fn break_with_err(error: DataFusionError) -> PartialHashAggregateStateTransition {
@@ -655,8 +664,7 @@ impl PartialHashAggregateStream {
 
                         // Emitting clears the aggregate table and releases its
                         // accumulated memory. Update the reservation accordingly.
-                        let resize_result =
-                            self.reservation.try_resize(hash_table.memory_size());
+                        let resize_result = self.resize_table(hash_table.memory_size());
 
                         if let Err(e) = resize_result {
                             return Self::break_with_err(e);
@@ -781,7 +789,7 @@ impl PartialHashAggregateStream {
 
         match result {
             Ok(Some(batch)) => {
-                let _ = self.reservation.try_resize(hash_table.memory_size());
+                let _ = self.resize_table(hash_table.memory_size());
                 self.reduction_factor.add_part(batch.num_rows());
                 debug_assert!(batch.num_rows() > 0);
                 let next_state = if hash_table.is_done() {
@@ -968,11 +976,13 @@ impl Stream for PartialHashAggregateStream {
                 state @ PartialHashAggregateState::Error => {
                     self.close_input();
                     self.reservation.free();
+                    self.fixed_reservation.free();
                     self.state = Some(state);
                     return Poll::Ready(None);
                 }
                 state @ PartialHashAggregateState::Done => {
                     let _ = self.reservation.try_resize(0);
+                    self.fixed_reservation.free();
                     self.state = Some(state);
                     return Poll::Ready(None);
                 }
@@ -990,6 +1000,7 @@ impl Stream for PartialHashAggregateStream {
                     // Release the remaining stream-owned resources before returning.
                     self.close_input();
                     self.reservation.free();
+                    self.fixed_reservation.free();
                     self.state = Some(PartialHashAggregateState::Error);
                     return Poll::Ready(Some(Err(e)));
                 }
@@ -1616,9 +1627,12 @@ mod tests {
         )?;
         let input_partitions = vec![vec![batch]];
 
-        // Create constrained memory to trigger early emission but not completely fail
+        // Admit the initial table, but stay below the group keys/count state
+        // alone (13,488 bytes), preserving the memory/skip trigger collision.
+        let memory_limit = 8 * 1024;
+        assert!(num_groups * (size_of::<i32>() + size_of::<i64>()) > memory_limit);
         let runtime = RuntimeEnvBuilder::default()
-            .with_memory_limit(1024, 1.0) // small enough to start but will trigger pressure
+            .with_memory_limit(memory_limit, 1.0)
             .build_arc()?;
 
         let mut task_ctx = TaskContext::default().with_runtime(runtime);

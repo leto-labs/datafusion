@@ -268,6 +268,11 @@ struct ExternalSorter {
     sort_spill_reservation_bytes: usize,
 }
 
+enum SortBatchReservation {
+    InMemory,
+    Spill(MemoryReservation),
+}
+
 impl ExternalSorter {
     // TODO: make a builder or some other nicer API to avoid the
     // clippy warning
@@ -334,10 +339,15 @@ impl ExternalSorter {
         }
 
         self.reserve_memory_for_merge()?;
-        self.reserve_memory_for_batch_and_maybe_spill(&input)
-            .await?;
-
-        self.in_mem_batches.push(input);
+        match self
+            .reserve_memory_for_batch_and_maybe_spill(&input)
+            .await?
+        {
+            SortBatchReservation::InMemory => self.in_mem_batches.push(input),
+            SortBatchReservation::Spill(reservation) => {
+                self.sort_and_spill_batch(input, reservation).await?;
+            }
+        }
         Ok(())
     }
 
@@ -794,23 +804,71 @@ impl ExternalSorter {
     async fn reserve_memory_for_batch_and_maybe_spill(
         &mut self,
         input: &RecordBatch,
-    ) -> Result<()> {
+    ) -> Result<SortBatchReservation> {
         let size = get_reserved_bytes_for_record_batch(input)?;
 
         match self.reservation.try_grow(size) {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(SortBatchReservation::InMemory),
             Err(e) => {
                 if self.in_mem_batches.is_empty() {
-                    return Err(Self::err_with_oom_context(e));
+                    return self.reserve_for_immediate_spill(size, e);
                 }
 
                 // Spill and try again.
                 self.sort_and_spill_in_mem_batches().await?;
-                self.reservation
-                    .try_grow(size)
-                    .map_err(Self::err_with_oom_context)
+                match self.reservation.try_grow(size) {
+                    Ok(_) => Ok(SortBatchReservation::InMemory),
+                    Err(e) => self.reserve_for_immediate_spill(size, e),
+                }
             }
         }
+    }
+
+    /// An empty sorter cannot free another consumer's spillable loan. Charge
+    /// only this batch's sorting footprint as transient unspillable work, then
+    /// spill it immediately. The ordinary merge reservation stays charged, and
+    /// the pool's fallible admission still enforces the aggregate byte cap.
+    fn reserve_for_immediate_spill(
+        &self,
+        size: usize,
+        error: DataFusionError,
+    ) -> Result<SortBatchReservation> {
+        if !self.runtime.disk_manager.tmp_files_enabled()
+            || !matches!(error.find_root(), DataFusionError::ResourcesExhausted(_))
+        {
+            return Err(Self::err_with_oom_context(error));
+        }
+        let reservation =
+            MemoryConsumer::new(format!("{}Spill", self.reservation.consumer().name()))
+                .register(&self.runtime.memory_pool);
+        reservation
+            .try_grow(size)
+            .map_err(Self::err_with_oom_context)?;
+        Ok(SortBatchReservation::Spill(reservation))
+    }
+
+    /// Persist one batch without retaining it in the spillable buffer. The
+    /// reservation and unfinished file release on error or cancellation; the
+    /// completed run uses the existing bounded multi-level merge path.
+    async fn sort_and_spill_batch(
+        &mut self,
+        input: RecordBatch,
+        reservation: MemoryReservation,
+    ) -> Result<()> {
+        let mut sorted = self.sort_batch_stream(input, reservation)?;
+        let mut file = self.spill_manager.create_in_progress_file("Sorting")?;
+        let mut max_record_batch_memory = 0;
+        while let Some(batch) = sorted.next().await {
+            max_record_batch_memory =
+                max_record_batch_memory.max(file.append_batch(&batch?)?);
+        }
+        if let Some(file) = file.finish()? {
+            self.finished_spill_files.push(SortedSpillFile {
+                file,
+                max_record_batch_memory,
+            });
+        }
+        Ok(())
     }
 
     /// Wraps the error with a context message suggesting settings to tweak.

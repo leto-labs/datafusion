@@ -3164,7 +3164,7 @@ mod tests {
     use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
     use datafusion_common::{DataFusionError, internal_err};
     use datafusion_execution::config::SessionConfig;
-    use datafusion_execution::memory_pool::FairSpillPool;
+    use datafusion_execution::memory_pool::{FairSpillPool, MemoryConsumer};
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
     use datafusion_expr::{
@@ -3347,6 +3347,22 @@ mod tests {
         ))
     }
 
+    // Observe the startup charge without reading input. Fixture budgets can
+    // then retain pressure coverage while accounting fixed table storage.
+    fn initial_partial_reservation(
+        aggregate: &dyn ExecutionPlan,
+        partitions: usize,
+    ) -> Result<usize> {
+        let probe = new_spill_ctx(2, usize::MAX);
+        let streams = (0..partitions)
+            .map(|partition| aggregate.execute(partition, Arc::clone(&probe)))
+            .collect::<Result<Vec<_>>>()?;
+        let bytes = probe.memory_pool().reserved();
+        drop(streams);
+        assert_eq!(probe.memory_pool().reserved(), 0);
+        Ok(bytes)
+    }
+
     async fn check_grouping_sets(
         input: Arc<dyn ExecutionPlan>,
         spill: bool,
@@ -3527,13 +3543,6 @@ mod tests {
                 .build()?,
         )];
 
-        let task_ctx = if spill {
-            // set to an appropriate value to trigger spill
-            new_spill_ctx(2, 1600)
-        } else {
-            Arc::new(TaskContext::default())
-        };
-
         let partial_aggregate = Arc::new(AggregateExec::try_new(
             AggregateMode::Partial,
             grouping_set.clone(),
@@ -3542,6 +3551,19 @@ mod tests {
             input,
             Arc::clone(&input_schema),
         )?);
+
+        let fixed_bytes = if spill {
+            initial_partial_reservation(partial_aggregate.as_ref(), 1)?
+        } else {
+            0
+        };
+        let task_ctx = if spill {
+            // Leave one byte for growth, preserving early emission after the
+            // initial table is admitted. All expected partial states stay fixed.
+            new_spill_ctx(2, fixed_bytes + 1)
+        } else {
+            Arc::new(TaskContext::default())
+        };
 
         let result =
             collect(partial_aggregate.execute(0, Arc::clone(&task_ctx))?).await?;
@@ -3595,7 +3617,7 @@ mod tests {
 
         let task_ctx = if spill {
             // enlarge memory limit to let the final aggregation finish
-            new_spill_ctx(2, 4640)
+            new_spill_ctx(2, fixed_bytes + 4640)
         } else {
             Arc::clone(&task_ctx)
         };
@@ -4873,12 +4895,6 @@ mod tests {
         spill: bool,
         max_memory: usize,
     ) -> Result<()> {
-        let task_ctx = if spill {
-            new_spill_ctx(2, max_memory)
-        } else {
-            Arc::new(TaskContext::default())
-        };
-
         let (schema, data) = some_data_v2();
         let partition1 = data[0].clone();
         let partition2 = data[1].clone();
@@ -4916,6 +4932,29 @@ mod tests {
             memory_exec,
             Arc::clone(&schema),
         )?);
+        let fixed_bytes = if spill {
+            initial_partial_reservation(aggregate_exec.as_ref(), 4)?
+        } else {
+            0
+        };
+        let task_ctx = if spill {
+            new_spill_ctx(2, fixed_bytes + max_memory)
+        } else {
+            Arc::new(TaskContext::default())
+        };
+        // Preserve transient Fair pressure while partial streams hold fixed
+        // storage, with enough share for replay after those streams finish.
+        let _idle = if spill {
+            (0..2)
+                .map(|i| {
+                    MemoryConsumer::new(format!("idle spill fixture[{i}]"))
+                        .with_can_spill(true)
+                        .register(task_ctx.memory_pool())
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let coalesce = Arc::new(CoalescePartitionsExec::new(aggregate_exec))
             as Arc<dyn ExecutionPlan>;
         let aggregate_final = Arc::new(AggregateExec::try_new(
@@ -4927,7 +4966,11 @@ mod tests {
             schema,
         )?) as Arc<dyn ExecutionPlan>;
 
-        let result = crate::collect(aggregate_final, task_ctx).await?;
+        let result = crate::collect(Arc::clone(&aggregate_final), task_ctx).await?;
+        assert_eq!(
+            aggregate_final.metrics().unwrap().spilled_bytes().unwrap() > 0,
+            spill
+        );
         if is_first_acc {
             allow_duplicates! {
             assert_snapshot!(batches_to_string(&result), @r"
