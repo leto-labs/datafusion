@@ -25,6 +25,8 @@ pub use aggregate::PlainAggregateWindowExpr;
 pub use sliding_aggregate::SlidingAggregateWindowExpr;
 pub use standard::StandardWindowExpr;
 pub use standard_window_function_expr::StandardWindowFunctionExpr;
+// Longbow: expose the FILTER accessor used by the stage plan codec.
+pub use window_expr::AggregateWindowExpr;
 pub use window_expr::PartitionBatches;
 pub use window_expr::PartitionKey;
 pub use window_expr::PartitionWindowAggStates;

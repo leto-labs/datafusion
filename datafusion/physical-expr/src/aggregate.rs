@@ -772,6 +772,12 @@ impl AggregateFunctionExpr {
         }
     }
 
+    /// Longbow: complete stored ordering for fidelity preflight and Debug fields.
+    /// Optimizer callers must keep using the filtered `order_bys` accessor.
+    pub fn stored_order_bys(&self) -> &[PhysicalSortExpr] {
+        &self.order_bys
+    }
+
     /// Indicates whether aggregator can produce the correct result with any
     /// arbitrary input ordering. By default, we assume that aggregate expressions
     /// are order insensitive.
