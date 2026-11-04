@@ -1146,8 +1146,15 @@ impl ScalarUDFImpl for AliasedScalarUDFImpl {
         self.inner.invoke_with_args(args)
     }
 
-    fn with_updated_config(&self, _config: &ConfigOptions) -> Option<ScalarUDF> {
-        None
+    fn with_updated_config(&self, config: &ConfigOptions) -> Option<ScalarUDF> {
+        let updated = self.inner.with_updated_config(config)?;
+        // Longbow: refresh native aliases and retain only this wrapper's additions.
+        let mut aliases = updated.aliases().to_vec();
+        aliases.extend_from_slice(&self.aliases[self.inner.aliases().len()..]);
+        Some(ScalarUDF::new_from_impl(Self {
+            inner: updated.inner.into(),
+            aliases,
+        }))
     }
 
     fn aliases(&self) -> &[String] {
@@ -1225,6 +1232,11 @@ impl ScalarUDFImpl for AliasedScalarUDFImpl {
         self.inner.placement(args)
     }
 }
+
+// Longbow: regressions for forwarding configuration through alias wrappers.
+#[cfg(test)]
+#[path = "udf_alias_config_tests.rs"]
+mod alias_config_tests;
 
 #[cfg(test)]
 mod tests {

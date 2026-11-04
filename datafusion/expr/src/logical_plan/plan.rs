@@ -64,10 +64,9 @@ use datafusion_common::{
     Column, Constraints, DFSchema, DFSchemaRef, DataFusionError, Dependency,
     FunctionalDependence, FunctionalDependencies, NullEquality, ParamValues, Result,
     ScalarValue, Spans, SplitPoint, TableReference, UnnestOptions,
-    aggregate_functional_dependencies, assert_eq_or_internal_err, assert_or_internal_err,
-    internal_err, plan_err, validate_range_split_points,
+    assert_eq_or_internal_err, assert_or_internal_err, internal_err, plan_err,
+    validate_range_split_points,
 };
-use indexmap::IndexSet;
 use itertools::Itertools as _;
 
 // backwards compatibility
@@ -4117,35 +4116,141 @@ fn contains_grouping_set(group_expr: &[Expr]) -> bool {
 }
 
 /// Calculates functional dependencies for aggregate expressions.
+// Longbow: repair aggregate-output dependencies before any optimizer consumes
+// them. Later optimizer rewrites reconstruct Aggregate through this same path.
 fn calc_func_dependencies_for_aggregate(
-    // Expressions in the GROUP BY clause:
     group_expr: &[Expr],
-    // Input plan of the aggregate:
     input: &LogicalPlan,
-    // Aggregate schema
     aggr_schema: &DFSchema,
 ) -> Result<FunctionalDependencies> {
-    // We can do a case analysis on how to propagate functional dependencies based on
-    // whether the GROUP BY in question contains a grouping set expression:
-    // - If so, the functional dependencies will be empty because we cannot guarantee
-    //   that GROUP BY expression results will be unique.
-    // - Otherwise, it may be possible to propagate functional dependencies.
-    if !contains_grouping_set(group_expr) {
-        let group_by_expr_names = group_expr
-            .iter()
-            .map(|item| item.schema_name().to_string())
-            .collect::<IndexSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let aggregate_func_dependencies = aggregate_functional_dependencies(
-            input.schema(),
-            &group_by_expr_names,
-            aggr_schema,
-        );
-        Ok(aggregate_func_dependencies)
-    } else {
-        Ok(FunctionalDependencies::empty())
+    if contains_grouping_set(group_expr) {
+        return Ok(FunctionalDependencies::empty());
     }
+    // Use the exact expression list used to build the aggregate schema. Casts
+    // can share a schema name with a column without preserving its determinant.
+    let grouping_exprs = grouping_set_to_exprlist(group_expr)?;
+    let indices = grouping_exprs
+        .iter()
+        .map(|expr| match expr {
+            Expr::Column(column) => input.schema().index_of_column(column).map(Some),
+            _ => Ok(None),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(aggregate_dependencies_by_indices(
+        input.schema(),
+        &indices,
+        aggr_schema,
+    ))
+}
+
+// Longbow: only a determinant of the complete grouping key can determine all
+// aggregate values. A joined dimension key otherwise retains just its own
+// dependent grouping columns, not unrelated groups or aggregate outputs.
+fn aggregate_dependencies_by_indices(
+    input: &DFSchema,
+    group_input_indices: &[Option<usize>],
+    output: &DFSchema,
+) -> FunctionalDependencies {
+    let count = group_input_indices.len();
+    if count == 0 {
+        return FunctionalDependencies::empty();
+    }
+    let valid = |dep: &FunctionalDependence| {
+        !dep.nullable
+            || dep
+                .source_indices
+                .iter()
+                .all(|&index| !input.field(index).is_nullable())
+    };
+    let mut result = vec![];
+    for dep in input
+        .functional_dependencies()
+        .iter()
+        .filter(|dep| valid(dep))
+    {
+        if dep.source_indices.is_empty() {
+            continue;
+        }
+        let Some(sources) = dep
+            .source_indices
+            .iter()
+            .map(|source| {
+                group_input_indices
+                    .iter()
+                    .position(|index| *index == Some(*source))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        // Include reflexive dependencies and close over justified transitive
+        // dependencies. Nullable UNIQUE facts cannot hold across NULL groups.
+        let mut closure = dep.source_indices.clone();
+        loop {
+            let old_len = closure.len();
+            for candidate in input
+                .functional_dependencies()
+                .iter()
+                .filter(|dep| valid(dep))
+            {
+                if candidate
+                    .source_indices
+                    .iter()
+                    .all(|index| closure.contains(index))
+                {
+                    for target in &candidate.target_indices {
+                        if !closure.contains(target) {
+                            closure.push(*target);
+                        }
+                    }
+                }
+            }
+            if closure.len() == old_len {
+                break;
+            }
+        }
+        let determines_all_groups = dep.mode == Dependency::Single
+            || group_input_indices
+                .iter()
+                .all(|index| index.is_some_and(|index| closure.contains(&index)));
+        let (targets, mode) = if determines_all_groups {
+            ((0..output.fields().len()).collect(), Dependency::Single)
+        } else {
+            let targets = group_input_indices
+                .iter()
+                .enumerate()
+                .filter_map(|(index, source)| {
+                    source
+                        .is_some_and(|source| closure.contains(&source))
+                        .then_some(index)
+                })
+                .collect();
+            (targets, Dependency::Multi)
+        };
+        result.push(
+            FunctionalDependence::new(sources, targets, dep.nullable).with_mode(mode),
+        );
+    }
+    // GROUP BY has one output row per complete key, including NULL keys. A
+    // partial Multi dependency must not suppress this independent guarantee.
+    let group_key = (0..count).collect::<Vec<_>>();
+    if !result
+        .iter()
+        .any(|dep| dep.mode == Dependency::Single && dep.source_indices == group_key)
+    {
+        let nullable = group_key
+            .iter()
+            .any(|&index| output.field(index).is_nullable());
+        result.push(
+            FunctionalDependence::new(
+                group_key,
+                (0..output.fields().len()).collect(),
+                nullable,
+            )
+            .with_mode(Dependency::Single),
+        );
+    }
+    FunctionalDependencies::new(result)
 }
 
 /// This function projects functional dependencies of the `input` plan according
