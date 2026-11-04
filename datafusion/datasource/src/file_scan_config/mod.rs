@@ -720,13 +720,21 @@ impl DataSource for FileScanConfig {
             .and_then(|state| state.downcast_ref::<SharedWorkSource>())
             .cloned();
 
+        let mut morselizer = source.create_morselizer(object_store, self, partition)?;
+        if let Some(shared_work_source) = &shared_work_source {
+            morselizer.attach_shared_work_source(shared_work_source);
+        }
+
         let stream = FileStreamBuilder::new(self)
             .with_partition(partition)
             .with_shared_work_source(shared_work_source)
             .with_morselizer(morselizer)
             .with_metrics(source.metrics())
             .build()?;
-        Ok(Box::pin(cooperative(stream)))
+        Ok(preparation::session_stream(
+            Box::pin(cooperative(stream)),
+            context.session_config().options(),
+        ))
     }
 
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> FmtResult {
