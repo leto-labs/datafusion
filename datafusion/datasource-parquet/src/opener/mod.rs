@@ -38,6 +38,7 @@ use crate::{
 };
 use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
+use datafusion_datasource::file_stream::work_source::SharedWorkSource;
 use datafusion_datasource::morsel::{Morsel, MorselPlan, MorselPlanner, Morselizer};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
@@ -301,6 +302,9 @@ pub(super) struct ParquetMorselizer {
     /// Per-scan virtual-column state (validation already performed). `None`
     /// when no virtual columns are requested — the common path.
     pub(crate) virtual_state: Option<Arc<VirtualColumnsState>>,
+    /// Longbow: the execution's shared work source when this scan can spread
+    /// the surviving row groups of pruned files over idle sibling streams.
+    pub(crate) shared_work_source: Option<SharedWorkSource>,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -317,6 +321,22 @@ impl fmt::Debug for ParquetMorselizer {
 impl Morselizer for ParquetMorselizer {
     fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>> {
         Ok(Box::new(ParquetMorselPlanner::try_new(self, file)?))
+    }
+
+    /// Longbow: a scan whose output order and row count do not depend on
+    /// which stream reads a row group can split pruned files (see
+    /// [`RowGroupsPrunedParquetOpen::split_for_idle_siblings`]). Ordered,
+    /// limited, reordered and reversed scans keep one stream per file.
+    fn attach_shared_work_source(&mut self, source: &SharedWorkSource) {
+        if self.preserve_order
+            || self.limit.is_some()
+            || self.reverse_row_groups
+            || self.sort_order_for_reorder.is_some()
+        {
+            return;
+        }
+        source.enable_publishing();
+        self.shared_work_source = Some(source.clone());
     }
 }
 
@@ -460,6 +480,10 @@ struct PreparedParquetOpen {
     reverse_row_groups: bool,
     sort_order_for_reorder: Option<LexOrdering>,
     preserve_order: bool,
+    /// Longbow: set when this file may be split for idle sibling streams.
+    /// Files that already carry an access plan or row selection (including
+    /// published units) are never split again.
+    shared_work_source: Option<SharedWorkSource>,
     #[cfg(feature = "parquet_encryption")]
     file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
 }
@@ -730,6 +754,10 @@ impl ParquetMorselizer {
     ) -> Result<PreparedParquetOpen> {
         let file_range = partitioned_file.range.clone();
         let extensions = partitioned_file.extensions.clone();
+        let shared_work_source = self.shared_work_source.clone().filter(|_| {
+            extensions.get::<ParquetAccessPlan>().is_none()
+                && extensions.get::<ParquetRowSelection>().is_none()
+        });
         let file_name = partitioned_file.object_meta.location.to_string();
         let file_metrics =
             ParquetFileMetrics::new(self.partition_index, &file_name, &self.metrics);
@@ -857,6 +885,7 @@ impl ParquetMorselizer {
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             preserve_order: self.preserve_order,
+            shared_work_source,
             #[cfg(feature = "parquet_encryption")]
             file_decryption_properties: None,
         })
@@ -890,6 +919,9 @@ impl PreparedParquetOpen {
             self.file_metrics
                 .files_ranges_pruned_statistics
                 .add_pruned(1);
+            if let Some(source) = &self.shared_work_source {
+                source.mark_pruned();
+            }
             return Ok(None);
         }
 
@@ -1101,6 +1133,7 @@ impl FiltersPreparedParquetOpen {
         if let Some(range) = prepared.file_range.as_ref() {
             row_groups.prune_by_range(rg_metadata, range);
         }
+        let row_groups_in_range = row_groups.remaining_row_group_count();
 
         // If there is a predicate that can be evaluated against the metadata
         if let Some(predicate) = self.pruning_predicate.as_ref().map(|p| p.as_ref()) {
@@ -1140,6 +1173,11 @@ impl FiltersPreparedParquetOpen {
                 .file_metrics
                 .row_groups_pruned_bloom_filter
                 .add_matched(remaining);
+        }
+        if row_groups.remaining_row_group_count() < row_groups_in_range
+            && let Some(source) = &prepared.shared_work_source
+        {
+            source.mark_pruned();
         }
 
         Ok(RowGroupsPrunedParquetOpen {
@@ -1320,11 +1358,18 @@ impl BloomFiltersLoadedParquetOpen {
             && self.prepared.prepared.loaded.prepared.enable_bloom_filter
             && !self.prepared.row_groups.is_empty()
         {
+            let before = self.prepared.row_groups.remaining_row_group_count();
             self.prepared.row_groups.prune_by_bloom_filters(
                 predicate,
                 &self.prepared.prepared.loaded.prepared.file_metrics,
                 &self.row_group_bloom_filters,
             );
+            if self.prepared.row_groups.remaining_row_group_count() < before
+                && let Some(source) =
+                    &self.prepared.prepared.loaded.prepared.shared_work_source
+            {
+                source.mark_pruned();
+            }
         }
 
         self.prepared
@@ -1332,6 +1377,60 @@ impl BloomFiltersLoadedParquetOpen {
 }
 
 impl RowGroupsPrunedParquetOpen {
+    /// Longbow: spread the surviving row groups of a pruned scan over sibling
+    /// streams that would otherwise be idle, and return the part this stream
+    /// reads.
+    ///
+    /// Static byte ranges give each stream a fixed share of a file. When
+    /// pruning leaves a few files or row groups (TPC-DS q39: the `inventory`
+    /// row groups of one month), those ranges sit in a few streams and the rest
+    /// of the pipeline runs on them alone. DuckDB has no fixed assignment:
+    /// every thread claims the next row group from a shared cursor
+    /// (`ParquetReader::TryInitializeScan`,
+    /// `extension/parquet/parquet_multi_file_info.cpp`) and skips row groups
+    /// whose statistics fail the filter when it reads them
+    /// (`ParquetReader::RegisterRowGroupReads`, `parquet_reader.cpp`), so the
+    /// surviving row groups spread over all threads.
+    ///
+    /// A published unit costs one more file open, so a file is split only
+    /// when [`SharedWorkSource::split_width`] reports idle streams for a
+    /// pruned scan. Full scans keep the static assignment. A predicate with a
+    /// dynamic filter that can still change keeps the file in one stream: the
+    /// file's stream checks that filter while it reads.
+    fn split_for_idle_siblings(
+        prepared: &mut PreparedParquetOpen,
+        access_plan: ParquetAccessPlan,
+    ) -> ParquetAccessPlan {
+        let Some(source) = prepared.shared_work_source.take() else {
+            return access_plan;
+        };
+        if prepared.predicate.as_ref().is_some_and(|predicate| {
+            matches!(
+                DynamicFilterTracking::classify(predicate),
+                DynamicFilterTracking::Watching(_)
+            )
+        }) {
+            return access_plan;
+        }
+        let parts = source.split_width(access_plan.row_group_index_iter().count());
+        if parts < 2 {
+            return access_plan;
+        }
+        let mut plans = access_plan.split(parts).into_iter();
+        let local = plans.next().expect("split returns at least one plan");
+        let units: Vec<_> = plans
+            .map(|plan| prepared.partitioned_file.clone().with_extension(plan))
+            .collect();
+        ParquetFileMetrics::add_row_group_units_published(
+            &prepared.metrics,
+            prepared.partition_index,
+            &prepared.file_name,
+            units.len(),
+        );
+        source.publish(units);
+        local
+    }
+
     /// Build the final parquet stream once all pruning work is complete.
     fn build_stream(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let RowGroupsPrunedParquetOpen {
@@ -1344,7 +1443,7 @@ impl RowGroupsPrunedParquetOpen {
             page_pruning_predicate,
         } = prepared;
         let MetadataLoadedParquetOpen {
-            prepared,
+            mut prepared,
             reader_metadata,
             options: _,
         } = loaded;
@@ -1385,6 +1484,8 @@ impl RowGroupsPrunedParquetOpen {
                 page_pruning_result.pages_skipped_by_fully_matched,
             );
         }
+
+        let access_plan = Self::split_for_idle_siblings(&mut prepared, access_plan);
 
         // Prepare access plans, then apply row-group ordering tweaks per
         // run. Two composable steps:
@@ -1740,6 +1841,9 @@ async fn load_page_index<T: AsyncFileReader>(
         Ok(reader_metadata)
     }
 }
+
+#[cfg(test)]
+mod split_tests;
 
 #[cfg(test)]
 mod test {
@@ -2199,6 +2303,7 @@ mod test {
                 reverse_row_groups: self.reverse_row_groups,
                 sort_order_for_reorder: None,
                 virtual_state,
+                shared_work_source: None,
             })
         }
     }

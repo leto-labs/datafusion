@@ -31,6 +31,7 @@ mod adapters;
 pub(crate) mod mocks;
 
 use crate::PartitionedFile;
+use crate::file_stream::work_source::SharedWorkSource;
 pub(crate) use adapters::FileOpenerMorselizer;
 use arrow::array::RecordBatch;
 use datafusion_common::Result;
@@ -66,6 +67,16 @@ pub trait Morselizer: Send + Sync + Debug {
     /// work, such as reading from the file. Any needed I/O should be done using
     /// [`MorselPlan::with_pending_planner`].
     fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>>;
+
+    /// Attach the execution's shared work source, which exists when sibling
+    /// streams share their files.
+    ///
+    /// A morselizer that can split a file into finer work units while it
+    /// plans the file keeps the source, calls
+    /// [`SharedWorkSource::enable_publishing`], and publishes the units with
+    /// [`SharedWorkSource::publish`] before it returns the first morsel of
+    /// the file. The default ignores the source.
+    fn attach_shared_work_source(&mut self, _source: &SharedWorkSource) {}
 }
 
 /// A Morsel Planner is responsible for creating morsels for a given scan.

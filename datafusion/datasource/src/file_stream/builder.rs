@@ -120,7 +120,7 @@ impl<'a> FileStreamBuilder<'a> {
             );
         };
         let work_source = match shared_work_source {
-            Some(shared) => WorkSource::Shared(shared),
+            Some(shared) => WorkSource::Shared(shared.stream()),
             None => WorkSource::Local(file_group.into_inner().into()),
         };
 

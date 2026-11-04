@@ -544,6 +544,29 @@ impl ParquetAccessPlan {
         self.row_group_index_iter().collect()
     }
 
+    /// Split the scanned row groups into at most `parts` plans of contiguous
+    /// row groups with nearly equal counts. Each plan covers the whole file and
+    /// skips the row groups of the other plans; access and fully-matched flags
+    /// are kept. Together the plans scan exactly the row groups of `self`.
+    pub(crate) fn split(&self, parts: usize) -> Vec<Self> {
+        let scanned = self.row_group_indexes();
+        let parts = parts.clamp(1, scanned.len().max(1));
+        let (base, extra) = (scanned.len() / parts, scanned.len() % parts);
+        let mut start = 0;
+        (0..parts)
+            .map(|part| {
+                let end = start + base + usize::from(part < extra);
+                let mut plan = Self::new_none(self.len());
+                for &idx in &scanned[start..end] {
+                    plan.row_groups[idx] = self.row_groups[idx].clone();
+                    plan.fully_matched[idx] = self.fully_matched[idx];
+                }
+                start = end;
+                plan
+            })
+            .collect()
+    }
+
     /// Return the total number of row groups (not the total number or groups to
     /// scan)
     pub fn len(&self) -> usize {
@@ -810,6 +833,34 @@ mod test {
         // scan all row groups, no selection
         assert_eq!(row_group_indexes, vec![0, 1, 2, 3]);
         assert_eq!(row_selection, None);
+    }
+
+    #[test]
+    fn split_partitions_scanned_row_groups_contiguously() {
+        let selection = RowSelection::from(vec![RowSelector::select(5)]);
+        let mut access_plan = ParquetAccessPlan::new(vec![
+            RowGroupAccess::Skip,
+            RowGroupAccess::Scan,
+            RowGroupAccess::Selection(selection.clone()),
+            RowGroupAccess::Scan,
+            RowGroupAccess::Skip,
+            RowGroupAccess::Scan,
+            RowGroupAccess::Scan,
+        ]);
+        access_plan.mark_fully_matched(3);
+
+        let parts = access_plan.split(3);
+        let indexes: Vec<_> = parts.iter().map(|p| p.row_group_indexes()).collect();
+        assert_eq!(indexes, vec![vec![1, 2], vec![3, 5], vec![6]]);
+        assert!(parts.iter().all(|p| p.len() == 7));
+        assert_eq!(parts[0].inner()[2], RowGroupAccess::Selection(selection));
+        assert!(parts[1].is_fully_matched(3));
+        assert!(!parts[1].is_fully_matched(5));
+
+        // More parts than row groups: one row group per part.
+        assert_eq!(access_plan.split(10).len(), 5);
+        // One part is the plan itself.
+        assert_eq!(access_plan.split(1), vec![access_plan.clone()]);
     }
 
     #[test]

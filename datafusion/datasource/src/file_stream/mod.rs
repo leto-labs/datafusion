@@ -24,7 +24,10 @@
 mod builder;
 mod metrics;
 mod scan_state;
-pub(crate) mod work_source;
+pub mod work_source;
+
+#[cfg(test)]
+mod publish_tests;
 
 use std::pin::Pin;
 use std::sync::Arc;
