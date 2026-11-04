@@ -33,6 +33,8 @@ use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr_common::physical_expr::DynHash;
 
 mod tracker;
+#[cfg(test)]
+mod watch_state_tests;
 pub use tracker::{DynamicFilterTracker, DynamicFilterTracking};
 
 /// Per-generation cache of the remapped current expression for
@@ -336,8 +338,9 @@ impl DynamicFilterPhysicalExpr {
         };
         drop(current); // Release the lock before broadcasting
 
-        // Broadcast the new state to all waiters
-        let _ = self.state_watch.send(FilterState::InProgress {
+        // Longbow: retain the latest publication even without receivers. `send`
+        // otherwise leaves a stale watch value for late subscribers and codec.
+        self.state_watch.send_replace(FilterState::InProgress {
             generation: new_generation,
         });
         Ok(())
@@ -353,8 +356,8 @@ impl DynamicFilterPhysicalExpr {
         current.is_complete = true;
         drop(current);
 
-        // Broadcast completion to all waiters
-        let _ = self.state_watch.send(FilterState::Complete {
+        // Longbow: completion must also survive a period without subscribers.
+        self.state_watch.send_replace(FilterState::Complete {
             generation: current_generation,
         });
     }
