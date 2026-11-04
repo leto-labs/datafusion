@@ -24,6 +24,9 @@ mod exec;
 mod filter;
 pub(crate) mod materializing_stream;
 mod metrics;
+mod parent_filter;
 
+#[cfg(test)]
+mod parent_filter_tests;
 #[cfg(test)]
 mod tests;

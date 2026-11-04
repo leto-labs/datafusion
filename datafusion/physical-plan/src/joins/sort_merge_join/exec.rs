@@ -27,6 +27,10 @@ use super::materializing_stream::MaterializingSortMergeJoinStream;
 use super::metrics::SortMergeJoinMetrics;
 use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::expressions::PhysicalSortExpr;
+use crate::filter_pushdown::{
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+    FilterPushdownPropagation,
+};
 use crate::joins::utils::{
     JoinFilter, JoinOn, JoinOnRef, build_join_schema, check_join_is_valid,
     estimate_join_statistics, reorder_output_after_swap,
@@ -47,6 +51,7 @@ use crate::{
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, assert_eq_or_internal_err, internal_err,
@@ -623,6 +628,39 @@ impl ExecutionPlan for SortMergeJoinExec {
             &self.join_type,
             &self.schema,
         )?))
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        phase: FilterPushdownPhase,
+        parent_filters: Vec<PhysicalExprRef>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        if phase == FilterPushdownPhase::Post && self.join_type == JoinType::Inner {
+            super::parent_filter::describe(self, &parent_filters)
+        } else {
+            Ok(FilterDescription::all_unsupported(
+                &parent_filters,
+                &self.children(),
+            ))
+        }
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        phase: FilterPushdownPhase,
+        result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        // An inner row retains each input's columns. Applying a one-sided
+        // parent predicate on that input fully evaluates it for joined rows.
+        Ok(
+            if phase == FilterPushdownPhase::Post && self.join_type == JoinType::Inner {
+                FilterPushdownPropagation::if_any(result)
+            } else {
+                FilterPushdownPropagation::if_all(result)
+            },
+        )
     }
 
     /// Tries to swap the projection with its input [`SortMergeJoinExec`]. If it can be done,
