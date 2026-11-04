@@ -70,6 +70,7 @@ mod visitor;
 pub mod aggregates;
 pub mod analyze;
 pub mod async_func;
+pub mod attempt_tasks;
 pub mod buffer;
 pub mod coalesce;
 pub mod coalesce_batches;
@@ -113,3 +114,9 @@ pub mod udaf {
 }
 
 pub mod test;
+
+#[cfg(test)]
+mod attempt_spawn_tests;
+
+#[cfg(test)]
+mod attempt_buffer_tests;

@@ -25,7 +25,8 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::common::spawn_buffered;
+use crate::attempt_tasks::AttemptTasks;
+use crate::common::spawn_buffered_with_scope;
 use crate::execution_plan::{
     Boundedness, CardinalityEffect, EmissionType, has_same_children_properties,
     replace_children_if_necessary,
@@ -256,6 +257,7 @@ struct ExternalSorter {
     /// Reservation for in_mem_batches
     reservation: MemoryReservation,
     spill_manager: SpillManager,
+    attempt_tasks: Option<Arc<AttemptTasks>>,
 
     /// Reservation for the merging of in-memory batches. If the sort
     /// might spill, `sort_spill_reservation_bytes` will be
@@ -307,12 +309,20 @@ impl ExternalSorter {
             metrics,
             reservation,
             spill_manager,
+            attempt_tasks: None,
             merge_reservation,
             runtime,
             batch_size,
             sort_spill_reservation_bytes,
             sort_in_place_threshold_bytes,
         })
+    }
+
+    /// Retain the same attempt scope for in-memory buffers and recursive spill reads.
+    pub fn with_attempt_tasks(mut self, scope: Option<Arc<AttemptTasks>>) -> Self {
+        self.spill_manager = self.spill_manager.with_attempt_tasks(scope.clone());
+        self.attempt_tasks = scope;
+        self
     }
 
     /// Appends an unsorted [`RecordBatch`] to `in_mem_batches`
@@ -650,7 +660,7 @@ impl ExternalSorter {
                     .reservation
                     .split(get_reserved_bytes_for_record_batch(&batch)?);
                 let input = self.sort_batch_stream(batch, reservation)?;
-                Ok(spawn_buffered(input, 1))
+                spawn_buffered_with_scope(input, 1, self.attempt_tasks.clone())
             })
             .collect::<Result<_>>()?;
 
@@ -1435,7 +1445,8 @@ impl ExecutionPlan for SortExec {
                     context.session_config().spill_compression(),
                     &self.metrics_set,
                     context.runtime_env(),
-                )?;
+                )?
+                .with_attempt_tasks(AttemptTasks::from_task(&context));
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     self.schema(),
                     futures::stream::once(async move {

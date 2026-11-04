@@ -18,8 +18,9 @@
 //! Define the `SpillManager` struct, which is responsible for reading and writing `RecordBatch`es to raw files based on the provided configurations.
 
 use super::{SpillReaderStream, in_progress_spill_file::InProgressSpillFile};
+use crate::attempt_tasks::AttemptTasks;
 use crate::coop::cooperative;
-use crate::{common::spawn_buffered, metrics::SpillMetrics};
+use crate::{common::spawn_buffered_with_scope, metrics::SpillMetrics};
 use arrow::array::{BinaryViewArray, GenericByteViewArray, StringViewArray};
 use arrow::datatypes::{ByteViewType, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -41,6 +42,7 @@ pub struct SpillManager {
     env: Arc<RuntimeEnv>,
     pub(crate) metrics: SpillMetrics,
     schema: SchemaRef,
+    attempt_tasks: Option<Arc<AttemptTasks>>,
     /// Number of batches to buffer in memory during disk reads
     batch_read_buffer_capacity: usize,
     /// general-purpose compression options
@@ -53,9 +55,16 @@ impl SpillManager {
             env,
             metrics,
             schema,
+            attempt_tasks: None,
             batch_read_buffer_capacity: 2,
             compression: SpillCompression::default(),
         }
+    }
+
+    /// Retain the attempt scope for every buffered read, including cloned managers.
+    pub fn with_attempt_tasks(mut self, scope: Option<Arc<AttemptTasks>>) -> Self {
+        self.attempt_tasks = scope;
+        self
     }
 
     pub fn with_batch_read_buffer_capacity(
@@ -191,7 +200,11 @@ impl SpillManager {
             max_record_batch_memory,
         )?));
 
-        Ok(spawn_buffered(stream, self.batch_read_buffer_capacity))
+        spawn_buffered_with_scope(
+            stream,
+            self.batch_read_buffer_capacity,
+            self.attempt_tasks.clone(),
+        )
     }
 
     /// Same as `read_spill_as_stream`, but without buffering.

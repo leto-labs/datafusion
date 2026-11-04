@@ -283,7 +283,7 @@ impl ExecutionPlan for AnalyzeExec {
                 Arc::clone(&self.input),
                 input_partition,
                 Arc::clone(&context),
-            );
+            )?;
         }
 
         // Create future that computes the final output

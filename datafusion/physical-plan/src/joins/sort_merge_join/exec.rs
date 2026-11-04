@@ -544,6 +544,7 @@ impl ExecutionPlan for SortMergeJoinExec {
             SpillMetrics::new(&self.metrics, partition),
             buffered.schema(),
         )
+        .with_attempt_tasks(crate::attempt_tasks::AttemptTasks::from_task(&context))
         .with_compression_type(context.session_config().spill_compression());
 
         if matches!(

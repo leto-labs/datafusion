@@ -22,6 +22,7 @@ use std::fs::metadata;
 use std::sync::Arc;
 
 use super::SendableRecordBatchStream;
+use crate::attempt_tasks::AttemptTasks;
 use crate::expressions::{CastExpr, Column};
 use crate::projection::{ProjectionExec, ProjectionExpr};
 use crate::stream::RecordBatchReceiverStream;
@@ -31,7 +32,7 @@ use arrow::array::Array;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::stats::Precision;
-use datafusion_common::{Result, plan_err};
+use datafusion_common::{Result, internal_datafusion_err, plan_err};
 use datafusion_execution::memory_pool::MemoryReservation;
 
 use futures::{StreamExt, TryStreamExt};
@@ -184,19 +185,31 @@ pub fn project_plan_to_schema(
 /// allowing it to execute in parallel with an intermediate buffer of size `buffer`.
 /// At most `buffer` record batches will be produced ahead of the consumer.
 pub fn spawn_buffered(
-    mut input: SendableRecordBatchStream,
+    input: SendableRecordBatchStream,
     buffer: usize,
 ) -> SendableRecordBatchStream {
+    spawn_buffered_with_scope(input, buffer, None)
+        .expect("unscoped buffered spawn cannot fail registration")
+}
+
+/// Scoped sibling of [`spawn_buffered`], registering only actual spawned producers.
+/// A closed scope fails before spawning; direct input remains owned by its caller.
+pub fn spawn_buffered_with_scope(
+    mut input: SendableRecordBatchStream,
+    buffer: usize,
+    scope: Option<Arc<AttemptTasks>>,
+) -> Result<SendableRecordBatchStream> {
     // Use tokio only if running from a multi-thread tokio context
     match tokio::runtime::Handle::try_current() {
         Ok(handle)
             if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
         {
-            let mut builder = RecordBatchReceiverStream::builder(input.schema(), buffer);
+            let mut builder = RecordBatchReceiverStream::builder(input.schema(), buffer)
+                .with_scope(scope.clone());
 
             let sender = builder.tx();
 
-            builder.spawn(async move {
+            let produce = async move {
                 // We call `reserve` (which waits until there's room for at least 1 message in the
                 // channel buffer) **before** polling from input to ensure we hold a maximum of
                 // `buffer` record batches in memory.
@@ -217,11 +230,21 @@ pub fn spawn_buffered(
                 }
 
                 Ok(())
-            });
+            };
 
-            builder.build()
+            if let Some(scope) = scope {
+                let tracked = scope
+                    .track_producer(produce)
+                    .map_err(|error| internal_datafusion_err!("{error}"))?;
+                // Producer stop ends teardown; it does not select task success.
+                builder.spawn(async move { tracked.await.unwrap_or(Ok(())) });
+            } else {
+                builder.spawn(produce);
+            }
+
+            Ok(builder.build())
         }
-        _ => input,
+        _ => Ok(input),
     }
 }
 

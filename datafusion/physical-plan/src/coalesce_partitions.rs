@@ -247,7 +247,7 @@ impl ExecutionPlan for CoalescePartitionsExec {
                         Arc::clone(&self.input),
                         part_i,
                         Arc::clone(&context),
-                    );
+                    )?;
                 }
 
                 let stream = builder.build();

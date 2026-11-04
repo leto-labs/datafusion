@@ -1562,6 +1562,7 @@ impl NestedLoopJoinStream {
                     spill_metrics,
                     Arc::clone(&schema),
                 )
+                .with_attempt_tasks(crate::attempt_tasks::AttemptTasks::from_task(&ctx))
                 .with_compression_type(ctx.session_config().spill_compression());
 
                 let result = left_spill_manager
@@ -1611,6 +1612,7 @@ impl NestedLoopJoinStream {
             self.metrics.spill_metrics.clone(),
             right_schema,
         )
+        .with_attempt_tasks(crate::attempt_tasks::AttemptTasks::from_task(&context))
         .with_compression_type(context.session_config().spill_compression());
 
         self.spill_state = SpillState::Active(Box::new(SpillStateActive {
