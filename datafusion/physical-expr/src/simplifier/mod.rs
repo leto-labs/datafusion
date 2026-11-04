@@ -355,7 +355,10 @@ impl<'a> PhysicalExprSimplifier<'a> {
 
                 // Apply NOT expression simplification first, then unwrap cast optimization,
                 // then constant expression evaluation
-                #[expect(deprecated, reason = "`simplify_not_expr` is marked as deprecated until it's made private.")]
+                #[expect(
+                    deprecated,
+                    reason = "`simplify_not_expr` is marked as deprecated until it's made private."
+                )]
                 let rewritten = not::simplify_not_expr(node, schema)?
                     .transform_data(|node| unwrap_cast_in_comparison(node, schema))?
                     .transform_data(|node| {
@@ -444,8 +447,7 @@ mod tests {
         let column_expr = col("c2", &schema).unwrap();
         let cast_expr = Arc::new(CastExpr::new(column_expr, DataType::Int32, None));
         let literal_expr = lit(ScalarValue::Int32(Some(99)));
-        let binary_expr =
-            Arc::new(BinaryExpr::new(cast_expr, Operator::NotEq, literal_expr));
+        let binary_expr = Arc::new(BinaryExpr::new(cast_expr, Operator::NotEq, literal_expr));
 
         // Apply full simplification (uses TreeNodeRewriter)
         let optimized = simplifier.simplify(binary_expr).unwrap();
@@ -839,8 +841,7 @@ mod tests {
             Operator::Multiply,
             lit(2i32),
         ));
-        let expr: Arc<dyn PhysicalExpr> =
-            Arc::new(BinaryExpr::new(left, Operator::Plus, right));
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(left, Operator::Plus, right));
         let result = simplifier.simplify(expr).unwrap();
         let literal = as_literal(&result);
         assert_eq!(literal.value(), &ScalarValue::Int32(Some(15)));

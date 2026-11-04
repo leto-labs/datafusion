@@ -834,7 +834,9 @@ impl PhysicalExpr for RangeExpr {
     #[cfg(feature = "proto")]
     fn try_to_proto(
         &self,
-        ctx: &datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncodeCtx<'_>,
+        ctx: &datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncodeCtx<
+            '_,
+        >,
     ) -> Result<Option<protobuf::PhysicalExprNode>> {
         // Encode the raw ordered children: rebuilding a `LexOrdering` would
         // deduplicate equivalent children after dynamic-filter remapping.
@@ -874,7 +876,9 @@ impl RangeExpr {
     /// Reconstructs a [`RangeExpr`] from its protobuf representation.
     pub fn try_from_proto(
         node: &protobuf::PhysicalExprNode,
-        ctx: &datafusion_physical_expr_common::physical_expr::proto_decode::PhysicalExprDecodeCtx<'_>,
+        ctx: &datafusion_physical_expr_common::physical_expr::proto_decode::PhysicalExprDecodeCtx<
+            '_,
+        >,
     ) -> Result<PhysicalExprRef> {
         // Decode the raw ordered children for the same reason as `try_to_proto`.
         let range_expr = match &node.expr_type {
