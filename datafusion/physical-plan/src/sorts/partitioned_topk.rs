@@ -522,6 +522,7 @@ async fn do_partitioned_topk(
             )?;
             while let Some(batch) = input.next().await {
                 state.insert_batch(&batch?)?;
+                tokio::task::yield_now().await;
             }
             drop(input);
             state.emit()

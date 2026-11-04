@@ -17,6 +17,13 @@
 
 //! TopK: Combination of Sort / LIMIT
 
+#[cfg(test)]
+mod rank_drop_tests;
+mod rank_emit;
+mod rank_memory;
+#[cfg(test)]
+mod rank_memory_tests;
+
 use arrow::{
     array::{Array, AsArray},
     compute::{
@@ -1460,8 +1467,8 @@ impl PartitionedTopK {
 }
 
 /// A run of rows from a single source [`RecordBatch`] that tied at the
-/// boundary when inserted. Stored as `(batch, indices)` and materialized
-/// at emit time via [`take_record_batch`].
+/// boundary when inserted. Stored as `(batch, indices)` and emitted in
+/// bounded source slices without materializing the complete peer set.
 #[derive(Debug)]
 struct TieEntry {
     batch: RecordBatch,
@@ -1494,7 +1501,18 @@ impl RankPartitionState {
             .iter()
             .map(|t| t.row_indices.capacity() * size_of::<u32>() + t.batch_bytes)
             .sum();
-        self.heap.size() + ties_buffer + ties_contents
+        self.heap.size() - self.heap.store.batches_size
+            + self
+                .heap
+                .store
+                .batches
+                .values()
+                .map(|entry| rank_memory::batch_bytes(&entry.batch))
+                .sum::<usize>()
+            + self.heap.store.batches.capacity()
+                * (size_of::<(u32, RecordBatchEntry)>() + 2)
+            + ties_buffer
+            + ties_contents
     }
 }
 
@@ -1525,9 +1543,8 @@ impl RankPartitionState {
 pub(crate) struct PartitionedTopKRank {
     schema: SchemaRef,
     metrics: TopKMetrics,
-    reservation: MemoryReservation,
     /// ORDER BY expressions (excludes PARTITION BY).
-    expr: LexOrdering,
+    expr: Vec<PhysicalSortExpr>,
     /// Encoder for ORDER BY columns. Reused across partitions.
     row_converter: RowConverter,
     /// Scratch row buffer reused across `insert_batch` calls.
@@ -1544,6 +1561,8 @@ pub(crate) struct PartitionedTopKRank {
     states: HashMap<OwnedRow, RankPartitionState>,
     k: usize,
     batch_size: usize,
+    // Last: all buffers must be destroyed before their credits are returned.
+    reservation: MemoryReservation,
 }
 
 impl PartitionedTopKRank {
@@ -1559,25 +1578,47 @@ impl PartitionedTopKRank {
         runtime: &Arc<RuntimeEnv>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Self> {
-        assert!(k > 0, "PartitionedTopKRank requires k > 0");
+        rank_memory::validate(&schema, &partition_exprs, &order_expr, k, batch_size)?;
         let reservation =
             MemoryConsumer::new(format!("PartitionedTopKRank[{partition_id}]"))
                 .register(&runtime.memory_pool);
 
-        let order_sort_fields = build_sort_fields(&order_expr, &schema)?;
-        let row_converter = RowConverter::new(order_sort_fields)?;
-        let scratch_rows =
-            row_converter.empty_rows(batch_size, ESTIMATED_BYTES_PER_ROW * batch_size);
-
-        let partition_converter = RowConverter::new(partition_sort_fields)?;
-        let partition_scratch_rows = partition_converter
-            .empty_rows(batch_size, ESTIMATED_BYTES_PER_ROW * batch_size);
+        // Flat column keys have stateless codecs. Charge their metadata before
+        // constructing converters; scratch buffers start empty rather than
+        // allocating according to an unchecked caller-supplied batch size.
+        reservation.try_grow(rank_memory::metadata_bound(
+            partition_exprs
+                .capacity()
+                .max(partition_sort_fields.capacity()),
+            order_expr.capacity(),
+        )?)?;
+        let converters = (|| {
+            let order_sort_fields = build_sort_fields(&order_expr, &schema)?;
+            let row_converter = RowConverter::new(order_sort_fields)?;
+            let partition_converter = RowConverter::new(partition_sort_fields)?;
+            Ok::<_, datafusion_common::DataFusionError>((
+                row_converter,
+                partition_converter,
+            ))
+        })();
+        let (row_converter, partition_converter) = match converters {
+            Ok(converters) => converters,
+            Err(error) => {
+                // Arguments own buffers too: release them before the local
+                // reservation on a converter-construction error.
+                drop(order_expr);
+                drop(partition_exprs);
+                return Err(error);
+            }
+        };
+        let scratch_rows = row_converter.empty_rows(0, 0);
+        let partition_scratch_rows = partition_converter.empty_rows(0, 0);
 
         Ok(Self {
             schema,
             metrics: TopKMetrics::new(metrics, partition_id),
             reservation,
-            expr: order_expr,
+            expr: order_expr.into_iter().collect(),
             row_converter,
             scratch_rows,
             partition_exprs,
@@ -1602,11 +1643,16 @@ impl PartitionedTopKRank {
             return Ok(());
         }
 
+        // Reserve conversion/grouping scratch BEFORE allocating it. Only flat
+        // column keys are admitted, so evaluation cannot allocate hidden arrays.
+        let scratch = rank_memory::scratch_bound(self, batch)?;
+        rank_memory::reserve(self, scratch)?;
+
         // Captured once so the per-tie push from this batch can reuse
         // it (computing `get_record_batch_memory_size` is O(cols ×
         // buffer walk) and we'd otherwise pay it per push and again
         // per `try_resize` call).
-        let input_batch_bytes = get_record_batch_memory_size(batch);
+        let input_batch_bytes = rank_memory::batch_bytes(batch);
 
         // 1. Evaluate + encode partition columns into the reusable
         //    scratch (cleared then appended).
@@ -1621,12 +1667,9 @@ impl PartitionedTopKRank {
         let pk_rows = &self.partition_scratch_rows;
 
         // 2. Demultiplex row indices by partition key (per-batch).
-        let mut groups: HashMap<OwnedRow, Vec<u32>> = HashMap::new();
+        let mut groups: HashMap<arrow::row::Row<'_>, Vec<u32>> = HashMap::new();
         for i in 0..num_rows {
-            groups
-                .entry(pk_rows.row(i).owned())
-                .or_default()
-                .push(i as u32);
+            groups.entry(pk_rows.row(i)).or_default().push(i as u32);
         }
 
         // 3. Evaluate ORDER BY columns on the full batch and encode ONCE.
@@ -1642,12 +1685,46 @@ impl PartitionedTopKRank {
         // 4. Per-partition: classify each row and dispatch.
         let k = self.k;
         let mut replacements: usize = 0;
+        let mut retained = self.size();
 
         for (pk, indices) in groups {
-            let state = self.states.entry(pk).or_insert_with(|| RankPartitionState {
-                heap: TopKHeap::new(k),
-                ties: Vec::new(),
-            });
+            // The working bound covers hash-table/Vec growth (including both
+            // old and new allocations), new owned keys and evicted-row scratch.
+            use std::hash::BuildHasher;
+            let hash = self.states.hasher().hash_one(pk);
+            let existing = self
+                .states
+                .raw_entry()
+                .from_hash(hash, |key| key.as_ref() == pk.as_ref());
+            let old_state_bytes = existing
+                .map(|(key, state)| key.as_ref().len() + state.size())
+                .unwrap_or(0);
+            let old_table_bytes = rank_memory::table_bytes(self.states.capacity());
+            let working = rank_memory::partition_bound(
+                self.states.capacity(),
+                existing.map(|(_, state)| state),
+                pk.as_ref().len(),
+                &indices,
+                k,
+                input_batch_bytes,
+            )?;
+            let target = rank_memory::add(retained, rank_memory::add(scratch, working)?)?;
+            self.reservation
+                .try_resize(target.max(self.reservation.size()))?;
+            let state = self
+                .states
+                .raw_entry_mut()
+                .from_hash(hash, |key| key.as_ref() == pk.as_ref())
+                .or_insert_with(|| {
+                    (
+                        pk.owned(),
+                        RankPartitionState {
+                            heap: TopKHeap::new(k),
+                            ties: Vec::new(),
+                        },
+                    )
+                })
+                .1;
 
             // Equal indices for THIS batch only. Coalesced into a single
             // tie entry at the end of the partition's loop. Discarded if
@@ -1678,6 +1755,11 @@ impl PartitionedTopKRank {
                     Some(Ordering::Less) | None => {
                         // Heap path: heap not yet full, or row strictly
                         // better than the current boundary.
+                        if state.heap.store.next_id == u32::MAX && entry.is_none() {
+                            return Err(datafusion_common::resources_datafusion_err!(
+                                "PartitionedTopKRank source batch ID overflow"
+                            ));
+                        }
                         let entry_ref = entry.get_or_insert_with(|| {
                             state.heap.register_batch(batch.clone())
                         });
@@ -1709,7 +1791,7 @@ impl PartitionedTopKRank {
                                 // at the (unchanged) boundary; push as a
                                 // single-row entry.
                                 let batch_bytes =
-                                    get_record_batch_memory_size(&evicted_batch);
+                                    rank_memory::batch_bytes(&evicted_batch);
                                 state.ties.push(TieEntry {
                                     batch: evicted_batch,
                                     row_indices: vec![evicted_index as u32],
@@ -1724,7 +1806,9 @@ impl PartitionedTopKRank {
 
             if let Some(e) = entry {
                 state.heap.insert_batch_entry(e);
-                state.heap.maybe_compact()?;
+                // Keep source batches charged. Compaction materializes a full
+                // heap and needs additional payload scratch; the opt-in rank
+                // path instead refuses at the pool limit without losing peers.
             }
 
             // Commit this batch's ties as a single entry.
@@ -1735,79 +1819,43 @@ impl PartitionedTopKRank {
                     batch_bytes: input_batch_bytes,
                 });
             }
+            let new_state_bytes = pk.as_ref().len() + state.size();
+            retained = retained - old_state_bytes - old_table_bytes
+                + new_state_bytes
+                + rank_memory::table_bytes(self.states.capacity());
         }
 
         if replacements > 0 {
             self.metrics.row_replacements.add(replacements);
         }
-        self.reservation.try_resize(self.size())?;
+        drop(pk_arrays);
+        drop(ob_arrays);
+        // All per-batch scratch has gone before releasing its credits.
+        debug_assert_eq!(retained, self.size());
+        assert!(retained <= self.reservation.size(), "rank working bound");
+        self.reservation.shrink(self.reservation.size() - retained);
         Ok(())
     }
 
-    /// Drain all heaps and ties in partition-key order and return the
-    /// rows as a stream of coalesced [`RecordBatch`]es ordered by
-    /// `(partition_keys, order_keys)`. Within a partition, heap rows
-    /// come first (sorted by ob), then tie rows (all sharing the
-    /// boundary ob).
+    /// Incrementally drain bounded ordered batches while retaining all credits.
     pub(crate) fn emit(self) -> Result<SendableRecordBatchStream> {
-        let Self {
-            schema,
-            metrics,
-            reservation: _,
-            expr: _,
-            row_converter: _,
-            scratch_rows: _,
-            partition_exprs: _,
-            partition_converter: _,
-            partition_scratch_rows: _,
-            mut states,
-            k: _,
-            batch_size,
-        } = self;
-        let _timer = metrics.baseline.elapsed_compute().timer();
-
-        let mut sorted_pks: Vec<OwnedRow> = states.keys().cloned().collect();
-        sorted_pks.sort();
-
-        let mut coalescer = BatchCoalescer::new(Arc::clone(&schema), batch_size);
-
-        for pk in sorted_pks {
-            let RankPartitionState { mut heap, ties, .. } =
-                states.remove(&pk).expect("key from states.keys()");
-            if let Some(batch) = heap.emit()? {
-                (&batch).record_output(&metrics.baseline);
-                coalescer.push_batch(batch)?;
-            }
-            for tie in ties {
-                let indices = UInt32Array::from(tie.row_indices);
-                let tie_batch = take_record_batch(&tie.batch, &indices)?;
-                (&tie_batch).record_output(&metrics.baseline);
-                coalescer.push_batch(tie_batch)?;
-            }
-        }
-        coalescer.finish_buffered_batch()?;
-
-        let mut out: Vec<Result<RecordBatch>> = Vec::new();
-        while let Some(b) = coalescer.next_completed_batch() {
-            out.push(Ok(b));
-        }
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::iter(out),
-        )))
+        rank_emit::emit(self)
     }
 
     /// Total memory currently held, including all per-partition states.
     fn size(&self) -> usize {
         size_of::<Self>()
+            + self.expr.capacity() * size_of::<PhysicalSortExpr>()
+            + self.partition_exprs.capacity() * size_of::<Arc<dyn PhysicalExpr>>()
             + self.row_converter.size()
             + self.partition_converter.size()
             + self.scratch_rows.size()
             + self.partition_scratch_rows.size()
-            + self.states.values().map(|s| s.size()).sum::<usize>()
-            + self.states.capacity()
-                * (size_of::<OwnedRow>() + size_of::<RankPartitionState>())
+            + self.states.iter().map(|(key, state)| {
+                key.as_ref().len() + state.size()
+            }).sum::<usize>()
+            // Include table control bytes and bucket padding, not just values.
+            + rank_memory::table_bytes(self.states.capacity())
     }
 }
 
