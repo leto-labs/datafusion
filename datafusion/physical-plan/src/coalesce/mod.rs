@@ -120,6 +120,36 @@ impl LimitedBatchCoalescer {
         Ok(PushBatchStatus::Continue)
     }
 
+    /// Append a borrowed row range, preserving limit and finish semantics.
+    pub(crate) fn push_batch_range(
+        &mut self,
+        batch: &RecordBatch,
+        start: usize,
+        len: usize,
+    ) -> Result<PushBatchStatus> {
+        assert_or_internal_err!(
+            !self.finished,
+            "LimitedBatchCoalescer: cannot push batch after finish"
+        );
+        assert_or_internal_err!(
+            start <= batch.num_rows() && len <= batch.num_rows() - start,
+            "LimitedBatchCoalescer: range exceeds input rows"
+        );
+        let remaining = self
+            .fetch
+            .map(|fetch| fetch.saturating_sub(self.total_rows));
+        let len = remaining.map_or(len, |remaining| len.min(remaining));
+        self.inner.push_batch_range(batch, start, len)?;
+        self.total_rows += len;
+        Ok(
+            if self.fetch.is_some_and(|fetch| self.total_rows >= fetch) {
+                PushBatchStatus::LimitReached
+            } else {
+                PushBatchStatus::Continue
+            },
+        )
+    }
+
     /// Return true if there is no data buffered
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
@@ -373,3 +403,6 @@ mod tests {
             .to_string()
     }
 }
+
+#[cfg(test)]
+mod range_tests;

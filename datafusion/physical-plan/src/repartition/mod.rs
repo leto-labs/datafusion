@@ -89,6 +89,11 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use log::trace;
 use parking_lot::Mutex;
 
+#[cfg(test)]
+mod contention_tests;
+#[cfg(test)]
+mod schema_tests;
+
 mod distributor_channels;
 use crate::repartition::distributor_channels::SendError;
 use distributor_channels::{
@@ -212,8 +217,20 @@ impl PartitionSpillWriters {
 impl OutputChannel {
     fn coalesce(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
         match &self.shared_coalescer {
-            Some(shared) => Ok(shared.push_and_drain(batch)?),
+            Some(shared) => shared.push_batch_and_drain(batch),
             None => Ok(vec![batch]),
+        }
+    }
+
+    fn coalesce_range(
+        &mut self,
+        batch: &RecordBatch,
+        start: usize,
+        len: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        match &self.shared_coalescer {
+            Some(shared) => shared.push_range_and_drain(batch, start, len),
+            None => Ok(vec![batch.slice(start, len)]),
         }
     }
 
@@ -267,7 +284,7 @@ impl SharedCoalescer {
     fn new(schema: SchemaRef, target_batch_size: usize, num_senders: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(LimitedBatchCoalescer::new(
-                schema,
+                private_schema(&schema),
                 target_batch_size,
                 None,
             ))),
@@ -275,12 +292,27 @@ impl SharedCoalescer {
         }
     }
 
-    /// Push `batch` into the coalescer and drain any newly completed
-    /// batches. The mutex is held only briefly.
-    fn push_and_drain(&self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+    fn push_batch_and_drain(&self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
         let mut acc = Vec::new();
         let mut c = self.inner.lock();
         c.push_batch(batch)?;
+        while let Some(b) = c.next_completed_batch() {
+            acc.push(b);
+        }
+        Ok(acc)
+    }
+
+    /// Push `batch` into the coalescer and drain any newly completed
+    /// batches. The mutex is held only briefly.
+    fn push_range_and_drain(
+        &self,
+        batch: &RecordBatch,
+        start: usize,
+        len: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        let mut acc = Vec::new();
+        let mut c = self.inner.lock();
+        c.push_batch_range(batch, start, len)?;
         while let Some(b) = c.next_completed_batch() {
             acc.push(b);
         }
@@ -625,8 +657,28 @@ impl RepartitionExecState {
     }
 }
 
+// Schema values remain equal, but tiny slices must not clone the schema Arc
+// shared by every input stream. Top-level Field Arcs are private as well.
+fn private_schema(schema: &SchemaRef) -> SchemaRef {
+    Arc::new(Schema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    ))
+}
+
+struct PartitionedBatch {
+    batch: RecordBatch,
+    ranges: Vec<(usize, usize, usize)>,
+}
+
 /// A utility that can be used to partition batches based on [`Partitioning`]
 pub struct BatchPartitioner {
+    // Source identity and a private equal schema, reused across this input stream.
+    schema: Option<(SchemaRef, SchemaRef)>,
     state: BatchPartitionerState,
     timer: metrics::Time,
 }
@@ -968,6 +1020,7 @@ impl BatchPartitioner {
         }
 
         Ok(Self {
+            schema: None,
             state: BatchPartitionerState::Hash {
                 exprs,
                 partition_reducer: StrengthReducedU64::new(num_partitions as u64),
@@ -996,6 +1049,7 @@ impl BatchPartitioner {
         num_input_partitions: usize,
     ) -> Self {
         Self {
+            schema: None,
             state: BatchPartitionerState::RoundRobin {
                 num_partitions,
                 next_idx: (input_partition * num_partitions) / num_input_partitions,
@@ -1019,6 +1073,7 @@ impl BatchPartitioner {
         let sort_options: Vec<SortOptions> = ordering.iter().map(|e| e.options).collect();
 
         Self {
+            schema: None,
             state: BatchPartitionerState::Range {
                 partition_buffer: Vec::with_capacity(ordering.len()),
                 ordering,
@@ -1108,89 +1163,113 @@ impl BatchPartitioner {
         &mut self,
         batch: RecordBatch,
     ) -> Result<impl Iterator<Item = Result<(usize, RecordBatch)>> + Send + '_> {
-        let it: Box<dyn Iterator<Item = Result<(usize, RecordBatch)>> + Send> =
-            match &mut self.state {
-                BatchPartitionerState::RoundRobin {
-                    num_partitions,
-                    next_idx,
-                } => {
-                    let idx = *next_idx;
-                    *next_idx = (*next_idx + 1) % *num_partitions;
-                    Box::new(std::iter::once(Ok((idx, batch))))
-                }
-                BatchPartitionerState::Hash {
-                    exprs,
-                    partition_reducer,
+        let PartitionedBatch { batch, ranges } = self.partition_batch(batch)?;
+        let whole =
+            ranges.len() == 1 && ranges[0].1 == 0 && ranges[0].2 == batch.num_rows();
+        let mut batch = Some(batch);
+        Ok(ranges.into_iter().map(move |(partition, start, len)| {
+            let batch = if whole {
+                batch.take().unwrap()
+            } else {
+                batch.as_ref().unwrap().slice(start, len)
+            };
+            Ok((partition, batch))
+        }))
+    }
+
+    // Internal consumers can coalesce borrowed ranges without making tiny batches.
+    fn partition_batch(&mut self, batch: RecordBatch) -> Result<PartitionedBatch> {
+        match &mut self.state {
+            BatchPartitionerState::RoundRobin {
+                num_partitions,
+                next_idx,
+            } => {
+                let idx = *next_idx;
+                *next_idx = (*next_idx + 1) % *num_partitions;
+                let len = batch.num_rows();
+                Ok(PartitionedBatch {
+                    batch,
+                    ranges: vec![(idx, 0, len)],
+                })
+            }
+            BatchPartitionerState::Hash {
+                exprs,
+                partition_reducer,
+                hash_buffer,
+                indices,
+            } => {
+                // Tracking time required for distributing indexes across output partitions
+                let timer = self.timer.timer();
+
+                let arrays = evaluate_expressions_to_arrays(exprs.as_slice(), &batch)?;
+
+                hash_buffer.clear();
+                hash_buffer.resize(batch.num_rows(), 0);
+
+                create_hashes(
+                    &arrays,
+                    REPARTITION_RANDOM_STATE.random_state(),
                     hash_buffer,
+                )?;
+
+                indices.iter_mut().for_each(|v| v.clear());
+
+                partition_reducer.partition_indices(hash_buffer, indices);
+
+                // Finished building index-arrays for output partitions
+                timer.done();
+
+                Self::partition_grouped_take(
+                    &batch,
                     indices,
-                } => {
-                    // Tracking time required for distributing indexes across output partitions
-                    let timer = self.timer.timer();
-
-                    let arrays =
-                        evaluate_expressions_to_arrays(exprs.as_slice(), &batch)?;
-
-                    hash_buffer.clear();
-                    hash_buffer.resize(batch.num_rows(), 0);
-
-                    create_hashes(
-                        &arrays,
-                        REPARTITION_RANDOM_STATE.random_state(),
-                        hash_buffer,
+                    &self.timer,
+                    &mut self.schema,
+                )
+            }
+            BatchPartitionerState::Range {
+                ordering,
+                sort_options,
+                split_points,
+                indices,
+                partition_buffer,
+            } => {
+                // Tracking time required for distributing indexes across output partitions
+                let timer = self.timer.timer();
+                if split_points.is_empty() {
+                    timer.done();
+                    let len = batch.num_rows();
+                    Ok(PartitionedBatch {
+                        batch,
+                        ranges: vec![(0, 0, len)],
+                    })
+                } else {
+                    let arrays = evaluate_expressions_to_arrays(
+                        ordering.iter().map(|e| &e.expr),
+                        &batch,
                     )?;
 
                     indices.iter_mut().for_each(|v| v.clear());
 
-                    partition_reducer.partition_indices(hash_buffer, indices);
+                    Self::partition_range_indices(
+                        &arrays,
+                        split_points,
+                        sort_options,
+                        partition_buffer,
+                        indices,
+                    )?;
 
                     // Finished building index-arrays for output partitions
                     timer.done();
 
-                    let partitioned_batches =
-                        Self::partition_grouped_take(&batch, indices, &self.timer)?;
-
-                    Box::new(partitioned_batches.into_iter())
+                    Self::partition_grouped_take(
+                        &batch,
+                        indices,
+                        &self.timer,
+                        &mut self.schema,
+                    )
                 }
-                BatchPartitionerState::Range {
-                    ordering,
-                    sort_options,
-                    split_points,
-                    indices,
-                    partition_buffer,
-                } => {
-                    // Tracking time required for distributing indexes across output partitions
-                    let timer = self.timer.timer();
-                    if split_points.is_empty() {
-                        timer.done();
-                        Box::new(std::iter::once(Ok((0, batch))))
-                    } else {
-                        let arrays = evaluate_expressions_to_arrays(
-                            ordering.iter().map(|e| &e.expr),
-                            &batch,
-                        )?;
-
-                        indices.iter_mut().for_each(|v| v.clear());
-
-                        Self::partition_range_indices(
-                            &arrays,
-                            split_points,
-                            sort_options,
-                            partition_buffer,
-                            indices,
-                        )?;
-
-                        // Finished building index-arrays for output partitions
-                        timer.done();
-
-                        let partitioned_batches =
-                            Self::partition_grouped_take(&batch, indices, &self.timer)?;
-
-                        Box::new(partitioned_batches.into_iter())
-                    }
-                }
-            };
-
-        Ok(it)
+            }
+        }
     }
 
     /// Groups input row indices by range partition. This populates `indices[p]` with the
@@ -1224,11 +1303,11 @@ impl BatchPartitioner {
         }
     }
 
-    /// Build repartitioned hash/range output batches using one `take` per input batch.
+    /// Build grouped hash/range data using one `take` per input batch.
     ///
-    /// The routers first fills one index vector per output partition. This method
+    /// The router first fills one index vector per output partition. This method
     /// concatenates those index vectors, performs one grouped `take_arrays`, and
-    /// then returns each output partition as a slice of the reordered batch.
+    /// then returns each output partition as a range into the reordered batch.
     ///
     /// For example, given partition indices:
     ///
@@ -1244,7 +1323,8 @@ impl BatchPartitioner {
         batch: &RecordBatch,
         indices: &mut [Vec<u32>],
         timer: &metrics::Time,
-    ) -> Result<Vec<Result<(usize, RecordBatch)>>> {
+        schema: &mut Option<(SchemaRef, SchemaRef)>,
+    ) -> Result<PartitionedBatch> {
         let mut partition_ranges = Vec::with_capacity(indices.len());
         let mut reordered_indices = Vec::with_capacity(batch.num_rows());
 
@@ -1260,28 +1340,31 @@ impl BatchPartitioner {
         }
 
         if reordered_indices.is_empty() {
-            return Ok(vec![]);
+            return Ok(PartitionedBatch {
+                batch: batch.slice(0, 0),
+                ranges: vec![],
+            });
         }
 
-        let batches = {
-            let _timer = timer.timer();
-            let indices_array: PrimitiveArray<UInt32Type> = reordered_indices.into();
-            let columns = take_arrays(batch.columns(), &indices_array, None)?;
-
-            let mut options = RecordBatchOptions::new();
-            options = options.with_row_count(Some(indices_array.len()));
-            let reordered_batch =
-                RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
-
-            partition_ranges
-                .into_iter()
-                .map(|(partition, start, len)| {
-                    Ok((partition, reordered_batch.slice(start, len)))
-                })
-                .collect()
-        };
-
-        Ok(batches)
+        let _timer = timer.timer();
+        let indices_array: PrimitiveArray<UInt32Type> = reordered_indices.into();
+        let columns = take_arrays(batch.columns(), &indices_array, None)?;
+        let options = RecordBatchOptions::new().with_row_count(Some(indices_array.len()));
+        // Input stream schemas normally share one Arc. Preserve the public
+        // partitioner's behavior if a caller supplies a different schema later.
+        let cache = schema
+            .get_or_insert_with(|| (batch.schema(), private_schema(batch.schema_ref())));
+        if !Arc::ptr_eq(&cache.0, batch.schema_ref())
+            && cache.0.as_ref() != batch.schema_ref().as_ref()
+        {
+            *cache = (batch.schema(), private_schema(batch.schema_ref()));
+        }
+        let reordered_batch =
+            RecordBatch::try_new_with_options(Arc::clone(&cache.1), columns, &options)?;
+        Ok(PartitionedBatch {
+            batch: reordered_batch,
+            ranges: partition_ranges,
+        })
     }
 }
 
@@ -2152,13 +2235,25 @@ impl RepartitionExec {
                 continue;
             }
 
-            for res in partitioner.partition_iter(batch)? {
-                let (partition, batch) = res?;
-
-                let timer = metrics.send_time[partition].timer();
+            let PartitionedBatch { batch, ranges } =
+                partitioner.partition_batch(batch)?;
+            let whole =
+                ranges.len() == 1 && ranges[0].1 == 0 && ranges[0].2 == batch.num_rows();
+            let mut batch = Some(batch);
+            for (partition, start, len) in ranges {
+                let timer = metrics.send_time.timer();
                 // if there is still a receiver, send to it
                 if let Some(output_channel) = output_channels.get_mut(&partition) {
-                    for batch in output_channel.coalesce(batch)? {
+                    let completed = if whole {
+                        output_channel.coalesce(batch.take().unwrap())?
+                    } else {
+                        output_channel.coalesce_range(
+                            batch.as_ref().unwrap(),
+                            start,
+                            len,
+                        )?
+                    };
+                    for batch in completed {
                         if output_channel.send(batch).await.is_err() {
                             // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
                             // so ignore this channel from now on.
