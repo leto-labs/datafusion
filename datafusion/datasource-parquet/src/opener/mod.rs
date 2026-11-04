@@ -1595,6 +1595,19 @@ impl RowGroupsPrunedParquetOpen {
                 }
             }
 
+            // Longbow: final static statistics/bloom/page pruning and first
+            // predicate projection are now known. Keep decoding unchanged.
+            // Active dynamic pruning is deliberately demand-only: future
+            // groups can become pruned before their native boundary check.
+            if prepared.predicate.as_ref().is_none_or(|predicate| {
+                !matches!(
+                    DynamicFilterTracking::classify(predicate),
+                    DynamicFilterTracking::Watching(_)
+                )
+            }) {
+                builder.configure_read_ahead(prepared.async_file_reader.as_mut());
+            }
+
             (builder.build()?, rg_plan, has_row_selection)
         };
 
