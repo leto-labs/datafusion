@@ -27,6 +27,8 @@ pub(crate) mod sort_pushdown;
 #[cfg(feature = "proto")]
 mod proto;
 
+mod preparation;
+
 use crate::file_groups::FileGroup;
 use crate::{
     PartitionedFile, display::FileGroupsDisplay, file::FileSource,

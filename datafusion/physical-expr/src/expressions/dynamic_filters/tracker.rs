@@ -94,6 +94,10 @@ impl DynamicFilterTracking {
         }
     }
 
+    pub(crate) fn cacheable(&self) -> bool {
+        matches!(self, Self::Static)
+    }
+
     /// `true` if the predicate contains any dynamic filter (complete or not),
     /// i.e. its value may differ from what was known at planning time and is
     /// therefore worth re-evaluating at least once.

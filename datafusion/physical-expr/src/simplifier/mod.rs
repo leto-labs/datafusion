@@ -19,13 +19,19 @@
 
 use arrow::datatypes::Schema;
 use datafusion_common::{Result, tree_node::TreeNode};
-use std::sync::Arc;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::fs::OpenOptions;
+use std::hash::{Hash, Hasher};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use crate::{
     PhysicalExpr,
-    simplifier::{
-        const_evaluator::create_dummy_batch, unwrap_cast::unwrap_cast_in_comparison,
-    },
+    expressions::{DynamicFilterTracker, DynamicFilterTracking},
+    simplifier::{const_evaluator::create_dummy_batch, unwrap_cast::unwrap_cast_in_comparison},
 };
 
 pub mod const_evaluator;
@@ -33,6 +39,205 @@ pub mod not;
 pub mod unwrap_cast;
 
 const MAX_LOOP_COUNT: usize = 5;
+const PREPARATION_CACHE_CAPACITY: usize = 256;
+const PREPARATION_CACHE_PRUNE_INTERVAL: u64 = 64;
+// The simplifier's constant evaluator uses a fixed one-row dummy batch. Keep
+// the context in the key so a future evaluator context cannot reuse entries
+// prepared for this one.
+const DEFAULT_EVALUATION_CONTEXT: u64 = 0;
+
+static PREPARATION_CALLS: AtomicU64 = AtomicU64::new(0);
+static PREPARATION_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static PREPARATION_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static PREPARATION_CLONED_TREES: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static CACHE_ENABLED: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Run synchronous scan work with this session's preparation-cache setting.
+///
+/// A stream must enter this scope for each poll, never across an await. The
+/// previous setting is restored on return or panic, so interleaved sessions and
+/// tasks moving between worker threads cannot change one another's settings.
+pub fn with_preparation_cache<T>(enabled: bool, operation: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CACHE_ENABLED.set(self.0);
+        }
+    }
+    let _restore = Restore(CACHE_ENABLED.replace(enabled));
+    operation()
+}
+
+/// Whether synchronous scan work currently permits preparation-cache reuse.
+pub fn preparation_cache_enabled() -> bool {
+    CACHE_ENABLED.get()
+}
+
+fn preparation_counter_path() -> Option<&'static Path> {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os("LONGBOW_EXPR_PREP_COUNTERS").map(PathBuf::from))
+        .as_deref()
+}
+
+fn record_preparation_counters() {
+    let Some(path) = preparation_counter_path() else {
+        return;
+    };
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let line = format!(
+        "{}\t{}\t{}\t{}\t{}\n",
+        std::process::id(),
+        PREPARATION_CALLS.load(Ordering::Relaxed),
+        PREPARATION_CACHE_HITS.load(Ordering::Relaxed),
+        PREPARATION_CACHE_MISSES.load(Ordering::Relaxed),
+        PREPARATION_CLONED_TREES.load(Ordering::Relaxed),
+    );
+    let _ = file.write_all(line.as_bytes());
+}
+
+/// A cache entry for one schema-bound expression preparation.
+///
+/// Weak references keep the cache from retaining expression trees, large
+/// literal payloads, or dynamic-filter state after the owning scan/query is
+/// dropped. Dead entries are pruned periodically and before a full insertion.
+struct PreparationCacheEntry {
+    input: Weak<dyn PhysicalExpr>,
+    output: Weak<dyn PhysicalExpr>,
+    schema: Schema,
+    schema_fingerprint: u64,
+    evaluation_context: u64,
+}
+
+#[derive(Default)]
+struct PreparationCache {
+    entries: VecDeque<PreparationCacheEntry>,
+    lookups: u64,
+    hits: u64,
+    misses: u64,
+    lookups_since_prune: u64,
+}
+
+impl PreparationCache {
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.lookups = 0;
+        self.hits = 0;
+        self.misses = 0;
+        self.lookups_since_prune = 0;
+    }
+
+    fn prune_dead(&mut self) {
+        self.entries
+            .retain(|entry| entry.input.strong_count() != 0 && entry.output.strong_count() != 0);
+        self.lookups_since_prune = 0;
+    }
+
+    fn lookup(
+        &mut self,
+        input: &Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+        schema_fingerprint: u64,
+        evaluation_context: u64,
+    ) -> Option<Arc<dyn PhysicalExpr>> {
+        self.lookups += 1;
+        self.lookups_since_prune += 1;
+        if self.lookups_since_prune >= PREPARATION_CACHE_PRUNE_INTERVAL {
+            self.prune_dead();
+        }
+        let index = self.entries.iter().position(|entry| {
+            std::ptr::addr_eq(entry.input.as_ptr(), Arc::as_ptr(input))
+                && entry.evaluation_context == evaluation_context
+                && entry.schema_fingerprint == schema_fingerprint
+                && entry.schema == *schema
+        });
+        let Some(index) = index else {
+            self.misses += 1;
+            return None;
+        };
+
+        let entry = self
+            .entries
+            .remove(index)
+            .expect("cache entry index was found before removal");
+        let Some(output) = entry.output.upgrade() else {
+            self.misses += 1;
+            return None;
+        };
+        self.entries.push_back(entry);
+        self.hits += 1;
+        Some(output)
+    }
+
+    #[cfg(test)]
+    fn insert(
+        &mut self,
+        input: &Arc<dyn PhysicalExpr>,
+        output: &Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+        schema_fingerprint: u64,
+        evaluation_context: u64,
+    ) {
+        let tracking = DynamicFilterTracking::classify(input);
+        self.insert_with_tracking(
+            input,
+            output,
+            schema,
+            schema_fingerprint,
+            evaluation_context,
+            tracking,
+        );
+    }
+
+    fn insert_with_tracking(
+        &mut self,
+        input: &Arc<dyn PhysicalExpr>,
+        output: &Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+        schema_fingerprint: u64,
+        evaluation_context: u64,
+        tracking: DynamicFilterTracking,
+    ) {
+        if self.entries.len() >= PREPARATION_CACHE_CAPACITY {
+            self.prune_dead();
+        }
+        // No dynamic tree is retained, even when complete. Producers support
+        // post-completion updates and may publish nested filters in the future.
+        if !tracking.cacheable() {
+            return;
+        }
+        self.entries.push_back(PreparationCacheEntry {
+            input: Arc::downgrade(input),
+            output: Arc::downgrade(output),
+            schema: schema.clone(),
+            schema_fingerprint,
+            evaluation_context,
+        });
+        if self.entries.len() > PREPARATION_CACHE_CAPACITY {
+            self.entries.pop_front();
+        }
+    }
+}
+
+thread_local! {
+    /// Scan preparation is performed on the executor worker that owns the
+    /// opener. Keeping the bounded cache thread-local avoids turning a hot
+    /// per-file path into a process-wide mutex while still reusing entries for
+    /// the files and row groups handled by that worker.
+    static PREPARATION_CACHE: RefCell<PreparationCache> =
+        RefCell::new(PreparationCache::default());
+}
+
+fn schema_fingerprint(schema: &Schema) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    schema.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Simplifies physical expressions by applying various optimizations
 ///
@@ -41,16 +246,101 @@ const MAX_LOOP_COUNT: usize = 5;
 /// potentially be unwrapped.
 pub struct PhysicalExprSimplifier<'a> {
     schema: &'a Schema,
+    schema_fingerprint: Option<u64>,
+    evaluation_context: u64,
 }
 
 impl<'a> PhysicalExprSimplifier<'a> {
     /// Create a new physical expression simplifier
     pub fn new(schema: &'a Schema) -> Self {
-        Self { schema }
+        Self {
+            schema,
+            schema_fingerprint: preparation_cache_enabled().then(|| schema_fingerprint(schema)),
+            evaluation_context: DEFAULT_EVALUATION_CONTEXT,
+        }
     }
 
     /// Simplify a physical expression
     pub fn simplify(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
+        let owned_expr = expr;
+        let counters_enabled = preparation_counter_path().is_some();
+        if counters_enabled {
+            PREPARATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        let Some(schema_fingerprint) = self.schema_fingerprint else {
+            if !counters_enabled {
+                return self.simplify_uncached(owned_expr);
+            }
+            PREPARATION_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+            let result = self.simplify_uncached(Arc::clone(&owned_expr))?;
+            if !Arc::ptr_eq(&owned_expr, &result) {
+                PREPARATION_CLONED_TREES.fetch_add(1, Ordering::Relaxed);
+            }
+            record_preparation_counters();
+            return Ok(result);
+        };
+        if let Some(cached) = PREPARATION_CACHE.with(|cache| {
+            cache.borrow_mut().lookup(
+                &owned_expr,
+                self.schema,
+                schema_fingerprint,
+                self.evaluation_context,
+            )
+        }) {
+            if counters_enabled {
+                PREPARATION_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            }
+            record_preparation_counters();
+            return Ok(cached);
+        }
+
+        if counters_enabled {
+            PREPARATION_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Subscribe before preparation. The tracker is carried through the
+        // preparation and insertion so an update observed during the walk is
+        // never re-baselined by a second classification.
+        let mut tracking = DynamicFilterTracking::classify(&owned_expr);
+        let mut result = self.simplify_uncached(Arc::clone(&owned_expr))?;
+        let mut changed_during_preparation = tracking
+            .watcher()
+            .is_some_and(DynamicFilterTracker::changed);
+        if changed_during_preparation {
+            // A single retry closes the common update-during-fold window while
+            // keeping a continuously updating producer from causing an
+            // unbounded preparation loop. The second result is never cached if
+            // another update is observed.
+            result = self.simplify_uncached(Arc::clone(&owned_expr))?;
+            changed_during_preparation = tracking
+                .watcher()
+                .is_some_and(DynamicFilterTracker::changed);
+        }
+        if counters_enabled && !Arc::ptr_eq(&owned_expr, &result) {
+            PREPARATION_CLONED_TREES.fetch_add(1, Ordering::Relaxed);
+        }
+        // A rewritten root is normally owned only by this call site (the
+        // Parquet pruning builders pass fresh trees), so weakly caching it
+        // cannot produce a hit and only adds lookup/pruning work. Cache the
+        // unchanged roots that remain owned by the scan plan instead.
+        if !changed_during_preparation && tracking.cacheable() && Arc::ptr_eq(&owned_expr, &result)
+        {
+            PREPARATION_CACHE.with(|cache| {
+                cache.borrow_mut().insert_with_tracking(
+                    &owned_expr,
+                    &result,
+                    self.schema,
+                    schema_fingerprint,
+                    self.evaluation_context,
+                    tracking,
+                );
+            });
+        }
+        record_preparation_counters();
+        Ok(result)
+    }
+
+    fn simplify_uncached(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
         let mut current_expr = expr;
         let mut count = 0;
         let schema = self.schema;
@@ -92,6 +382,9 @@ impl<'a> PhysicalExprSimplifier<'a> {
 }
 
 #[cfg(test)]
+mod preparation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::expressions::{
@@ -101,7 +394,7 @@ mod tests {
     use datafusion_common::ScalarValue;
     use datafusion_expr::Operator;
 
-    fn test_schema() -> Schema {
+    pub(super) fn test_schema() -> Schema {
         Schema::new(vec![
             Field::new("c1", DataType::Int32, false),
             Field::new("c2", DataType::Int64, false),
@@ -118,7 +411,7 @@ mod tests {
     }
 
     /// Helper function to extract a Literal from a PhysicalExpr
-    fn as_literal(expr: &Arc<dyn PhysicalExpr>) -> &Literal {
+    pub(super) fn as_literal(expr: &Arc<dyn PhysicalExpr>) -> &Literal {
         expr.downcast_ref::<Literal>()
             .unwrap_or_else(|| panic!("Expected Literal, got: {expr}"))
     }
