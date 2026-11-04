@@ -495,6 +495,20 @@ impl PartialHashAggregateStream {
             MemoryConsumer::new(format!("PartialHashAggregateStream[{partition}]"))
                 .with_can_spill(true)
                 .register(context.memory_pool());
+        let fixed_reservation =
+            MemoryConsumer::new(format!("PartialHashAggregateFixed[{partition}]"))
+                .register(context.memory_pool());
+        fixed_reservation.try_grow(hash_table.memory_size())?;
+        let group_values_soft_limit = agg.limit_options().map(|config| config.limit());
+        // DISTINCT ... LIMIT keeps its own early stop.
+        let max_groups = if group_values_soft_limit.is_none() && agg.group_by.is_single()
+        {
+            configured_groups(context.session_config().options())
+        } else {
+            0
+        };
+        let bounded = BoundedPartial::new(max_groups, &agg.metrics, partition);
+        let input = agg.input.execute(partition, Arc::clone(context))?;
 
         Ok(Self {
             schema,
@@ -502,9 +516,12 @@ impl PartialHashAggregateStream {
             batch_size,
             baseline_metrics,
             reservation,
+            fixed_reservation,
             reduction_factor,
             skip_aggregation_probe,
-            group_values_soft_limit: agg.limit_options().map(|config| config.limit()),
+            group_values_soft_limit,
+            bounded,
+            num_group_columns: agg.group_by.num_group_exprs(),
             state: Some(PartialHashAggregateState::ReadingInput { hash_table }),
         })
     }
@@ -664,11 +681,30 @@ impl PartialHashAggregateStream {
                     }
                 }
 
+                // ---------------------------------------------
+                // Step 4: Cache-sized table (bounded early emit)
+                // ---------------------------------------------
+                if self
+                    .bounded
+                    .after_batch(input_rows, hash_table.building_group_count())
+                {
+                    let _timer = elapsed_compute.timer();
+                    return match self.flush_bounded(&mut hash_table) {
+                        Ok(remaining_groups) => ControlFlow::Continue(
+                            PartialHashAggregateState::EmittingOnMemoryPressure {
+                                hash_table,
+                                remaining_groups,
+                            },
+                        ),
+                        Err(e) => Self::break_with_err(e),
+                    };
+                }
+
                 // -------------------------------------------------
-                // Step 4: Larger-than-memory execution (early emit)
+                // Step 5: Larger-than-memory execution (early emit)
                 // -------------------------------------------------
                 let timer = elapsed_compute.timer();
-                let resize_result = self.reservation.try_resize(hash_table.memory_size());
+                let resize_result = self.resize_table(hash_table.memory_size());
                 timer.done();
                 match resize_result {
                     Ok(()) => {}
