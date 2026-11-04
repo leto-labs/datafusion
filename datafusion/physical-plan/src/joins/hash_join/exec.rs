@@ -100,6 +100,7 @@ use futures::TryStreamExt;
 use parking_lot::Mutex;
 
 use super::partitioned_hash_eval::SeededRandomState;
+use shared_build::ParallelBuild;
 
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
 pub(crate) const HASH_JOIN_SEED: SeededRandomState =
@@ -1505,6 +1506,7 @@ impl ExecutionPlan for HashJoinExec {
                     Arc::clone(context.session_config().options()),
                     self.null_equality,
                     array_map_created_count,
+                    ParallelBuild::from_task(&context, &self.metrics, partition),
                 ))
             })?,
             PartitionMode::Partitioned => {
@@ -1525,6 +1527,7 @@ impl ExecutionPlan for HashJoinExec {
                     Arc::clone(context.session_config().options()),
                     self.null_equality,
                     array_map_created_count,
+                    None,
                 ))
             }
             PartitionMode::Auto => {
@@ -2239,6 +2242,7 @@ async fn collect_left_input(
     config: Arc<ConfigOptions>,
     null_equality: NullEquality,
     array_map_created_count: Count,
+    parallel: Option<ParallelBuild>,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
 
@@ -2303,8 +2307,32 @@ async fn collect_left_input(
         _ => None,
     };
 
+    // Longbow patch: a build large enough for the parallel shared build
+    // (`shared_build.rs`) takes it before the serial perfect-hash ArrayMap.
+    let mut parallel_built = false;
+    // Charges of build copies, released once `reconcile` charges the batch.
+    let copies = reservation.new_empty();
+    let mut parallel_copies = None;
     let (join_hash_map, batch, left_values) =
-        if let Some((array_map, batch, left_value)) = try_create_array_map(
+        if let Some(parallel) = &parallel
+            && let Some((hashmap, batch, shared_copies)) = parallel
+                .build(
+                    &batches,
+                    num_rows,
+                    &schema,
+                    &on_left,
+                    &random_state,
+                    null_equality,
+                    &mut reservation,
+                )
+                .await?
+        {
+            metrics.build_mem_used.set_max(reservation.size());
+            parallel_built = true;
+            parallel_copies = Some(shared_copies);
+            let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+            (Map::HashMap(hashmap), batch, left_values)
+        } else if let Some((array_map, batch, left_value)) = try_create_array_map(
             &bounds,
             &schema,
             &batches,
