@@ -16971,6 +16971,12 @@ impl serde::Serialize for PartitionedFile {
         if self.arrow_schema.is_some() {
             len += 1;
         }
+        if self.e_tag.is_some() {
+            len += 1;
+        }
+        if self.version.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.PartitionedFile", len)?;
         if !self.path.is_empty() {
             struct_ser.serialize_field("path", &self.path)?;
@@ -16997,6 +17003,12 @@ impl serde::Serialize for PartitionedFile {
         if let Some(v) = self.arrow_schema.as_ref() {
             struct_ser.serialize_field("arrowSchema", v)?;
         }
+        if let Some(v) = self.e_tag.as_ref() {
+            struct_ser.serialize_field("eTag", v)?;
+        }
+        if let Some(v) = self.version.as_ref() {
+            struct_ser.serialize_field("version", v)?;
+        }
         struct_ser.end()
     }
 }
@@ -17017,6 +17029,9 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
             "statistics",
             "arrow_schema",
             "arrowSchema",
+            "e_tag",
+            "eTag",
+            "version",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -17028,6 +17043,8 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
             Range,
             Statistics,
             ArrowSchema,
+            ETag,
+            Version,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -17056,6 +17073,8 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
                             "range" => Ok(GeneratedField::Range),
                             "statistics" => Ok(GeneratedField::Statistics),
                             "arrowSchema" | "arrow_schema" => Ok(GeneratedField::ArrowSchema),
+                            "eTag" | "e_tag" => Ok(GeneratedField::ETag),
+                            "version" => Ok(GeneratedField::Version),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -17082,6 +17101,8 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
                 let mut range__ = None;
                 let mut statistics__ = None;
                 let mut arrow_schema__ = None;
+                let mut e_tag__ = None;
+                let mut version__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Path => {
@@ -17124,6 +17145,18 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
                             }
                             statistics__ = map_.next_value()?;
                         }
+                        GeneratedField::ETag => {
+                            if e_tag__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("eTag"));
+                            }
+                            e_tag__ = map_.next_value()?;
+                        }
+                        GeneratedField::Version => {
+                            if version__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("version"));
+                            }
+                            version__ = map_.next_value()?;
+                        }
                         GeneratedField::ArrowSchema => {
                             if arrow_schema__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("arrowSchema"));
@@ -17140,6 +17173,8 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
                     range: range__,
                     statistics: statistics__,
                     arrow_schema: arrow_schema__,
+                    e_tag: e_tag__,
+                    version: version__,
                 })
             }
         }

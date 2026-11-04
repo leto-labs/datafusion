@@ -57,3 +57,6 @@ pub mod protobuf {
 /// Re-export of the `datafusion_proto_common` types as exposed through this
 /// crate's generated module, for callers that want the common-only namespace.
 pub use generated::datafusion_common;
+
+#[cfg(test)]
+mod identity_tests;

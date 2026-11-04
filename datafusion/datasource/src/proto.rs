@@ -82,6 +82,8 @@ impl TryFrom<&PartitionedFile> for protobuf::PartitionedFile {
             path: file.object_meta.location.as_ref().to_owned(),
             size: file.object_meta.size,
             last_modified_ns,
+            e_tag: file.object_meta.e_tag.clone(),
+            version: file.object_meta.version.clone(),
             partition_values: file
                 .partition_values
                 .iter()
@@ -103,8 +105,8 @@ impl TryFrom<&protobuf::PartitionedFile> for PartitionedFile {
             })?,
             last_modified: Utc.timestamp_nanos(file.last_modified_ns as i64),
             size: file.size,
-            e_tag: None,
-            version: None,
+            e_tag: file.e_tag.clone(),
+            version: file.version.clone(),
         })
         .with_partition_values(
             file.partition_values
@@ -173,8 +175,8 @@ mod tests {
             location: Path::parse("foo/bar.parquet")?,
             last_modified: Utc.timestamp_nanos(1_000_000_000),
             size: 1234,
-            e_tag: None,
-            version: None,
+            e_tag: Some("\"multipart-etag-2\"".to_owned()),
+            version: Some("version/with+escapes=".to_owned()),
         })
         .with_partition_values(vec![ScalarValue::from("2024-01-01")])
         .with_range(10, 20)
@@ -186,6 +188,8 @@ mod tests {
 
         assert_eq!(decoded.object_meta.location, pf.object_meta.location);
         assert_eq!(decoded.object_meta.size, pf.object_meta.size);
+        assert_eq!(decoded.object_meta.e_tag, pf.object_meta.e_tag);
+        assert_eq!(decoded.object_meta.version, pf.object_meta.version);
         assert_eq!(
             decoded.object_meta.last_modified,
             pf.object_meta.last_modified
@@ -200,6 +204,25 @@ mod tests {
             schema.fields().len() + pf.partition_values.len()
         );
         assert_eq!(decoded.statistics, pf.statistics);
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_file_identity_presence_roundtrip() -> Result<()> {
+        for (e_tag, version) in [
+            (None, None),
+            (Some(""), Some("")),
+            (Some("W/weak"), Some("null")),
+            (Some("etag"), None),
+            (None, Some("version")),
+        ] {
+            let mut file = PartitionedFile::new("identity.parquet", 123);
+            file.object_meta.e_tag = e_tag.map(str::to_owned);
+            file.object_meta.version = version.map(str::to_owned);
+            let encoded = protobuf::PartitionedFile::try_from(&file)?;
+            let decoded = PartitionedFile::try_from(&encoded)?;
+            assert_eq!(decoded.object_meta, file.object_meta);
+        }
         Ok(())
     }
 

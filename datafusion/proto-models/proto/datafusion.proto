@@ -1589,6 +1589,8 @@ message PartitionedFile {
   FileRange range = 5;
   datafusion_common.Statistics statistics = 6;
   datafusion_common.Schema arrow_schema = 7;
+  optional string e_tag = 8;
+  optional string version = 9;
 }
 
 message FileRange {

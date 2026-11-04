@@ -95,7 +95,7 @@ pub type FileMetadataCache = dyn Cache<Path, CachedFileMetadataEntry>;
 /// the `file_schema` fingerprint, cached statistics, and ordering information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedFileMetadata {
-    /// File metadata used for cache validation (size, last_modified).
+    /// File metadata used for cache validation (size, last_modified, ETag, version).
     pub meta: ObjectMeta,
     /// Fingerprint of the `file_schema` used to compute `statistics`.
     pub schema_fingerprint: Arc<SchemaFingerprint>,
@@ -123,7 +123,7 @@ impl CachedFileMetadata {
 
     /// Check if this cached entry is still valid for the given metadata.
     ///
-    /// Returns true if the file size, last modified time, and schema match.
+    /// Returns true if size, last modified time, ETag, version, and schema match.
     pub fn is_valid_for(
         &self,
         current_meta: &ObjectMeta,
@@ -131,6 +131,8 @@ impl CachedFileMetadata {
     ) -> bool {
         self.meta.size == current_meta.size
             && self.meta.last_modified == current_meta.last_modified
+            && self.meta.e_tag == current_meta.e_tag
+            && self.meta.version == current_meta.version
             && (Arc::ptr_eq(&self.schema_fingerprint, current_schema_fingerprint)
                 || self.schema_fingerprint.as_ref()
                     == current_schema_fingerprint.as_ref())
@@ -259,7 +261,7 @@ pub trait FileMetadata: Any + Send + Sync {
 /// Cached file metadata entry with validation information.
 #[derive(Clone)]
 pub struct CachedFileMetadataEntry {
-    /// File metadata used for cache validation (size, last_modified).
+    /// File metadata used for cache validation (size, last_modified, ETag, version).
     pub meta: ObjectMeta,
     /// The cached file metadata.
     pub file_metadata: Arc<dyn FileMetadata>,
@@ -284,6 +286,8 @@ impl CachedFileMetadataEntry {
     pub fn is_valid_for(&self, current_meta: &ObjectMeta) -> bool {
         self.meta.size == current_meta.size
             && self.meta.last_modified == current_meta.last_modified
+            && self.meta.e_tag == current_meta.e_tag
+            && self.meta.version == current_meta.version
     }
 }
 
