@@ -27,11 +27,12 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::task::{Context, Poll};
 use std::vec;
 
-use super::common::SharedMemoryReservation;
 use super::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use super::{
     DisplayAs, ExecutionPlanProperties, RecordBatchStream, SendableRecordBatchStream,
 };
+use crate::attempt_tasks::{AttemptTasks, discard};
+use crate::batch_memory::{ReservedBatch, SharedBatchReservation};
 use crate::coalesce::LimitedBatchCoalescer;
 use crate::execution_plan::{CardinalityEffect, EvaluationType, SchedulingType};
 use crate::hash_utils::create_hashes;

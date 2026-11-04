@@ -26,14 +26,13 @@ use std::task::Poll;
 use super::metrics::ExecutionPlanMetricsSet;
 use super::metrics::{BaselineMetrics, SplitMetrics};
 use super::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
+use crate::attempt_tasks::{AttemptTasks, ScopedValue, discard};
 use crate::displayable;
-use crate::spill::get_record_batch_memory_size;
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
-use datafusion_common::{Result, exec_err};
+use datafusion_common::{Result, exec_err, internal_datafusion_err};
 use datafusion_common_runtime::JoinSet;
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::MemoryReservation;
 
 use futures::ready;
 use futures::stream::BoxStream;
