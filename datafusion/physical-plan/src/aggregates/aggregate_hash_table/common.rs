@@ -498,7 +498,7 @@ impl MaterializedAggregateOutput {
     }
 
     pub(super) fn memory_size(&self) -> usize {
-        self.batch.get_array_memory_size()
+        crate::batch_memory::get_record_batch_memory_size_with_metadata(&self.batch)
     }
 }
 
@@ -680,6 +680,31 @@ mod tests {
         assert!(output.is_exhausted());
 
         Ok(())
+    }
+
+    #[test]
+    fn memory_accounting_materialized_shared_string_views() {
+        use arrow::array::StringViewArray;
+        use datafusion_common::utils::memory::get_record_batch_memory_size;
+        let values = Arc::new(StringViewArray::from(vec![
+            "a string longer than twelve bytes",
+            "another long string value",
+        ]));
+        let batch = RecordBatch::try_from_iter(vec![
+            ("first", values.clone() as ArrayRef),
+            ("second", values as ArrayRef),
+        ])
+        .unwrap();
+        let buffers = get_record_batch_memory_size(&batch);
+        let metadata = batch
+            .columns()
+            .iter()
+            .map(|array| array.get_array_memory_size() - array.to_data().get_buffer_memory_size())
+            .sum::<usize>();
+        assert!(metadata > 0);
+        assert_eq!(buffers + metadata, 16_640);
+        let output = MaterializedAggregateOutput::new(batch);
+        assert_eq!(output.memory_size(), buffers + metadata);
     }
 
     fn int32_values(batch: &RecordBatch, column: usize) -> Vec<i32> {

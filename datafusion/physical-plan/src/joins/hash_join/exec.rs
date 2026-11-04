@@ -2285,8 +2285,11 @@ async fn collect_left_input(
         metrics,
         mut reservation,
         bounds_accumulators,
-        memory_counter: _,
+        memory_counter,
     } = state;
+
+    let input_bytes = memory_counter.memory_usage();
+    drop(memory_counter);
 
     // Compute bounds
     let mut bounds = match bounds_accumulators {

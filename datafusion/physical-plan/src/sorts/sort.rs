@@ -48,7 +48,7 @@ use crate::spill::get_record_batch_memory_size;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::{GetSlicedSize, SpillManager};
 use crate::statistics::{ChildStats, StatisticsArgs};
-use crate::stream::ReservationStream;
+use crate::batch_memory::SharedBatchReservation;
 use crate::stream::{ObservedStream, RecordBatchStreamAdapter};
 use crate::topk::TopK;
 use crate::topk::TopKDynamicFilters;
@@ -760,26 +760,11 @@ impl ExternalSorter {
             // Sort the batch immediately and get all output batches
             let sorted_batches = sort_batch_chunked(&batch, &expressions, batch_size)?;
 
-            // Resize the reservation to match the actual sorted output size.
-            // Using try_resize avoids a release-then-reacquire cycle, which
-            // matters for MemoryPool implementations where grow/shrink have
-            // non-trivial cost (e.g. JNI calls in Comet).
-            let total_sorted_size: usize = sorted_batches
-                .iter()
-                .map(get_record_batch_memory_size)
-                .sum();
-            reservation
-                .try_resize(total_sorted_size)
+            let reserved = SharedBatchReservation::reserve_all(reservation, sorted_batches)
                 .map_err(Self::err_with_oom_context)?;
-
-            // Wrap in ReservationStream to hold the reservation
-            Result::<_, DataFusionError>::Ok(Box::pin(ReservationStream::new(
+            Result::<_, DataFusionError>::Ok(Box::pin(RecordBatchStreamAdapter::new(
                 Arc::clone(&schema),
-                Box::pin(RecordBatchStreamAdapter::new(
-                    Arc::clone(&schema),
-                    futures::stream::iter(sorted_batches.into_iter().map(Ok)),
-                )),
-                reservation,
+                futures::stream::iter(reserved.into_iter().map(|batch| Ok(batch.into_batch()))),
             )) as SendableRecordBatchStream)
         })
         .try_flatten();

@@ -639,7 +639,20 @@ mod tests {
         let rb = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)])?;
         let schema = rb.schema();
 
-        let rbs = std::iter::repeat_n(rb, 1024).collect::<Vec<_>>();
+        // This fixture tests real queue pressure. Cloning rb would retain the
+        // same buffers 1024 times, which allocation-based accounting correctly
+        // charges once and no longer forces the non-round-robin case to fail.
+        let indices = arrow::array::UInt32Array::from_iter_values(0..row_size as u32);
+        let rbs = (0..1024)
+            .map(|_| {
+                let columns = rb
+                    .columns()
+                    .iter()
+                    .map(|array| arrow::compute::take(array.as_ref(), &indices, None))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                RecordBatch::try_new(Arc::clone(&schema), columns)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let sort = [
             PhysicalSortExpr {
                 expr: col("b", &schema)?,

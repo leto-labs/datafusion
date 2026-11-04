@@ -788,76 +788,11 @@ impl RecordBatchStream for BatchSplitStream {
     }
 }
 
-/// A stream that holds a memory reservation for its lifetime,
-/// shrinking the reservation as batches are consumed.
-/// The original reservation must have its batch sizes calculated using [`get_record_batch_memory_size`]
-/// On error, the reservation is *NOT* freed, until the stream is dropped.
-pub(crate) struct ReservationStream {
-    schema: SchemaRef,
-    inner: SendableRecordBatchStream,
-    reservation: MemoryReservation,
-}
-
-impl ReservationStream {
-    pub(crate) fn new(
-        schema: SchemaRef,
-        inner: SendableRecordBatchStream,
-        reservation: MemoryReservation,
-    ) -> Self {
-        Self {
-            schema,
-            inner,
-            reservation,
-        }
-    }
-}
-
-impl Stream for ReservationStream {
-    type Item = Result<RecordBatch>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        let res = self.inner.poll_next_unpin(cx);
-
-        match res {
-            Poll::Ready(res) => {
-                match res {
-                    Some(Ok(batch)) => {
-                        self.reservation
-                            .shrink(get_record_batch_memory_size(&batch));
-                        Poll::Ready(Some(Ok(batch)))
-                    }
-                    Some(Err(err)) => Poll::Ready(Some(Err(err))),
-                    None => {
-                        // Stream is done so free the reservation completely
-                        self.reservation.free();
-                        // Release the input pipeline's resources.
-                        let inner_schema = self.inner.schema();
-                        self.inner = Box::pin(EmptyRecordBatchStream::new(inner_schema));
-                        Poll::Ready(None)
-                    }
-                }
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-
-impl RecordBatchStream for ReservationStream {
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::batch_memory::SharedBatchReservation;
+    use crate::spill::get_record_batch_memory_size;
     use crate::test::exec::{
         BlockingExec, MockExec, PanicExec, assert_strong_count_converges_to_zero,
     };
@@ -1119,13 +1054,11 @@ mod test {
         let initial_reserved = runtime.memory_pool.reserved();
         assert_eq!(initial_reserved, batch1_size + batch2_size);
 
-        // Create stream with batches
-        let stream = futures::stream::iter(vec![Ok(batch1), Ok(batch2)]);
-        let inner = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), stream))
-            as SendableRecordBatchStream;
-
-        let mut res_stream =
-            ReservationStream::new(Arc::clone(&schema), inner, reservation);
+        // Use the sorted-output path: tickets release allocations as consumed.
+        let batches =
+            SharedBatchReservation::reserve_all(reservation, vec![batch1, batch2]).unwrap();
+        let stream = futures::stream::iter(batches.into_iter().map(|batch| Ok(batch.into_batch())));
+        let mut res_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
 
         // Poll first batch
         let result1 = res_stream.next().await;
@@ -1169,13 +1102,17 @@ mod test {
         let initial = runtime.memory_pool.reserved();
         assert_eq!(initial, 1000);
 
-        // Create a stream that errors
-        let stream = futures::stream::iter(vec![exec_err!("Test error")]);
-        let inner = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), stream))
-            as SendableRecordBatchStream;
-
-        let mut res_stream =
-            ReservationStream::new(Arc::clone(&schema), inner, reservation);
+        // An error before retained output must not release the pending batches.
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int32Array::from((0..250).collect::<Vec<i32>>()))],
+        )
+        .unwrap();
+        let batches = SharedBatchReservation::reserve_all(reservation, vec![batch]).unwrap();
+        let stream = futures::stream::iter(vec![exec_err!("Test error")]).chain(
+            futures::stream::iter(batches.into_iter().map(|batch| Ok(batch.into_batch()))),
+        );
+        let mut res_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
 
         // Get the error
         let result = res_stream.next().await;
