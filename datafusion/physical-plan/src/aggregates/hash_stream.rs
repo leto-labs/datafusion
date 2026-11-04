@@ -44,6 +44,7 @@ use super::AggregateExec;
 use super::aggregate_hash_table::{
     AggregateHashTable, FinalMarker, PartialMarker, PartialSkipMarker,
 };
+use super::bounded_partial::{BoundedPartial, configured_groups};
 use super::group_values::GroupByMetrics;
 use super::ordered_final_stream::OrderedFinalAggregateStream;
 use super::skip_partial::SkipAggregationProbe;
@@ -117,6 +118,14 @@ use crate::{InputOrderMode, RecordBatchStream, SendableRecordBatchStream, metric
 /// remaining input batch is converted directly to partial aggregate state rows
 /// without inserting the rows into the grouped hash table.
 ///
+/// # Optimization: Cache-sized Partial Tables (Longbow patch)
+///
+/// With `longbow.execution.partial_aggregate_groups` set, a table that holds
+/// that many groups after a batch flushes its partial states through the
+/// memory-pressure path below and keeps its map capacity. [`BoundedPartial`]
+/// removes the bound when a full table reduced its cycle less than 2x, or when
+/// flushes re-emit keys that an unbounded table would have merged.
+///
 /// # Feature: Memory-limited Execution
 ///
 /// ## Partial Aggregation
@@ -169,6 +178,12 @@ pub(crate) struct PartialHashAggregateStream {
     /// Invariant: when this is `Some(..)`, the accumulators inside `hash_table` must
     /// be empty. See struct comments for details.
     group_values_soft_limit: Option<usize>,
+
+    /// Cache-sized table flush policy; unbounded unless configured.
+    bounded: BoundedPartial,
+
+    /// Leading group key columns of an emitted state batch.
+    num_group_columns: usize,
 
     /// Tracks the high-level stream lifecycle. The hash table owns the lower-level
     /// state for emitting output batches.
@@ -615,9 +630,11 @@ impl PartialHashAggregateStream {
                 // ----------------------------------------------
                 // Step 3: Skip partial aggregation optimization
                 // ----------------------------------------------
+                // Flushed groups count as output, so flushing does not hide a
+                // poor reduction from the probe.
                 self.update_skip_aggregation_probe(
                     input_rows,
-                    hash_table.building_group_count(),
+                    self.bounded.flushed_groups() + hash_table.building_group_count(),
                 );
 
                 // True branch: a decision has been made to skip partial aggregation.
@@ -712,6 +729,27 @@ impl PartialHashAggregateStream {
                 }
             }
         }
+    }
+
+    /// Takes a full bounded table's states, keeping its map capacity, and
+    /// shrinks the reservation to the emptied table.
+    fn flush_bounded(
+        &mut self,
+        hash_table: &mut AggregateHashTable<PartialMarker>,
+    ) -> Result<RecordBatch> {
+        let retain = self.bounded.bound().unwrap_or(0);
+        let Some(batch) = hash_table.take_state_batch_retaining(retain)? else {
+            return Err(internal_datafusion_err!(
+                "Bounded partial hash aggregate flushed with no aggregated groups"
+            ));
+        };
+        self.bounded.record_flush(
+            &batch.columns()[..self.num_group_columns],
+            batch.num_rows(),
+            self.batch_size,
+        )?;
+        self.resize_table(hash_table.memory_size())?;
+        Ok(batch)
     }
 
     /// Handle EmittingOnMemoryPressure state - emit a materialized partial-state
@@ -1849,5 +1887,267 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    mod bounded {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use arrow::array::AsArray;
+        use arrow::compute::concat_batches;
+        use arrow::datatypes::Int64Type;
+        use datafusion_execution::config::SessionConfig;
+        use datafusion_execution::memory_pool::{
+            FairSpillPool, MemoryPool, MemoryReservation, UnboundedMemoryPool,
+        };
+        use datafusion_functions_aggregate::sum::sum_udaf;
+
+        use super::*;
+        use crate::aggregates::bounded_partial::test_option::with_groups;
+        use crate::common::collect;
+
+        const BATCH_ROWS: usize = 256;
+
+        /// Records the peak reservation of an unbounded pool.
+        #[derive(Debug, Default)]
+        struct PeakPool {
+            inner: UnboundedMemoryPool,
+            peak: AtomicUsize,
+        }
+
+        impl PeakPool {
+            fn observe(&self) {
+                self.peak
+                    .fetch_max(self.inner.reserved(), Ordering::Relaxed);
+            }
+        }
+
+        impl std::fmt::Display for PeakPool {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "peak")
+            }
+        }
+
+        impl MemoryPool for PeakPool {
+            fn name(&self) -> &str {
+                "peak"
+            }
+            fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+                self.inner.grow(reservation, additional);
+                self.observe();
+            }
+            fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+                self.inner.shrink(reservation, shrink);
+            }
+            fn try_grow(
+                &self,
+                reservation: &MemoryReservation,
+                additional: usize,
+            ) -> Result<()> {
+                self.inner.try_grow(reservation, additional)?;
+                self.observe();
+                Ok(())
+            }
+            fn reserved(&self) -> usize {
+                self.inner.reserved()
+            }
+        }
+
+        fn schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+            ]))
+        }
+
+        /// `rows` rows in `BATCH_ROWS` batches with key `key(row)` and value `row`.
+        fn input(rows: usize, key: impl Fn(usize) -> i64) -> Vec<RecordBatch> {
+            (0..rows)
+                .step_by(BATCH_ROWS)
+                .map(|start| {
+                    let end = (start + BATCH_ROWS).min(rows);
+                    RecordBatch::try_new(
+                        schema(),
+                        vec![
+                            Arc::new(Int64Array::from_iter_values(
+                                (start..end).map(&key),
+                            )),
+                            Arc::new(Int64Array::from_iter_values(
+                                (start..end).map(|row| row as i64),
+                            )),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect()
+        }
+
+        fn clustered(row: usize) -> i64 {
+            (row / 4) as i64
+        }
+
+        /// Uniform draws with replacement from `domain` keys (splitmix64 of the row).
+        fn scattered(domain: usize) -> impl Fn(usize) -> i64 {
+            move |row| {
+                let mut x = (row as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+                x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                ((x ^ (x >> 31)) % domain as u64) as i64
+            }
+        }
+
+        fn partial(batches: Vec<RecordBatch>) -> Result<Arc<AggregateExec>> {
+            let schema = schema();
+            let exec = TestMemoryExec::try_new(&[batches], Arc::clone(&schema), None)?;
+            let exec = Arc::new(TestMemoryExec::update_cache(&Arc::new(exec)));
+            let aggr_expr = vec![Arc::new(
+                AggregateExprBuilder::new(sum_udaf(), vec![col("v", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("sum_v")
+                    .build()?,
+            )];
+            Ok(Arc::new(AggregateExec::try_new(
+                AggregateMode::Partial,
+                PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".into())]),
+                aggr_expr,
+                vec![None],
+                exec,
+                schema,
+            )?))
+        }
+
+        fn final_over(partial: Arc<AggregateExec>) -> Result<Arc<AggregateExec>> {
+            Ok(Arc::new(AggregateExec::try_new(
+                AggregateMode::Final,
+                partial.group_expr().as_final(),
+                partial.aggr_expr().to_vec(),
+                vec![None],
+                Arc::clone(&partial) as _,
+                partial.input_schema(),
+            )?))
+        }
+
+        fn context(groups: usize, pool: Arc<dyn MemoryPool>) -> Result<Arc<TaskContext>> {
+            let runtime = RuntimeEnvBuilder::default()
+                .with_memory_pool(pool)
+                .build_arc()?;
+            let config =
+                with_groups(SessionConfig::new().with_batch_size(BATCH_ROWS), groups);
+            Ok(Arc::new(
+                TaskContext::default()
+                    .with_runtime(runtime)
+                    .with_session_config(config),
+            ))
+        }
+
+        struct Run {
+            /// Final `(k, sum_v)` sorted by key.
+            rows: Vec<(i64, i64)>,
+            partial_rows: usize,
+            flushes: Option<usize>,
+            peak: usize,
+        }
+
+        async fn run(batches: Vec<RecordBatch>, groups: usize) -> Result<Run> {
+            let pool = Arc::new(PeakPool::default());
+            let partial = partial(batches)?;
+            let plan = final_over(Arc::clone(&partial))?;
+            let output =
+                collect(plan.execute(0, context(groups, pool.clone())?)?).await?;
+            Ok(Run {
+                rows: sorted_rows(&output),
+                partial_rows: partial.metrics().unwrap().output_rows().unwrap(),
+                flushes: flushes(&partial),
+                peak: pool.peak.load(Ordering::Relaxed),
+            })
+        }
+
+        fn sorted_rows(output: &[RecordBatch]) -> Vec<(i64, i64)> {
+            let batch = concat_batches(&output[0].schema(), output).unwrap();
+            let keys = batch.column(0).as_primitive::<Int64Type>();
+            let sums = batch.column(1).as_primitive::<Int64Type>();
+            let mut rows: Vec<_> = (0..batch.num_rows())
+                .map(|row| (keys.value(row), sums.value(row)))
+                .collect();
+            rows.sort_unstable();
+            rows
+        }
+
+        fn flushes(partial: &AggregateExec) -> Option<usize> {
+            partial
+                .metrics()
+                .unwrap()
+                .sum_by_name("partial_flushes")
+                .map(|count| count.as_usize())
+        }
+
+        #[tokio::test]
+        async fn clustered_input_flushes_with_identical_results() -> Result<()> {
+            let rows = 40_000;
+            let native = run(input(rows, clustered), 0).await?;
+            let bounded = run(input(rows, clustered), 1_000).await?;
+            assert_eq!(native.rows.len(), rows / 4);
+            assert_eq!(bounded.rows, native.rows);
+            assert_eq!(native.flushes, None);
+            let flushes = bounded.flushes.unwrap();
+            assert!(flushes >= 9, "{flushes}");
+            // A flush splits at most the group that straddles it.
+            assert_eq!(native.partial_rows, rows / 4);
+            assert!(bounded.partial_rows <= rows / 4 + flushes);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn bounded_table_keeps_memory_bounded() -> Result<()> {
+            let rows = 400_000;
+            let native = run(input(rows, clustered), 0).await?;
+            let bounded = run(input(rows, clustered), 1_000).await?;
+            assert_eq!(bounded.rows, native.rows);
+            // The final table holds every group in both runs; the partial table
+            // adds its whole size natively but only a bounded table here.
+            assert!(
+                bounded.peak * 10 < native.peak * 7,
+                "bounded {} native {}",
+                bounded.peak,
+                native.peak
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn scattered_keys_revert_to_the_native_table() -> Result<()> {
+            let rows = 50_000;
+            let native = run(input(rows, scattered(5_000)), 0).await?;
+            let bounded = run(input(rows, scattered(5_000)), 1_000).await?;
+            assert_eq!(bounded.rows, native.rows);
+            assert_eq!(bounded.flushes, None);
+            assert_eq!(bounded.partial_rows, 5_000);
+            assert_eq!(native.partial_rows, 5_000);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn repeated_keys_across_flushes_revert_after_two_flushes() -> Result<()> {
+            let rows = 50_000;
+            let native = run(input(rows, scattered(1_100)), 0).await?;
+            let bounded = run(input(rows, scattered(1_100)), 1_000).await?;
+            assert_eq!(bounded.rows, native.rows);
+            assert_eq!(bounded.flushes, Some(2));
+            assert!(bounded.partial_rows <= 2 * (1_000 + BATCH_ROWS) + 1_100);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn final_spill_merges_bounded_flushes() -> Result<()> {
+            let rows = 40_000;
+            let native = run(input(rows, clustered), 0).await?;
+            let partial = partial(input(rows, clustered))?;
+            let plan = final_over(Arc::clone(&partial))?;
+            let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(256 * 1024));
+            let output = collect(plan.execute(0, context(1_000, pool)?)?).await?;
+            assert_eq!(sorted_rows(&output), native.rows);
+            assert!(flushes(&partial).unwrap() > 0);
+            assert!(plan.metrics().unwrap().spill_count().unwrap() > 0);
+            Ok(())
+        }
     }
 }

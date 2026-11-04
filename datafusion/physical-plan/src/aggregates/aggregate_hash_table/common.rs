@@ -306,6 +306,16 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
     pub(in crate::aggregates) fn take_state_batch(
         &mut self,
     ) -> Result<Option<RecordBatch>> {
+        self.take_state_batch_retaining(0)
+    }
+
+    /// Like [`Self::take_state_batch`], but the cleared group map keeps room for
+    /// `retain_groups` groups, so a bounded table that flushes repeatedly does
+    /// not reallocate and rehash its map on every cycle. Zero frees the map.
+    pub(in crate::aggregates) fn take_state_batch_retaining(
+        &mut self,
+        retain_groups: usize,
+    ) -> Result<Option<RecordBatch>> {
         let state_schema = Arc::clone(&self.state_schema);
         let state = self.state.building_mut();
         if state.group_values.is_empty() {
@@ -323,9 +333,11 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         // `emit(EmitTo::All)` resets accumulator state. Explicitly shrink the
         // key/index buffers too so the memory reservation can be released
         // before the batch is sorted for spilling.
-        state.group_values.clear_shrink(0);
+        state.group_values.clear_shrink(retain_groups);
         state.batch_group_indices.clear();
-        state.batch_group_indices.shrink_to_fit();
+        if retain_groups == 0 {
+            state.batch_group_indices.shrink_to_fit();
+        }
 
         Ok(Some(batch))
     }
