@@ -17,7 +17,11 @@
 
 //! Hash computation and hash table lookup expressions for dynamic filtering
 
-use std::{fmt::Display, hash::Hash, sync::Arc};
+use std::{
+    fmt::Display,
+    hash::Hash,
+    sync::{Arc, Weak},
+};
 
 use arrow::{
     array::{ArrayRef, UInt64Array},
@@ -29,6 +33,7 @@ use datafusion_common::hash_utils::RandomState;
 use datafusion_common::hash_utils::{create_hashes, with_hashes};
 #[cfg(feature = "proto")]
 use datafusion_common::internal_err;
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr_common::physical_expr::{
     DynHash, PhysicalExpr, PhysicalExprRef,
@@ -265,6 +270,10 @@ pub struct HashTableLookupExpr {
     map: Arc<Map>,
     /// Description for display
     description: String,
+    /// Build-side key arrays of `map`, held weakly (Longbow read-only accessor).
+    build_keys: Weak<[ArrayRef]>,
+    /// Empty reservation of the build's memory consumer (Longbow accessor).
+    build_memory: Option<Arc<MemoryReservation>>,
 }
 impl HashTableLookupExpr {
     /// Create a new HashTableLookupExpr
@@ -288,7 +297,49 @@ impl HashTableLookupExpr {
             random_state,
             map,
             description,
+            build_keys: Weak::<[ArrayRef; 0]>::new(),
+            build_memory: None,
         }
+    }
+
+    /// Attaches the build-side key arrays (held weakly, so the lookup never
+    /// extends their lifetime) and an empty reservation of the build's memory
+    /// consumer (Longbow patch). Evaluation, equality and display are unchanged.
+    pub fn with_build_side(
+        mut self,
+        build_keys: Weak<[ArrayRef]>,
+        build_memory: Arc<MemoryReservation>,
+    ) -> Self {
+        self.build_keys = build_keys;
+        self.build_memory = Some(build_memory);
+        self
+    }
+
+    /// The build-side key arrays, one per `on_columns` entry, in the build's
+    /// row order, while the join still holds them (Longbow read-only accessor).
+    pub fn build_keys(&self) -> Option<Arc<[ArrayRef]>> {
+        self.build_keys.upgrade()
+    }
+
+    /// An empty reservation of the build's memory consumer; derived
+    /// structures charge it through `new_empty` (Longbow read-only accessor).
+    pub fn build_memory(&self) -> Option<&MemoryReservation> {
+        self.build_memory.as_deref()
+    }
+
+    /// The probe-side join key expressions (Longbow read-only accessor).
+    pub fn on_columns(&self) -> &[PhysicalExprRef] {
+        &self.on_columns
+    }
+
+    /// The seeded hash state used for lookups (Longbow read-only accessor).
+    pub fn random_state(&self) -> &SeededRandomState {
+        &self.random_state
+    }
+
+    /// The build-side map checked by lookups (Longbow read-only accessor).
+    pub fn map(&self) -> &Arc<Map> {
+        &self.map
     }
 }
 impl std::fmt::Debug for HashTableLookupExpr {
@@ -353,12 +404,14 @@ impl PhysicalExpr for HashTableLookupExpr {
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        Ok(Arc::new(HashTableLookupExpr::new(
-            children,
-            self.random_state.clone(),
-            Arc::clone(&self.map),
-            self.description.clone(),
-        )))
+        Ok(Arc::new(HashTableLookupExpr {
+            on_columns: children,
+            random_state: self.random_state.clone(),
+            map: Arc::clone(&self.map),
+            description: self.description.clone(),
+            build_keys: Weak::clone(&self.build_keys),
+            build_memory: self.build_memory.clone(),
+        }))
     }
 
     fn data_type(&self, _input_schema: &Schema) -> Result<DataType> {

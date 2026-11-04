@@ -198,8 +198,9 @@ pub(super) struct JoinLeftData {
     pub(super) map: Arc<Map>,
     /// The input rows for the build side
     batch: RecordBatch,
-    /// The build side on expressions values
-    values: Vec<ArrayRef>,
+    /// The build side on expressions values, shared weakly with membership
+    /// lookups (Longbow patch)
+    values: Arc<[ArrayRef]>,
     /// Shared bitmap builder for visited left indices
     visited_indices_bitmap: SharedBitmapBuilder,
     /// Counter of running probe-threads, potentially
@@ -2438,6 +2439,12 @@ async fn collect_left_input(
     };
 
     let map = Arc::new(join_hash_map);
+    let left_values: Arc<[ArrayRef]> = left_values.into();
+    let map_pushdown = || PushdownStrategy::Map {
+        map: Arc::clone(&map),
+        build_keys: Arc::downgrade(&left_values),
+        build_memory: Arc::new(reservation.new_empty()),
+    };
 
     let membership = if num_rows == 0 {
         PushdownStrategy::Empty
@@ -2457,11 +2464,11 @@ async fn collect_left_input(
                     .optimizer
                     .hash_join_inlist_pushdown_max_distinct_values
         {
-            PushdownStrategy::Map(Arc::clone(&map))
+            map_pushdown()
         } else if let Some(in_list_values) = build_struct_inlist_values(&left_values)? {
             PushdownStrategy::InList(in_list_values)
         } else {
-            PushdownStrategy::Map(Arc::clone(&map))
+            map_pushdown()
         }
     };
 

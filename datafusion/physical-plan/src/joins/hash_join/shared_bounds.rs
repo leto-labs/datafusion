@@ -19,7 +19,7 @@
 // TODO: include the link to the Dynamic Filter blog post.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::ExecutionPlan;
 use crate::ExecutionPlanProperties;
@@ -39,6 +39,7 @@ use datafusion_common::{
     DataFusionError, NullEquality, Result, ScalarValue, SharedResult,
     assert_or_internal_err,
 };
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::Operator;
 use datafusion_functions::core::r#struct as struct_func;
 use datafusion_physical_expr::expressions::{
@@ -136,12 +137,19 @@ fn create_membership_predicate(
             )?)))
         }
         // Use hash table lookup for large build sides
-        PushdownStrategy::Map(hash_map) => Ok(Some(Arc::new(HashTableLookupExpr::new(
-            on_right.to_vec(),
-            random_state.clone(),
-            hash_map,
-            "hash_lookup".to_string(),
-        )) as Arc<dyn PhysicalExpr>)),
+        PushdownStrategy::Map {
+            map,
+            build_keys,
+            build_memory,
+        } => Ok(Some(Arc::new(
+            HashTableLookupExpr::new(
+                on_right.to_vec(),
+                random_state.clone(),
+                map,
+                "hash_lookup".to_string(),
+            )
+            .with_build_side(build_keys, build_memory),
+        ) as Arc<dyn PhysicalExpr>)),
         // Empty partition - should not create a filter for this
         PushdownStrategy::Empty => Ok(None),
     }
@@ -278,7 +286,13 @@ pub(crate) enum PushdownStrategy {
     /// Use InList for small build sides (< 128MB)
     InList(ArrayRef),
     /// Use map lookup for large build sides
-    Map(Arc<Map>),
+    Map {
+        map: Arc<Map>,
+        /// The build's key arrays, held weakly (Longbow patch)
+        build_keys: Weak<[ArrayRef]>,
+        /// An empty reservation of the build's consumer (Longbow patch)
+        build_memory: Arc<MemoryReservation>,
+    },
     /// There was no data in this partition, do not build a dynamic filter for it
     Empty,
 }
