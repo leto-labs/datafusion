@@ -50,6 +50,7 @@ mod test_util;
 mod virtual_column;
 mod writer;
 
+pub use opener::{PreparedParquetFile, PreparedParquetScan};
 pub use access_plan::{ParquetAccessPlan, ParquetRowSelection, RowGroupAccess};
 pub use bloom_filter::BloomFilterStatistics;
 pub use file_format::*;

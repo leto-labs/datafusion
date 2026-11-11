@@ -21,6 +21,8 @@
 
 mod early_stop;
 mod encryption;
+mod prepared;
+pub use prepared::{PreparedParquetFile, PreparedParquetScan};
 
 use self::early_stop::EarlyStoppingStream;
 #[cfg(feature = "parquet_encryption")]
@@ -1445,8 +1447,15 @@ impl RowGroupsPrunedParquetOpen {
         local
     }
 
-    /// Build the final parquet stream once all pruning work is complete.
-    fn build_stream(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    fn prepare_parts(
+        self,
+    ) -> Result<(
+        PreparedParquetOpen,
+        ArrowReaderMetadata,
+        ParquetAccessPlan,
+        DecoderProjection,
+        ArrowReaderOptions,
+    )> {
         let RowGroupsPrunedParquetOpen {
             prepared,
             mut row_groups,
@@ -1459,7 +1468,7 @@ impl RowGroupsPrunedParquetOpen {
         let MetadataLoadedParquetOpen {
             mut prepared,
             reader_metadata,
-            options: _,
+            options,
         } = loaded;
 
         let file_metadata = Arc::clone(reader_metadata.metadata());
@@ -1501,6 +1510,33 @@ impl RowGroupsPrunedParquetOpen {
 
         let access_plan = Self::split_for_idle_siblings(&mut prepared, access_plan);
 
+        // Build the decoder projection (mask + per-batch transform) in a
+        // single call. Encapsulating it behind `DecoderProjection` keeps the
+        // opener's orchestration body focused on filter / decoder / stream
+        // wiring.
+
+        let decoder_projection = DecoderProjection::try_new(
+            &prepared.projection,
+            &prepared.physical_file_schema,
+            reader_metadata.parquet_schema(),
+            &prepared.output_schema,
+            prepared.virtual_state.as_deref(),
+        )?;
+        Ok((
+            prepared,
+            reader_metadata,
+            access_plan,
+            decoder_projection,
+            options,
+        ))
+    }
+
+    /// Build the final parquet stream once all pruning work is complete.
+    fn build_stream(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        let (mut prepared, reader_metadata, access_plan, decoder_projection, _options) =
+            self.prepare_parts()?;
+        let file_metadata = Arc::clone(reader_metadata.metadata());
+        let rg_metadata = file_metadata.row_groups();
         // Prepare access plans, then apply row-group ordering tweaks per
         // run. Two composable steps:
         //
@@ -1537,18 +1573,6 @@ impl RowGroupsPrunedParquetOpen {
             };
 
         let arrow_reader_metrics = ArrowReaderMetrics::enabled();
-
-        // Build the decoder projection (mask + per-batch transform) in a
-        // single call. Encapsulating it behind `DecoderProjection` keeps the
-        // opener's orchestration body focused on filter / decoder / stream
-        // wiring.
-        let decoder_projection = DecoderProjection::try_new(
-            &prepared.projection,
-            &prepared.physical_file_schema,
-            reader_metadata.parquet_schema(),
-            &prepared.output_schema,
-            prepared.virtual_state.as_deref(),
-        )?;
 
         let (decoder, rg_plan, has_row_selection) = {
             let pushdown_predicate = prepared
