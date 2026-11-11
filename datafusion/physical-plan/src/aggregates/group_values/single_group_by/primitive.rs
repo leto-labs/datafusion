@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -241,11 +243,16 @@ where
 
     fn clear_shrink(&mut self, num_rows: usize) {
         self.values.clear();
+        self.null_group = None;
         self.values.shrink_to(num_rows);
         self.map.clear();
         self.map.shrink_to(num_rows, |_| 0); // hasher does not matter since the map is cleared
     }
 }
+
+#[cfg(test)]
+#[path = "primitive_tests.rs"]
+mod probe_tests;
 
 #[cfg(test)]
 mod tests {
