@@ -97,7 +97,8 @@ impl MorselPlanner for GatedPlanner {
         Ok(Some(MorselPlan::new().with_pending_planner(async move {
             match signal.await.expect("signal sent") {
                 Signal::Publish(files, rows) => {
-                    source.publish(files.into_iter().map(|f| PartitionedFile::new(f, 10)));
+                    source
+                        .publish(files.into_iter().map(|f| PartitionedFile::new(f, 10)));
                     Ok(Box::new(RowsPlanner(rows)) as Box<dyn MorselPlanner>)
                 }
                 Signal::Empty => Ok(Box::new(EmptyPlanner) as Box<dyn MorselPlanner>),
@@ -134,7 +135,8 @@ impl Morsel for RowsMorsel {
     fn into_stream(self: Box<Self>) -> BoxStream<'static, Result<RecordBatch>> {
         let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
         let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(self.0))]).unwrap();
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(self.0))])
+                .unwrap();
         stream::iter([Ok(batch)]).boxed()
     }
 }
@@ -157,7 +159,8 @@ struct Sibling {
 impl Sibling {
     fn poll(&mut self) -> Poll<Option<Result<RecordBatch>>> {
         let waker = Waker::from(Arc::clone(&self.wakes));
-        self.stream.poll_next_unpin(&mut Context::from_waker(&waker))
+        self.stream
+            .poll_next_unpin(&mut Context::from_waker(&waker))
     }
 
     fn wakes(&self) -> usize {
@@ -167,9 +170,11 @@ impl Sibling {
 
 fn rows(poll: Poll<Option<Result<RecordBatch>>>) -> Vec<i32> {
     match poll {
-        Poll::Ready(Some(Ok(batch))) => {
-            batch.column(0).as_primitive::<Int32Type>().values().to_vec()
-        }
+        Poll::Ready(Some(Ok(batch))) => batch
+            .column(0)
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec(),
         other => panic!("expected a batch, got {other:?}"),
     }
 }
@@ -267,7 +272,8 @@ fn dropping_the_planning_stream_releases_waiters() {
 
 #[test]
 fn published_work_is_read_once_after_a_waiting_sibling_is_dropped() {
-    let (mut siblings, signal) = siblings(3, HashMap::from([("a-1", vec![2]), ("a-2", vec![3])]));
+    let (mut siblings, signal) =
+        siblings(3, HashMap::from([("a-1", vec![2]), ("a-2", vec![3])]));
     hold_and_wait(&mut siblings);
     assert!(siblings[2].poll().is_pending());
     // Drop a waiting sibling before anything is published.
@@ -284,6 +290,10 @@ fn published_work_is_read_once_after_a_waiting_sibling_is_dropped() {
     assert_eq!(waiter.wakes(), 1);
     assert_eq!(rows(waiter.poll()), vec![2]);
     assert_eq!(rows(planner.poll()), vec![3]);
-    assert!(matches!(waiter.poll(), Poll::Ready(None)));
+    assert!(
+        waiter.poll().is_pending(),
+        "the last reader may still offer work"
+    );
     assert!(matches!(planner.poll(), Poll::Ready(None)));
+    assert!(matches!(waiter.poll(), Poll::Ready(None)));
 }

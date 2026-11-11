@@ -260,8 +260,8 @@ impl ParquetFileMetrics {
         count.add(n);
     }
 
-    /// Record row-group work units that a pruned scan published to idle
-    /// sibling streams (Longbow sparse-scan split).
+    /// Record runs of unopened whole row groups donated to idle siblings.
+    /// The count is work units, not the number of groups within those units.
     pub(crate) fn add_row_group_units_published(
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,

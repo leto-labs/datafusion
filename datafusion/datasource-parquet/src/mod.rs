@@ -48,13 +48,16 @@ mod supported_predicates;
 #[cfg(test)]
 mod test_util;
 mod virtual_column;
+mod work_sharing;
+#[cfg(test)]
+mod work_sharing_tests;
 mod writer;
 
-pub use opener::{PreparedParquetFile, PreparedParquetScan};
 pub use access_plan::{ParquetAccessPlan, ParquetRowSelection, RowGroupAccess};
 pub use bloom_filter::BloomFilterStatistics;
 pub use file_format::*;
 pub use metrics::ParquetFileMetrics;
+pub use opener::{PreparedParquetFile, PreparedParquetScan};
 pub use page_filter::PagePruningAccessPlanFilter;
 pub use reader::*; // Expose so downstream crates can use it
 pub use row_filter::build_row_filter;

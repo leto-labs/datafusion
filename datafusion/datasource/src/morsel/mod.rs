@@ -73,11 +73,11 @@ pub trait Morselizer: Send + Sync + Debug {
     /// Attach the execution's shared work source, which exists when sibling
     /// streams share their files.
     ///
-    /// A morselizer that can split a file into finer work units while it
-    /// plans the file keeps the source, calls
-    /// [`SharedWorkSource::enable_publishing`], and publishes the units with
-    /// [`SharedWorkSource::publish`] before it returns the first morsel of
-    /// the file. The default ignores the source.
+    /// A morselizer that can share finer work units keeps the source and calls
+    /// [`SharedWorkSource::enable_publishing`] before the first file is taken.
+    /// Its planners or readers may publish disjoint unread units with
+    /// [`SharedWorkSource::publish`], including after a reader has started.
+    /// The default ignores the source.
     fn attach_shared_work_source(&mut self, _source: &SharedWorkSource) {}
 }
 

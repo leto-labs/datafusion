@@ -216,9 +216,6 @@ impl ScanState {
 
         // No active reader, but a morsel is ready to become the reader.
         if let Some(morsel) = self.ready_morsels.pop_front() {
-            // Planning has produced data, so any work it published to sibling
-            // streams is already queued.
-            self.work_source.planning_finished();
             self.metrics.time_opening.stop();
             self.metrics.time_scanning_until_data.start();
             self.metrics.time_scanning_total.start();
@@ -271,8 +268,8 @@ impl ScanState {
         }
 
         // No outstanding work remains, so begin planning the next unopened file.
-        // A shared work source can return `Pending` while a sibling still plans
-        // a file and may publish more work.
+        // A shared source can return `Pending` while a sibling is planning or
+        // reading, or still owns unopened files that can produce more work.
         let part_file = match self.work_source.poll_next_file(cx) {
             Poll::Ready(Some(part_file)) => part_file,
             Poll::Ready(None) => return ScanAndReturn::Done(None),

@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -47,6 +49,14 @@ use std::sync::Arc;
 ///
 /// See [`DefaultParquetFileReaderFactory`] for a simple implementation.
 pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
+    /// Maximum row groups that this reader can prefetch ahead of demand.
+    /// Work sharing keeps this window with the owner and gives idle siblings
+    /// only whole row groups beyond it. Factories that add read-ahead must
+    /// override this bound; wrappers must forward it.
+    fn read_ahead_row_groups(&self, _selected_row_groups: usize) -> usize {
+        0
+    }
+
     /// Provides an `AsyncFileReader` for reading data from a parquet file specified
     ///
     /// # Notes

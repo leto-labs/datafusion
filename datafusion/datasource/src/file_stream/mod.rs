@@ -1063,6 +1063,11 @@ mod tests {
     #[tokio::test]
     async fn morsel_shared_files_can_be_stolen() -> Result<()> {
         let test = two_partition_morsel_test().with_file_stream_events(false);
+        assert!(
+            test.test_config()
+                .create_sibling_state(&ConfigOptions::default())
+                .is_some()
+        );
 
         // Partition 0 starts with 3 files, but Partition 1 is polled first.
         // Since Partition 1 is polled first, it will run all the files even those
@@ -1092,6 +1097,11 @@ mod tests {
         let test = two_partition_morsel_test()
             .with_preserve_order(true)
             .with_file_stream_events(false);
+        assert!(
+            test.test_config()
+                .create_sibling_state(&ConfigOptions::default())
+                .is_none()
+        );
 
         // Even though that Partition 1 is polled first, it can not steal files
         // from partition 0. The three files originally assigned to Partition 0
@@ -1120,6 +1130,11 @@ mod tests {
         let test = two_partition_morsel_test()
             .with_declared_output_partitioning(true)
             .with_file_stream_events(false);
+        assert!(
+            test.test_config()
+                .create_sibling_state(&ConfigOptions::default())
+                .is_none()
+        );
 
         insta::assert_snapshot!(test.run().await.unwrap(), @r"
         ----- Partition 0 -----
@@ -1152,6 +1167,9 @@ mod tests {
         let test = two_partition_morsel_test()
             .with_enable_file_stream_work_stealing(false)
             .with_file_stream_events(false);
+        let mut options = ConfigOptions::default();
+        options.execution.enable_file_stream_work_stealing = false;
+        assert!(test.test_config().create_sibling_state(&options).is_none());
 
         // Even though Partition 1 is polled first, it cannot steal the three
         // files assigned to Partition 0; each partition reads only its own.
@@ -1456,8 +1474,7 @@ mod tests {
         ///
         /// The default builds all streams before polling begins, which matches
         /// normal execution. Tests may enable lazy creation to model races
-        /// where one sibling polls before another has contributed its files to
-        /// the shared queue.
+        /// where one sibling is polled before another stream is constructed.
         fn with_build_streams_on_first_read(
             mut self,
             build_streams_on_first_read: bool,

@@ -19,34 +19,22 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use crate::PartitionedFile;
-use crate::file_groups::FileGroup;
 use crate::file_scan_config::FileScanConfig;
 use parking_lot::Mutex;
 
-/// Source of work for `ScanState`.
-///
-/// Streams that may share work across siblings use [`WorkSource::Shared`],
-/// while streams that can not share work (e.g. because they must preserve file
-/// order) use  [`WorkSource::Local`].
+/// Source of work for `ScanState`. Ordered and independently executed streams
+/// keep their work local; eligible siblings can share format-specific units.
 #[derive(Debug)]
 pub(super) enum WorkSource {
-    /// Files this stream will plan locally without sharing them.
     Local(VecDeque<PartitionedFile>),
-    /// Files shared with sibling streams.
     Shared(SharedStream),
 }
 
 impl WorkSource {
-    /// Take the next file to plan from this work source.
-    ///
-    /// The stream must have finished its previous file. A shared stream
-    /// returns `Poll::Pending`, with `cx` registered, while the queue is empty
-    /// and a sibling may still publish work (see
-    /// [`SharedWorkSource::publish`]).
     pub(super) fn poll_next_file(
         &mut self,
         cx: &mut Context<'_>,
@@ -57,16 +45,6 @@ impl WorkSource {
         }
     }
 
-    /// Record that the current file has finished planning: any work it
-    /// publishes is already in the queue.
-    pub(super) fn planning_finished(&mut self) {
-        if let Self::Shared(shared) = self {
-            shared.planning_finished();
-        }
-    }
-
-    /// Return how many queued files should be counted as already processed
-    /// when this stream stops early after hitting a global limit.
     pub(super) fn skipped_on_limit(&self) -> usize {
         match self {
             Self::Local(files) => files.len(),
@@ -75,52 +53,56 @@ impl WorkSource {
     }
 }
 
-/// Shared source of work for sibling `FileStream`s
+/// Execution-local work sharing between sibling file streams.
 ///
-/// The queue is created once per execution and shared by all reorderable
-/// sibling streams for that execution. Whichever stream becomes idle first may
-/// take the next unopened file from the front of the queue.
+/// Planned files remain in their byte-balanced partition. Each stream drains
+/// its own files first, then takes units published by a format reader. Parquet
+/// publishes disjoint runs of whole, unopened row groups after pruning.
 ///
-/// A file format may also [`publish`](Self::publish) finer work units that it
-/// finds while it plans a file (Longbow: the surviving row groups of a pruned
-/// Parquet scan). When publishing is enabled, an idle stream does not finish
-/// while a sibling still plans a file, because that sibling can still publish
-/// work for it.
-///
-/// It uses a [`Mutex`] internally to provide thread-safe access
-/// to the shared file queue.
+/// An idle stream waits while any owner can still publish, including owners
+/// that are already reading or have not opened their next planned file. This
+/// permits a reader to offer its tail when siblings become idle later. When no
+/// reader is active, an idle stream can take an unopened file so a consumer
+/// that drains partitions sequentially does not wait for an unpolled owner.
 #[derive(Debug, Clone)]
 pub struct SharedWorkSource {
     inner: Arc<SharedWorkSourceInner>,
 }
 
 #[derive(Debug)]
-pub(super) struct SharedWorkSourceInner {
+struct SharedWorkSourceInner {
     queue: Mutex<SharedQueue>,
-    /// Number of sibling streams (the scan's output partitions).
-    streams: usize,
-    /// Set when a morselizer can publish work while it plans a file.
     publishing: AtomicBool,
-    /// Set when a file or row group of this scan was pruned.
-    pruned: AtomicBool,
-    next_stream_id: AtomicU64,
+    /// Unassigned waiters. Readers check this without taking the queue lock
+    /// on the ordinary row-group path where no sibling needs work.
+    idle: AtomicUsize,
 }
 
 #[derive(Debug, Default)]
 struct SharedQueue {
+    owned: Vec<VecDeque<PartitionedFile>>,
+    /// Until publishing is enabled, preserve the format's global file order.
+    /// `Some(empty)` remains distinct from owner-first publishing mode.
+    global: Option<VecDeque<PartitionedFile>>,
+    /// Format-specific published units, never the original planned files.
     files: VecDeque<PartitionedFile>,
-    /// Streams that hold a file, from when they take it until they take the
-    /// next one or finish. Counted only when publishing is enabled.
     active: usize,
-    /// Held files that are still being planned and so can still publish work.
-    planning: usize,
-    /// Wakers of streams that wait for published work, by stream id.
-    waiters: HashMap<u64, Waker>,
+    waiters: HashMap<usize, Waker>,
 }
 
 impl SharedQueue {
-    /// Remove all registered wakers so the caller can wake them after it
-    /// releases the lock.
+    fn has_owners(&self) -> bool {
+        self.active > 0
+            || self.global.as_ref().map_or_else(
+                || self.owned.iter().any(|files| !files.is_empty()),
+                |files| !files.is_empty(),
+            )
+    }
+
+    fn wakers(&self) -> Vec<Waker> {
+        self.waiters.values().cloned().collect()
+    }
+
     fn take_waiters(&mut self) -> Vec<Waker> {
         self.waiters.drain().map(|(_, waker)| waker).collect()
     }
@@ -131,355 +113,443 @@ fn wake_all(wakers: Vec<Waker>) {
 }
 
 impl SharedWorkSource {
-    /// Create a shared work source for `streams` sibling streams that
-    /// contains the provided unopened files.
-    pub(crate) fn new(
-        files: impl IntoIterator<Item = PartitionedFile>,
-        streams: usize,
-    ) -> Self {
+    fn from_groups(owned: Vec<VecDeque<PartitionedFile>>) -> Self {
         Self {
             inner: Arc::new(SharedWorkSourceInner {
                 queue: Mutex::new(SharedQueue {
-                    files: files.into_iter().collect(),
+                    owned,
                     ..Default::default()
                 }),
-                streams,
                 publishing: AtomicBool::new(false),
-                pruned: AtomicBool::new(false),
-                next_stream_id: AtomicU64::new(0),
+                idle: AtomicUsize::new(0),
             }),
         }
     }
 
-    /// Create a shared work source for the unopened files in `config`.
-    ///
-    /// Files are reordered by the file source (e.g. by statistics for TopK)
-    /// before being placed in the shared queue, so the most promising files
-    /// are processed first across all partitions.
-    pub(crate) fn from_config(config: &FileScanConfig) -> Self {
-        let files: Vec<_> = config
-            .file_groups
-            .iter()
-            .flat_map(FileGroup::iter)
-            .cloned()
-            .collect();
-        let files = config.file_source.reorder_files(files);
-        Self::new(files, config.file_groups.len())
+    #[cfg(test)]
+    fn new(files: impl IntoIterator<Item = PartitionedFile>, streams: usize) -> Self {
+        let mut groups = vec![VecDeque::new(); streams];
+        for (index, file) in files.into_iter().enumerate() {
+            groups[index % streams].push_back(file);
+        }
+        Self::from_groups(groups)
     }
 
-    /// Create the handle of one sibling stream.
-    pub(super) fn stream(&self) -> SharedStream {
+    /// Preserve planned ownership for publishers, and the format's global
+    /// statistics order for scans that keep ordinary file-sized work units.
+    pub(crate) fn from_config(config: &FileScanConfig) -> Self {
+        let source = Self::from_groups(
+            config
+                .file_groups
+                .iter()
+                .map(|group| group.iter().cloned().collect())
+                .collect(),
+        );
+        source.inner.queue.lock().global = Some(
+            config
+                .file_source
+                .reorder_files(
+                    config
+                        .file_groups
+                        .iter()
+                        .flat_map(|group| group.iter().cloned())
+                        .collect(),
+                )
+                .into(),
+        );
+        source
+    }
+
+    pub(super) fn stream(&self, partition: usize) -> SharedStream {
         SharedStream {
             source: self.clone(),
-            id: self.inner.next_stream_id.fetch_add(1, Ordering::Relaxed),
-            held: Held::Nothing,
+            id: partition,
+            held: false,
         }
     }
 
-    /// Enable publishing. A morselizer calls this before its stream takes the
-    /// first file. All morselizers of one scan have the same configuration,
-    /// so every stream sees the flag before its first `poll_next_file`.
+    /// Enable publishing before the first stream takes a file.
     pub fn enable_publishing(&self) {
-        self.inner.publishing.store(true, Ordering::Release);
+        let global = {
+            let mut queue = self.inner.queue.lock();
+            self.inner.publishing.store(true, Ordering::Release);
+            queue.global.take()
+        };
+        // File extensions can own resources with arbitrary destructors.
+        drop(global);
     }
 
-    /// Record that this scan pruned a file range or a row group.
-    pub fn mark_pruned(&self) {
-        self.inner.pruned.store(true, Ordering::Relaxed);
-    }
-
-    /// Return into how many units a file with `units` independent work units
-    /// (e.g. surviving row groups) should be split: 1 means do not split.
-    ///
-    /// The cost gate. A split costs one more file open per published unit, so
-    /// split only when all of these are true:
-    ///
-    /// * the scan pruned work, so the static assignment of byte ranges to
-    ///   streams no longer reflects the work that remains;
-    /// * more sibling streams are idle than there are queued files, so a
-    ///   published unit goes to a stream that would otherwise have no work.
-    ///
-    /// A full scan never splits, and a pruned scan splits only while streams
-    /// would otherwise be idle.
+    /// Number of useful parts for `units` remaining independent work units.
+    /// This is queried again at reader boundaries, not just at file open.
     pub fn split_width(&self, units: usize) -> usize {
-        if units < 2 || !self.inner.pruned.load(Ordering::Relaxed) {
-            return 1;
-        }
-        let queue = self.inner.queue.lock();
-        let idle = self
-            .inner
-            .streams
-            .saturating_sub(queue.active)
-            .saturating_sub(queue.files.len());
-        units.min(idle + 1)
+        units
+            .min(self.inner.idle.load(Ordering::Relaxed).saturating_add(1))
+            .max(1)
     }
 
-    /// Publish work units that a stream found while it planned a file, and
-    /// wake the streams that wait for work.
+    /// Publish disjoint work removed from the donor's unread plan. Wake outside
+    /// the lock; retain waiter registrations until they actually claim work.
     pub fn publish(&self, files: impl IntoIterator<Item = PartitionedFile>) {
         let wakers = {
             let mut queue = self.inner.queue.lock();
             queue.files.extend(files);
-            queue.take_waiters()
+            self.update_idle(&queue);
+            queue.wakers()
         };
         wake_all(wakers);
     }
 
-    fn publishing(&self) -> bool {
-        self.inner.publishing.load(Ordering::Acquire)
+    fn update_idle(&self, queue: &SharedQueue) {
+        self.inner.idle.store(
+            queue.waiters.len().saturating_sub(queue.files.len()),
+            Ordering::Relaxed,
+        );
     }
 }
 
-/// What a [`SharedStream`] holds from the shared queue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Held {
-    Nothing,
-    /// A file that is still being planned.
-    Planning,
-    /// A file whose planning finished.
-    Reading,
-}
-
-/// One sibling stream's handle to a [`SharedWorkSource`].
-///
-/// It accounts for the file that the stream holds, and releases it when the
-/// stream takes the next file or is dropped.
+/// One output partition's handle. Its file stays active until the reader and
+/// all planners finish, or the stream is dropped on error, limit or cancellation.
 #[derive(Debug)]
 pub(super) struct SharedStream {
     source: SharedWorkSource,
-    id: u64,
-    held: Held,
+    id: usize,
+    held: bool,
 }
 
 impl SharedStream {
     fn poll_next_file(&mut self, cx: &mut Context<'_>) -> Poll<Option<PartitionedFile>> {
-        let publishing = self.source.publishing();
-        let mut wakers = Vec::new();
-        let result = {
-            let mut queue = self.source.inner.queue.lock();
-            if let Some(waiters) = release(&mut self.held, &mut queue) {
-                wakers = waiters;
-            }
-            if let Some(file) = queue.files.pop_front() {
-                if publishing {
-                    queue.active += 1;
-                    queue.planning += 1;
-                    self.held = Held::Planning;
-                }
-                queue.waiters.remove(&self.id);
-                Poll::Ready(Some(file))
-            } else if publishing && queue.planning > 0 {
-                queue.waiters.insert(self.id, cx.waker().clone());
-                Poll::Pending
-            } else {
-                queue.waiters.remove(&self.id);
-                Poll::Ready(None)
-            }
+        let mut queue = self.source.inner.queue.lock();
+        if std::mem::take(&mut self.held) {
+            queue.active -= 1;
+        }
+        let file = if let Some(global) = &mut queue.global {
+            global.pop_front().or_else(|| queue.files.pop_front())
+        } else {
+            queue.owned[self.id]
+                .pop_front()
+                .or_else(|| queue.files.pop_front())
+                .or_else(|| {
+                    // Consumers may drain partitions sequentially, or never
+                    // create another owner's stream. With no active reader,
+                    // there is nobody to publish: take an unopened file to
+                    // make progress instead of waiting for an unpolled owner.
+                    (queue.active == 0)
+                        .then(|| queue.owned.iter_mut().find_map(VecDeque::pop_front))
+                        .flatten()
+                })
         };
+        let result = if let Some(file) = file {
+            queue.active += 1;
+            self.held = true;
+            queue.waiters.remove(&self.id);
+            Poll::Ready(Some(file))
+        } else if self.source.inner.publishing.load(Ordering::Acquire)
+            && queue.has_owners()
+        {
+            queue.waiters.insert(self.id, cx.waker().clone());
+            Poll::Pending
+        } else {
+            queue.waiters.remove(&self.id);
+            Poll::Ready(None)
+        };
+        let wakers = if queue.active == 0 {
+            queue.take_waiters()
+        } else {
+            vec![]
+        };
+        self.source.update_idle(&queue);
+        drop(queue);
         wake_all(wakers);
         result
-    }
-
-    fn planning_finished(&mut self) {
-        if self.held != Held::Planning {
-            return;
-        }
-        let wakers = {
-            let mut queue = self.source.inner.queue.lock();
-            queue.planning -= 1;
-            self.held = Held::Reading;
-            if queue.planning == 0 {
-                queue.take_waiters()
-            } else {
-                Vec::new()
-            }
-        };
-        wake_all(wakers);
-    }
-}
-
-/// Release the file a stream holds. Return the wakers to wake when no file is
-/// planned any more: the waiting streams can then finish.
-fn release(held: &mut Held, queue: &mut SharedQueue) -> Option<Vec<Waker>> {
-    match std::mem::replace(held, Held::Nothing) {
-        Held::Nothing => None,
-        Held::Reading => {
-            queue.active -= 1;
-            None
-        }
-        Held::Planning => {
-            queue.active -= 1;
-            queue.planning -= 1;
-            (queue.planning == 0).then(|| queue.take_waiters())
-        }
     }
 }
 
 impl Drop for SharedStream {
     fn drop(&mut self) {
-        let wakers = {
+        let (wakers, abandoned) = {
             let mut queue = self.source.inner.queue.lock();
             queue.waiters.remove(&self.id);
-            release(&mut self.held, &mut queue)
+            let abandoned = std::mem::take(&mut queue.owned[self.id]);
+            if self.held {
+                queue.active -= 1;
+            }
+            let wakers = if queue.active == 0 {
+                queue.take_waiters()
+            } else {
+                vec![]
+            };
+            self.source.update_idle(&queue);
+            (wakers, abandoned)
         };
-        if let Some(wakers) = wakers {
-            wake_all(wakers);
-        }
+        // File extensions can own other resources. Release them outside the
+        // queue lock, just as we invoke wakers outside it.
+        drop(abandoned);
+        wake_all(wakers);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::task::Wake;
 
-    use super::*;
-
     #[derive(Default)]
     struct CountingWaker(AtomicUsize);
-
     impl Wake for CountingWaker {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
-
     fn waker() -> (Arc<CountingWaker>, Waker) {
         let counter = Arc::new(CountingWaker::default());
         (Arc::clone(&counter), Waker::from(Arc::clone(&counter)))
     }
-
     fn file(name: &str) -> PartitionedFile {
         PartitionedFile::new(name, 10)
     }
-
     fn path(poll: Poll<Option<PartitionedFile>>) -> Poll<Option<String>> {
         poll.map(|file| file.map(|file| file.object_meta.location.to_string()))
     }
 
     #[test]
-    fn full_scan_does_not_split() {
-        // Four streams take one file each. Nothing is pruned.
-        let source = SharedWorkSource::new((0..4).map(|i| file(&format!("f{i}"))), 4);
-        source.enable_publishing();
+    fn stream_drains_its_planned_files_before_shared_units() {
+        use crate::TableSchema;
+        use crate::file_groups::FileGroup;
+        use crate::file_scan_config::FileScanConfigBuilder;
+        use crate::test_util::MockSource;
+        use arrow::datatypes::Schema;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(MockSource::new(TableSchema::from(
+                Arc::new(Schema::empty()),
+            ))),
+        )
+        .with_file_groups(vec![
+            FileGroup::new(vec![file("a"), file("c")]),
+            FileGroup::new(vec![file("b")]),
+        ])
+        .build();
+        let source = SharedWorkSource::from_config(&config);
         let (_, waker) = waker();
         let mut cx = Context::from_waker(&waker);
-        let mut streams: Vec<_> = (0..4).map(|_| source.stream()).collect();
-        for stream in &mut streams {
-            assert!(matches!(stream.poll_next_file(&mut cx), Poll::Ready(Some(_))));
+        let mut b = source.stream(1);
+        let mut a = source.stream(0);
+        source.enable_publishing();
+        source.publish([file("stolen-row-groups")]);
+        assert_eq!(
+            path(b.poll_next_file(&mut cx)),
+            Poll::Ready(Some("b".into()))
+        );
+        assert_eq!(
+            path(a.poll_next_file(&mut cx)),
+            Poll::Ready(Some("a".into()))
+        );
+        assert_eq!(
+            path(a.poll_next_file(&mut cx)),
+            Poll::Ready(Some("c".into()))
+        );
+        assert_eq!(
+            path(b.poll_next_file(&mut cx)),
+            Poll::Ready(Some("stolen-row-groups".into()))
+        );
+    }
+
+    #[test]
+    fn non_publishing_stream_uses_global_file_order() {
+        use crate::TableSchema;
+        use crate::file_groups::FileGroup;
+        use crate::file_scan_config::FileScanConfigBuilder;
+        use crate::test_util::MockSource;
+        use arrow::datatypes::Schema;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(MockSource::new(TableSchema::from(
+                Arc::new(Schema::empty()),
+            ))),
+        )
+        .with_file_groups(vec![
+            FileGroup::new(vec![file("a"), file("c")]),
+            FileGroup::new(vec![file("b")]),
+        ])
+        .build();
+        let source = SharedWorkSource::from_config(&config);
+        let (_, waker) = waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut b = source.stream(1);
+        // Claim from the single global queue, even when partition 1 polls first.
+        for expected in ["a", "c", "b"] {
+            assert_eq!(
+                path(b.poll_next_file(&mut cx)),
+                Poll::Ready(Some(expected.into()))
+            );
         }
-        assert_eq!(source.split_width(3), 1);
+        assert_eq!(path(b.poll_next_file(&mut cx)), Poll::Ready(None));
     }
 
     #[test]
-    fn pruned_scan_splits_only_for_idle_streams() {
-        let source = SharedWorkSource::new([file("a"), file("b")], 8);
+    fn dropping_last_active_owner_wakes_waiter_to_take_unopened_file() {
+        let source = SharedWorkSource::new([file("a"), file("b")], 3);
         source.enable_publishing();
-        let (_, waker) = waker();
+        let mut a = source.stream(0);
+        let mut idle = source.stream(2);
+        let (wakes, waker) = waker();
         let mut cx = Context::from_waker(&waker);
-        let mut a = source.stream();
         assert!(matches!(a.poll_next_file(&mut cx), Poll::Ready(Some(_))));
-
-        // Not pruned: no split, however many streams are idle.
-        assert_eq!(source.split_width(2), 1);
-        source.mark_pruned();
-        // One file is queued and one stream is active, so 6 streams have no
-        // work: two row groups split into two units.
-        assert_eq!(source.split_width(2), 2);
-        assert_eq!(source.split_width(24), 7);
-        // A single unit never splits.
-        assert_eq!(source.split_width(1), 1);
-    }
-
-    #[test]
-    fn queued_work_counts_against_idle_streams() {
-        let source = SharedWorkSource::new([file("a")], 3);
-        source.enable_publishing();
-        source.mark_pruned();
-        let (_, waker) = waker();
-        let mut cx = Context::from_waker(&waker);
-        let mut a = source.stream();
-        assert!(matches!(a.poll_next_file(&mut cx), Poll::Ready(Some(_))));
-        // Two idle streams, nothing queued.
-        assert_eq!(source.split_width(10), 3);
-        source.publish([file("a-1"), file("a-2")]);
-        // The two published units already cover the two idle streams.
-        assert_eq!(source.split_width(10), 1);
-    }
-
-    #[test]
-    fn idle_stream_waits_for_a_planning_sibling_and_takes_published_work() {
-        let source = SharedWorkSource::new([file("a")], 2);
-        source.enable_publishing();
-        let (_, waker_a) = waker();
-        let (wakes_b, waker_b) = waker();
-        let mut cx_a = Context::from_waker(&waker_a);
-        let mut cx_b = Context::from_waker(&waker_b);
-        let mut a = source.stream();
-        let mut b = source.stream();
-
-        assert_eq!(path(a.poll_next_file(&mut cx_a)), Poll::Ready(Some("a".into())));
-        // `a` still plans its file, so `b` waits instead of finishing.
-        assert_eq!(path(b.poll_next_file(&mut cx_b)), Poll::Pending);
-
-        source.publish([file("a-1")]);
-        assert_eq!(wakes_b.0.load(Ordering::SeqCst), 1);
-        assert_eq!(path(b.poll_next_file(&mut cx_b)), Poll::Ready(Some("a-1".into())));
-
-        // Both streams finish only when no file is planned any more.
-        a.planning_finished();
-        assert_eq!(path(a.poll_next_file(&mut cx_a)), Poll::Pending);
-        b.planning_finished();
-        assert_eq!(path(b.poll_next_file(&mut cx_b)), Poll::Ready(None));
-        assert_eq!(path(a.poll_next_file(&mut cx_a)), Poll::Ready(None));
-    }
-
-    #[test]
-    fn waiting_stream_is_woken_when_the_last_planner_finishes() {
-        let source = SharedWorkSource::new([file("a")], 2);
-        source.enable_publishing();
-        let (_, waker_a) = waker();
-        let (wakes_b, waker_b) = waker();
-        let mut cx_a = Context::from_waker(&waker_a);
-        let mut cx_b = Context::from_waker(&waker_b);
-        let mut a = source.stream();
-        let mut b = source.stream();
-        assert!(matches!(a.poll_next_file(&mut cx_a), Poll::Ready(Some(_))));
-        assert_eq!(path(b.poll_next_file(&mut cx_b)), Poll::Pending);
-        a.planning_finished();
-        assert_eq!(wakes_b.0.load(Ordering::SeqCst), 1);
-        assert_eq!(path(b.poll_next_file(&mut cx_b)), Poll::Ready(None));
-    }
-
-    #[test]
-    fn dropping_a_planning_stream_releases_waiters() {
-        let source = SharedWorkSource::new([file("a")], 2);
-        source.enable_publishing();
-        let (_, waker_a) = waker();
-        let (wakes_b, waker_b) = waker();
-        let mut cx_a = Context::from_waker(&waker_a);
-        let mut cx_b = Context::from_waker(&waker_b);
-        let mut a = source.stream();
-        let mut b = source.stream();
-        assert!(matches!(a.poll_next_file(&mut cx_a), Poll::Ready(Some(_))));
-        assert_eq!(path(b.poll_next_file(&mut cx_b)), Poll::Pending);
+        assert_eq!(path(idle.poll_next_file(&mut cx)), Poll::Pending);
         drop(a);
-        assert_eq!(wakes_b.0.load(Ordering::SeqCst), 1);
-        assert_eq!(path(b.poll_next_file(&mut cx_b)), Poll::Ready(None));
-        let queue = source.inner.queue.lock();
-        assert_eq!((queue.active, queue.planning, queue.waiters.len()), (0, 0, 0));
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            path(idle.poll_next_file(&mut cx)),
+            Poll::Ready(Some("b".into()))
+        );
+        assert_eq!(path(idle.poll_next_file(&mut cx)), Poll::Ready(None));
     }
 
     #[test]
-    fn without_publishing_an_empty_queue_finishes_at_once() {
+    fn idle_stream_waits_for_row_groups_after_a_sibling_started_reading() {
+        let source = SharedWorkSource::new([file("a")], 2);
+        source.enable_publishing();
+        let (_, waker) = waker();
+        let (wakes, waiting) = self::waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut wait_cx = Context::from_waker(&waiting);
+        let mut a = source.stream(0);
+        let mut b = source.stream(1);
+        assert!(matches!(a.poll_next_file(&mut cx), Poll::Ready(Some(_))));
+        assert_eq!(path(b.poll_next_file(&mut wait_cx)), Poll::Pending);
+        assert_eq!(source.split_width(12), 2);
+        source.publish([file("late-row-groups")]);
+        assert_eq!(source.split_width(12), 1);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            path(b.poll_next_file(&mut wait_cx)),
+            Poll::Ready(Some("late-row-groups".into()))
+        );
+        assert_eq!(path(a.poll_next_file(&mut cx)), Poll::Pending);
+        assert_eq!(path(b.poll_next_file(&mut wait_cx)), Poll::Ready(None));
+        assert_eq!(path(a.poll_next_file(&mut cx)), Poll::Ready(None));
+    }
+
+    #[test]
+    fn late_opened_owned_files_can_publish_after_another_owner_finishes() {
+        let source = SharedWorkSource::new([file("a"), file("b"), file("c")], 2);
+        source.enable_publishing();
+        let (_, waker) = waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut a = source.stream(0);
+        let mut b = source.stream(1);
+        assert!(matches!(a.poll_next_file(&mut cx), Poll::Ready(Some(_))));
+        assert!(matches!(b.poll_next_file(&mut cx), Poll::Ready(Some(_))));
+        assert_eq!(source.split_width(12), 1);
+        assert_eq!(path(b.poll_next_file(&mut cx)), Poll::Pending);
+        assert_eq!(
+            path(a.poll_next_file(&mut cx)),
+            Poll::Ready(Some("c".into()))
+        );
+        assert_eq!(source.split_width(12), 2);
+        source.publish([file("c-tail")]);
+        assert_eq!(
+            path(b.poll_next_file(&mut cx)),
+            Poll::Ready(Some("c-tail".into()))
+        );
+    }
+
+    #[test]
+    fn sequential_stream_takes_unopened_file_when_no_reader_is_active() {
+        let source = SharedWorkSource::new([file("a"), file("b")], 2);
+        source.enable_publishing();
+        let (_, waker) = waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut a = source.stream(0);
+        assert_eq!(
+            path(a.poll_next_file(&mut cx)),
+            Poll::Ready(Some("a".into()))
+        );
+        assert_eq!(
+            path(a.poll_next_file(&mut cx)),
+            Poll::Ready(Some("b".into()))
+        );
+        assert_eq!(path(a.poll_next_file(&mut cx)), Poll::Ready(None));
+        let mut b = source.stream(1);
+        assert_eq!(path(b.poll_next_file(&mut cx)), Poll::Ready(None));
+    }
+
+    #[test]
+    fn idle_stream_can_claim_an_unopened_owner_before_it_is_polled() {
+        let source = SharedWorkSource::new([file("a")], 2);
+        source.enable_publishing();
+        let a = source.stream(0);
+        let mut b = source.stream(1);
+        let (wakes, waker) = waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(
+            path(b.poll_next_file(&mut cx)),
+            Poll::Ready(Some("a".into()))
+        );
+        drop(a);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        assert_eq!(path(b.poll_next_file(&mut cx)), Poll::Ready(None));
+    }
+
+    #[test]
+    fn dropping_a_reading_or_planning_stream_releases_waiters() {
+        let source = SharedWorkSource::new([file("a")], 2);
+        source.enable_publishing();
+        let mut a = source.stream(0);
+        let mut b = source.stream(1);
+        let (wakes, waker) = waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(a.poll_next_file(&mut cx), Poll::Ready(Some(_))));
+        assert_eq!(path(b.poll_next_file(&mut cx)), Poll::Pending);
+        drop(a);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert_eq!(path(b.poll_next_file(&mut cx)), Poll::Ready(None));
+    }
+
+    #[test]
+    fn without_publishing_an_empty_owner_finishes_at_once() {
         let source = SharedWorkSource::new([file("a")], 2);
         let (_, waker) = waker();
         let mut cx = Context::from_waker(&waker);
-        let mut a = source.stream();
-        let mut b = source.stream();
+        let mut a = source.stream(0);
+        let mut b = source.stream(1);
         assert!(matches!(a.poll_next_file(&mut cx), Poll::Ready(Some(_))));
         assert_eq!(path(b.poll_next_file(&mut cx)), Poll::Ready(None));
-        let queue = source.inner.queue.lock();
-        assert_eq!((queue.active, queue.planning), (0, 0));
+    }
+
+    #[test]
+    fn concurrent_stealers_claim_each_published_unit_once() {
+        let source = SharedWorkSource::new([], 8);
+        source.publish((0..200).map(|i| file(&format!("rg{i}"))));
+        let mut paths = std::thread::scope(|scope| {
+            (0..8)
+                .map(|partition| {
+                    let source = source.clone();
+                    scope.spawn(move || {
+                        let (_, waker) = waker();
+                        let mut cx = Context::from_waker(&waker);
+                        let mut stream = source.stream(partition);
+                        let mut paths = Vec::new();
+                        while let Poll::Ready(Some(file)) =
+                            path(stream.poll_next_file(&mut cx))
+                        {
+                            paths.push(file);
+                            std::thread::yield_now();
+                        }
+                        paths
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        paths.sort();
+        assert_eq!(paths.len(), 200);
+        paths.dedup();
+        assert_eq!(paths.len(), 200);
     }
 }

@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -62,6 +64,7 @@ use datafusion_pruning::{PruningPredicate, PruningPredicateBuilder};
 use crate::access_plan::PreparedAccessPlan;
 use crate::decoder_projection::DecoderProjection;
 use crate::row_group_filter::RowGroupPruningStatistics;
+use crate::work_sharing::RowGroupSharing;
 
 /// Shared options applied to the [`ParquetPushDecoderBuilder`] for a file
 /// scan, and to any later rebuilds performed via
@@ -272,6 +275,9 @@ pub(crate) struct PushDecoderStreamState {
     pub(crate) row_group_pruner: Option<RowGroupPruner>,
     /// Count of row groups skipped at runtime by [`Self::row_group_pruner`].
     pub(crate) row_groups_pruned_dynamic: Count,
+    /// Unordered, unlimited streams can donate their unread tail after a
+    /// sibling becomes idle, even after initial planning has finished.
+    pub(crate) row_group_sharing: Option<Box<RowGroupSharing>>,
 }
 
 impl PushDecoderStreamState {
@@ -342,8 +348,8 @@ impl PushDecoderStreamState {
                 .as_ref()
                 .expect("decoder present")
                 .is_at_row_group_boundary();
-            // Only the runtime pruner rebuilds the decoder from `rg_plan`, so
-            // only it needs `rg_plan` kept in sync with the decoder frontier.
+            // Keep the runtime pruner's input aligned with the decoder frontier.
+            // Donation separately synchronizes below, only when there is demand.
             // arrow-rs silently finishes row groups whose post-predicate
             // selection is empty without handing back a reader, so without this
             // sync `rg_plan` trails the decoder by one and a rebuild re-reads an
@@ -387,6 +393,29 @@ impl PushDecoderStreamState {
                             return Some((Err(DataFusionError::from(e)), self));
                         }
                     }
+                }
+            }
+
+            if at_boundary
+                && self
+                    .row_group_sharing
+                    .as_ref()
+                    .is_some_and(|sharing| sharing.wants_work(self.rg_plan.len()))
+            {
+                // A row filter can silently consume an empty group without
+                // producing a reader. Never donate such an already-read group.
+                if let Err(error) = self.sync_rg_plan_to_decoder_frontier() {
+                    return Some((Err(error), self));
+                }
+                let decoder = self.decoder.take().expect("decoder present");
+                match self
+                    .row_group_sharing
+                    .as_ref()
+                    .expect("sharing present")
+                    .offer(decoder, &mut self.rg_plan, self.reader.as_mut())
+                {
+                    Ok(decoder) => self.decoder = Some(decoder),
+                    Err(error) => return Some((Err(error), self)),
                 }
             }
 

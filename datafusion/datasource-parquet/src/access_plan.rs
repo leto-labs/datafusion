@@ -546,6 +546,17 @@ impl ParquetAccessPlan {
         self.row_group_index_iter().collect()
     }
 
+    /// Retain exactly these whole row groups with their page selections and
+    /// fully-matched flags. The caller supplies indices from this plan.
+    pub(crate) fn select_row_groups(&self, indices: &[usize]) -> Self {
+        let mut plan = Self::new_none(self.len());
+        for &index in indices {
+            plan.row_groups[index] = self.row_groups[index].clone();
+            plan.fully_matched[index] = self.fully_matched[index];
+        }
+        plan
+    }
+
     /// Split the scanned row groups into at most `parts` plans of contiguous
     /// row groups with nearly equal counts. Each plan covers the whole file and
     /// skips the row groups of the other plans; access and fully-matched flags
@@ -558,11 +569,7 @@ impl ParquetAccessPlan {
         (0..parts)
             .map(|part| {
                 let end = start + base + usize::from(part < extra);
-                let mut plan = Self::new_none(self.len());
-                for &idx in &scanned[start..end] {
-                    plan.row_groups[idx] = self.row_groups[idx].clone();
-                    plan.fully_matched[idx] = self.fully_matched[idx];
-                }
+                let plan = self.select_row_groups(&scanned[start..end]);
                 start = end;
                 plan
             })

@@ -999,10 +999,11 @@ config_namespace! {
         pub keep_partition_by_columns: bool, default = false
 
         /// When `true` (the default), DataFusion's built-in file scans
-        /// dynamically rebalance files across partitions at query execution
-        /// time: a partition that goes idle reads files (or byte-range morsels)
-        /// originally assigned to a sibling partition, which keeps all
-        /// partitions busy in a single process.
+        /// let eligible Parquet readers keep their planned files and give
+        /// unopened whole row groups to idle siblings after pruning, including
+        /// after a file starts reading. Reader windows stay protected. When no
+        /// reader is active, a stream can take an unopened file for progress.
+        /// Non-publishing scans keep a globally reordered queue of whole files.
         ///
         /// Executors that depend on the plan-time partition assignment — such as
         /// Ballista and datafusion-distributed, which run each partition as an
@@ -3300,14 +3301,14 @@ impl TryFrom<ConfigFileEncryptionProperties> for FileEncryptionProperties {
     type Error = DataFusionError;
 
     fn try_from(val: ConfigFileEncryptionProperties) -> Result<Self> {
-        let mut fep = FileEncryptionProperties::builder(
-            hex::decode(val.footer_key_as_hex)
-            .map_err(|e| {
-                DataFusionError::Configuration(format!("Unable to decode hex footer key from ConfigFileEncryptionProperties: {e}"))
-            })?,
-        )
-        .with_plaintext_footer(!val.encrypt_footer)
-        .with_aad_prefix_storage(val.store_aad_prefix);
+        let mut fep =
+            FileEncryptionProperties::builder(hex::decode(val.footer_key_as_hex).map_err(|e| {
+                DataFusionError::Configuration(format!(
+                    "Unable to decode hex footer key from ConfigFileEncryptionProperties: {e}"
+                ))
+            })?)
+            .with_plaintext_footer(!val.encrypt_footer)
+            .with_aad_prefix_storage(val.store_aad_prefix);
 
         if !val.footer_key_metadata_as_hex.is_empty() {
             fep = fep.with_footer_key_metadata(
@@ -3319,17 +3320,20 @@ impl TryFrom<ConfigFileEncryptionProperties> for FileEncryptionProperties {
         }
 
         for (column_name, encryption_props) in val.column_encryption_properties.iter() {
-            let encryption_key = hex::decode(&encryption_props.column_key_as_hex)
-                .map_err(|e| {
-                    DataFusionError::Configuration(format!("Unable to decode hex encryption key for column {column_name}: {e}"))
-                })?;
+            let encryption_key = hex::decode(&encryption_props.column_key_as_hex).map_err(|e| {
+                DataFusionError::Configuration(format!(
+                    "Unable to decode hex encryption key for column {column_name}: {e}"
+                ))
+            })?;
             let key_metadata = encryption_props
                 .column_metadata_as_hex
                 .as_ref()
                 .map(hex::decode)
                 .transpose()
                 .map_err(|e| {
-                    DataFusionError::Configuration(format!("Unable to decode hex column metadata for column {column_name}: {e}"))
+                    DataFusionError::Configuration(format!(
+                        "Unable to decode hex column metadata for column {column_name}: {e}"
+                    ))
                 })?;
 
             match key_metadata {

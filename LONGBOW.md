@@ -162,3 +162,35 @@ reservation while its parent is retained. Later merges and the ordinary final
 aggregate combine duplicate states. The normal successful merge path is unchanged;
 raw input is never retried. Retained spilling uses the attempt task scope.
 The consumer adds independent DuckDB-authored SLT and TPC-DS answer checks.
+
+## Family WS: partition-owned files and late row-group sharing
+
+Purpose: replace the global file-sized work queue and open-time sparse-scan
+split gate with planned-file ownership and cooperative tail donation. Dependent
+Longbow feature: PARTITIONED-SCAN-BALANCE. Audit classification: UPSTREAMABLE.
+
+Each publishing stream drains its own planned files before taking published
+whole-row-group runs. Idle streams wait while a sibling reader is active. If no
+reader is active, an idle stream takes an unopened planned file: sequential
+partition consumers must not wait for an owner that has never been polled. Eligible Parquet readers reconsider donation at native row-group boundaries
+after pruning, including when demand appears after file open. Published access
+plans preserve page selections, fully-matched flags, ranges and file identity,
+and can donate again. The reader retains its decoder buffers and a protected
+read-ahead prefix; the factory reports the advisory row-group window.
+
+This replaces family S's initial-pruning gate and file queue, while preserving
+its scan eligibility guards. Ordered, limited, reversed and statistics-reordered
+scans do not publish. Non-publishing scans retain the global, statistics-ordered
+file queue; preserved-order and declared-partitioning scans remain local.
+Watching dynamic filters defer donation until completion.
+An external file-level ParquetRowSelection remains local; page-index selections
+are carried by the published access plans. Native regressions cover planned
+ownership, late demand, unopened owners, cancellation, concurrent exact-once
+claims, page selections, and physical reads with silently empty filtered groups.
+The consumer's read-ahead tests cover retained requests and released credits.
+
+Review regressions include 1,500 random file/range/predicate shapes across three
+schedules, 300 cancellation and 300 injected-error cases, sequential partition
+consumption, filter completion during a scan, receiver re-donation, and explicit
+reverse/statistics-order eligibility guards. Idle fallback and cancellation
+wakeups are decided while holding the shared queue lock.

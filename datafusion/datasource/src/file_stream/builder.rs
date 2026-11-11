@@ -122,7 +122,7 @@ impl<'a> FileStreamBuilder<'a> {
             );
         };
         let work_source = match shared_work_source {
-            Some(shared) => WorkSource::Shared(shared.stream()),
+            Some(shared) => WorkSource::Shared(shared.stream(partition)),
             None => WorkSource::Local(file_group.into_inner().into()),
         };
 

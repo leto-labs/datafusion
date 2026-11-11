@@ -715,8 +715,8 @@ impl DataSource for FileScanConfig {
         let source = self.file_source.with_batch_size(batch_size);
 
         // Extract the shared work source from the sibling state if it exists.
-        // This allows multiple sibling streams to steal work from a single
-        // shared queue of unopened files.
+        // Each sibling keeps its planned files and can consume finer work
+        // units offered by eligible readers after pruning.
         let shared_work_source = sibling_state
             .as_ref()
             .and_then(|state| state.downcast_ref::<SharedWorkSource>())

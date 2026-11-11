@@ -35,6 +35,7 @@ use crate::push_decoder::{
 };
 use crate::row_filter::RowFilterGenerator;
 use crate::row_group_filter::RowGroupAccessPlanFilter;
+use crate::work_sharing::RowGroupSharing;
 use crate::{
     BloomFilterStatistics, Int96Coercer, ParquetAccessPlan, ParquetFileMetrics,
     ParquetFileReaderFactory, ParquetRowSelection, ParquetVirtualColumn,
@@ -306,8 +307,8 @@ pub(super) struct ParquetMorselizer {
     /// Per-scan virtual-column state (validation already performed). `None`
     /// when no virtual columns are requested — the common path.
     pub(crate) virtual_state: Option<Arc<VirtualColumnsState>>,
-    /// Longbow: the execution's shared work source when this scan can spread
-    /// the surviving row groups of pruned files over idle sibling streams.
+    /// Longbow: the execution's source for sharing unopened row groups with
+    /// idle siblings after pruning.
     pub(crate) shared_work_source: Option<SharedWorkSource>,
 }
 
@@ -327,10 +328,9 @@ impl Morselizer for ParquetMorselizer {
         Ok(Box::new(ParquetMorselPlanner::try_new(self, file)?))
     }
 
-    /// Longbow: a scan whose output order and row count do not depend on
-    /// which stream reads a row group can split pruned files (see
-    /// [`RowGroupsPrunedParquetOpen::split_for_idle_siblings`]). Ordered,
-    /// limited, reordered and reversed scans keep one stream per file.
+    /// Share unread whole row groups for scans whose order and row count do
+    /// not depend on the reading stream. Ordered, limited, reordered and
+    /// reversed scans retain their planned ownership.
     fn attach_shared_work_source(&mut self, source: &SharedWorkSource) {
         if self.preserve_order
             || self.limit.is_some()
@@ -484,9 +484,8 @@ struct PreparedParquetOpen {
     reverse_row_groups: bool,
     sort_order_for_reorder: Option<LexOrdering>,
     preserve_order: bool,
-    /// Longbow: set when this file may be split for idle sibling streams.
-    /// Files that already carry an access plan or row selection (including
-    /// published units) are never split again.
+    /// Longbow: eligible readers can offer their unread tail to idle siblings.
+    /// Published access plans remain eligible for later tail donation.
     shared_work_source: Option<SharedWorkSource>,
     #[cfg(feature = "parquet_encryption")]
     file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
@@ -758,10 +757,12 @@ impl ParquetMorselizer {
     ) -> Result<PreparedParquetOpen> {
         let file_range = partitioned_file.range.clone();
         let extensions = partitioned_file.extensions.clone();
-        let shared_work_source = self.shared_work_source.clone().filter(|_| {
-            extensions.get::<ParquetAccessPlan>().is_none()
-                && extensions.get::<ParquetRowSelection>().is_none()
-        });
+        // A file-level external selection is not a row-group descriptor and
+        // cannot coexist with a published ParquetAccessPlan extension.
+        let shared_work_source = self
+            .shared_work_source
+            .clone()
+            .filter(|_| extensions.get::<ParquetRowSelection>().is_none());
         let file_name = partitioned_file.object_meta.location.to_string();
         let file_metrics =
             ParquetFileMetrics::new(self.partition_index, &file_name, &self.metrics);
@@ -923,9 +924,6 @@ impl PreparedParquetOpen {
             self.file_metrics
                 .files_ranges_pruned_statistics
                 .add_pruned(1);
-            if let Some(source) = &self.shared_work_source {
-                source.mark_pruned();
-            }
             return Ok(None);
         }
 
@@ -1149,7 +1147,6 @@ impl FiltersPreparedParquetOpen {
         if let Some(range) = prepared.file_range.as_ref() {
             row_groups.prune_by_range(rg_metadata, range);
         }
-        let row_groups_in_range = row_groups.remaining_row_group_count();
 
         // If there is a predicate that can be evaluated against the metadata
         if let Some(predicate) = self.pruning_predicate.as_ref().map(|p| p.as_ref()) {
@@ -1189,11 +1186,6 @@ impl FiltersPreparedParquetOpen {
                 .file_metrics
                 .row_groups_pruned_bloom_filter
                 .add_matched(remaining);
-        }
-        if row_groups.remaining_row_group_count() < row_groups_in_range
-            && let Some(source) = &prepared.shared_work_source
-        {
-            source.mark_pruned();
         }
 
         Ok(RowGroupsPrunedParquetOpen {
@@ -1374,18 +1366,11 @@ impl BloomFiltersLoadedParquetOpen {
             && self.prepared.prepared.loaded.prepared.enable_bloom_filter
             && !self.prepared.row_groups.is_empty()
         {
-            let before = self.prepared.row_groups.remaining_row_group_count();
             self.prepared.row_groups.prune_by_bloom_filters(
                 predicate,
                 &self.prepared.prepared.loaded.prepared.file_metrics,
                 &self.row_group_bloom_filters,
             );
-            if self.prepared.row_groups.remaining_row_group_count() < before
-                && let Some(source) =
-                    &self.prepared.prepared.loaded.prepared.shared_work_source
-            {
-                source.mark_pruned();
-            }
         }
 
         self.prepared
@@ -1393,60 +1378,6 @@ impl BloomFiltersLoadedParquetOpen {
 }
 
 impl RowGroupsPrunedParquetOpen {
-    /// Longbow: spread the surviving row groups of a pruned scan over sibling
-    /// streams that would otherwise be idle, and return the part this stream
-    /// reads.
-    ///
-    /// Static byte ranges give each stream a fixed share of a file. When
-    /// pruning leaves a few files or row groups (TPC-DS q39: the `inventory`
-    /// row groups of one month), those ranges sit in a few streams and the rest
-    /// of the pipeline runs on them alone. DuckDB has no fixed assignment:
-    /// every thread claims the next row group from a shared cursor
-    /// (`ParquetReader::TryInitializeScan`,
-    /// `extension/parquet/parquet_multi_file_info.cpp`) and skips row groups
-    /// whose statistics fail the filter when it reads them
-    /// (`ParquetReader::RegisterRowGroupReads`, `parquet_reader.cpp`), so the
-    /// surviving row groups spread over all threads.
-    ///
-    /// A published unit costs one more file open, so a file is split only
-    /// when [`SharedWorkSource::split_width`] reports idle streams for a
-    /// pruned scan. Full scans keep the static assignment. A predicate with a
-    /// dynamic filter that can still change keeps the file in one stream: the
-    /// file's stream checks that filter while it reads.
-    fn split_for_idle_siblings(
-        prepared: &mut PreparedParquetOpen,
-        access_plan: ParquetAccessPlan,
-    ) -> ParquetAccessPlan {
-        let Some(source) = prepared.shared_work_source.take() else {
-            return access_plan;
-        };
-        if prepared.predicate.as_ref().is_some_and(|predicate| {
-            matches!(
-                DynamicFilterTracking::classify(predicate),
-                DynamicFilterTracking::Watching(_)
-            )
-        }) {
-            return access_plan;
-        }
-        let parts = source.split_width(access_plan.row_group_index_iter().count());
-        if parts < 2 {
-            return access_plan;
-        }
-        let mut plans = access_plan.split(parts).into_iter();
-        let local = plans.next().expect("split returns at least one plan");
-        let units: Vec<_> = plans
-            .map(|plan| prepared.partitioned_file.clone().with_extension(plan))
-            .collect();
-        ParquetFileMetrics::add_row_group_units_published(
-            &prepared.metrics,
-            prepared.partition_index,
-            &prepared.file_name,
-            units.len(),
-        );
-        source.publish(units);
-        local
-    }
-
     fn prepare_parts(
         self,
     ) -> Result<(
@@ -1466,7 +1397,7 @@ impl RowGroupsPrunedParquetOpen {
             page_pruning_predicate,
         } = prepared;
         let MetadataLoadedParquetOpen {
-            mut prepared,
+            prepared,
             reader_metadata,
             options,
         } = loaded;
@@ -1508,8 +1439,6 @@ impl RowGroupsPrunedParquetOpen {
             );
         }
 
-        let access_plan = Self::split_for_idle_siblings(&mut prepared, access_plan);
-
         // Build the decoder projection (mask + per-batch transform) in a
         // single call. Encapsulating it behind `DecoderProjection` keeps the
         // opener's orchestration body focused on filter / decoder / stream
@@ -1537,6 +1466,42 @@ impl RowGroupsPrunedParquetOpen {
             self.prepare_parts()?;
         let file_metadata = Arc::clone(reader_metadata.metadata());
         let rg_metadata = file_metadata.row_groups();
+        // The complete post-pruning plan remains with this reader. Sharing is
+        // reconsidered at native row-group boundaries when siblings run dry.
+        let read_ahead_enabled = prepared.predicate.as_ref().is_none_or(|predicate| {
+            !matches!(
+                DynamicFilterTracking::classify(predicate),
+                DynamicFilterTracking::Watching(_)
+            )
+        });
+        let row_group_sharing = prepared.shared_work_source.take().and_then(|source| {
+            let selected = access_plan.row_group_index_iter().count();
+            let lookahead = if read_ahead_enabled {
+                prepared
+                    .parquet_file_reader_factory
+                    .read_ahead_row_groups(selected)
+            } else {
+                0
+            };
+            if selected / lookahead.saturating_add(1) < 2 {
+                // This stream can only get shorter. Avoid retaining a duplicate
+                // plan for readers that can never offer a useful whole-group run.
+                return None;
+            }
+            Some(Box::new(RowGroupSharing {
+                source,
+                file: prepared.partitioned_file.clone(),
+                plan: access_plan.clone(),
+                metadata: Arc::clone(&file_metadata),
+                predicate: prepared.predicate.clone(),
+                lookahead,
+                has_selection: false,
+                read_ahead_enabled,
+                metrics: prepared.metrics.clone(),
+                partition: prepared.partition_index,
+            }))
+        });
+
         // Prepare access plans, then apply row-group ordering tweaks per
         // run. Two composable steps:
         //
@@ -1637,12 +1602,7 @@ impl RowGroupsPrunedParquetOpen {
             // predicate projection are now known. Keep decoding unchanged.
             // Active dynamic pruning is deliberately demand-only: future
             // groups can become pruned before their native boundary check.
-            if prepared.predicate.as_ref().is_none_or(|predicate| {
-                !matches!(
-                    DynamicFilterTracking::classify(predicate),
-                    DynamicFilterTracking::Watching(_)
-                )
-            }) {
+            if read_ahead_enabled {
                 builder.configure_read_ahead(prepared.async_file_reader.as_mut());
             }
 
@@ -1709,6 +1669,10 @@ impl RowGroupsPrunedParquetOpen {
             baseline_metrics: prepared.baseline_metrics,
             row_group_pruner,
             row_groups_pruned_dynamic,
+            row_group_sharing: row_group_sharing.map(|mut sharing| {
+                sharing.has_selection = has_row_selection;
+                sharing
+            }),
         }
         .into_stream();
 
@@ -1964,6 +1928,48 @@ mod test {
         max_in_list_size: usize,
         reverse_row_groups: bool,
         preserve_order: bool,
+    }
+
+    #[test]
+    fn sharing_attachment_guards_order_limit_reverse_and_statistics_reorder() {
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_datasource::source::DataSource;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+        use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(crate::source::ParquetSource::new(Arc::clone(&schema))),
+        )
+        .build();
+        let state = config
+            .create_sibling_state(&datafusion_common::config::ConfigOptions::default())
+            .unwrap();
+        let shared = state.downcast_ref::<SharedWorkSource>().unwrap();
+        for guard in 0..5 {
+            let mut opener = ParquetMorselizerBuilder::new()
+                .with_store(Arc::new(InMemory::new()))
+                .with_schema(Arc::clone(&schema))
+                .build();
+            match guard {
+                0 => opener.preserve_order = true,
+                1 => opener.limit = Some(10),
+                2 => opener.reverse_row_groups = true,
+                3 => {
+                    opener.sort_order_for_reorder =
+                        LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(
+                            Column::new("k", 0),
+                        ))])
+                }
+                _ => {}
+            }
+            opener.attach_shared_work_source(shared);
+            assert_eq!(
+                opener.shared_work_source.is_some(),
+                guard == 4,
+                "guard {guard}"
+            );
+        }
     }
 
     #[test]

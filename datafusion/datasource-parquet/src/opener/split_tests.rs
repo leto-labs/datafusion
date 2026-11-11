@@ -17,10 +17,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Longbow: a pruned scan spreads its surviving row groups over idle sibling
-//! streams; full scans, single-stream scans and scans with a live dynamic
-//! filter keep the static assignment. A published unit carries its page
-//! selection and is read with the same row filter as the original file.
+//! Whole-row-group sharing preserves planned file ownership, selections and
+//! read filters. Idle siblings can receive unread tails after a reader opens;
+//! ordered, limited and watching-filter readers retain their own work.
 
 use std::sync::Arc;
 
@@ -41,14 +40,15 @@ use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{
     BinaryExpr, Column, DynamicFilterPhysicalExpr, Literal,
 };
+use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::metrics::{MetricValue, MetricsSet};
-use datafusion_physical_plan::{ExecutionPlan, collect_partitioned};
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
+use crate::reader::ParquetFileReaderFactory;
 use crate::source::ParquetSource;
 
 const ROW_GROUPS: i32 = 24;
@@ -73,13 +73,17 @@ async fn store() -> (Arc<dyn ObjectStore>, u64) {
         .build();
     let mut out = BytesMut::new().writer();
     {
-        let mut writer = ArrowWriter::try_new(&mut out, schema(), Some(properties)).unwrap();
+        let mut writer =
+            ArrowWriter::try_new(&mut out, schema(), Some(properties)).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
     }
     let data = out.into_inner().freeze();
     let size = data.len() as u64;
-    store.put(&Path::from("k.parquet"), data.into()).await.unwrap();
+    store
+        .put(&Path::from("k.parquet"), data.into())
+        .await
+        .unwrap();
     (store, size)
 }
 
@@ -120,32 +124,69 @@ async fn run(
     streams: usize,
     work_stealing: bool,
 ) -> (Vec<i32>, MetricsSet) {
+    // Model an asynchronous object-store open so every sibling can register
+    // before this tiny fixture finishes its first group. An idle stream may
+    // take an unopened file when no owner is active (sequential consumers).
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(object_store::throttle::ThrottledStore::new(
+            store,
+            object_store::throttle::ThrottleConfig {
+                wait_get_per_call: std::time::Duration::from_micros(1),
+                ..Default::default()
+            },
+        ));
     let mut groups: Vec<FileGroup> = groups.into_iter().map(FileGroup::new).collect();
     groups.resize_with(streams, || FileGroup::new(vec![]));
-    let config =
-        FileScanConfigBuilder::new(ObjectStoreUrl::parse("memory://").unwrap(), Arc::new(source))
-            .with_file_groups(groups)
-            .build();
+    let config = FileScanConfigBuilder::new(
+        ObjectStoreUrl::parse("memory://").unwrap(),
+        Arc::new(source),
+    )
+    .with_file_groups(groups)
+    .build();
     let exec: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
 
     let mut options = ConfigOptions::default();
     options.execution.enable_file_stream_work_stealing = work_stealing;
-    let context = TaskContext::default()
-        .with_session_config(SessionConfig::from(options));
+    let context =
+        TaskContext::default().with_session_config(SessionConfig::from(options));
     context.runtime_env().register_object_store(
         ObjectStoreUrl::parse("memory://").unwrap().as_ref(),
         store,
     );
-    let batches = collect_partitioned(Arc::clone(&exec), Arc::new(context))
-        .await
-        .unwrap();
+    use futures::{FutureExt, StreamExt, TryStreamExt};
+    let context = Arc::new(context);
+    let mut readers: Vec<_> = (0..streams)
+        .map(|partition| exec.execute(partition, Arc::clone(&context)).unwrap())
+        .collect();
+    let mut batches: Vec<Vec<RecordBatch>> = vec![vec![]; streams];
+    // Make idle siblings visible before the owner runs. In-memory readers can
+    // finish an entire tiny fixture without yielding to Tokio.
+    for partition in (0..streams).rev() {
+        if let Some(Some(batch)) = readers[partition].next().now_or_never() {
+            batches[partition].push(batch.unwrap());
+        }
+    }
+    let rest: Vec<Vec<RecordBatch>> = futures::future::try_join_all(
+        readers.into_iter().map(|reader| reader.try_collect()),
+    )
+    .await
+    .unwrap();
+    for (batches, rest) in batches.iter_mut().zip(rest) {
+        batches.extend(rest);
+    }
 
     let mut keys: Vec<i32> = batches
         .iter()
         .flatten()
         .flat_map(|batch| {
-            let column = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-            (0..column.len()).map(|i| column.value(i)).collect::<Vec<_>>()
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            (0..column.len())
+                .map(|i| column.value(i))
+                .collect::<Vec<_>>()
         })
         .collect();
     keys.sort_unstable();
@@ -180,7 +221,10 @@ fn dynamic_filter(complete: bool) -> Arc<dyn PhysicalExpr> {
     Arc::new(filter)
 }
 
-fn and(left: Arc<dyn PhysicalExpr>, right: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
+fn and(
+    left: Arc<dyn PhysicalExpr>,
+    right: Arc<dyn PhysicalExpr>,
+) -> Arc<dyn PhysicalExpr> {
     Arc::new(BinaryExpr::new(left, Operator::And, right))
 }
 
@@ -206,14 +250,14 @@ async fn pruned_scan_spreads_over_all_idle_streams() {
     // Twelve surviving row groups, 7 idle streams: 8 parts, 7 published.
     let (keys, published) = scan(8, true, Some(key_between(0, 1200))).await;
     assert_eq!(keys, (0..1200).collect::<Vec<_>>());
-    assert_eq!(published, 7);
+    assert!((7..12).contains(&published));
 }
 
 #[tokio::test]
-async fn full_scan_does_not_publish() {
+async fn full_scan_offers_whole_row_groups_to_idle_siblings() {
     let (keys, published) = scan(8, true, None).await;
     assert_eq!(keys, (0..ROW_GROUPS * ROWS_PER_GROUP).collect::<Vec<_>>());
-    assert_eq!(published, 0);
+    assert!((7..ROW_GROUPS as usize).contains(&published));
 }
 
 #[tokio::test]
@@ -265,7 +309,8 @@ async fn paged_store() -> (Arc<dyn ObjectStore>, u64, i64) {
         .build();
     let mut out = BytesMut::new().writer();
     {
-        let mut writer = ArrowWriter::try_new(&mut out, schema, Some(properties)).unwrap();
+        let mut writer =
+            ArrowWriter::try_new(&mut out, schema, Some(properties)).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
     }
@@ -280,7 +325,10 @@ async fn paged_store() -> (Arc<dyn ObjectStore>, u64, i64) {
     let boundary = column
         .dictionary_page_offset()
         .unwrap_or_else(|| column.data_page_offset());
-    store_put(&data).await.map(|store| (store, size, boundary)).unwrap()
+    store_put(&data)
+        .await
+        .map(|store| (store, size, boundary))
+        .unwrap()
 }
 
 async fn store_put(data: &bytes::Bytes) -> Option<Arc<dyn ObjectStore>> {
@@ -299,7 +347,9 @@ async fn published_units_keep_page_selections_and_row_filters() {
     let ranges = || {
         vec![
             vec![PartitionedFile::new("k.parquet", size).with_range(0, boundary)],
-            vec![PartitionedFile::new("k.parquet", size).with_range(boundary, size as i64)],
+            vec![
+                PartitionedFile::new("k.parquet", size).with_range(boundary, size as i64),
+            ],
         ]
     };
     // Row groups 1-4 survive statistics pruning; each range prunes one or
@@ -343,3 +393,185 @@ async fn published_units_keep_page_selections_and_row_filters() {
     assert_eq!(count(&metrics, "row_group_units_published"), 0);
     assert_eq!(count(&metrics, "page_index_rows_pruned"), 400);
 }
+
+/// Count native data reads, excluding footer and page-index metadata requests.
+#[derive(Debug)]
+struct ReadCountingFactory {
+    inner: crate::reader::DefaultParquetFileReaderFactory,
+    reads: Arc<std::sync::Mutex<Vec<std::ops::Range<u64>>>>,
+}
+impl ParquetFileReaderFactory for ReadCountingFactory {
+    fn create_reader(
+        &self,
+        partition: usize,
+        file: PartitionedFile,
+        hint: Option<usize>,
+        metrics: &datafusion_physical_plan::metrics::ExecutionPlanMetricsSet,
+    ) -> datafusion_common::Result<
+        Box<dyn parquet::arrow::async_reader::AsyncFileReader + Send>,
+    > {
+        Ok(Box::new(ReadCountingReader {
+            inner: self.inner.create_reader(partition, file, hint, metrics)?,
+            reads: Arc::clone(&self.reads),
+        }))
+    }
+}
+struct ReadCountingReader {
+    inner: Box<dyn parquet::arrow::async_reader::AsyncFileReader + Send>,
+    reads: Arc<std::sync::Mutex<Vec<std::ops::Range<u64>>>>,
+}
+impl parquet::arrow::async_reader::AsyncFileReader for ReadCountingReader {
+    fn get_bytes(
+        &mut self,
+        range: std::ops::Range<u64>,
+    ) -> futures::future::BoxFuture<'_, parquet::errors::Result<bytes::Bytes>> {
+        self.reads.lock().unwrap().push(range.clone());
+        self.inner.get_bytes(range)
+    }
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> futures::future::BoxFuture<'_, parquet::errors::Result<Vec<bytes::Bytes>>> {
+        self.reads.lock().unwrap().extend(ranges.iter().cloned());
+        self.inner.get_byte_ranges(ranges)
+    }
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a parquet::arrow::arrow_reader::ArrowReaderOptions>,
+    ) -> futures::future::BoxFuture<
+        'a,
+        parquet::errors::Result<Arc<parquet::file::metadata::ParquetMetaData>>,
+    > {
+        self.inner.get_metadata(options)
+    }
+}
+
+/// Open the long reader before another partition goes idle. Every row group
+/// has unique keys, so a duplicated or lost row group changes the exact result.
+#[tokio::test]
+async fn idle_after_file_open_receives_unread_whole_row_groups_exactly_once() {
+    late_scan(false).await;
+}
+
+#[tokio::test]
+async fn silently_empty_filtered_groups_are_never_donated_or_read_twice() {
+    late_scan(true).await;
+}
+
+async fn late_scan(only_odd_groups: bool) {
+    use futures::{FutureExt, StreamExt, TryStreamExt};
+
+    let (store, size) = store().await;
+    let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let metadata = {
+        let factory =
+            crate::reader::DefaultParquetFileReaderFactory::new(Arc::clone(&store));
+        factory
+            .create_reader(
+                0,
+                PartitionedFile::new("k.parquet", size),
+                None,
+                &datafusion_physical_plan::metrics::ExecutionPlanMetricsSet::new(),
+            )
+            .unwrap()
+            .get_metadata(None)
+            .await
+            .unwrap()
+    };
+    let mut source = ParquetSource::new(schema()).with_parquet_file_reader_factory(
+        Arc::new(ReadCountingFactory {
+            inner: crate::reader::DefaultParquetFileReaderFactory::new(Arc::clone(
+                &store,
+            )),
+            reads: Arc::clone(&reads),
+        }),
+    );
+    if only_odd_groups {
+        source.table_parquet_options.global.pruning = false;
+        // This is evaluated by the row filter, not statistics pruning. The
+        // decoder silently skips even groups before handing back a reader.
+        source =
+            source
+                .with_pushdown_filters(true)
+                .with_predicate(Arc::new(BinaryExpr::new(
+                    Arc::new(BinaryExpr::new(
+                        Arc::new(Column::new("k", 0)),
+                        Operator::Modulo,
+                        Arc::new(Literal::new(ScalarValue::Int32(Some(
+                            2 * ROWS_PER_GROUP,
+                        )))),
+                    )),
+                    Operator::GtEq,
+                    Arc::new(Literal::new(ScalarValue::Int32(Some(ROWS_PER_GROUP)))),
+                )));
+    }
+    let config = FileScanConfigBuilder::new(
+        ObjectStoreUrl::parse("memory://").unwrap(),
+        Arc::new(source),
+    )
+    .with_file_groups(vec![
+        FileGroup::new(vec![PartitionedFile::new("k.parquet", size)]),
+        FileGroup::new(vec![]),
+    ])
+    .build();
+    let exec: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
+    let mut options = ConfigOptions::default();
+    options.execution.enable_file_stream_work_stealing = true;
+    let context = Arc::new(
+        TaskContext::default().with_session_config(SessionConfig::from(options)),
+    );
+    context.runtime_env().register_object_store(
+        ObjectStoreUrl::parse("memory://").unwrap().as_ref(),
+        store,
+    );
+    let mut owner = exec.execute(0, Arc::clone(&context)).unwrap();
+    let first = owner.next().await.unwrap().unwrap();
+    let mut idle = exec.execute(1, context).unwrap();
+    assert!(
+        idle.next().now_or_never().is_none(),
+        "an idle sibling must wait for the already-open reader's tail"
+    );
+    // Advancing the owner crosses a row-group boundary and offers the tail.
+    let second = owner.next().await.unwrap().unwrap();
+    let stolen = idle.next().await.unwrap().unwrap();
+    let (owner, idle): (Vec<_>, Vec<_>) =
+        futures::try_join!(owner.try_collect(), idle.try_collect(),).unwrap();
+    let mut batches = vec![first, second, stolen];
+    batches.extend(owner);
+    batches.extend(idle);
+    let mut keys: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        (0..ROW_GROUPS * ROWS_PER_GROUP)
+            .filter(|key| !only_odd_groups || (key / ROWS_PER_GROUP) % 2 == 1)
+            .collect::<Vec<_>>()
+    );
+    assert!(count(&exec.metrics().unwrap(), "row_group_units_published") > 0);
+    let reads = reads.lock().unwrap();
+    for (index, group) in metadata.row_groups().iter().enumerate() {
+        let (start, len) = group.column(0).byte_range();
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|range| range.start < start + len && start < range.end)
+                .count(),
+            1,
+            "row group {index} must be physically read exactly once: {reads:?}"
+        );
+    }
+}
+
+#[path = "split_tests/schedules.rs"]
+mod schedules;
