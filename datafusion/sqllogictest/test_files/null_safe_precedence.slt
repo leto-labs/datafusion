@@ -1,0 +1,22 @@
+# Modified by the Longbow authors; see third_party/README.md.
+
+# Both readings type-check, but only the SQL precedence gives these rows.
+query BBBB
+SELECT true IS DISTINCT FROM true AND false, false IS NOT DISTINCT FROM false AND false, false IS DISTINCT FROM true OR true, false IS NOT DISTINCT FROM true OR true
+----
+false false true true
+
+query BBBB
+SELECT true IS DISTINCT FROM (true AND false), false IS NOT DISTINCT FROM (false AND false), false IS DISTINCT FROM (true OR true), false IS NOT DISTINCT FROM (true OR true)
+----
+true true true false
+
+query BB
+SELECT 1 IS NOT DISTINCT FROM 1 AND 2 IS NOT DISTINCT FROM 2, 1 IS NOT DISTINCT FROM 2 OR NULL IS NOT DISTINCT FROM NULL
+----
+true true
+
+query BB
+SELECT 1 IS NOT DISTINCT FROM 1 + 0 AND 2 = 2, 1 IS DISTINCT FROM 1 IS NULL
+----
+true false

@@ -41,3 +41,17 @@ compensation; predicate-subquery callers keep their prior unsupported behavior.
 Inner casts remain unsupported for this new null-safe path: a non-injective cast
 can map distinct inner groups to one outer key. Both operand orders are guarded
 by a native regression; general expression decorrelation needs separate work.
+
+## Family AI: null-safe comparison precedence
+
+Purpose: backport sqlparser's `IS [NOT] DISTINCT FROM` right-operand precedence
+fix without changing the 0.62 parser API. Dependent Longbow feature:
+CORE-SQL-NULL-SEMANTICS. Audit classification: UPSTREAMABLE. The local path
+copy's `third_party/sqlparser/LONGBOW.md` records the published archive checksum,
+exact two-call source delta and upstream tracking (#2436).
+
+The workspace and consumer both select that copy; it is excluded from workspace
+membership so its optional development dependencies do not enter DataFusion's
+locked graph. Native AST and SQL planner regressions cover both comparisons and
+AND/OR. The native `null_safe_precedence.slt` fixture also checks type-valid wrong
+answers, explicit boolean operands, arithmetic and chained IS predicates.

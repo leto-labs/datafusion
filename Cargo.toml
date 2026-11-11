@@ -1,3 +1,5 @@
+# Modified by the Longbow authors; see third_party/README.md.
+
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -67,7 +69,7 @@ members = [
     "datafusion/macros",
     "datafusion/doc",
 ]
-exclude = ["dev/depcheck"]
+exclude = ["dev/depcheck", "third_party/sqlparser"]
 resolver = "2"
 
 [workspace.package]
@@ -197,7 +199,7 @@ rstest = "0.26.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "^0.11.0"
-sqlparser = { version = "0.62.0", default-features = false, features = ["std", "visitor"] }
+sqlparser = { version = "0.62.0", path = "third_party/sqlparser", default-features = false, features = ["std", "visitor"] }
 stacker = "0.1.24"
 strum = "0.28.0"
 strum_macros = "0.28.0"
