@@ -36,7 +36,7 @@ use crate::row_group_filter::RowGroupAccessPlanFilter;
 use crate::{
     BloomFilterStatistics, Int96Coercer, ParquetAccessPlan, ParquetFileMetrics,
     ParquetFileReaderFactory, ParquetRowSelection, ParquetVirtualColumn,
-    apply_file_schema_type_coercions,
+    apply_file_schema_type_coercions, coerce_decimals_to_table_width,
 };
 use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
@@ -997,6 +997,18 @@ impl MetadataLoadedParquetOpen {
         // reader to read strings using Utf8View instead). Update if necessary
         let mut metadata_dirty = false;
         if let Some(merged) = apply_file_schema_type_coercions(
+            &prepared.logical_file_schema,
+            &physical_file_schema,
+        ) {
+            physical_file_schema = Arc::new(merged);
+            options = options.with_schema(Arc::clone(&physical_file_schema));
+            metadata_dirty = true;
+        }
+
+        // A table that declares a narrow decimal for a `Decimal128` file column
+        // reads the column at the table's width instead of casting each batch.
+        if let Some(merged) = coerce_decimals_to_table_width(
+            reader_metadata.parquet_schema(),
             &prepared.logical_file_schema,
             &physical_file_schema,
         ) {

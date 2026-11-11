@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -133,6 +135,79 @@ pub fn apply_file_schema_type_coercions(
         transformed_fields,
         file_schema.metadata.clone(),
     ))
+}
+
+/// Coerces `Decimal128` file columns to the narrower decimal type that the
+/// table schema declares for them, so that the Parquet reader decodes them
+/// without widening each value to 128 bits.
+///
+/// A column is coerced only when all of the following are true:
+/// - the table declares `Decimal32` or `Decimal64` with the precision and scale
+///   of the file's `Decimal128`, so that every value is unchanged;
+/// - the column is a top-level primitive stored as `INT32`, `INT64` or
+///   `FIXED_LEN_BYTE_ARRAY`, the physical types that the reader decodes to a
+///   narrow decimal directly.
+///
+/// Every other column keeps its file type, and the schema adapter casts it.
+///
+/// Returns `None` if no column is coerced.
+pub fn coerce_decimals_to_table_width(
+    parquet_schema: &SchemaDescriptor,
+    table_schema: &Schema,
+    file_schema: &Schema,
+) -> Option<Schema> {
+    let narrow: HashMap<&String, &DataType> = table_schema
+        .fields()
+        .iter()
+        .filter(|field| {
+            matches!(
+                field.data_type(),
+                DataType::Decimal32(..) | DataType::Decimal64(..)
+            )
+        })
+        .map(|field| (field.name(), field.data_type()))
+        .collect();
+    if narrow.is_empty() {
+        return None;
+    }
+    // A top-level primitive column is the only leaf of its root.
+    let decodable: HashSet<&str> = parquet_schema
+        .columns()
+        .iter()
+        .filter(|column| {
+            column.path().parts().len() == 1
+                && matches!(
+                    column.physical_type(),
+                    Type::INT32 | Type::INT64 | Type::FIXED_LEN_BYTE_ARRAY
+                )
+        })
+        .map(|column| column.name())
+        .collect();
+
+    let mut coerced = false;
+    let fields: Vec<FieldRef> = file_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let DataType::Decimal128(precision, scale) = field.data_type() else {
+                return Arc::clone(field);
+            };
+            match narrow.get(field.name()) {
+                Some(
+                    table_type @ (DataType::Decimal32(table_precision, table_scale)
+                    | DataType::Decimal64(table_precision, table_scale)),
+                ) if table_precision == precision
+                    && table_scale == scale
+                    && decodable.contains(field.name().as_str()) =>
+                {
+                    coerced = true;
+                    field_with_new_type(field, (*table_type).clone())
+                }
+                _ => Arc::clone(field),
+            }
+        })
+        .collect();
+    coerced.then(|| Schema::new_with_metadata(fields, file_schema.metadata.clone()))
 }
 
 /// Coerces the file schema's Timestamps to the provided TimeUnit if the
@@ -871,5 +946,70 @@ mod tests {
                 "field {path} changed shape: {original_type} -> {coerced_type}",
             ),
         }
+    }
+    /// A file `Decimal128` becomes the narrow decimal of the table only when
+    /// the precision and the scale are equal and the reader can decode the
+    /// physical type at that width.
+    #[test]
+    fn coerce_decimals_to_table_width_requires_equal_type_parameters() {
+        let message = "
+        message schema {
+          required int64 money (DECIMAL(15,2));
+          optional int32 small (DECIMAL(9,2));
+          required fixed_len_byte_array(9) fixed (DECIMAL(18,4));
+          required binary bytes (DECIMAL(18,4));
+          required int64 other_scale (DECIMAL(15,2));
+          required int64 other_precision (DECIMAL(15,2));
+          required int64 wide (DECIMAL(15,2));
+          required group nested { required int64 money (DECIMAL(15,2)); }
+          required int64 id;
+        }
+        ";
+        let schema = parse_message_type(message).expect("should parse schema");
+        let descr = SchemaDescriptor::new(Arc::new(schema));
+        let file_schema = parquet_to_arrow_schema(&descr, None).unwrap();
+        let table = |name: &str, data_type: DataType| Field::new(name, data_type, true);
+        let table_schema = Schema::new(vec![
+            table("money", DataType::Decimal64(15, 2)),
+            table("small", DataType::Decimal32(9, 2)),
+            table("fixed", DataType::Decimal64(18, 4)),
+            table("bytes", DataType::Decimal64(18, 4)),
+            table("other_scale", DataType::Decimal64(15, 3)),
+            table("other_precision", DataType::Decimal64(16, 2)),
+            table("wide", DataType::Decimal128(15, 2)),
+            table("id", DataType::Decimal64(18, 0)),
+            table("missing", DataType::Decimal64(15, 2)),
+        ]);
+
+        let coerced = coerce_decimals_to_table_width(&descr, &table_schema, &file_schema)
+            .expect("three columns are coerced");
+        let data_type =
+            |name: &str| coerced.field_with_name(name).unwrap().data_type().clone();
+        assert_eq!(data_type("money"), DataType::Decimal64(15, 2));
+        assert_eq!(data_type("small"), DataType::Decimal32(9, 2));
+        assert_eq!(data_type("fixed"), DataType::Decimal64(18, 4));
+        // The reader has no narrow decoder for BYTE_ARRAY decimals.
+        assert_eq!(data_type("bytes"), DataType::Decimal128(18, 4));
+        assert_eq!(data_type("other_scale"), DataType::Decimal128(15, 2));
+        assert_eq!(data_type("other_precision"), DataType::Decimal128(15, 2));
+        assert_eq!(data_type("wide"), DataType::Decimal128(15, 2));
+        assert_eq!(data_type("id"), DataType::Int64);
+        assert_eq!(
+            coerced.field_with_name("nested").unwrap(),
+            file_schema.field_with_name("nested").unwrap()
+        );
+        // Nullability, order and schema metadata are the file's.
+        assert_eq!(coerced.fields().len(), file_schema.fields().len());
+        assert!(!coerced.field_with_name("money").unwrap().is_nullable());
+        assert!(coerced.field_with_name("small").unwrap().is_nullable());
+
+        // A table without narrow decimals coerces nothing.
+        assert!(
+            coerce_decimals_to_table_width(&descr, &file_schema, &file_schema).is_none()
+        );
+        let unrelated = Schema::new(vec![table("id", DataType::Decimal64(18, 0))]);
+        assert!(
+            coerce_decimals_to_table_width(&descr, &unrelated, &file_schema).is_none()
+        );
     }
 }
