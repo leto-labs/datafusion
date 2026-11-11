@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -49,6 +51,5 @@ pub mod topk_aggregation;
 pub mod topk_repartition;
 pub mod update_aggr_exprs;
 pub mod utils;
-pub mod window_topn;
 
 pub use optimizer::{ConfigOnlyContext, PhysicalOptimizerContext, PhysicalOptimizerRule};

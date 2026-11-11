@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -39,6 +41,5 @@ mod sanity_checker;
 #[expect(clippy::needless_pass_by_value)]
 mod test_utils;
 mod window_optimize;
-mod window_topn;
 
 mod pushdown_utils;

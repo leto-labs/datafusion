@@ -48,8 +48,9 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 
 use crate::execution_plan::{Boundedness, EmissionType};
-use crate::metrics::ExecutionPlanMetricsSet;
-use crate::topk::{PartitionedTopK, PartitionedTopKRank, build_sort_fields};
+use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use crate::topk::row_number::RowNumberTopK;
+use crate::topk::{PartitionedTopKRank, build_sort_fields};
 use crate::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use crate::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
@@ -102,17 +103,18 @@ pub enum WindowFnKind {
 ///
 /// # Optimization
 ///
-/// `PartitionedTopKExec` replaces the `SortExec` and the `FilterExec` is
-/// removed. The optimized plan becomes:
+/// `PartitionedTopKExec` supplies the window ordering while the consumer's
+/// conservative rewrite retains the final filter. The optimized plan becomes:
 ///
 /// ```text
-/// BoundedWindowAggExec: ROW_NUMBER() PARTITION BY [store] ORDER BY [revenue DESC]
-///   PartitionedTopKExec: fetch=3, partition=[store], order=[revenue DESC]
-///     DataSourceExec
+/// FilterExec: rn <= 3
+///   BoundedWindowAggExec: ROW_NUMBER() PARTITION BY [store] ORDER BY [revenue DESC]
+///     PartitionedTopKExec: fetch=3, partition=[store], order=[revenue DESC]
+///       DataSourceExec
 /// ```
 ///
 /// Instead of sorting the entire dataset, this operator reads unsorted input
-/// and delegates to a per-partition heap-of-K implementation (`PartitionedTopK`
+/// and delegates to a per-partition heap-of-K implementation (`RowNumberTopK`
 /// for `ROW_NUMBER` and `PartitionedTopKRank` for `RANK`), each maintaining
 /// one heap per distinct partition key while sharing a single
 /// [`arrow::row::RowConverter`] /
@@ -166,15 +168,15 @@ pub enum WindowFnKind {
 ///
 /// # Limitations
 ///
-/// - Only activated when the window function is `ROW_NUMBER` or `RANK` with
-///   a `PARTITION BY` clause. `RANK` additionally requires a non-empty
+/// - The consumer activates this operator for `ROW_NUMBER` or `RANK`. An
+///   empty partition prefix denotes a global ranking. `RANK` additionally requires a non-empty
 ///   `ORDER BY` (with an empty `ORDER BY`, every row ties at rank 1 and the
-///   heap-of-K rewrite doesn't apply). Global top-K (no `PARTITION BY`) is
-///   already handled efficiently by `SortExec` with `fetch`.
+///   heap-of-K rewrite doesn't apply). Global RANK still needs its boundary
+///   peers, unlike an ordinary SortExec with fetch.
 /// - For very high cardinality partition keys (millions of distinct values),
 ///   both memory usage and runtime overhead can become significant. In such
-///   cases, the sort-based plan is more robust. Therefore, this optimization
-///   is currently controlled by a configuration flag.
+///   cases, the sort-based plan can be more robust. Admission policy belongs
+///   to the consumer's conservative optimizer rule.
 #[derive(Debug, Clone)]
 pub struct PartitionedTopKExec {
     /// Input execution plan (reads unsorted data)
@@ -211,7 +213,7 @@ impl PartitionedTopKExec {
     /// * `expr` - Full sort ordering `[partition_keys..., order_keys...]`.
     ///   For `PARTITION BY pk ORDER BY val ASC`, this would be `[pk ASC, val ASC]`.
     /// * `partition_prefix_len` - Number of leading expressions in `expr`
-    ///   that form the partition key. Must be >= 1.
+    ///   that form the partition key. Zero means one global partition.
     /// * `fetch` - Maximum rows to retain per partition (the K in "top-K").
     /// * `fn_kind` - Which ranking window function this operator optimizes
     ///   ([`WindowFnKind::RowNumber`] or [`WindowFnKind::Rank`]).
@@ -235,6 +237,11 @@ impl PartitionedTopKExec {
         fetch: usize,
         fn_kind: WindowFnKind,
     ) -> Result<Self> {
+        if fetch == 0 || partition_prefix_len >= expr.len() {
+            return datafusion_common::plan_err!(
+                "Top-K requires positive K and a valid ordering suffix"
+            );
+        }
         let cache = Self::compute_properties(&input, expr.clone())?;
         Ok(Self {
             input,
@@ -342,6 +349,10 @@ impl ExecutionPlan for PartitionedTopKExec {
         "PartitionedTopKExec"
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics_set.clone_inner())
+    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
@@ -356,9 +367,11 @@ impl ExecutionPlan for PartitionedTopKExec {
             .iter()
             .map(|e| Arc::clone(&e.expr))
             .collect();
-        crate::InputDistributionRequirements::new(vec![Distribution::KeyPartitioned(
-            partition_exprs,
-        )])
+        crate::InputDistributionRequirements::new(vec![if partition_exprs.is_empty() {
+            Distribution::SinglePartition
+        } else {
+            Distribution::KeyPartitioned(partition_exprs)
+        }])
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -455,7 +468,7 @@ impl ExecutionPlan for PartitionedTopKExec {
 }
 
 /// Read all input, feed each batch into a per-partition top-K state
-/// (either [`PartitionedTopK`] for `ROW_NUMBER` or
+/// (either [`RowNumberTopK`] for `ROW_NUMBER` or
 /// [`PartitionedTopKRank`] for `RANK`), then emit results ordered by
 /// `(partition_keys, order_keys)`.
 ///
@@ -491,43 +504,52 @@ async fn do_partitioned_topk(
     runtime: Arc<RuntimeEnv>,
     metrics_set: ExecutionPlanMetricsSet,
 ) -> Result<SendableRecordBatchStream> {
-    match fn_kind {
-        WindowFnKind::RowNumber => {
-            let mut state = PartitionedTopK::try_new(
-                partition_id,
-                schema,
-                partition_exprs,
-                partition_sort_fields,
-                order_expr,
-                fetch,
-                batch_size,
-                &runtime,
-                &metrics_set,
-            )?;
-            while let Some(batch) = input.next().await {
-                state.insert_batch(&batch?)?;
-            }
-            drop(input);
-            state.emit()
+    // Key-only ROW_NUMBER can retain compact encoded values and coalesce output
+    // across groups. Arbitrary payloads keep the checked family N batch path.
+    let key_only = schema.fields().iter().enumerate().all(|(i, _)| {
+        partition_exprs
+            .iter()
+            .chain(order_expr.iter().map(|e| &e.expr))
+            .any(|e| {
+                e.downcast_ref::<datafusion_physical_expr::expressions::Column>()
+                    .is_some_and(|c| c.index() == i)
+            })
+    });
+    if fn_kind == WindowFnKind::RowNumber && key_only {
+        let mut state = RowNumberTopK::try_new(
+            partition_id,
+            schema,
+            partition_exprs,
+            partition_sort_fields,
+            order_expr,
+            fetch,
+            batch_size,
+            &runtime,
+            &metrics_set,
+        )?;
+        while let Some(batch) = input.next().await {
+            state.insert_batch(&batch?)?;
+            tokio::task::yield_now().await;
         }
-        WindowFnKind::Rank => {
-            let mut state = PartitionedTopKRank::try_new(
-                partition_id,
-                schema,
-                partition_exprs,
-                partition_sort_fields,
-                order_expr,
-                fetch,
-                batch_size,
-                &runtime,
-                &metrics_set,
-            )?;
-            while let Some(batch) = input.next().await {
-                state.insert_batch(&batch?)?;
-                tokio::task::yield_now().await;
-            }
-            drop(input);
-            state.emit()
-        }
+        drop(input);
+        return state.emit();
     }
+    let mut state = PartitionedTopKRank::try_new(
+        partition_id,
+        schema,
+        partition_exprs,
+        partition_sort_fields,
+        order_expr,
+        fetch,
+        batch_size,
+        &runtime,
+        &metrics_set,
+    )?;
+    state.retain_peers(fn_kind == WindowFnKind::Rank);
+    while let Some(batch) = input.next().await {
+        state.insert_batch(&batch?)?;
+        tokio::task::yield_now().await;
+    }
+    drop(input);
+    state.emit()
 }

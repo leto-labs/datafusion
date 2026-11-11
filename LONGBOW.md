@@ -55,3 +55,11 @@ membership so its optional development dependencies do not enter DataFusion's
 locked graph. Native AST and SQL planner regressions cover both comparisons and
 AND/OR. The native `null_safe_precedence.slt` fixture also checks type-valid wrong
 answers, explicit boolean operands, arithmetic and chained IS predicates.
+
+## Family N: bounded window Top-K
+
+Family N / WINDOW-TOPK / KEEP: bounded ROW_NUMBER and global rank execution,
+compact encoded key-only heaps, bounded incremental output, and removal of the
+superseded experimental policy/configuration. The consumer owns conservative
+admission. Native heap ordering regressions and the consumer's semantic,
+codec, pool-refusal and drop tests qualify this family together.

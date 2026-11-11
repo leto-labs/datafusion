@@ -1,6 +1,6 @@
 // Modified by the Longbow authors; see third_party/README.md.
 
-//! Conservative, checked working bounds for the opt-in native rank path.
+//! Conservative, checked working bounds for native rank and row-number storage.
 use super::*;
 use arrow::datatypes::DataType;
 use datafusion_common::resources_datafusion_err;
@@ -74,7 +74,7 @@ pub(super) fn validate(
 // Row encoding of flat values uses at most 2*logical_bytes + 64 per
 // column/row (validity, block markers, padding). Views can reference a tiny
 // shared buffer repeatedly: physical buffer size is NOT a bound on encoding.
-fn encoded_bound(array: &ArrayRef) -> Result<usize> {
+pub(super) fn encoded_bound(array: &ArrayRef) -> Result<usize> {
     let mut bytes = mul(array.len(), 64)?;
     for i in 0..array.len() {
         let len = match array.data_type() {
