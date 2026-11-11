@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -60,8 +62,8 @@ pub use row_group_filter::RowGroupAccessPlanFilter;
 #[expect(deprecated)]
 pub use schema_coercion::coerce_int96_to_resolution;
 pub use schema_coercion::{
-    Int96Coercer, apply_file_schema_type_coercions, transform_binary_to_string,
-    transform_schema_to_view,
+    Int96Coercer, apply_file_schema_type_coercions, coerce_decimals_to_table_width,
+    transform_binary_to_string, transform_schema_to_view,
 };
 pub use sink::ParquetSink;
 pub use virtual_column::ParquetVirtualColumn;
