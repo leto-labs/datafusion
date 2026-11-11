@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -88,6 +90,7 @@ pub mod regr;
 pub mod stddev;
 pub mod string_agg;
 pub mod sum;
+mod sum_widening;
 pub mod variance;
 
 pub mod planner;
