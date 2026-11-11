@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Modified by the Longbow authors; see third_party/README.md.
+
 //! [`ExtractEquijoinPredicate`] identifies equality join (equijoin) predicates
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
@@ -66,6 +68,13 @@ impl OptimizerRule for ExtractEquijoinPredicate {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
+        // Existing NULL-safe keys cannot share one key policy with a new
+        // strict equality pushed from WHERE. Keep it as a residual predicate.
+        if matches!(&plan, LogicalPlan::Join(join)
+            if join.null_equality == NullEquality::NullEqualsNull)
+        {
+            return Ok(Transformed::no(plan));
+        }
         match plan {
             LogicalPlan::Join(Join {
                 left,
@@ -293,6 +302,28 @@ mod tests {
                 @ $expected,
             )
         }};
+    }
+
+    #[test]
+    fn strict_residual_on_null_safe_join_remains_a_filter() -> Result<()> {
+        let a = test_table_scan_with_name("t1")?;
+        let b = test_table_scan_with_name("t2")?;
+        let mut plan = LogicalPlanBuilder::from(a)
+            .join(
+                b,
+                JoinType::Inner,
+                (vec!["t1.a"], vec!["t2.a"]),
+                Some(col("t1.a").eq(col("t2.a"))),
+            )?
+            .build()?;
+        if let LogicalPlan::Join(join) = &mut plan {
+            join.null_equality = NullEquality::NullEqualsNull;
+        }
+        let result = ExtractEquijoinPredicate::new()
+            .rewrite(plan.clone(), &crate::optimizer::OptimizerContext::new())?;
+        assert!(!result.transformed);
+        assert_eq!(result.data, plan);
+        Ok(())
     }
 
     #[test]
