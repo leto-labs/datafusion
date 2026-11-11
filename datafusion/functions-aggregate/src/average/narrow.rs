@@ -108,6 +108,14 @@ fn high_word(sum: i128) -> Result<Option<i32>> {
         .map_err(|_| exec_datafusion_err!("Integer AVG state exceeds 96 bits"))
 }
 
+fn finish(sum: f64, count: i64) -> Option<f64> {
+    match count {
+        0 => None,
+        1 => Some(sum),
+        _ => Some(sum / count as f64),
+    }
+}
+
 /// Normal state has no null counts/sums and an all-NULL high word. Iterate
 /// native i64 slices directly; decode extension words only for promoted state.
 fn visit_state(
@@ -183,9 +191,7 @@ where
         )
     }
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        Ok(ScalarValue::Float64(
-            (self.count != 0).then(|| self.sum.float() / self.count as f64),
-        ))
+        Ok(ScalarValue::Float64(finish(self.sum.float(), self.count)))
     }
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
         Ok(vec![
@@ -336,12 +342,12 @@ where
             Sums::Narrow(sums) => Float64Array::from_iter(
                 sums.into_iter()
                     .zip(counts)
-                    .map(|(sum, count)| (count != 0).then(|| sum as f64 / count as f64)),
+                    .map(|(sum, count)| finish(sum as f64, count)),
             ),
             Sums::Wide(sums) => Float64Array::from_iter(
                 sums.into_iter()
                     .zip(counts)
-                    .map(|(sum, count)| (count != 0).then(|| sum as f64 / count as f64)),
+                    .map(|(sum, count)| finish(sum as f64, count)),
             ),
         };
         Ok(Arc::new(result))
@@ -359,8 +365,45 @@ where
     ) -> Result<()> {
         self.resize(total_groups);
         assert_eq!(states[0].len(), groups.len());
+        let counts = states[0].as_primitive::<Int64Type>();
+        let lows = states[1].as_primitive::<Int64Type>();
+        let highs = states[2].as_primitive::<Int32Type>();
+        assert_eq!(counts.len(), lows.len());
+        assert_eq!(counts.len(), highs.len());
+        let mut merged = 0;
+        // Keep promotion dispatch and wide arithmetic outside the common loop.
+        // On overflow, leave that row uncommitted and resume through promotion
+        // without replaying the already-merged prefix.
+        if let Sums::Narrow(sums) = &mut self.sums
+            && counts.null_count() == 0
+            && lows.null_count() == 0
+            && highs.null_count() == highs.len()
+        {
+            for ((&count, &low), &group) in
+                counts.values().iter().zip(lows.values()).zip(groups)
+            {
+                if count != 0 {
+                    let current_count = &mut self.counts[group];
+                    let next_count = add_count(*current_count, count)?;
+                    let current_sum = &mut sums[group];
+                    let Some(next_sum) = current_sum.checked_add(low) else {
+                        break;
+                    };
+                    *current_count = next_count;
+                    *current_sum = next_sum;
+                }
+                merged += 1;
+            }
+            if merged == counts.len() {
+                return Ok(());
+            }
+        }
         visit_state(states, |index, sum, count| {
-            self.add(groups[index], sum, count)
+            if index < merged {
+                Ok(())
+            } else {
+                self.add(groups[index], sum, count)
+            }
         })
     }
     fn convert_to_state(
@@ -425,9 +468,7 @@ where
                 exec_datafusion_err!("Overflow in narrow integer AVG DISTINCT")
             })?;
         let count = self.values.values.len() as i64;
-        Ok(ScalarValue::Float64(
-            (count != 0).then(|| sum as f64 / count as f64),
-        ))
+        Ok(ScalarValue::Float64(finish(sum as f64, count)))
     }
     fn size(&self) -> usize {
         size_of_val(self) + self.values.size()

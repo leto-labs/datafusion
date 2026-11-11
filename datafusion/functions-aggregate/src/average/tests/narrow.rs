@@ -275,6 +275,18 @@ fn integer_avg_narrow_count_errors_and_promoted_state_ipc() -> Result<()> {
             .merge_batch(&narrow_state(-1, 0))
             .is_err()
     );
+    let mut count_limit = avg_groups_accumulator(&ty, &DataType::Float64)?;
+    count_limit.merge_batch(&narrow_state(i64::MAX, 0), &[0], 1)?;
+    assert!(
+        count_limit
+            .merge_batch(&narrow_state(1, 0), &[0], 1)
+            .is_err()
+    );
+    assert!(
+        avg_groups_accumulator(&ty, &DataType::Float64)?
+            .merge_batch(&narrow_state(-1, 0), &[0], 1)
+            .is_err()
+    );
     let mut groups = avg_groups_accumulator(&ty, &DataType::Float64)?;
     let count = (1_i64 << 31) + 1;
     let sum = i128::from(u32::MAX) * i128::from(count);
@@ -296,5 +308,71 @@ fn integer_avg_narrow_count_errors_and_promoted_state_ipc() -> Result<()> {
         scalar.evaluate()?,
         ScalarValue::Float64(Some(sum as f64 / count as f64))
     );
+    Ok(())
+}
+
+#[test]
+fn integer_avg_narrow_merge_promotes_without_replaying_committed_prefix() -> Result<()> {
+    for (ty, value, count) in [
+        (DataType::UInt32, i128::from(u32::MAX), 1_i64 << 31),
+        (DataType::Int32, i128::from(i32::MIN), 1_i64 << 32),
+    ] {
+        let mut groups = avg_groups_accumulator(&ty, &DataType::Float64)?;
+        groups.merge_batch(&narrow_state(count, value * i128::from(count)), &[0], 3)?;
+        // Ignore the empty row's invalid group. Commit row 1, promote on row 2,
+        // then process row 3 exactly once without replaying the prefix.
+        let incoming: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![0, 1, 1, 1])),
+            Arc::new(Int64Array::from(vec![i64::MAX, 7, value as i64, 11])),
+            Arc::new(Int32Array::from(vec![None, None, None, None])),
+        ];
+        groups.merge_batch(&incoming, &[usize::MAX, 1, 0, 1], 3)?;
+        let actual = groups.evaluate(EmitTo::All)?;
+        assert_eq!(
+            ScalarValue::try_from_array(actual.as_ref(), 0)?,
+            ScalarValue::Float64(Some(value as f64))
+        );
+        assert_eq!(
+            ScalarValue::try_from_array(actual.as_ref(), 1)?,
+            ScalarValue::Float64(Some(9.0))
+        );
+        assert!(actual.is_null(2));
+    }
+    Ok(())
+}
+
+#[test]
+fn integer_avg_narrow_singleton_outputs_match_existing_i128_kernel() -> Result<()> {
+    for (ty, min, max) in [
+        (DataType::Int8, i64::from(i8::MIN), i64::from(i8::MAX)),
+        (DataType::Int16, i64::from(i16::MIN), i64::from(i16::MAX)),
+        (DataType::Int32, i64::from(i32::MIN), i64::from(i32::MAX)),
+        (DataType::UInt8, 0, i64::from(u8::MAX)),
+        (DataType::UInt16, 0, i64::from(u16::MAX)),
+        (DataType::UInt32, 0, i64::from(u32::MAX)),
+    ] {
+        let wide: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(min),
+            Some(max),
+            Some(0),
+            None,
+            Some(min),
+            Some(max),
+        ]));
+        let narrow = arrow::compute::cast(wide.as_ref(), &ty)?;
+        let mut reference = avg_groups_accumulator(&DataType::Int64, &DataType::Float64)?;
+        let mut candidate = avg_groups_accumulator(&ty, &DataType::Float64)?;
+        reference.update_batch(&[wide], &[0, 1, 2, 3, 4, 4], None, 5)?;
+        candidate.update_batch(&[narrow], &[0, 1, 2, 3, 4, 4], None, 5)?;
+        let reference = reference.evaluate(EmitTo::All)?;
+        let candidate = candidate.evaluate(EmitTo::All)?;
+        for group in 0..5 {
+            assert_eq!(
+                ScalarValue::try_from_array(candidate.as_ref(), group)?,
+                ScalarValue::try_from_array(reference.as_ref(), group)?,
+                "{ty} group {group}"
+            );
+        }
+    }
     Ok(())
 }
