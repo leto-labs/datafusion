@@ -32,6 +32,7 @@ use datafusion_common::utils::memory::RecordBatchMemoryCounter;
 use datafusion_common::{Result, resources_datafusion_err};
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_physical_expr::window::{AggregateWindowExpr, PlainAggregateWindowExpr};
 
 pub(super) struct WindowBufferMemory {
     buffers: RecordBatchMemoryCounter,
@@ -74,7 +75,26 @@ impl WindowBufferMemory {
         // This covers buffer-counter hash buckets, ArrayData/RecordBatch/Vec
         // headers and per-column allocation padding, before any counter grows.
         let metadata_per_batch = add(mul(schema.fields().len(), 1024)?, 512)?;
-        let work_per_row = add(mul(width, 4)?, 128)?;
+        // Constant global aggregates take get_result_column's scalar-fill
+        // path: no row-wise ScalarValue vector or ordering indices exist.
+        // Four fixed-width copies cover concatenation, result construction
+        // and result concatenation; one byte per field bounds validity bits.
+        // Other window evaluators keep a checked allowance for the actual
+        // ScalarValue vector (including spare capacity) and index scratch.
+        let constant = expressions.iter().all(|e| {
+            e.as_any()
+                .downcast_ref::<PlainAggregateWindowExpr>()
+                .is_some_and(AggregateWindowExpr::is_constant_in_partition)
+        });
+        let scratch = if constant {
+            0
+        } else {
+            add(
+                mul(size_of::<datafusion_common::ScalarValue>(), 2)?,
+                mul(size_of::<usize>(), 2)?,
+            )?
+        };
+        let work_per_row = add(add(mul(width, 4)?, schema.fields().len())?, scratch)?;
         let reservation =
             MemoryConsumer::new("WindowAggExecBuffer").register(context.memory_pool());
         reservation.try_grow(add(metadata_per_batch, 4096)?)?;

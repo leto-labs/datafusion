@@ -221,3 +221,13 @@ fn longbow_window_memory_accounting_execution_refuses_before_input() -> Result<(
     assert_eq!(pool.reserved(), 0);
     Ok(())
 }
+
+#[test]
+fn longbow_window_memory_accounting_constant_global_has_no_row_vector() -> Result<()> {
+    let (_, context, expr, schema) = setup(1 << 20);
+    let memory = WindowBufferMemory::try_new(&schema, &expr, &context)?.unwrap();
+    // Input i64 plus result i64; four copies plus per-field validity, with
+    // no former arbitrary 128-byte scratch allowance on the scalar-fill path.
+    assert_eq!(memory.work_per_row, 4 * (8 + 8) + 2);
+    Ok(())
+}
