@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -182,7 +184,9 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     && subquery_filter_exprs
                         .iter()
                         .filter(|e| e.contains_outer())
-                        .all(|&e| can_pullup_over_aggregation(e));
+                        .all(|&e| {
+                            can_pullup_over_aggregation(e, self.need_handle_count_bug)
+                        });
                 let (mut join_filters, subquery_filters) =
                     find_join_exprs(subquery_filter_exprs)?;
                 if let Some(in_predicate) = &self.in_predicate_opt {
@@ -425,23 +429,30 @@ impl PullUpCorrelatedExpr {
     }
 }
 
-fn can_pullup_over_aggregation(expr: &Expr) -> bool {
+fn can_pullup_over_aggregation(expr: &Expr, handle_count_bug: bool) -> bool {
+    // Null-safe equality is constant within each inner key group, like ordinary
+    // equality. Preserve its operator and require empty-input compensation.
+    // Do not extend inner casts to null-safe equality: a non-injective cast can
+    // split one scalar aggregate into several groups of the original column.
     if let Expr::BinaryExpr(BinaryExpr {
         left,
-        op: Operator::Eq,
+        op: op @ (Operator::Eq | Operator::IsNotDistinctFrom),
         right,
     }) = expr
     {
+        if *op == Operator::IsNotDistinctFrom && !handle_count_bug {
+            return false;
+        }
         match (left.deref(), right.deref()) {
             (Expr::Column(_), right) => !right.any_column_refs(),
             (left, Expr::Column(_)) => !left.any_column_refs(),
             (Expr::Cast(Cast { expr, .. }), right)
-                if matches!(expr.deref(), Expr::Column(_)) =>
+                if *op == Operator::Eq && matches!(expr.deref(), Expr::Column(_)) =>
             {
                 !right.any_column_refs()
             }
             (left, Expr::Cast(Cast { expr, .. }))
-                if matches!(expr.deref(), Expr::Column(_)) =>
+                if *op == Operator::Eq && matches!(expr.deref(), Expr::Column(_)) =>
             {
                 !left.any_column_refs()
             }

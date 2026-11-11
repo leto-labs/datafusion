@@ -22,3 +22,22 @@ Arrow borrowed-range and Parquet selector/read-ahead patches remain in the
 consumer's vendor tree. Longbow runs native regressions through a generated
 standalone harness with its pinned graph and Arrow patches. A standalone
 upstream-workspace build does not provide those Arrow extensions.
+
+## Family AH: null-safe scalar aggregates
+
+Purpose: allow direct inner-key `IS NOT DISTINCT FROM` correlations across
+aggregates. Dependent Longbow feature: CORE-SUBQUERIES. Audit classification:
+UPSTREAMABLE. The operator remains null-safe and the existing independent
+`__always_true` marker still distinguishes absent groups from matched NULL-key
+groups, preserving COUNT's zero result on empty input.
+
+Native optimizer regressions cover COUNT(*) and COUNT(column), both operand
+orders and the presence-marker compensation. The native SLT fixture
+`subquery_null_safe_count.slt` covers real NULL keys, absent groups, nullable
+arguments, duplicate outer rows, mixed predicates, GROUP BY and HAVING. The
+Longbow consumer runs the same fixture in all five modes against DuckDB rows.
+The new aggregate path requires a caller that enables the existing empty-input
+compensation; predicate-subquery callers keep their prior unsupported behavior.
+Inner casts remain unsupported for this new null-safe path: a non-injective cast
+can map distinct inner groups to one outer key. Both operand orders are guarded
+by a native regression; general expression decorrelation needs separate work.

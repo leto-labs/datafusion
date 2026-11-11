@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -460,6 +462,96 @@ mod tests {
                 @ $expected,
             )
         }};
+    }
+
+    #[test]
+    fn null_safe_correlated_count() -> Result<()> {
+        use datafusion_expr::{Operator, binary_expr};
+        use datafusion_functions_aggregate::count::{count, count_all};
+
+        // A NULL correlation key can match a real group. Only the independent
+        // presence marker distinguishes that group from an absent group.
+        for aggregate in [count_all(), count(col("orders.o_custkey"))] {
+            for reverse in [false, true] {
+                let inner = col("orders.o_custkey");
+                let outer = out_ref_col(DataType::Int64, "customer.c_custkey");
+                let predicate = if reverse {
+                    binary_expr(outer, Operator::IsNotDistinctFrom, inner)
+                } else {
+                    binary_expr(inner, Operator::IsNotDistinctFrom, outer)
+                };
+                let sq = LogicalPlanBuilder::from(scan_tpch_table("orders"))
+                    .filter(predicate)?
+                    .aggregate(Vec::<Expr>::new(), vec![aggregate.clone()])?
+                    .project(vec![aggregate.clone()])?
+                    .build()?;
+                let subquery = Subquery {
+                    subquery: Arc::new(sq),
+                    outer_ref_columns: vec![out_ref_col(
+                        DataType::Int64,
+                        "customer.c_custkey",
+                    )],
+                    spans: Default::default(),
+                };
+                // Predicate-subquery callers do not repair empty aggregate
+                // groups. Keep this new capability on compensated callers.
+                let mut uncompensated = PullUpCorrelatedExpr::new();
+                subquery
+                    .subquery
+                    .as_ref()
+                    .clone()
+                    .rewrite(&mut uncompensated)?;
+                assert!(!uncompensated.can_pull_up);
+                let (joined, compensation) =
+                    build_join(&subquery, &scan_tpch_table("customer"), "sq")?
+                        .expect("null-safe equality must decorrelate");
+                let plan = joined.display_indent().to_string();
+                assert!(plan.contains("IS NOT DISTINCT FROM"), "{plan}");
+                assert!(!joined.contains_outer_reference(), "{plan}");
+                assert_eq!(compensation.len(), 1);
+                let expression = compensation.values().next().unwrap().to_string();
+                assert!(
+                    expression.contains("sq.__always_true IS NULL"),
+                    "{expression}"
+                );
+                assert!(expression.contains("THEN Int64(0)"), "{expression}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn null_safe_correlated_count_rejects_inner_cast() -> Result<()> {
+        use datafusion_expr::{Operator, binary_expr, cast};
+        use datafusion_functions_aggregate::count::count_all;
+
+        // Different Float64 keys can cast to the same Int64. Grouping by the
+        // original keys would split one scalar count into multiple join rows.
+        for reverse in [false, true] {
+            let inner = cast(col("orders.o_totalprice"), DataType::Int64);
+            let outer = out_ref_col(DataType::Int64, "customer.c_custkey");
+            let (left, right) = if reverse {
+                (outer, inner)
+            } else {
+                (inner, outer)
+            };
+            let aggregate = count_all();
+            let sq = LogicalPlanBuilder::from(scan_tpch_table("orders"))
+                .filter(binary_expr(left, Operator::IsNotDistinctFrom, right))?
+                .aggregate(Vec::<Expr>::new(), vec![aggregate.clone()])?
+                .project(vec![aggregate])?
+                .build()?;
+            let subquery = Subquery {
+                subquery: Arc::new(sq),
+                outer_ref_columns: vec![out_ref_col(
+                    DataType::Int64,
+                    "customer.c_custkey",
+                )],
+                spans: Default::default(),
+            };
+            assert!(build_join(&subquery, &scan_tpch_table("customer"), "sq")?.is_none());
+        }
+        Ok(())
     }
 
     /// Test multiple correlated subqueries
