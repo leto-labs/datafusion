@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -17,9 +19,15 @@
 
 //! Defines `Avg` & `Mean` aggregate & accumulators
 
+mod integer;
+
+use integer::{
+    IntegerAvgAccumulator, IntegerAvgGroupsAccumulator, IntegerDistinctAvgAccumulator,
+};
+
 use arrow::array::{
     Array, ArrayRef, ArrowNativeTypeOp, ArrowNumericType, ArrowPrimitiveType, AsArray,
-    BooleanArray, PrimitiveArray, PrimitiveBuilder, UInt64Array,
+    BooleanArray, PrimitiveArray, PrimitiveBuilder, UInt64Array, downcast_integer,
 };
 
 use arrow::compute::{DecimalCast, sum};
@@ -109,9 +117,12 @@ impl Avg {
                     TypeSignature::Coercible(vec![Coercion::new_exact(
                         TypeSignatureClass::Duration,
                     )]),
+                    TypeSignature::Coercible(vec![Coercion::new_exact(
+                        TypeSignatureClass::Integer,
+                    )]),
                     TypeSignature::Coercible(vec![Coercion::new_implicit(
                         TypeSignatureClass::Native(logical_float64()),
-                        vec![TypeSignatureClass::Integer, TypeSignatureClass::Float],
+                        vec![TypeSignatureClass::Float],
                         NativeType::Float64,
                     )]),
                 ],
@@ -255,10 +266,25 @@ impl AggregateUDFImpl for Avg {
         let data_type = acc_args.expr_fields[0].data_type();
         use DataType::*;
 
+        if data_type.is_integer() {
+            macro_rules! make_integer {
+                ($t:ty) => {
+                    if acc_args.is_distinct {
+                        Ok(Box::new(IntegerDistinctAvgAccumulator::<$t>::new())
+                            as Box<dyn Accumulator>)
+                    } else {
+                        Ok(Box::new(IntegerAvgAccumulator::<$t>::new())
+                            as Box<dyn Accumulator>)
+                    }
+                };
+            }
+            return downcast_integer! { data_type => (make_integer), _ => unreachable!("integer type checked") };
+        }
+
         // instantiate specialized accumulator based for the type
         if acc_args.is_distinct {
             match (data_type, acc_args.return_type()) {
-                // Numeric types are converted to Float64 via `coerce_avg_type` during logical plan creation
+                // Floating inputs are coerced to Float64 during logical planning.
                 (Float64, _) => Ok(Box::new(Float64DistinctAvgAccumulator::default())),
 
                 (Decimal32(..), Decimal32(..))
@@ -331,6 +357,7 @@ impl AggregateUDFImpl for Avg {
                 DataType::Decimal256(_, scale) => {
                     DataType::Decimal256(DECIMAL256_MAX_PRECISION, *scale)
                 }
+                dt if dt.is_integer() => dt.clone(),
                 _ => args.return_type().clone(),
             };
             // Similar to datafusion_functions_aggregate::sum::Sum::state_fields
@@ -344,7 +371,12 @@ impl AggregateUDFImpl for Avg {
                 .into(),
             ])
         } else {
-            let sum_data_type = avg_sum_data_type(args.input_fields[0].data_type());
+            let input_type = args.input_fields[0].data_type();
+            let sum_data_type = if input_type.is_integer() {
+                DataType::FixedSizeBinary(16)
+            } else {
+                avg_sum_data_type(input_type)
+            };
             Ok(vec![
                 Field::new(
                     format_state_name(args.name, "count"),
@@ -378,6 +410,16 @@ impl AggregateUDFImpl for Avg {
         use DataType::*;
 
         let data_type = args.expr_fields[0].data_type();
+
+        if data_type.is_integer() {
+            macro_rules! make_integer_groups {
+                ($t:ty) => {
+                    Ok(Box::new(IntegerAvgGroupsAccumulator::<$t>::new())
+                        as Box<dyn GroupsAccumulator>)
+                };
+            }
+            return downcast_integer! { data_type => (make_integer_groups), _ => unreachable!("integer type checked") };
+        }
 
         // instantiate specialized accumulator based for the type
         match (data_type, args.return_field.data_type()) {
@@ -1153,6 +1195,8 @@ mod tests {
         DurationSecondArray, Float64Array,
     };
     use arrow::datatypes::{Schema, i256};
+
+    mod integer;
 
     struct AvgCase {
         name: &'static str,
