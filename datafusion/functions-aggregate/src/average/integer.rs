@@ -42,7 +42,7 @@ fn add_total(sum: &mut i128, count: &mut u64, value: i128, rows: u64) -> Result<
     Ok(())
 }
 
-fn batch_total<I: ArrowNumericType>(values: &PrimitiveArray<I>) -> (i128, u64)
+pub(super) fn batch_total<I: ArrowNumericType>(values: &PrimitiveArray<I>) -> (i128, u64)
 where
     I::Native: Into<i128>,
 {
