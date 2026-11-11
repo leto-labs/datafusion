@@ -98,38 +98,109 @@ macro_rules! hash_float {
 
 hash_float!(f16, f32, f64);
 
+/// Small primitive keys stay in the probe slot. Wider keys keep cached hashes
+/// and an index so Decimal128/256 and wide intervals do not enlarge every slot.
+enum PrimitiveMap<N> {
+    Inline(HashTable<(N, usize)>),
+    Indirect(HashTable<(usize, u64)>),
+}
+
+impl<N> PrimitiveMap<N> {
+    fn clear(&mut self) {
+        match self {
+            Self::Inline(map) => map.clear(),
+            Self::Indirect(map) => map.clear(),
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            Self::Inline(map) => map.capacity() * size_of::<(N, usize)>(),
+            Self::Indirect(map) => map.capacity() * size_of::<(usize, u64)>(),
+        }
+    }
+
+    fn remove_first(&mut self, n: usize) {
+        match self {
+            Self::Inline(map) => map.retain(|(_, group)| match group.checked_sub(n) {
+                Some(remaining) => {
+                    *group = remaining;
+                    true
+                }
+                None => false,
+            }),
+            Self::Indirect(map) => map.retain(|(group, _)| match group.checked_sub(n) {
+                Some(remaining) => {
+                    *group = remaining;
+                    true
+                }
+                None => false,
+            }),
+        }
+    }
+
+    fn shrink_to(&mut self, n: usize) {
+        // The caller clears the table first; no key will be rehashed.
+        match self {
+            Self::Inline(map) => map.shrink_to(n, |_| 0),
+            Self::Indirect(map) => map.shrink_to(n, |_| 0),
+        }
+    }
+}
+
 /// A [`GroupValues`] storing a single column of primitive values
 ///
 /// This specialization is significantly faster than using the more general
 /// purpose `Row`s format
 pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
-    /// The data type of the output array
     data_type: DataType,
-    /// Stores the `(group_index, hash)` based on the hash of its value
-    ///
-    /// We also store `hash` is for reducing cost of rehashing. Such cost
-    /// is obvious in high cardinality group by situation.
-    /// More details can see:
-    /// <https://github.com/apache/datafusion/issues/15961>
-    map: HashTable<(usize, u64)>,
-    /// The group index of the null value if any
+    map: PrimitiveMap<T::Native>,
     null_group: Option<usize>,
-    /// The values for each group index
+    /// Kept in first-seen order for group-index addressing and emission.
     values: Vec<T::Native>,
-    /// The random state used to generate hashes
     random_state: RandomState,
 }
 
 impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
     pub fn new(data_type: DataType) -> Self {
         assert!(PrimitiveArray::<T>::is_compatible(&data_type));
+        let map = if size_of::<T::Native>() <= size_of::<u64>() {
+            PrimitiveMap::Inline(HashTable::with_capacity(128))
+        } else {
+            PrimitiveMap::Indirect(HashTable::with_capacity(128))
+        };
         Self {
             data_type,
-            map: HashTable::with_capacity(128),
+            map,
             values: Vec::with_capacity(128),
             null_group: None,
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
         }
+    }
+}
+
+/// Share null handling and group-id order, while choosing the table layout once
+/// per batch. The lookup closure is monomorphized for each layout and key type.
+fn intern_batch<T: ArrowPrimitiveType>(
+    array: &PrimitiveArray<T>,
+    groups: &mut Vec<usize>,
+    values: &mut Vec<T::Native>,
+    null_group: &mut Option<usize>,
+    mut intern_key: impl FnMut(T::Native, &mut Vec<T::Native>) -> usize,
+) where
+    T::Native: HashValue,
+{
+    groups.clear();
+    for value in array {
+        let group = match value {
+            None => *null_group.get_or_insert_with(|| {
+                let group = values.len();
+                values.push(Default::default());
+                group
+            }),
+            Some(key) => intern_key(key.canonicalize(), values),
+        };
+        groups.push(group);
     }
 }
 
@@ -139,48 +210,61 @@ where
 {
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
         assert_eq!(cols.len(), 1);
-        groups.clear();
-
-        for v in cols[0].as_primitive::<T>() {
-            let group_id = match v {
-                None => *self.null_group.get_or_insert_with(|| {
-                    let group_id = self.values.len();
-                    self.values.push(Default::default());
-                    group_id
-                }),
-                Some(key) => {
-                    // Fold equivalence-class duplicates (e.g. `-0.0` → `+0.0`)
-                    // so the bit-equal `is_eq` matches and the stored value is
-                    // the canonical representative.
-                    let key = key.canonicalize();
-                    let state = &self.random_state;
+        let array = cols[0].as_primitive::<T>();
+        let state = &self.random_state;
+        match &mut self.map {
+            PrimitiveMap::Inline(map) => intern_batch::<T>(
+                array,
+                groups,
+                &mut self.values,
+                &mut self.null_group,
+                |key, values| match map.entry(
+                    key.hash(state),
+                    |&(stored_key, _)| stored_key.is_eq(key),
+                    |&(stored_key, _)| stored_key.hash(state),
+                ) {
+                    hashbrown::hash_table::Entry::Occupied(entry) => entry.get().1,
+                    hashbrown::hash_table::Entry::Vacant(entry) => {
+                        let group = values.len();
+                        entry.insert((key, group));
+                        values.push(key);
+                        group
+                    }
+                },
+            ),
+            PrimitiveMap::Indirect(map) => intern_batch::<T>(
+                array,
+                groups,
+                &mut self.values,
+                &mut self.null_group,
+                |key, values| {
                     let hash = key.hash(state);
-                    let insert = self.map.entry(
+                    match map.entry(
                         hash,
-                        |&(g, h)| unsafe {
-                            hash == h && self.values.get_unchecked(g).is_eq(key)
+                        |&(group, stored_hash)| {
+                            // SAFETY: only live group indices are stored in the
+                            // map, and emit(First) shifts them with the values.
+                            hash == stored_hash
+                                && unsafe { values.get_unchecked(group).is_eq(key) }
                         },
-                        |&(_, h)| h,
-                    );
-
-                    match insert {
-                        hashbrown::hash_table::Entry::Occupied(o) => o.get().0,
-                        hashbrown::hash_table::Entry::Vacant(v) => {
-                            let g = self.values.len();
-                            v.insert((g, hash));
-                            self.values.push(key);
-                            g
+                        |&(_, stored_hash)| stored_hash,
+                    ) {
+                        hashbrown::hash_table::Entry::Occupied(entry) => entry.get().0,
+                        hashbrown::hash_table::Entry::Vacant(entry) => {
+                            let group = values.len();
+                            entry.insert((group, hash));
+                            values.push(key);
+                            group
                         }
                     }
-                }
-            };
-            groups.push(group_id)
+                },
+            ),
         }
         Ok(())
     }
 
     fn size(&self) -> usize {
-        self.map.capacity() * size_of::<(usize, u64)>() + self.values.allocated_size()
+        self.map.size() + self.values.allocated_size()
     }
 
     fn is_empty(&self) -> bool {
@@ -213,19 +297,7 @@ where
                 build_primitive(std::mem::take(&mut self.values), self.null_group.take())
             }
             EmitTo::First(n) => {
-                self.map.retain(|entry| {
-                    // Decrement group index by n
-                    let group_idx = entry.0;
-                    match group_idx.checked_sub(n) {
-                        // Group index was >= n, shift value down
-                        Some(sub) => {
-                            entry.0 = sub;
-                            true
-                        }
-                        // Group index was < n, so remove from table
-                        None => false,
-                    }
-                });
+                self.map.remove_first(n);
                 let null_group = match &mut self.null_group {
                     Some(v) if *v >= n => {
                         *v -= n;
@@ -246,7 +318,7 @@ where
         self.null_group = None;
         self.values.shrink_to(num_rows);
         self.map.clear();
-        self.map.shrink_to(num_rows, |_| 0); // hasher does not matter since the map is cleared
+        self.map.shrink_to(num_rows);
     }
 }
 
