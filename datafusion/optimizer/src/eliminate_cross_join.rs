@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Modified by the Longbow authors; see third_party/README.md.
+
 //! [`EliminateCrossJoin`] converts `CROSS JOIN` to `INNER JOIN` if join predicates are available.
 use crate::{OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
@@ -116,6 +118,15 @@ impl OptimizerRule for EliminateCrossJoin {
             if !rewritable {
                 // recursively try to rewrite children
                 return rewrite_children(self, LogicalPlan::Filter(filter), config);
+            }
+
+            // Filter equality is strict. Adding it to a NULL-safe key set
+            // (or removing a repeated strict predicate from the filter) would
+            // change which NULL rows pass, even in an otherwise uniform cluster.
+            if matches!(filter.input.as_ref(), LogicalPlan::Join(join)
+                if join.null_equality == NullEquality::NullEqualsNull)
+            {
+                return Ok(Transformed::no(LogicalPlan::Filter(filter)));
             }
 
             if !can_flatten_join_inputs(&filter.input) {
@@ -310,17 +321,20 @@ fn flatten_join_inputs(
 /// Must stay in sync with `flatten_join_inputs`
 fn can_flatten_join_inputs(plan: &LogicalPlan) -> bool {
     // can only flatten inner / cross joins
-    match plan {
-        LogicalPlan::Join(join) if join.join_type == JoinType::Inner => {}
+    let null_equality = match plan {
+        LogicalPlan::Join(join) if join.join_type == JoinType::Inner => {
+            join.null_equality
+        }
         _ => return false,
     };
 
     for child in plan.inputs() {
-        if let LogicalPlan::Join(Join {
-            join_type: JoinType::Inner,
-            ..
-        }) = child
-            && !can_flatten_join_inputs(child)
+        if let LogicalPlan::Join(join) = child
+            && join.join_type == JoinType::Inner
+            // Flattening collects all keys in one JoinKeySet and rebuilds
+            // every join with the root's NULL policy. Mixed clusters must
+            // retain their original boundaries and per-key semantics.
+            && (join.null_equality != null_equality || !can_flatten_join_inputs(child))
         {
             return false;
         }
@@ -1390,6 +1404,85 @@ mod tests {
               TableScan: t2 [a:UInt32, b:UInt32, c:UInt32]
         "
         )
+    }
+
+    /// Keys from adjacent joins cannot share one NULL policy unless they agree.
+    /// Covers `a JOIN b ON a.k=b.k JOIN c ON b.k IS NOT DISTINCT FROM c.k`
+    /// and the reverse policy / right-child shapes, with and without a filter.
+    #[test]
+    fn mixed_null_equality_cluster_is_not_flattened() -> Result<()> {
+        for nulls in [
+            NullEquality::NullEqualsNothing,
+            NullEquality::NullEqualsNull,
+        ] {
+            for right_child in [false, true] {
+                for filtered in [false, true] {
+                    let a = test_table_scan_with_name("t1")?;
+                    let b = test_table_scan_with_name("t2")?;
+                    let c = test_table_scan_with_name("t3")?;
+                    let mut child = LogicalPlanBuilder::from(a)
+                        .join(b, JoinType::Inner, (vec!["t1.a"], vec!["t2.a"]), None)?
+                        .build()?;
+                    if let LogicalPlan::Join(j) = &mut child {
+                        j.null_equality = nulls;
+                    }
+                    let mut plan = if right_child {
+                        LogicalPlanBuilder::from(c)
+                            .join(
+                                child,
+                                JoinType::Inner,
+                                (vec!["t3.a"], vec!["t2.a"]),
+                                None,
+                            )?
+                            .build()?
+                    } else {
+                        LogicalPlanBuilder::from(child)
+                            .join(c, JoinType::Inner, (vec!["t2.a"], vec!["t3.a"]), None)?
+                            .build()?
+                    };
+                    if let LogicalPlan::Join(j) = &mut plan {
+                        j.null_equality = if nulls == NullEquality::NullEqualsNull {
+                            NullEquality::NullEqualsNothing
+                        } else {
+                            NullEquality::NullEqualsNull
+                        };
+                    }
+                    if filtered {
+                        plan = LogicalPlanBuilder::from(plan)
+                            .filter(col("t1.b").eq(lit(1u32)))?
+                            .build()?;
+                    }
+                    let before = plan.clone();
+                    let result = EliminateCrossJoin::new()
+                        .rewrite(plan, &OptimizerContext::new())?;
+                    assert!(!result.transformed);
+                    assert_eq!(result.data, before);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn strict_filter_keys_do_not_acquire_null_safe_semantics() -> Result<()> {
+        let a = test_table_scan_with_name("t1")?;
+        let b = test_table_scan_with_name("t2")?;
+        let mut join = LogicalPlanBuilder::from(a)
+            .join(b, JoinType::Inner, (vec!["t1.a"], vec!["t2.a"]), None)?
+            .build()?;
+        if let LogicalPlan::Join(j) = &mut join {
+            j.null_equality = NullEquality::NullEqualsNull;
+        }
+        for predicate in [col("t1.a").eq(col("t2.a")), col("t1.b").eq(col("t2.b"))] {
+            let plan = LogicalPlanBuilder::from(join.clone())
+                .filter(predicate)?
+                .build()?;
+            let result = EliminateCrossJoin::new()
+                .rewrite(plan.clone(), &OptimizerContext::new())?;
+            assert!(!result.transformed);
+            assert_eq!(result.data, plan);
+        }
+        Ok(())
     }
 
     #[test]
