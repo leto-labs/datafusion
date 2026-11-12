@@ -653,7 +653,7 @@ impl ParquetSource {
             projection: self.projection.clone(),
             batch_size: self.batch_size.or(base_config.batch_size).unwrap_or(8192),
             limit: base_config.limit,
-            preserve_order: base_config.preserve_order,
+            preserve_order: base_config.preserves_file_order(),
             predicate: self.predicate.clone(),
             table_schema: self.table_schema.clone(),
             metadata_size_hint: self.metadata_size_hint,

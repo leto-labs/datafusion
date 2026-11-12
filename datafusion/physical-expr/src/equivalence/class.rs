@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::vec::IntoIter;
 
 use super::ProjectionMapping;
-use crate::expressions::Literal;
+use crate::expressions::{Column, Literal};
 use crate::physical_expr::add_offset_to_expr;
 use crate::projection::ProjectionTargets;
 use crate::{PhysicalExpr, PhysicalExprRef, PhysicalSortExpr, PhysicalSortRequirement};
@@ -186,6 +186,13 @@ pub struct EquivalenceClass {
 }
 
 impl EquivalenceClass {
+    /// NULL padding preserves equality between columns, but not constants or
+    /// computed members (for example coalesce(a, 0) differs from padded a).
+    fn null_pad(&mut self) {
+        self.constant = None;
+        self.exprs.retain(|expr| expr.is::<Column>());
+    }
+
     // Create a new equivalence class from a pre-existing collection.
     pub fn new(exprs: impl IntoIterator<Item = Arc<dyn PhysicalExpr>>) -> Self {
         let mut class = Self::default();
@@ -258,6 +265,7 @@ impl EquivalenceClass {
         {
             cls.push(expr_result?);
         }
+        cls.constant.clone_from(&self.constant);
         Ok(cls)
     }
 }
@@ -798,12 +806,29 @@ impl EquivalenceGroup {
         let group = match join_type {
             JoinType::Inner | JoinType::Left | JoinType::Full | JoinType::Right => {
                 let mut result = Self::new(
-                    self.iter().cloned().chain(
-                        right_equivalences
-                            .iter()
-                            .map(|cls| cls.try_with_offset(left_size as _))
-                            .collect::<Result<Vec<_>>>()?,
-                    ),
+                    self.iter()
+                        .cloned()
+                        .map(|mut cls| {
+                            if matches!(join_type, JoinType::Right | JoinType::Full) {
+                                cls.null_pad();
+                            }
+                            cls
+                        })
+                        .chain(
+                            right_equivalences
+                                .iter()
+                                .map(|cls| {
+                                    let mut cls = cls.try_with_offset(left_size as _)?;
+                                    if matches!(
+                                        join_type,
+                                        JoinType::Left | JoinType::Full
+                                    ) {
+                                        cls.null_pad();
+                                    }
+                                    Ok(cls)
+                                })
+                                .collect::<Result<Vec<_>>>()?,
+                        ),
                 );
                 // In we have an inner join, expressions in the "on" condition
                 // are equal in the resulting table.
@@ -937,6 +962,89 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use datafusion_expr::Operator;
+
+    #[test]
+    fn joins_discard_padded_constants_and_computed_equalities() -> Result<()> {
+        let a: PhysicalExprRef = Arc::new(Column::new("a", 0));
+        let b: PhysicalExprRef = Arc::new(Column::new("b", 1));
+        let computed: PhysicalExprRef =
+            Arc::new(BinaryExpr::new(Arc::clone(&a), Operator::Plus, lit(0i64)));
+        for constant in [
+            AcrossPartitions::Uniform(Some(ScalarValue::Int64(Some(1)))),
+            AcrossPartitions::Uniform(Some(ScalarValue::Int64(None))),
+            AcrossPartitions::Uniform(None),
+            AcrossPartitions::Heterogeneous,
+        ] {
+            let mut class = EquivalenceClass::new([
+                Arc::clone(&a),
+                Arc::clone(&b),
+                Arc::clone(&computed),
+            ]);
+            class.constant = Some(constant);
+            let input = EquivalenceGroup::new([class]);
+            for join_type in [
+                JoinType::Inner,
+                JoinType::Left,
+                JoinType::Right,
+                JoinType::Full,
+                JoinType::LeftSemi,
+                JoinType::RightSemi,
+                JoinType::LeftAnti,
+                JoinType::RightAnti,
+                JoinType::LeftMark,
+                JoinType::RightMark,
+            ] {
+                let output = input.join(&input, &join_type, 2, &[])?;
+                for right in [false, true] {
+                    let projected = match join_type {
+                        JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
+                            !right
+                        }
+                        JoinType::RightSemi
+                        | JoinType::RightAnti
+                        | JoinType::RightMark => right,
+                        _ => true,
+                    };
+                    if !projected {
+                        continue;
+                    }
+                    let offset = if right
+                        && matches!(
+                            join_type,
+                            JoinType::Inner
+                                | JoinType::Left
+                                | JoinType::Right
+                                | JoinType::Full
+                        ) {
+                        2
+                    } else {
+                        0
+                    };
+                    let column = add_offset_to_expr(Arc::clone(&a), offset)?;
+                    let peer = add_offset_to_expr(Arc::clone(&b), offset)?;
+                    let expression = add_offset_to_expr(Arc::clone(&computed), offset)?;
+                    let padded = matches!(
+                        (join_type, right),
+                        (JoinType::Left, true)
+                            | (JoinType::Right, false)
+                            | (JoinType::Full, _)
+                    );
+                    assert_eq!(
+                        output.is_expr_constant(&column).is_some(),
+                        !padded,
+                        "{join_type:?} right={right}"
+                    );
+                    assert!(output.exprs_equal(&column, &peer));
+                    assert_eq!(
+                        output.exprs_equal(&column, &expression),
+                        !padded,
+                        "{join_type:?} right={right}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn unknown_uniform_constants_do_not_imply_equal_partition_keys() -> Result<()> {

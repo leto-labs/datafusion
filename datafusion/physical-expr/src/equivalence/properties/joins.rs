@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -41,13 +43,21 @@ pub fn join_equivalence_properties(
     )?)?;
 
     let EquivalenceProperties {
-        oeq_class: left_oeq_class,
+        oeq_class: mut left_oeq_class,
         ..
     } = left;
     let EquivalenceProperties {
         oeq_class: mut right_oeq_class,
         ..
     } = right;
+    // Unmatched rows insert NULLs on a padded side. Its input ordering is
+    // not a valid ordering of those output values, including as a suffix.
+    if matches!(join_type, JoinType::Right | JoinType::Full) {
+        left_oeq_class.clear();
+    }
+    if matches!(join_type, JoinType::Left | JoinType::Full) {
+        right_oeq_class.clear();
+    }
     match maintains_input_order {
         [true, false] => {
             // In this special case, right side ordering can be prefixed with
@@ -140,6 +150,70 @@ mod tests {
 
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
+
+    #[test]
+    fn padded_join_side_does_not_supply_orderings() -> Result<()> {
+        use crate::{PhysicalSortExpr, expressions::Column};
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        for join_type in [
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::LeftSemi,
+            JoinType::RightSemi,
+            JoinType::LeftAnti,
+            JoinType::RightAnti,
+        ] {
+            for right in [false, true] {
+                if matches!(
+                    (join_type, right),
+                    (JoinType::LeftSemi | JoinType::LeftAnti, true)
+                        | (JoinType::RightSemi | JoinType::RightAnti, false)
+                ) {
+                    continue;
+                }
+                let ordered = || {
+                    let mut properties = EquivalenceProperties::new(Arc::clone(&schema));
+                    properties.add_ordering([PhysicalSortExpr::new_default(Arc::new(
+                        Column::new("a", 0),
+                    ))]);
+                    properties
+                };
+                let out_schema = if matches!(
+                    join_type,
+                    JoinType::Left | JoinType::Right | JoinType::Full
+                ) {
+                    Arc::new(Schema::new(vec![
+                        schema.field(0).clone(),
+                        Field::new("b", DataType::Int64, true),
+                    ]))
+                } else {
+                    Arc::clone(&schema)
+                };
+                let output = join_equivalence_properties(
+                    ordered(),
+                    ordered(),
+                    &join_type,
+                    out_schema,
+                    &[!right, right],
+                    None,
+                    &[],
+                )?;
+                let padded = matches!(
+                    (join_type, right),
+                    (JoinType::Left, true)
+                        | (JoinType::Right, false)
+                        | (JoinType::Full, _)
+                );
+                assert_eq!(
+                    output.oeq_class.is_empty(),
+                    padded,
+                    "{join_type:?} right={right}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_join_equivalence_properties() -> Result<()> {

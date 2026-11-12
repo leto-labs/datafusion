@@ -719,6 +719,15 @@ impl DataSource for FileScanConfig {
         // units offered by eligible readers after pruning.
         let shared_work_source = sibling_state
             .as_ref()
+            // A selective consumer may require independent partitions even if
+            // this plan already initialized sibling state in another context.
+            .filter(|_| {
+                context
+                    .session_config()
+                    .options()
+                    .execution
+                    .enable_file_stream_work_stealing
+            })
             .and_then(|state| state.downcast_ref::<SharedWorkSource>())
             .cloned();
 
@@ -1196,7 +1205,7 @@ impl DataSource for FileScanConfig {
         &self,
         config: &ConfigOptions,
     ) -> Option<Arc<dyn Any + Send + Sync>> {
-        if self.preserve_order
+        if self.preserves_file_order()
             || self.output_partitioning.is_some()
             || !config.execution.enable_file_stream_work_stealing
         {
@@ -1220,6 +1229,12 @@ impl DataSource for FileScanConfig {
 }
 
 impl FileScanConfig {
+    /// A declared ordering is a promise to every parent, including after a
+    /// limit rewrite clears the explicit order-sensitivity flag.
+    pub fn preserves_file_order(&self) -> bool {
+        self.preserve_order || !self.output_ordering.is_empty()
+    }
+
     /// Returns only the output orderings that are validated against actual
     /// file group statistics.
     ///
@@ -1630,6 +1645,45 @@ mod tests {
     use futures::stream;
     use object_store::ObjectStore;
     use std::fmt::Debug;
+
+    #[test]
+    fn declared_order_survives_cleared_preserve_flag() {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Float64, false)]));
+        let mut config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(MockSource::new(schema)),
+        )
+        .with_file_groups(vec![
+            FileGroup::new(vec![make_file_with_stats("file1", 0.0, 9.0)]),
+            FileGroup::new(vec![make_file_with_stats("file2", 10.0, 19.0)]),
+        ])
+        .with_output_ordering(vec![
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(Column::new(
+                "a", 0,
+            )))])
+            .unwrap(),
+        ])
+        .build();
+        config.preserve_order = false;
+        assert!(
+            config
+                .create_sibling_state(&ConfigOptions::default())
+                .is_none()
+        );
+        config.output_ordering.clear();
+        assert!(
+            config
+                .create_sibling_state(&ConfigOptions::default())
+                .is_some()
+        );
+        config.preserve_order = true;
+        assert!(
+            config
+                .create_sibling_state(&ConfigOptions::default())
+                .is_none()
+        );
+    }
 
     #[derive(Clone)]
     struct InexactSortPushdownSource {

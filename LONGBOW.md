@@ -232,3 +232,32 @@ Independent key and payload branches use distinct scan counters even before
 a codec round trip. `ParquetSource::with_new_metrics` preserves all source
 options and reader factories while giving an independent clone fresh counters.
 Ordinary optimizer transformations continue to share their original counters.
+
+## Family SO: ordering correctness and merge progress
+
+Purpose: protect file-order promises after LIMIT rewrites, remove invalid
+NULL-padded join facts, and prevent a merge's selective backpressure from
+waiting on sibling scan publication. Dependent Longbow feature:
+CORE-ORDERING-CORRECTNESS. Audit classification: UPSTREAMABLE.
+
+Multi-input SortPreservingMergeExec executes its input with scan work sharing
+disabled. A cloned task context retains runtime, function registries, identities
+and session extensions, including the attempt task scope. FileScanConfig honors
+this restriction even if sibling state already exists. Other consumers keep
+work sharing. This is a conservative bound on late-publication scheduling.
+
+A scan's declared output ordering always protects file order and Parquet limit
+pruning. This is the relevant backport of Apache #26434 (63af08da). Join classes
+clear constants and computed members on NULL-padded sides, while keeping plain
+column equalities (Apache #26747, 99e723dd). Offsetting a preserved side retains
+its constant metadata, matching Apache main b5bcea88. Join ordering propagation
+also clears padded-side
+orderings. SEMI/ANTI facts remain on their emitted side.
+
+Native regressions cover all join types, known/unknown/partition-local/NULL
+constants, ordering facts and cleared scan flags. core/tests/parquet/stock_ordering.rs
+compares complete SQL results with a Rust sort over generated Parquet files;
+the Longbow consumer includes the same file in its stock_ordering integration
+test so its pinned Arrow/DataFusion dependency graph runs these regressions.
+The SO1 consumer report records the before/after evidence, upstream status,
+expanded differential harness and validation gates.

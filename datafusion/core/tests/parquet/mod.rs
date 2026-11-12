@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -1242,3 +1244,5 @@ fn make_test_file_page(scenario: Scenario, row_per_page: usize) -> NamedTempFile
     writer.close().unwrap();
     output_file
 }
+
+mod stock_ordering;
