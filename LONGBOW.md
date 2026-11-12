@@ -88,6 +88,15 @@ cancellation with live retained credits. Purpose: remove false Q67 admission
 failures without raising or bypassing the memory pool. Classification: KEEP;
 dependent feature: WINDOW-TOPK.
 
+Byte-view descriptor lists are shared allocations as well. Their Arc-backed
+storage is deduplicated independently from view/validity buffers. Temporary
+ArrayData descriptors are charged only as workspace, using the largest
+simultaneous copy instead of adding copies to every retained slice. Flat view
+arrays are visited directly; shared descriptor lists are scanned once per
+accounting pass. Buffer ownership bookkeeping remains conservatively charged.
+A many-buffer StringView regression covers shared descriptor lists.
+
+
 
 ## Family BSC: bitmap short-circuit evaluation
 

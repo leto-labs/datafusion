@@ -185,7 +185,10 @@ pub(super) fn batch_reference_bytes(batch: &RecordBatch) -> usize {
 
 /// View buffer descriptor lists are heap allocations too. Arrow's array size
 /// currently omits them; include them when bounding our temporary accountant.
-fn view_metadata(array: &dyn Array) -> Result<usize> {
+fn visit_view_buffers(
+    array: &dyn Array,
+    visit: &mut dyn FnMut(&[arrow::buffer::Buffer]) -> Result<()>,
+) -> Result<()> {
     use arrow::datatypes::{DataType, Int16Type, Int32Type, Int64Type};
     let list = match array.data_type() {
         DataType::Utf8View => Some(array.as_string_view().data_buffers()),
@@ -193,69 +196,91 @@ fn view_metadata(array: &dyn Array) -> Result<usize> {
         _ => None,
     };
     if let Some(list) = list {
-        return add(
-            mul(list.len(), size_of::<arrow::buffer::Buffer>())?,
-            2 * size_of::<usize>(),
-        );
+        return visit(list);
     }
     match array.data_type() {
-        DataType::List(_) => view_metadata(array.as_list::<i32>().values().as_ref()),
-        DataType::LargeList(_) => view_metadata(array.as_list::<i64>().values().as_ref()),
+        DataType::List(_) => {
+            visit_view_buffers(array.as_list::<i32>().values().as_ref(), visit)
+        }
+        DataType::LargeList(_) => {
+            visit_view_buffers(array.as_list::<i64>().values().as_ref(), visit)
+        }
         DataType::ListView(_) => {
-            view_metadata(array.as_list_view::<i32>().values().as_ref())
+            visit_view_buffers(array.as_list_view::<i32>().values().as_ref(), visit)
         }
         DataType::LargeListView(_) => {
-            view_metadata(array.as_list_view::<i64>().values().as_ref())
+            visit_view_buffers(array.as_list_view::<i64>().values().as_ref(), visit)
         }
         DataType::FixedSizeList(_, _) => {
-            view_metadata(array.as_fixed_size_list().values().as_ref())
+            visit_view_buffers(array.as_fixed_size_list().values().as_ref(), visit)
         }
         DataType::Struct(_) => array
             .as_struct()
             .columns()
             .iter()
-            .try_fold(0, |n, a| add(n, view_metadata(a.as_ref())?)),
-        DataType::Map(_, _) => view_metadata(array.as_map().entries()),
-        DataType::Union(fields, _) => fields.iter().try_fold(0, |n, (id, _)| {
-            add(n, view_metadata(array.as_union().child(id).as_ref())?)
+            .try_for_each(|a| visit_view_buffers(a.as_ref(), visit)),
+        DataType::Map(_, _) => visit_view_buffers(array.as_map().entries(), visit),
+        DataType::Union(fields, _) => fields.iter().try_for_each(|(id, _)| {
+            visit_view_buffers(array.as_union().child(id).as_ref(), visit)
         }),
         DataType::Dictionary(_, _) => {
-            view_metadata(array.as_any_dictionary().values().as_ref())
+            visit_view_buffers(array.as_any_dictionary().values().as_ref(), visit)
         }
         DataType::RunEndEncoded(ends, _) => match ends.data_type() {
             DataType::Int16 => {
-                view_metadata(array.as_run::<Int16Type>().values().as_ref())
+                visit_view_buffers(array.as_run::<Int16Type>().values().as_ref(), visit)
             }
             DataType::Int32 => {
-                view_metadata(array.as_run::<Int32Type>().values().as_ref())
+                visit_view_buffers(array.as_run::<Int32Type>().values().as_ref(), visit)
             }
             DataType::Int64 => {
-                view_metadata(array.as_run::<Int64Type>().values().as_ref())
+                visit_view_buffers(array.as_run::<Int64Type>().values().as_ref(), visit)
             }
             _ => datafusion_common::internal_err!("invalid rank run-end type"),
         },
-        _ => Ok(0),
+        _ => Ok(()),
     }
 }
 
-fn array_metadata(array: &dyn Array) -> Result<usize> {
+fn view_metadata(array: &dyn Array) -> Result<usize> {
+    let mut bytes = 0;
+    visit_view_buffers(array, &mut |list| {
+        bytes = add(bytes, descriptor_bytes(list)?)?;
+        Ok(())
+    })?;
+    Ok(bytes)
+}
+
+fn descriptor_bytes(list: &[arrow::buffer::Buffer]) -> Result<usize> {
     add(
-        array
+        mul(list.len(), size_of::<arrow::buffer::Buffer>())?,
+        2 * size_of::<usize>(),
+    )
+}
+
+fn array_metadata(array: &dyn Array) -> usize {
+    // Byte-view size methods scan every backing buffer. The object is fixed
+    // size; account its shared descriptor allocation separately instead.
+    match array.data_type() {
+        DataType::Utf8View => size_of::<arrow::array::StringViewArray>(),
+        DataType::BinaryView => size_of::<arrow::array::BinaryViewArray>(),
+        _ => array
             .get_array_memory_size()
             .saturating_sub(array.get_buffer_memory_size()),
-        view_metadata(array)?,
-    )
+    }
 }
 
 pub(super) fn counter_workspace(
     retained_metadata: usize,
     batch: &RecordBatch,
 ) -> Result<usize> {
-    let incoming = batch
-        .columns()
-        .iter()
-        .try_fold(0, |n, a| add(n, array_metadata(a.as_ref())?))?;
-    // Descriptor copies, two hash tables and geometric table growth. Payload
+    let incoming = batch.columns().iter().try_fold(0, |n, a| {
+        add(
+            n,
+            add(array_metadata(a.as_ref()), view_metadata(a.as_ref())?)?,
+        )
+    })?;
+    // Descriptor copies, identity hash tables and geometric table growth. Payload
     // bytes are never copied by this accountant. The fixed slack covers empty
     // tables and primitive ArrayData headers.
     add(mul(add(retained_metadata, incoming)?, 8)?, 4096)
@@ -265,6 +290,7 @@ pub(super) fn counter_workspace(
 pub(super) struct ArrayBytes {
     pub bytes: usize,
     pub metadata: usize,
+    pub counter_metadata: usize,
 }
 
 #[derive(Default)]
@@ -274,6 +300,8 @@ struct Counter {
     // across calls, so freed allocations cannot alias an ever-seen entry.
     arrays: datafusion_common::HashSet<usize>,
     buffers: HashMap<usize, usize>,
+    descriptors: datafusion_common::HashSet<usize>,
+    max_descriptor_copy: usize,
     size: ArrayBytes,
 }
 
@@ -285,7 +313,24 @@ impl Counter {
         let bytes = buffer
             .capacity()
             .max(add(buffer.ptr_offset(), buffer.len())?);
-        let old = self.buffers.entry(id).or_default();
+        // Include the allocation's shared Bytes/Arc ownership bookkeeping,
+        // not only its payload capacity. This bounds the pinned Arrow layout
+        // with or without its optional pool reservation. Empty buffers have no
+        // unique payload address, so conservatively charge their owners per use.
+        let ownership = 2 * size_of::<arrow::buffer::Buffer>() + 8 * size_of::<usize>();
+        if bytes == 0 {
+            self.size.metadata = add(self.size.metadata, ownership)?;
+            self.size.bytes = add(self.size.bytes, ownership)?;
+            return Ok(());
+        }
+        let old = match self.buffers.entry(id) {
+            hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                self.size.metadata = add(self.size.metadata, ownership)?;
+                self.size.bytes = add(self.size.bytes, ownership)?;
+                entry.insert(0)
+            }
+        };
         if bytes > *old {
             self.size.bytes = add(self.size.bytes, bytes - *old)?;
             *old = bytes;
@@ -306,21 +351,72 @@ impl Counter {
         Ok(())
     }
 
+    fn view(
+        &mut self,
+        views: &arrow::buffer::ScalarBuffer<u128>,
+        buffers: &[arrow::buffer::Buffer],
+        nulls: Option<&arrow::buffer::NullBuffer>,
+    ) -> Result<usize> {
+        self.buffer(views.inner())?;
+        if let Some(nulls) = nulls {
+            self.buffer(nulls.inner().inner())?;
+        }
+        if buffers.is_empty() {
+            // Empty lists may share a dangling address without sharing owners.
+            return descriptor_bytes(buffers);
+        }
+        if !self.descriptors.insert(buffers.as_ptr().addr()) {
+            return Ok(0);
+        }
+        for buffer in buffers {
+            self.buffer(buffer)?;
+        }
+        descriptor_bytes(buffers)
+    }
+
     fn batch(&mut self, batch: &RecordBatch) -> Result<()> {
         for array in batch.columns() {
             let id = Arc::as_ptr(array).cast::<()>().addr();
             if !self.arrays.insert(id) {
                 continue;
             }
-            let data = array.to_data();
-            let metadata = array_metadata(array.as_ref())?.max(
-                data.get_array_memory_size()
-                    .saturating_sub(data.get_buffer_memory_size()),
-            );
-            let metadata = add(metadata, 2 * size_of::<usize>())?;
+            let mut metadata =
+                add(array_metadata(array.as_ref()), 2 * size_of::<usize>())?;
+            match array.data_type() {
+                // Avoid copying/scanning the same shared descriptor list for
+                // every slice. Only each slice's views and validity can differ.
+                DataType::Utf8View => {
+                    let view = array.as_string_view();
+                    metadata = add(
+                        metadata,
+                        self.view(view.views(), view.data_buffers(), view.nulls())?,
+                    )?;
+                }
+                DataType::BinaryView => {
+                    let view = array.as_binary_view();
+                    metadata = add(
+                        metadata,
+                        self.view(view.views(), view.data_buffers(), view.nulls())?,
+                    )?;
+                }
+                _ => {
+                    // ArrayData's descriptors are temporary, not retained
+                    // storage. Bound the largest simultaneously copied list.
+                    self.max_descriptor_copy =
+                        self.max_descriptor_copy.max(view_metadata(array.as_ref())?);
+                    visit_view_buffers(array.as_ref(), &mut |list| {
+                        if list.is_empty()
+                            || self.descriptors.insert(list.as_ptr().addr())
+                        {
+                            metadata = add(metadata, descriptor_bytes(list)?)?;
+                        }
+                        Ok(())
+                    })?;
+                    self.data(&array.to_data())?;
+                }
+            }
             self.size.metadata = add(self.size.metadata, metadata)?;
             self.size.bytes = add(self.size.bytes, metadata)?;
-            self.data(&data)?;
         }
         Ok(())
     }
@@ -342,6 +438,8 @@ pub(super) fn retained_arrays(
     if let Some(batch) = incoming {
         counter.batch(batch)?;
     }
+    counter.size.counter_metadata =
+        add(counter.size.metadata, counter.max_descriptor_copy)?;
     Ok(counter.size)
 }
 

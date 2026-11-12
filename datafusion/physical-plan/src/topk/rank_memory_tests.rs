@@ -482,3 +482,61 @@ async fn rank_unique_storage_still_reserves_copied_output_growth() -> Result<()>
     assert_eq!(runtime.memory_pool.reserved(), 0);
     Ok(())
 }
+
+#[test]
+fn rank_shared_view_descriptors_are_not_per_slice_storage() -> Result<()> {
+    use arrow::array::builder::StringViewBuilder;
+    use datafusion_common::utils::memory::RecordBatchMemoryCounter;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8View, false),
+    ]));
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(FairSpillPool::new(16 * 1024 * 1024)))
+        .build_arc()?;
+    let mut state = PartitionedTopKRank::try_new(
+        0,
+        Arc::clone(&schema),
+        vec![col("k", &schema)?],
+        vec![SortField::new(DataType::Utf8)],
+        LexOrdering::new([PhysicalSortExpr::new_default(col("v", &schema)?)]).unwrap(),
+        1,
+        16,
+        &runtime,
+        &ExecutionPlanMetricsSet::new(),
+    )?;
+    let mut builder = StringViewBuilder::new().with_fixed_block_size(64);
+    for _ in 0..4096 {
+        builder.append_value("x".repeat(64));
+    }
+    let views = builder.finish();
+    assert_eq!(views.data_buffers().len(), 4096);
+    let descriptors = views.data_buffers().len() * size_of::<arrow::buffer::Buffer>();
+    let source = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["same"; 4096])),
+            Arc::new(Int64Array::from(vec![1; 4096])),
+            Arc::new(views),
+        ],
+    )?;
+    let mut unique = RecordBatchMemoryCounter::new();
+    unique.count_batch(&source);
+    for i in 0..100 {
+        state.insert_batch(&source.slice(i * 32, 32))?;
+    }
+    // Arrow's payload counter excludes shared allocation ownership headers.
+    // The retained charge also covers those headers and per-slice metadata.
+    let actual = unique.memory_usage() + descriptors;
+    let charged = runtime.memory_pool.reserved();
+    println!("view unique plus descriptors={actual}, retained_charge={charged}");
+    assert!(charged >= actual);
+    assert!(
+        charged < 3 * actual,
+        "shared descriptor lists multiplied: {charged} vs {actual}"
+    );
+    drop(state);
+    assert_eq!(runtime.memory_pool.reserved(), 0);
+    Ok(())
+}

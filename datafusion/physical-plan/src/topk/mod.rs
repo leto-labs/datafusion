@@ -1372,6 +1372,7 @@ pub(crate) struct PartitionedTopKRank {
     // conservatively includes the incoming batch until the final refresh.
     array_bytes: usize,
     array_metadata: usize,
+    array_counter_metadata: usize,
     keep_peers: bool,
     k: usize,
     batch_size: usize,
@@ -1444,6 +1445,7 @@ impl PartitionedTopKRank {
             states: HashMap::new(),
             array_bytes: 0,
             array_metadata: 0,
+            array_counter_metadata: 0,
             keep_peers: true,
             k,
             batch_size,
@@ -1471,7 +1473,8 @@ impl PartitionedTopKRank {
         // clones source arrays: evictions and ties allocate reference metadata,
         // never another copy of their Arrow buffers. Charge the accountant's
         // temporary maps before constructing them.
-        let workspace = rank_memory::counter_workspace(self.array_metadata, batch)?;
+        let workspace =
+            rank_memory::counter_workspace(self.array_counter_metadata, batch)?;
         self.reservation.try_grow(workspace)?;
         let arrays = rank_memory::retained_arrays(self, Some(batch));
         // Keep a single reservation: returning a separate zero-sized credit
@@ -1489,6 +1492,7 @@ impl PartitionedTopKRank {
             .try_resize(target.max(self.reservation.size()))?;
         self.array_bytes = arrays.bytes;
         self.array_metadata = arrays.metadata;
+        self.array_counter_metadata = arrays.counter_metadata;
         let input_batch_metadata = rank_memory::batch_reference_bytes(batch);
 
         // 1. Evaluate + encode partition columns into the reusable
@@ -1683,6 +1687,7 @@ impl PartitionedTopKRank {
         let arrays = rank_memory::retained_arrays(self, None)?;
         self.array_bytes = arrays.bytes;
         self.array_metadata = arrays.metadata;
+        self.array_counter_metadata = arrays.counter_metadata;
         let retained = rank_memory::add(retained, self.array_bytes)?;
         assert!(retained <= self.reservation.size(), "rank working bound");
         self.reservation.shrink(self.reservation.size() - retained);
