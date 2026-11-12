@@ -225,3 +225,8 @@ JSON codecs retain that count. Native regressions cover role reconstruction,
 invalid counts, group boundaries, empty selections and extension conflicts.
 The consumer owns the general rewrite, bounded native TopK and ordered payload
 retrieval, and changes its stage codec identity for these new plans.
+
+Independent key and payload branches use distinct scan counters even before
+a codec round trip. `ParquetSource::with_new_metrics` preserves all source
+options and reader factories while giving an independent clone fresh counters.
+Ordinary optimizer transformations continue to share their original counters.
