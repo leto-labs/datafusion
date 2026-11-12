@@ -14,6 +14,11 @@ fn encoded_floating_threshold_is_not_published() -> Result<()> {
             Box::new(ScalarValue::Float32(Some(f32::NAN))),
         ),
         ScalarValue::Float16(None),
+        ScalarValue::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new("values", DataType::Float64, true)),
+            Box::new(ScalarValue::Float64(Some(-f64::NAN))),
+        ),
     ] {
         let schema = Schema::new(vec![Field::new("f", value.data_type(), true)]);
         let key = PhysicalSortExpr::new_default(col("f", &schema)?);

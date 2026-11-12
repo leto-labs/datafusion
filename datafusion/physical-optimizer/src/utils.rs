@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -18,7 +20,9 @@
 use std::sync::Arc;
 
 use datafusion_common::Result;
-use datafusion_physical_expr::{Distribution, LexOrdering, LexRequirement};
+use datafusion_physical_expr::{
+    AcrossPartitions, Distribution, LexOrdering, LexRequirement,
+};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::repartition::RepartitionExec;
@@ -42,10 +46,14 @@ pub fn add_sort_above<T: Clone + Default>(
 ) -> PlanContext<T> {
     let mut sort_reqs: Vec<_> = sort_requirements.into();
     sort_reqs.retain(|sort_expr| {
-        node.plan
-            .equivalence_properties()
-            .is_expr_constant(&sort_expr.expr)
-            .is_none()
+        // Local comparisons also feed shared TopK thresholds and merge keys.
+        // A key constant only within each partition must remain in that order.
+        !matches!(
+            node.plan
+                .equivalence_properties()
+                .is_expr_constant(&sort_expr.expr),
+            Some(AcrossPartitions::Uniform(_))
+        )
     });
     let sort_exprs = sort_reqs.into_iter().map(Into::into).collect::<Vec<_>>();
     let Some(ordering) = LexOrdering::new(sort_exprs) else {
@@ -70,10 +78,12 @@ pub fn add_sort_above_with_distribution<T: Clone + Default>(
 ) -> PlanContext<T> {
     let mut sort_reqs: Vec<_> = sort_requirements.into();
     sort_reqs.retain(|sort_expr| {
-        node.plan
-            .equivalence_properties()
-            .is_expr_constant(&sort_expr.expr)
-            .is_none()
+        !matches!(
+            node.plan
+                .equivalence_properties()
+                .is_expr_constant(&sort_expr.expr),
+            Some(AcrossPartitions::Uniform(_))
+        )
     });
     let sort_exprs = sort_reqs.into_iter().map(Into::into).collect::<Vec<_>>();
     let Some(ordering) = LexOrdering::new(sort_exprs) else {
@@ -162,4 +172,61 @@ pub fn is_repartition(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// i.e. either a [`LocalLimitExec`] or a [`GlobalLimitExec`].
 pub fn is_limit(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.is::<GlobalLimitExec>() || plan.is::<LocalLimitExec>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_physical_expr::{
+        PhysicalSortExpr,
+        expressions::{col, lit},
+    };
+    use datafusion_physical_plan::{empty::EmptyExec, projection::ProjectionExec};
+
+    #[test]
+    fn partition_local_constants_remain_in_topk_and_merge_keys() -> Result<()> {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let branches = [1i32, 2]
+            .into_iter()
+            .map(|x| {
+                Ok(Arc::new(ProjectionExec::try_new(
+                    vec![(lit(x), "x".into()), (col("id", &schema)?, "id".into())],
+                    Arc::new(EmptyExec::new(Arc::clone(&schema))),
+                )?) as Arc<dyn ExecutionPlan>)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let union = UnionExec::try_new(branches)?;
+        let ordering = LexOrdering::new([
+            PhysicalSortExpr::new_default(col("x", &union.schema())?).desc(),
+            PhysicalSortExpr::new_default(col("id", &union.schema())?),
+        ])
+        .unwrap();
+        for fetch in [None, Some(3)] {
+            let node = PlanContext::new(Arc::clone(&union), (), vec![]);
+            let local =
+                add_sort_above(node, LexRequirement::from(ordering.clone()), fetch);
+            assert_eq!(
+                local.plan.downcast_ref::<SortExec>().unwrap().expr(),
+                &ordering
+            );
+            let node = PlanContext::new(Arc::clone(&union), (), vec![]);
+            let merged = add_sort_above_with_distribution(
+                node,
+                LexRequirement::from(ordering.clone()),
+                fetch,
+                &Distribution::SinglePartition,
+            );
+            assert_eq!(
+                merged
+                    .plan
+                    .downcast_ref::<SortPreservingMergeExec>()
+                    .unwrap()
+                    .expr(),
+                &ordering
+            );
+        }
+        Ok(())
+    }
 }

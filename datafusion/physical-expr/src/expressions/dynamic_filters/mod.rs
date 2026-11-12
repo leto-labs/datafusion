@@ -319,6 +319,12 @@ impl DynamicFilterPhysicalExpr {
     /// This should be called e.g.:
     /// - When we've computed the probe side's hash table in a HashJoinExec
     /// - After every batch is processed if we update the TopK heap in a SortExec using a TopK approach.
+    ///
+    /// Prefer publishing through the original producer. On a derived handle,
+    /// this method remaps before publication and `current()` remaps again, so
+    /// that mapping must be idempotent. Non-idempotent mappings must publish
+    /// through the original producer instead. Stock SortExec retains that
+    /// producer; serialized plan handles can carry identity remappings.
     pub fn update(&self, new_expr: Arc<dyn PhysicalExpr>) -> Result<()> {
         // Remap the children of the new expression to match the original children
         // We still do this again in `current()` but doing it preventively here

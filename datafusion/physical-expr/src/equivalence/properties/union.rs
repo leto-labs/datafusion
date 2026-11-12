@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -57,9 +59,12 @@ fn calculate_union_binary(
                 .find(|rhs_const| rhs_const.expr.eq(&lhs_const.expr))
                 .map(|rhs_const| {
                     let mut const_expr = lhs_const.clone();
-                    // If both sides have matching constant values, preserve it.
-                    // Otherwise, set fall back to heterogeneous values.
-                    if lhs_const.across_partitions != rhs_const.across_partitions {
+                    // Uniform(None) proves uniformity within one child, but
+                    // does not prove equality between different children.
+                    if !matches!(
+                        (&lhs_const.across_partitions, &rhs_const.across_partitions),
+                        (AcrossPartitions::Uniform(Some(lhs)), AcrossPartitions::Uniform(Some(rhs))) if lhs == rhs
+                    ) {
                         const_expr.across_partitions = AcrossPartitions::Heterogeneous;
                     }
                     const_expr
@@ -315,6 +320,40 @@ mod tests {
     use datafusion_common::ScalarValue;
 
     use itertools::Itertools;
+
+    #[test]
+    fn union_unknown_uniform_values_are_not_known_equal() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let x = col("x", &schema)?;
+        let known = |v| AcrossPartitions::Uniform(Some(ScalarValue::Int64(Some(v))));
+        for (left, right, expected) in [
+            (
+                AcrossPartitions::Uniform(None),
+                AcrossPartitions::Uniform(None),
+                AcrossPartitions::Heterogeneous,
+            ),
+            (known(1), known(2), AcrossPartitions::Heterogeneous),
+            (
+                known(1),
+                AcrossPartitions::Uniform(None),
+                AcrossPartitions::Heterogeneous,
+            ),
+            (
+                AcrossPartitions::Uniform(None),
+                known(1),
+                AcrossPartitions::Heterogeneous,
+            ),
+            (known(1), known(1), known(1)),
+        ] {
+            let mut lhs = EquivalenceProperties::new(Arc::clone(&schema));
+            let mut rhs = EquivalenceProperties::new(Arc::clone(&schema));
+            lhs.add_constants([ConstExpr::new(Arc::clone(&x), left)])?;
+            rhs.add_constants([ConstExpr::new(Arc::clone(&x), right)])?;
+            let union = calculate_union(vec![lhs, rhs], Arc::clone(&schema))?;
+            assert_eq!(union.eq_group().is_expr_constant(&x), Some(expected));
+        }
+        Ok(())
+    }
 
     /// Checks whether `expr` is among in the `const_exprs`.
     fn const_exprs_contains(

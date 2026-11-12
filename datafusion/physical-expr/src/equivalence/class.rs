@@ -335,7 +335,8 @@ impl EquivalenceGroup {
         }
         // If the expression is not in any equivalence class, but has the same
         // constant value with some class, add it to that class:
-        if let AcrossPartitions::Uniform(_) = &const_expr.across_partitions {
+        // Unknown uniform values prove scope, not equality with other constants.
+        if let AcrossPartitions::Uniform(Some(_)) = &const_expr.across_partitions {
             for (idx, cls) in self.classes.iter_mut().enumerate() {
                 if cls
                     .constant
@@ -936,6 +937,32 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use datafusion_expr::Operator;
+
+    #[test]
+    fn unknown_uniform_constants_do_not_imply_equal_partition_keys() -> Result<()> {
+        use crate::{Distribution, Partitioning};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, false),
+            Field::new("y", DataType::Utf8, false),
+        ]));
+        let x = col("x", &schema)?;
+        let y = col("y", &schema)?;
+        let mut props = crate::EquivalenceProperties::new(schema);
+        props.add_constants([
+            ConstExpr::new(Arc::clone(&x), AcrossPartitions::Uniform(None)),
+            ConstExpr::new(Arc::clone(&y), AcrossPartitions::Uniform(None)),
+        ])?;
+        assert_ne!(
+            props.eq_group().normalize_expr(Arc::clone(&x)).as_ref(),
+            props.eq_group().normalize_expr(Arc::clone(&y)).as_ref()
+        );
+        assert!(
+            !Partitioning::Hash(vec![x], 8)
+                .satisfaction(&Distribution::KeyPartitioned(vec![y]), &props, false,)
+                .is_satisfied()
+        );
+        Ok(())
+    }
 
     #[test]
     fn deterministic_constant_scope_survives_projection() -> Result<()> {
