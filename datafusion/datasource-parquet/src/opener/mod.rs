@@ -1987,19 +1987,19 @@ mod test {
     fn create_initial_plan_from_row_positions_and_reject_conflicts() {
         let metadata = row_group_metadata(&[10, 20, 30]);
         let mut extensions = datafusion_datasource::FileExtensions::new();
-        extensions.insert(crate::ParquetRowPositions::new(vec![0, 59]));
+        extensions.insert(ParquetRowPositions::new(vec![0, 59]));
         let plan = create_initial_plan("test.parquet", &extensions, &metadata).unwrap();
         assert_eq!(plan.row_group_indexes(), vec![0, 2]);
         assert_eq!(
             plan,
-            crate::ParquetRowPositions::new(vec![0, 59])
+            ParquetRowPositions::new(vec![0, 59])
                 .access_plan(&metadata)
                 .unwrap()
         );
         extensions.insert(ParquetAccessPlan::new_all(3));
         assert!(create_initial_plan("test.parquet", &extensions, &metadata).is_err());
         let mut extensions = datafusion_datasource::FileExtensions::new();
-        extensions.insert(crate::ParquetRowPositions::new(vec![0]));
+        extensions.insert(ParquetRowPositions::new(vec![0]));
         extensions.insert(ParquetRowSelection::new(
             vec![parquet::arrow::arrow_reader::RowSelector::select(60)].into(),
         ));
