@@ -63,3 +63,17 @@ compact encoded key-only heaps, bounded incremental output, and removal of the
 superseded experimental policy/configuration. The consumer owns conservative
 admission. Native heap ordering regressions and the consumer's semantic,
 codec, pool-refusal and drop tests qualify this family together.
+
+## Family BSC: bitmap short-circuit evaluation
+
+Purpose: avoid gathering whole batches for direct primitive comparisons when
+the selected column volume justifies a contiguous comparison. Expand retained
+short-circuit results with packed value and validity buffers, without temporary
+boolean slices. Dependent Longbow feature: STATIC-FILTER-EVALUATION. Audit
+classification: UPSTREAMABLE.
+
+The type guard admits only comparisons of matching primitive columns/literals.
+Casts, arithmetic, functions, and unknown expressions keep their existing
+evaluation path and error suppression. No predicate reordering occurs. Native
+differential regressions cover sliced bitmaps, NULLs, Kleene logic, floating
+edge values, decimals, dates, and division errors on rejected rows.

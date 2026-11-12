@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -15,7 +17,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod cheap_comparison;
 mod kernels;
+mod scatter;
+
+use scatter::pre_selection_scatter;
+
+#[cfg(test)]
+mod filter_tests;
 
 use crate::PhysicalExpr;
 use crate::intervals::cp_solver::{propagate_arithmetic, propagate_comparison};
@@ -26,7 +35,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::compute::kernels::boolean::{and_kleene, or_kleene};
 use arrow::compute::kernels::concat_elements::concat_elements_dyn;
-use arrow::compute::{SlicesIterator, cast, filter_record_batch};
+use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::*;
 use arrow::error::ArrowError;
 use datafusion_common::cast::as_boolean_array;
@@ -545,7 +554,15 @@ impl PhysicalExpr for BinaryExpr {
                 let rhs = self.right.evaluate(batch)?;
                 return Ok(rhs);
             }
-            ShortCircuitStrategy::PreSelection { mask, fill_value } => {
+            ShortCircuitStrategy::PreSelection { selected_rows, .. }
+                if cheap_comparison::prefer_full_comparison(
+                    self.right.as_ref(),
+                    batch,
+                    selected_rows,
+                ) => {}
+            ShortCircuitStrategy::PreSelection {
+                mask, fill_value, ..
+            } => {
                 // `mask` selects the rows whose result depends on the RHS; the
                 // unselected rows are all `fill_value` (see `ShortCircuitStrategy`).
                 //
@@ -1148,6 +1165,7 @@ enum ShortCircuitStrategy {
     PreSelection {
         mask: BooleanArray,
         fill_value: bool,
+        selected_rows: usize,
     },
 }
 
@@ -1220,6 +1238,7 @@ fn check_short_circuit(lhs: &ColumnarValue, op: &Operator) -> ShortCircuitStrate
                         return ShortCircuitStrategy::PreSelection {
                             mask: bool_array.clone(),
                             fill_value: false,
+                            selected_rows: true_count,
                         };
                     }
                 } else {
@@ -1240,6 +1259,7 @@ fn check_short_circuit(lhs: &ColumnarValue, op: &Operator) -> ShortCircuitStrate
                         return ShortCircuitStrategy::PreSelection {
                             mask,
                             fill_value: true,
+                            selected_rows: false_count,
                         };
                     }
                 }
@@ -1279,71 +1299,6 @@ fn uniform_pre_selection_result(
     } else {
         lhs
     }
-}
-
-/// Creates a boolean array by scattering compact RHS results into the positions
-/// selected by `mask`.
-///
-/// This function is used for short-circuit evaluation optimization of logical AND/OR operations:
-/// - Only selected rows are evaluated on the RHS
-/// - Values are copied from `right_result` where `mask` is true
-/// - All other positions are filled with `fill_value` (`false` for AND, `true` for OR)
-///
-/// # Parameters
-/// - `mask` Boolean array with the rows whose result depends on the RHS
-/// - `right_result` Result of evaluating right side of expression (only for selected positions)
-/// - `fill_value` The value for the unselected positions (`false` for AND, `true` for OR)
-///
-/// # Returns
-/// A combined `ColumnarValue` with the same length as `mask`.
-fn pre_selection_scatter(
-    mask: &BooleanArray,
-    right_result: Option<&BooleanArray>,
-    fill_value: bool,
-) -> Result<ColumnarValue> {
-    let result_len = mask.len();
-
-    let mut result_array_builder = BooleanArray::builder(result_len);
-
-    let mut right_array_pos = 0;
-    let mut last_end = 0;
-    match right_result {
-        Some(right_result) => {
-            SlicesIterator::new(mask).for_each(|(start, end)| {
-                if start > last_end {
-                    result_array_builder.append_n(start - last_end, fill_value);
-                }
-
-                // copy values from right array for this slice
-                let len = end - start;
-                right_result
-                    .slice(right_array_pos, len)
-                    .iter()
-                    .for_each(|v| result_array_builder.append_option(v));
-
-                right_array_pos += len;
-                last_end = end;
-            });
-        }
-        None => SlicesIterator::new(mask).for_each(|(start, end)| {
-            if start > last_end {
-                result_array_builder.append_n(start - last_end, fill_value);
-            }
-
-            let len = end - start;
-            result_array_builder.append_nulls(len);
-
-            last_end = end;
-        }),
-    }
-
-    // Fill any remaining positions with `fill_value`
-    if last_end < result_len {
-        result_array_builder.append_n(result_len - last_end, fill_value);
-    }
-    let boolean_result = result_array_builder.finish();
-
-    Ok(ColumnarValue::Array(Arc::new(boolean_result)))
 }
 
 /// Create a binary expression whose arguments are correctly coerced.
@@ -5742,8 +5697,9 @@ mod tests {
         let ColumnarValue::Array(array) = &left_value else {
             panic!("Expected ColumnarValue::Array");
         };
-        let ShortCircuitStrategy::PreSelection { mask, fill_value } =
-            check_short_circuit(&left_value, &Operator::And)
+        let ShortCircuitStrategy::PreSelection {
+            mask, fill_value, ..
+        } = check_short_circuit(&left_value, &Operator::And)
         else {
             panic!("Expected ShortCircuitStrategy::PreSelection");
         };
@@ -5770,8 +5726,9 @@ mod tests {
         let ColumnarValue::Array(array) = &left_value else {
             panic!("Expected ColumnarValue::Array");
         };
-        let ShortCircuitStrategy::PreSelection { mask, fill_value } =
-            check_short_circuit(&left_value, &Operator::Or)
+        let ShortCircuitStrategy::PreSelection {
+            mask, fill_value, ..
+        } = check_short_circuit(&left_value, &Operator::Or)
         else {
             panic!("Expected ShortCircuitStrategy::PreSelection");
         };
