@@ -220,22 +220,34 @@ impl PreparedParquetFile {
         Ok(builder)
     }
     /// Encoded ranges for a row group. Includes all predicate and output columns;
-    /// static page selections retain only their pages and required dictionaries.
+    /// Static selections include predicate-cache batch boundaries. Adjacent
+    /// pages are one buffer, so a full-column decoder request is also covered.
     /// Fetch once and share these immutable buffers between oversized RG slices.
-    pub fn byte_ranges(&self, group: usize) -> Vec<Range<u64>> {
+    pub fn byte_ranges(&self, group: usize, batch_size: usize) -> Vec<Range<u64>> {
+        assert!(batch_size > 0, "prepared scan batch size must be positive");
         let meta = self.metadata.metadata();
         let rg = meta.row_group(group);
+        let selection = match &self.access.inner()[group] {
+            RowGroupAccess::Skip => return vec![],
+            RowGroupAccess::Selection(selection) => Some(batch_selection(
+                selection,
+                batch_size,
+                rg.num_rows() as usize,
+            )),
+            RowGroupAccess::Scan => None,
+        };
         let mut ranges = Vec::new();
         for (column, chunk) in rg.columns().iter().enumerate() {
             if !self.read_mask.leaf_included(column) {
                 continue;
             }
             let (start, len) = chunk.byte_range();
-            if let RowGroupAccess::Selection(selection) = &self.access.inner()[group]
+            if let Some(selection) = &selection
                 && let Some(index) = meta
                     .offset_index()
                     .and_then(|i| i.get(group))
                     .and_then(|i| i.get(column))
+                    .filter(|index| !index.page_locations().is_empty())
             {
                 if let Some(first) = index.page_locations().first() {
                     let page = first.offset as u64;
@@ -249,7 +261,17 @@ impl PreparedParquetFile {
             }
         }
         ranges.sort_unstable_by_key(|r| r.start);
-        ranges
+        let mut merged: Vec<Range<u64>> = Vec::new();
+        for range in ranges {
+            if let Some(last) = merged.last_mut()
+                && range.start <= last.end
+            {
+                last.end = last.end.max(range.end);
+            } else {
+                merged.push(range);
+            }
+        }
+        merged
     }
     /// Leaf columns that must have offset indexes before slicing an oversized RG.
     pub fn read_projection(&self) -> &ProjectionMask {
@@ -282,6 +304,29 @@ impl PreparedParquetFile {
         )
         .should_prune(&[group])
     }
+}
+// Match Arrow's predicate-cache quantization without decoding any values.
+// Arrow keeps its equivalent helper private. All filter generations may use
+// any prepared read column, so plan this conservative superset for every column.
+fn batch_selection(selection: &RowSelection, batch: usize, total: usize) -> RowSelection {
+    let mut offset = 0;
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for selector in selection.iter() {
+        let end = offset + selector.row_count;
+        if !selector.skip {
+            let start = offset / batch * batch;
+            let end = end.div_ceil(batch).saturating_mul(batch).min(total);
+            if let Some(last) = ranges.last_mut()
+                && start <= last.end
+            {
+                last.end = last.end.max(end);
+            } else {
+                ranges.push(start..end);
+            }
+        }
+        offset = end;
+    }
+    RowSelection::from_consecutive_ranges(ranges.into_iter(), total)
 }
 impl crate::source::ParquetSource {
     /// Open and prepare one file using exactly the stream scan's reader factory,
@@ -417,9 +462,9 @@ mod tests {
         )?;
         let mut bytes = Vec::new();
         let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(3))
-            .set_data_page_row_count_limit(1)
-            .set_write_batch_size(1)
+            .set_max_row_group_row_count(Some(6))
+            .set_data_page_row_count_limit(3)
+            .set_write_batch_size(3)
             .build();
         let mut writer =
             ArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(props))?;
@@ -445,73 +490,88 @@ mod tests {
                 original.projection().unwrap().clone(),
                 Some(predicate),
             )
-            .with_pushdown_filters(true)
-            .with_enable_page_index(true);
-        let projection = ProjectionExprs::new(vec![
-            datafusion_physical_expr::projection::ProjectionExpr::new(
-                Arc::new(Column::new("price", 1)),
-                "price",
-            ),
-        ]);
-        let source = source
-            .try_pushdown_projection(&projection)?
-            .unwrap()
-            .with_batch_size(2);
-        let source = source
-            .downcast_ref::<crate::source::ParquetSource>()
-            .unwrap();
-        let config = FileScanConfigBuilder::new(
-            ObjectStoreUrl::local_filesystem(),
-            Arc::new(source.clone()),
-        )
-        .with_file(file.clone())
-        .build();
-        let scan = source.prepare_file(store, &config, file, 0).await?.unwrap();
-        assert_eq!(
-            scan.file.metadata().schema().field(1).data_type(),
-            &DataType::Decimal32(8, 2)
-        );
-        let mut count = 0;
-        let mut values = Vec::new();
-        let mut reader = scan.reader;
-        for group in scan.file.access_plan().row_group_indexes() {
-            let ranges = scan.file.byte_ranges(group);
-            let buffers = reader.get_byte_ranges(ranges.clone()).await?;
-            let rows =
-                scan.file.metadata().metadata().row_group(group).num_rows() as usize;
-            for interval in [0..1, 1..rows] {
-                let mut decoder =
-                    scan.file.decoder_builder(group, interval, 2)?.build()?;
-                decoder.push_ranges(ranges.clone(), buffers.clone())?;
-                loop {
-                    match decoder.try_decode()? {
-                        DecodeResult::Data(batch) => {
-                            let output = scan.file.project(&batch)?;
-                            count += output.num_rows();
-                            values.extend_from_slice(
-                                output
-                                    .column(0)
-                                    .as_any()
-                                    .downcast_ref::<arrow::array::Decimal32Array>()
-                                    .unwrap()
-                                    .values(),
-                            );
-                            assert_eq!(output.num_columns(), 1);
-                            assert_eq!(
-                                output.column(0).data_type(),
-                                &DataType::Decimal32(8, 2)
-                            );
-                        }
-                        DecodeResult::Finished => break,
-                        DecodeResult::NeedsData(ranges) => {
-                            panic!("missing prepared ranges {ranges:?}")
+            .with_pushdown_filters(true);
+        for page_index in [false, true] {
+            let source = source.clone().with_enable_page_index(page_index);
+            let projection = ProjectionExprs::new(vec![
+                datafusion_physical_expr::projection::ProjectionExpr::new(
+                    Arc::new(Column::new("price", 1)),
+                    "price",
+                ),
+            ]);
+            let source = source
+                .try_pushdown_projection(&projection)?
+                .unwrap()
+                .with_batch_size(2);
+            let source = source
+                .downcast_ref::<crate::source::ParquetSource>()
+                .unwrap();
+            let config = FileScanConfigBuilder::new(
+                ObjectStoreUrl::local_filesystem(),
+                Arc::new(source.clone()),
+            )
+            .with_file(file.clone())
+            .build();
+            let scan = source
+                .prepare_file(store.clone(), &config, file.clone(), 0)
+                .await?
+                .unwrap()
+                .with_page_index_if_oversized(1)
+                .await?;
+            assert_eq!(
+                scan.file.metadata().schema().field(1).data_type(),
+                &DataType::Decimal32(8, 2)
+            );
+            let mut reader = scan.reader;
+            for sliced in [false, true] {
+                let mut count = 0;
+                let mut values = Vec::new();
+                for group in scan.file.access_plan().row_group_indexes() {
+                    let ranges = scan.file.byte_ranges(group, 2);
+                    let buffers = reader.get_byte_ranges(ranges.clone()).await?;
+                    let rows = scan.file.metadata().metadata().row_group(group).num_rows()
+                        as usize;
+                    let intervals = if sliced {
+                        vec![0..1, 1..rows]
+                    } else {
+                        vec![0..rows]
+                    };
+                    for interval in intervals {
+                        let mut decoder =
+                            scan.file.decoder_builder(group, interval, 2)?.build()?;
+                        decoder.push_ranges(ranges.clone(), buffers.clone())?;
+                        loop {
+                            match decoder.try_decode()? {
+                                DecodeResult::Data(batch) => {
+                                    let output = scan.file.project(&batch)?;
+                                    count += output.num_rows();
+                                    values.extend_from_slice(
+                                        output
+                                            .column(0)
+                                            .as_any()
+                                            .downcast_ref::<arrow::array::Decimal32Array>(
+                                            )
+                                            .unwrap()
+                                            .values(),
+                                    );
+                                    assert_eq!(output.num_columns(), 1);
+                                    assert_eq!(
+                                        output.column(0).data_type(),
+                                        &DataType::Decimal32(8, 2)
+                                    );
+                                }
+                                DecodeResult::Finished => break,
+                                DecodeResult::NeedsData(ranges) => {
+                                    panic!("missing prepared ranges {ranges:?}")
+                                }
+                            }
                         }
                     }
                 }
+                assert_eq!(count, 4);
+                assert_eq!(values, vec![30, 40, 50, 60]);
             }
         }
-        assert_eq!(count, 4);
-        assert_eq!(values, vec![30, 40, 50, 60]);
         Ok(())
     }
 }
