@@ -194,3 +194,17 @@ schedules, 300 cancellation and 300 injected-error cases, sequential partition
 consumption, filter completion during a scan, receiver re-donation, and explicit
 reverse/statistics-order eligibility guards. Idle fallback and cancellation
 wakeups are decided while holding the shared queue lock.
+
+## Family GSS: grouping-set spill replay keys
+
+Purpose: retain the materialized grouping ID when the stock hash aggregate
+merges spilled states. Dependent Longbow feature: CORE-AGGREGATION.
+Audit classification: UPSTREAMABLE.
+
+Use the existing `PhysicalGroupBy::as_final()` conversion for replay keys.
+The grouping ID separates real NULLs, rolled-up NULLs and duplicate sets.
+Dropping it caused Single-mode replay to emit one column fewer than its
+output schema. Native regressions bypass family CG and cover GROUPING SETS
+and ROLLUP with NULLs, duplicate sets, filtered AVG states, Partial early
+emission and Final disk spills. Capped results must equal uncapped results,
+multiple spill runs must merge, and pool reservations must return to zero.

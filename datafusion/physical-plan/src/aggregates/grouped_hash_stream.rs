@@ -474,15 +474,10 @@ impl GroupedHashAggregateStream {
             AggregateMode::Partial,
         )?);
 
-        // Need to update the GROUP BY expressions to point to the correct column after schema change
-        let merging_group_by_expr = agg_group_by
-            .expr
-            .iter()
-            .enumerate()
-            .map(|(idx, (_, name))| {
-                (Arc::new(Column::new(name.as_str(), idx)) as _, name.clone())
-            })
-            .collect();
+        // Spill batches contain materialized group keys, including the grouping
+        // ID for grouping sets. Read them like a final aggregate: do not expand
+        // the sets again or drop the ID that distinguishes their NULL keys.
+        let merging_group_by = agg_group_by.as_final();
 
         let output_ordering = agg.cache.output_ordering();
 
@@ -568,7 +563,7 @@ impl GroupedHashAggregateStream {
             spill_schema,
             is_stream_merging: false,
             merging_aggregate_arguments,
-            merging_group_by: PhysicalGroupBy::new_single(merging_group_by_expr),
+            merging_group_by,
             peak_mem_used: MetricBuilder::new(&agg.metrics)
                 .peak_memory_usage("peak_mem_used", partition),
             spill_manager,
