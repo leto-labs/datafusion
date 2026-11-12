@@ -48,7 +48,19 @@ impl ParquetRowPositions {
             return exec_err!("Parquet row positions must be sorted and unique");
         }
         let mut total = 0usize;
+        let mut previous_ordinal = None;
         for group in groups {
+            // RowNumber resolves ordinals to file offsets; selections below
+            // resolve metadata list positions. Ambiguous ordinals must never
+            // redirect a winner to another group's payload.
+            if let Some(ordinal) = group.ordinal() {
+                if previous_ordinal.is_some_and(|previous| previous >= ordinal) {
+                    return exec_err!(
+                        "Parquet positional access requires increasing unique row-group ordinals"
+                    );
+                }
+                previous_ordinal = Some(ordinal);
+            }
             let Ok(rows) = usize::try_from(group.num_rows()) else {
                 return exec_err!("invalid Parquet row-group count");
             };
@@ -155,5 +167,20 @@ mod tests {
             ParquetRowPositions::new(vec![]).access_plan(&[]).unwrap(),
             ParquetAccessPlan::new_none(0)
         );
+    }
+
+    #[test]
+    fn row_positions_reject_ambiguous_footer_ordinals() {
+        let positions = ParquetRowPositions::new(vec![0, 30]);
+        for ordinals in [[0, 0, 2], [0, 2, 1]] {
+            let metadata: Vec<_> = groups()
+                .into_iter()
+                .zip(ordinals)
+                .map(|(group, ordinal)| {
+                    group.into_builder().set_ordinal(ordinal).build().unwrap()
+                })
+                .collect();
+            assert!(positions.access_plan(&metadata).is_err(), "{ordinals:?}");
+        }
     }
 }

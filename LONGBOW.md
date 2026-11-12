@@ -216,7 +216,9 @@ after the opener obtains metadata, preserving disjoint byte-range ownership.
 Dependent Longbow feature: TOPN-POSITIONAL. Audit classification: UPSTREAMABLE.
 Conflicting access extensions, duplicate/unsorted positions and out-of-file
 positions fail explicitly; positional streams do not publish row groups to the
-shared work source.
+shared work source. Duplicate or decreasing row-group ordinals are rejected
+before positional payload access, keeping ordinal-based key identities aligned
+with the metadata-list offsets used by payload selections.
 
 The generic file-scan codec carries virtual fields as an explicitly counted
 schema suffix after file and partition fields. It never infers a virtual role
