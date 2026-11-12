@@ -540,3 +540,32 @@ fn rank_shared_view_descriptors_are_not_per_slice_storage() -> Result<()> {
     assert_eq!(runtime.memory_pool.reserved(), 0);
     Ok(())
 }
+
+#[test]
+fn rank_nested_payload_metadata_covers_child_references_and_owners() -> Result<()> {
+    use arrow::array::{NullArray, StructArray};
+    let count = 1024;
+    let fields: arrow::datatypes::Fields = (0..count)
+        .map(|i| Field::new(format!("child_{i}"), DataType::Null, true))
+        .collect();
+    let children: Vec<ArrayRef> = (0..count)
+        .map(|_| Arc::new(NullArray::new(1)) as ArrayRef)
+        .collect();
+    let references = children.capacity() * size_of::<ArrayRef>();
+    let owners = count * (size_of::<NullArray>() + 2 * size_of::<usize>());
+    let array = StructArray::new(fields, children, None);
+    let batch = RecordBatch::try_from_iter([("payload", Arc::new(array) as ArrayRef)])?;
+    let lower_bound = size_of::<RecordBatch>()
+        + size_of::<ArrayRef>()
+        + size_of::<StructArray>()
+        + 2 * size_of::<usize>()
+        + references
+        + owners;
+    let charged = rank_memory::batch_bytes(&batch);
+    println!("nested metadata lower bound={lower_bound}, charge={charged}");
+    assert!(
+        charged >= lower_bound,
+        "nested references/owners undercharged"
+    );
+    Ok(())
+}

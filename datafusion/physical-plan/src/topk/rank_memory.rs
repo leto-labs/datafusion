@@ -183,62 +183,69 @@ pub(super) fn batch_reference_bytes(batch: &RecordBatch) -> usize {
     size_of::<RecordBatch>() + batch.num_columns() * size_of::<ArrayRef>()
 }
 
+/// Borrow children without materializing ArrayData before admitting workspace.
+fn visit_children(
+    array: &dyn Array,
+    visit: &mut dyn FnMut(&dyn Array) -> Result<()>,
+) -> Result<()> {
+    use arrow::datatypes::{Int16Type, Int32Type, Int64Type};
+    match array.data_type() {
+        DataType::List(_) => visit(array.as_list::<i32>().values().as_ref()),
+        DataType::LargeList(_) => visit(array.as_list::<i64>().values().as_ref()),
+        DataType::ListView(_) => visit(array.as_list_view::<i32>().values().as_ref()),
+        DataType::LargeListView(_) => {
+            visit(array.as_list_view::<i64>().values().as_ref())
+        }
+        DataType::FixedSizeList(_, _) => {
+            visit(array.as_fixed_size_list().values().as_ref())
+        }
+        DataType::Struct(_) => array
+            .as_struct()
+            .columns()
+            .iter()
+            .try_for_each(|a| visit(a.as_ref())),
+        DataType::Map(_, _) => visit(array.as_map().entries()),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .try_for_each(|(id, _)| visit(array.as_union().child(id).as_ref())),
+        DataType::Dictionary(_, _) => visit(array.as_any_dictionary().values().as_ref()),
+        DataType::RunEndEncoded(ends, _) => match ends.data_type() {
+            DataType::Int16 => visit(array.as_run::<Int16Type>().values().as_ref()),
+            DataType::Int32 => visit(array.as_run::<Int32Type>().values().as_ref()),
+            DataType::Int64 => visit(array.as_run::<Int64Type>().values().as_ref()),
+            _ => datafusion_common::internal_err!("invalid rank run-end type"),
+        },
+        _ => Ok(()),
+    }
+}
+
+/// Arrow's nested-array sizing omits child reference vectors and Arc headers.
+/// Include both per child; their payload buffers remain deduplicated separately.
+fn child_metadata(array: &dyn Array) -> Result<usize> {
+    let mut bytes = 0;
+    visit_children(array, &mut |child| {
+        bytes = add(
+            bytes,
+            add(
+                size_of::<ArrayRef>() + 2 * size_of::<usize>(),
+                child_metadata(child)?,
+            )?,
+        )?;
+        Ok(())
+    })?;
+    Ok(bytes)
+}
+
 /// View buffer descriptor lists are heap allocations too. Arrow's array size
 /// currently omits them; include them when bounding our temporary accountant.
 fn visit_view_buffers(
     array: &dyn Array,
     visit: &mut dyn FnMut(&[arrow::buffer::Buffer]) -> Result<()>,
 ) -> Result<()> {
-    use arrow::datatypes::{DataType, Int16Type, Int32Type, Int64Type};
-    let list = match array.data_type() {
-        DataType::Utf8View => Some(array.as_string_view().data_buffers()),
-        DataType::BinaryView => Some(array.as_binary_view().data_buffers()),
-        _ => None,
-    };
-    if let Some(list) = list {
-        return visit(list);
-    }
     match array.data_type() {
-        DataType::List(_) => {
-            visit_view_buffers(array.as_list::<i32>().values().as_ref(), visit)
-        }
-        DataType::LargeList(_) => {
-            visit_view_buffers(array.as_list::<i64>().values().as_ref(), visit)
-        }
-        DataType::ListView(_) => {
-            visit_view_buffers(array.as_list_view::<i32>().values().as_ref(), visit)
-        }
-        DataType::LargeListView(_) => {
-            visit_view_buffers(array.as_list_view::<i64>().values().as_ref(), visit)
-        }
-        DataType::FixedSizeList(_, _) => {
-            visit_view_buffers(array.as_fixed_size_list().values().as_ref(), visit)
-        }
-        DataType::Struct(_) => array
-            .as_struct()
-            .columns()
-            .iter()
-            .try_for_each(|a| visit_view_buffers(a.as_ref(), visit)),
-        DataType::Map(_, _) => visit_view_buffers(array.as_map().entries(), visit),
-        DataType::Union(fields, _) => fields.iter().try_for_each(|(id, _)| {
-            visit_view_buffers(array.as_union().child(id).as_ref(), visit)
-        }),
-        DataType::Dictionary(_, _) => {
-            visit_view_buffers(array.as_any_dictionary().values().as_ref(), visit)
-        }
-        DataType::RunEndEncoded(ends, _) => match ends.data_type() {
-            DataType::Int16 => {
-                visit_view_buffers(array.as_run::<Int16Type>().values().as_ref(), visit)
-            }
-            DataType::Int32 => {
-                visit_view_buffers(array.as_run::<Int32Type>().values().as_ref(), visit)
-            }
-            DataType::Int64 => {
-                visit_view_buffers(array.as_run::<Int64Type>().values().as_ref(), visit)
-            }
-            _ => datafusion_common::internal_err!("invalid rank run-end type"),
-        },
-        _ => Ok(()),
+        DataType::Utf8View => visit(array.as_string_view().data_buffers()),
+        DataType::BinaryView => visit(array.as_binary_view().data_buffers()),
+        _ => visit_children(array, &mut |child| visit_view_buffers(child, visit)),
     }
 }
 
@@ -258,16 +265,17 @@ fn descriptor_bytes(list: &[arrow::buffer::Buffer]) -> Result<usize> {
     )
 }
 
-fn array_metadata(array: &dyn Array) -> usize {
+fn array_metadata(array: &dyn Array) -> Result<usize> {
     // Byte-view size methods scan every backing buffer. The object is fixed
     // size; account its shared descriptor allocation separately instead.
-    match array.data_type() {
+    let bytes = match array.data_type() {
         DataType::Utf8View => size_of::<arrow::array::StringViewArray>(),
         DataType::BinaryView => size_of::<arrow::array::BinaryViewArray>(),
         _ => array
             .get_array_memory_size()
             .saturating_sub(array.get_buffer_memory_size()),
-    }
+    };
+    add(bytes, child_metadata(array)?)
 }
 
 pub(super) fn counter_workspace(
@@ -277,7 +285,7 @@ pub(super) fn counter_workspace(
     let incoming = batch.columns().iter().try_fold(0, |n, a| {
         add(
             n,
-            add(array_metadata(a.as_ref()), view_metadata(a.as_ref())?)?,
+            add(array_metadata(a.as_ref())?, view_metadata(a.as_ref())?)?,
         )
     })?;
     // Descriptor copies, identity hash tables and geometric table growth. Payload
@@ -381,7 +389,7 @@ impl Counter {
                 continue;
             }
             let mut metadata =
-                add(array_metadata(array.as_ref()), 2 * size_of::<usize>())?;
+                add(array_metadata(array.as_ref())?, 2 * size_of::<usize>())?;
             match array.data_type() {
                 // Avoid copying/scanning the same shared descriptor list for
                 // every slice. Only each slice's views and validity can differ.
