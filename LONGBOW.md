@@ -95,3 +95,11 @@ NULL/NOT IN result builder. Utf8/LargeUtf8 inputs, longer constants/lists,
 and other types keep the general
 strategies. Native tests compare with Arrow and the generic static filter;
 the ignored short-string kernel screen runs two ABBA pairs in one process.
+
+The scalar view-word comparison assumes every inline view has zero padding,
+including arrays that also contain external data buffers. Arrow validates this
+padding in byte-view array validation. Longbow has no unchecked view
+construction, so those validated inline words can be compared directly even in
+mixed inline/external arrays. Unlike stock's no-data-buffer fast path, this
+optimization relies on that invariant for every input array. Seeded IN/NOT IN
+properties cover lists both with and without NULL, including empty lists.

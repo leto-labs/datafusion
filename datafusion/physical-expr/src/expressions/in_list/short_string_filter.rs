@@ -192,40 +192,44 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(0xf251_2026_1111);
         for count in 0..=2 {
             for _ in 0..100 {
-                let list = (0..count)
-                    .map(|_| {
-                        let len = rng.random_range(0..=12);
-                        Some(
-                            (0..len)
-                                .map(|_| char::from(rng.random_range(0_u8..=127)))
-                                .collect::<String>(),
-                        )
-                    })
-                    .chain(std::iter::once(None))
-                    .collect::<Vec<_>>();
-                let needles = (0..100)
-                    .map(|_| {
-                        if rng.random_bool(0.5) {
-                            list[rng.random_range(0..list.len())].clone()
-                        } else {
-                            let len = rng.random_range(0..=20);
+                for with_null in [false, true] {
+                    let list = (0..count)
+                        .map(|_| {
+                            let len = rng.random_range(0..=12);
                             Some(
                                 (0..len)
                                     .map(|_| char::from(rng.random_range(0_u8..=127)))
                                     .collect::<String>(),
                             )
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let haystack: ArrayRef = Arc::new(StringViewArray::from_iter(list));
-                let values = StringViewArray::from_iter(needles);
-                let filter = ShortStringFilter::try_new(haystack.as_ref()).unwrap();
-                let reference = ArrayStaticFilter::try_new(haystack)?;
-                for negated in [false, true] {
-                    assert_eq!(
-                        filter.contains(&values, negated)?,
-                        reference.contains(&values, negated)?
-                    );
+                        })
+                        .chain(with_null.then_some(None))
+                        .collect::<Vec<_>>();
+                    let needles = (0..100)
+                        .map(|_| {
+                            if rng.random_bool(0.1) {
+                                None
+                            } else if !list.is_empty() && rng.random_bool(0.5) {
+                                list[rng.random_range(0..list.len())].clone()
+                            } else {
+                                let len = rng.random_range(0..=20);
+                                Some(
+                                    (0..len)
+                                        .map(|_| char::from(rng.random_range(0_u8..=127)))
+                                        .collect::<String>(),
+                                )
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let haystack: ArrayRef = Arc::new(StringViewArray::from_iter(list));
+                    let values = StringViewArray::from_iter(needles);
+                    let filter = ShortStringFilter::try_new(haystack.as_ref()).unwrap();
+                    let reference = ArrayStaticFilter::try_new(haystack)?;
+                    for negated in [false, true] {
+                        assert_eq!(
+                            filter.contains(&values, negated)?,
+                            reference.contains(&values, negated)?
+                        );
+                    }
                 }
             }
         }
