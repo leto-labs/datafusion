@@ -1,3 +1,4 @@
+// Modified by the Longbow authors; see third_party/README.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -322,6 +323,16 @@ impl ScalarUDFImpl for DateTruncFunc {
                 return Ok(ColumnarValue::Array(result));
             }
 
+            // Explicit UTC needs no calendar or DST lookup for hour/day.
+            // Keep the checked rescaling path: the unchecked fine-granularity
+            // kernel would change range errors at the nanosecond limits.
+            let parsed_tz = if tz_opt.as_deref() == Some("UTC")
+                && granularity.is_fine_granularity_utc()
+            {
+                None
+            } else {
+                parsed_tz
+            };
             let array: PrimitiveArray<T> = array
                 .try_unary(|x| general_date_trunc(T::UNIT, x, parsed_tz, granularity))?
                 .with_timezone_opt(tz_opt.clone());
@@ -745,7 +756,9 @@ fn date_trunc_coarse(
             // Use chrono DateTime<Tz> to clear the various fields because need to clear per timezone,
             // and NaiveDateTime (ISO 8601) has no concept of timezones
             let value = as_datetime_with_timezone::<TimestampNanosecondType>(value, tz)
-                .ok_or(exec_datafusion_err!("Timestamp {value} out of range"))?;
+                .ok_or_else(|| {
+                exec_datafusion_err!("Timestamp {value} out of range")
+            })?;
             _date_trunc_coarse_with_tz(granularity, value)?
         }
         None => _date_trunc_coarse_without_tz(granularity, value),
@@ -1532,5 +1545,99 @@ mod tests {
                     panic!("unexpected column type");
                 }
             });
+    }
+    // The scalar calendar path is an independent oracle for the array fast path.
+    fn utc_hour_day_matches_calendar<T: arrow::array::types::ArrowTimestampType>() {
+        use super::general_date_trunc;
+        use arrow::array::{ArrayRef, PrimitiveArray};
+
+        let scale = match T::UNIT {
+            TimeUnit::Second => 1_000_000_000,
+            TimeUnit::Millisecond => 1_000_000,
+            TimeUnit::Microsecond => 1_000,
+            TimeUnit::Nanosecond => 1,
+        };
+        let mut values = vec![None, Some(-1), Some(0), Some(1)];
+        // Negative epochs, exact boundaries, leap days, and the nanosecond limits.
+        for nanos in [
+            i64::MIN,
+            i64::MIN + 86_400_000_000_000,
+            -86_400_000_000_001,
+            -86_400_000_000_000,
+            -3_600_000_000_001,
+            -3_600_000_000_000,
+            951_868_799_999_999_999,
+            1_451_606_400_000_000_000,
+            i64::MAX,
+        ] {
+            values.push(Some(nanos / scale));
+        }
+        values.extend([Some(i64::MIN), Some(i64::MAX)]);
+        let mut seed = 0x1234_5678_9abc_def0_u64;
+        for _ in 0..512 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            values.push(Some((seed as i64) / scale));
+        }
+        for granularity in ["hour", "day"] {
+            let gran = DateTruncGranularity::from_str(granularity).unwrap();
+            for value in values.iter().copied() {
+                let input: ArrayRef = Arc::new(
+                    PrimitiveArray::<T>::from_iter([value]).with_timezone("UTC"),
+                );
+                let field: arrow::datatypes::FieldRef =
+                    Arc::new(Field::new("time", input.data_type().clone(), true));
+                let actual = DateTruncFunc::new().invoke_with_args(ScalarFunctionArgs {
+                    args: vec![
+                        ColumnarValue::Scalar(ScalarValue::from(granularity)),
+                        ColumnarValue::Array(input),
+                    ],
+                    arg_fields: vec![
+                        Arc::new(Field::new("unit", DataType::Utf8, false)),
+                        field.clone(),
+                    ],
+                    number_rows: 1,
+                    return_field: field,
+                    config_options: Arc::new(ConfigOptions::default()),
+                });
+                let expected = value
+                    .map(|v| {
+                        general_date_trunc(T::UNIT, v, Some("UTC".parse().unwrap()), gran)
+                    })
+                    .transpose();
+                match (actual, expected) {
+                    (Ok(ColumnarValue::Array(actual)), Ok(expected)) => {
+                        let actual = as_primitive_array::<T>(&actual);
+                        assert_eq!(
+                            actual.data_type(),
+                            &DataType::Timestamp(T::UNIT, Some("UTC".into()))
+                        );
+                        assert_eq!(
+                            actual.iter().collect::<Vec<_>>(),
+                            vec![expected],
+                            "{} {granularity} {value:?}",
+                            T::UNIT
+                        );
+                    }
+                    (Err(actual), Err(expected)) => {
+                        assert_eq!(actual.to_string(), expected.to_string())
+                    }
+                    (actual, expected) => panic!(
+                        "{} {granularity} {value:?}: {actual:?} != {expected:?}",
+                        T::UNIT
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn utc_hour_day_arrays_match_calendar_for_all_timestamp_units() {
+        use arrow::array::types::{
+            TimestampMicrosecondType, TimestampMillisecondType, TimestampSecondType,
+        };
+        utc_hour_day_matches_calendar::<TimestampSecondType>();
+        utc_hour_day_matches_calendar::<TimestampMillisecondType>();
+        utc_hour_day_matches_calendar::<TimestampMicrosecondType>();
+        utc_hour_day_matches_calendar::<TimestampNanosecondType>();
     }
 }

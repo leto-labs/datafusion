@@ -23,6 +23,19 @@ consumer's vendor tree. Longbow runs native regressions through a generated
 standalone harness with its pinned graph and Arrow patches. A standalone
 upstream-workspace build does not provide those Arrow extensions.
 
+## Family UT: checked UTC time buckets
+
+Purpose: truncate explicit UTC hourly/daily timestamp arrays with the existing
+checked arithmetic helper instead of converting each row through a timezone
+calendar. Construct calendar-path range errors lazily. Dependent Longbow
+feature: UTC-TIME-BUCKETS. Audit classification: UPSTREAMABLE.
+
+Units, UTC metadata, NULLs, negative-epoch flooring and range errors remain
+unchanged. Non-UTC timezones retain their calendar/DST handling. Differential
+native tests compare the array path with the retained scalar calendar path
+for every timestamp unit, random dates, leap dates and range boundaries.
+The consumer's TS1 report records the sampled CPU costs and paired screens.
+
 ## Family AH: null-safe scalar aggregates
 
 Purpose: allow direct inner-key `IS NOT DISTINCT FROM` correlations across
