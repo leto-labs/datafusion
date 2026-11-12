@@ -20,6 +20,8 @@
 //! TopK: Combination of Sort / LIMIT
 
 #[cfg(test)]
+mod correctness_tests;
+#[cfg(test)]
 mod rank_drop_tests;
 mod rank_emit;
 mod rank_memory;
@@ -612,6 +614,22 @@ impl TopK {
 
         let mut prev_sort_expr: Option<Arc<dyn PhysicalExpr>> = None;
         for (sort_expr, value) in sort_exprs.iter().zip(thresholds.iter()) {
+            // Parquet min/max omit NaN, while the sort's total order includes
+            // it. A float comparison can therefore prune a row group containing
+            // a better NaN row. Retain every tie on the safe prefix and leave
+            // this key and the remaining suffix to the heap comparator.
+            let mut unencoded = value;
+            while let ScalarValue::Dictionary(_, inner)
+            | ScalarValue::RunEndEncoded(_, _, inner) = unencoded
+            {
+                unencoded = inner;
+            }
+            if unencoded.data_type().is_floating() {
+                if let Some(prefix) = prev_sort_expr.take() {
+                    filters.push(prefix);
+                }
+                break;
+            }
             // Create the appropriate operator based on sort order
             let op = if sort_expr.options.descending {
                 // For descending sort, we want col > threshold (exclude smaller values)
@@ -1919,6 +1937,7 @@ mod tests {
         a_options: SortOptions,
         threshold_source_rows: &'static [AbRow],
         lagging_partition_rows: &'static [AbRow],
+        expected_heap_rows: usize,
         expected_finished: bool,
     }
 
@@ -1956,9 +1975,12 @@ mod tests {
         lagging_partition
             .insert_batch(make_ab_rows_batch(schema, case.lagging_partition_rows)?)?;
 
-        assert!(
-            lagging_partition.heap.inner.is_empty(),
-            "{}: lagging partition's local heap should remain empty",
+        // Float suffixes cannot prune prefix ties using Parquet statistics.
+        // A strictly worse prefix still admits no rows and can prove completion.
+        assert_eq!(
+            lagging_partition.heap.inner.len(),
+            case.expected_heap_rows,
+            "{}: rows admitted by the shared prefix filter",
             case.name
         );
         assert_eq!(
@@ -1978,6 +2000,7 @@ mod tests {
             a_options: SortOptions::default(),
             threshold_source_rows: &[(Some(1), 20.0), (Some(1), 15.0), (Some(2), 30.0)],
             lagging_partition_rows: &[(Some(3), 10.0), (Some(3), 20.0)],
+            expected_heap_rows: 0,
             expected_finished: true,
         })
     }
@@ -1995,6 +2018,7 @@ mod tests {
                     (Some(2), 30.0),
                 ],
                 lagging_partition_rows: &[(Some(2), 40.0), (Some(2), 50.0)],
+                expected_heap_rows: 2,
                 expected_finished: false,
             },
             SharedPrefixCase {
@@ -2010,6 +2034,7 @@ mod tests {
                     (Some(9), 3.0),
                 ],
                 lagging_partition_rows: &[(Some(8), 1.0), (Some(8), 2.0)],
+                expected_heap_rows: 0,
                 expected_finished: true,
             },
             SharedPrefixCase {
@@ -2025,6 +2050,7 @@ mod tests {
                     (Some(2), 30.0),
                 ],
                 lagging_partition_rows: &[(None, 10.0), (None, 20.0)],
+                expected_heap_rows: 0,
                 expected_finished: true,
             },
         ] {

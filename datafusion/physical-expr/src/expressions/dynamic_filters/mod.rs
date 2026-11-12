@@ -28,7 +28,7 @@ use arrow::datatypes::{DataType, Schema};
 use datafusion_common::internal_datafusion_err;
 use datafusion_common::{
     Result,
-    tree_node::{Transformed, TransformedResult, TreeNode},
+    tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
 };
 
 use datafusion_expr::ColumnarValue;
@@ -238,7 +238,9 @@ impl DynamicFilterPhysicalExpr {
         if let Some(remapped_children) = remapped_children {
             // Remap the children to the new children
             // of the expression.
-            expr.transform_up(|child| {
+            // Match complete keys before their descendants: one key can contain
+            // another. Replacements already use the destination schema.
+            expr.transform_down(|child| {
                 // Check if this is any of our original children
                 if let Some(pos) =
                     children.iter().position(|c| c.as_ref() == child.as_ref())
@@ -246,7 +248,7 @@ impl DynamicFilterPhysicalExpr {
                     // If so, remap it to the current children
                     // of the expression.
                     let new_child = Arc::clone(&remapped_children[pos]);
-                    Ok(Transformed::yes(new_child))
+                    Ok(Transformed::new(new_child, true, TreeNodeRecursion::Jump))
                 } else {
                     // Otherwise, just return the expression
                     Ok(Transformed::no(child))
@@ -837,6 +839,45 @@ mod test {
     use datafusion_common::ScalarValue;
 
     use super::*;
+
+    #[test]
+    fn remap_overlapping_keys_atomically() -> Result<()> {
+        use datafusion_expr::Operator;
+        let a =
+            Arc::new(crate::expressions::Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let b =
+            Arc::new(crate::expressions::Column::new("b", 1)) as Arc<dyn PhysicalExpr>;
+        let sum = Arc::new(BinaryExpr::new(
+            Arc::clone(&a),
+            Operator::Plus,
+            Arc::clone(&b),
+        )) as Arc<dyn PhysicalExpr>;
+        let new_a =
+            Arc::new(crate::expressions::Column::new("a", 2)) as Arc<dyn PhysicalExpr>;
+        let new_b =
+            Arc::new(crate::expressions::Column::new("b", 3)) as Arc<dyn PhysicalExpr>;
+        let new_sum = Arc::new(BinaryExpr::new(new_a, Operator::Plus, Arc::clone(&new_b)))
+            as Arc<dyn PhysicalExpr>;
+        let predicate = Arc::new(BinaryExpr::new(Arc::clone(&sum), Operator::Lt, lit(10)))
+            as Arc<dyn PhysicalExpr>;
+        let actual = DynamicFilterPhysicalExpr::remap_children(
+            &[sum, b],
+            Some(&vec![Arc::clone(&new_sum), new_b]),
+            predicate,
+        )?;
+        let expected = Arc::new(BinaryExpr::new(new_sum, Operator::Lt, lit(10)))
+            as Arc<dyn PhysicalExpr>;
+        assert_eq!(actual.as_ref(), expected.as_ref());
+
+        // A replacement can itself equal another original key. Never rewrite it twice.
+        let actual = DynamicFilterPhysicalExpr::remap_children(
+            &[Arc::clone(&a), Arc::clone(&expected)],
+            Some(&vec![Arc::clone(&expected), lit(99)]),
+            Arc::clone(&a),
+        )?;
+        assert_eq!(actual.as_ref(), expected.as_ref());
+        Ok(())
+    }
 
     #[test]
     fn test_remap_children() {

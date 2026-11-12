@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -755,17 +757,24 @@ impl EquivalenceGroup {
         {
             return cls.constant.clone();
         }
-        // TODO: This function should be able to return values of non-literal
-        //       complex constants as well; e.g. it should return `8` for the
-        //       expression `3 + 5`, not an unknown `heterogenous` value.
+        // A volatile node can vary even when its inputs are constant.
+        if expr.is_volatile_node() {
+            return None;
+        }
         let children = expr.children();
         if children.is_empty() {
             return None;
         }
+        // A deterministic expression of uniform constants is itself uniform.
+        // Losing this scope during projection makes a merge discard valid
+        // ordering proofs (for example CAST(k) after a global k = 3 filter).
+        let mut scope = AcrossPartitions::Uniform(None);
         for child in children {
-            self.is_expr_constant(child)?;
+            if self.is_expr_constant(child)? == AcrossPartitions::Heterogeneous {
+                scope = AcrossPartitions::Heterogeneous;
+            }
         }
-        Some(AcrossPartitions::Heterogeneous)
+        Some(scope)
     }
 
     /// Returns the equivalence class containing `expr`. If no equivalence class
@@ -927,6 +936,67 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use datafusion_expr::Operator;
+
+    #[test]
+    fn deterministic_constant_scope_survives_projection() -> Result<()> {
+        use crate::expressions::CastExpr;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, true)]));
+        let k = col("k", &schema)?;
+        let cast = Arc::new(CastExpr::new_with_target_field(
+            Arc::clone(&k),
+            Arc::new(Field::new("k", DataType::Int64, true)),
+            None,
+        )) as Arc<dyn PhysicalExpr>;
+        for scope in [
+            AcrossPartitions::Uniform(Some(ScalarValue::Int32(Some(3)))),
+            AcrossPartitions::Uniform(None),
+            AcrossPartitions::Heterogeneous,
+        ] {
+            let mut group = EquivalenceGroup::default();
+            group.add_constant(ConstExpr::new(Arc::clone(&k), scope.clone()));
+            let expected = match scope {
+                AcrossPartitions::Uniform(_) => AcrossPartitions::Uniform(None),
+                AcrossPartitions::Heterogeneous => AcrossPartitions::Heterogeneous,
+            };
+            assert_eq!(group.is_expr_constant(&cast), Some(expected));
+        }
+        assert_eq!(EquivalenceGroup::default().is_expr_constant(&cast), None);
+        Ok(())
+    }
+
+    #[test]
+    fn volatile_constant_inputs_do_not_make_a_uniform_constant() -> Result<()> {
+        use crate::ScalarFunctionExpr;
+        use datafusion_common::config::ConfigOptions;
+        use datafusion_expr::{ColumnarValue, Volatility, create_udf};
+        let schema = Schema::empty();
+        for volatility in [
+            Volatility::Immutable,
+            Volatility::Stable,
+            Volatility::Volatile,
+        ] {
+            let udf = Arc::new(create_udf(
+                "identity",
+                vec![DataType::Int32],
+                DataType::Int32,
+                volatility,
+                Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+            ));
+            let expr = Arc::new(ScalarFunctionExpr::try_new(
+                udf,
+                vec![lit(3i32)],
+                &schema,
+                Arc::new(ConfigOptions::new()),
+            )?) as Arc<dyn PhysicalExpr>;
+            let expected = (volatility != Volatility::Volatile)
+                .then_some(AcrossPartitions::Uniform(None));
+            assert_eq!(
+                EquivalenceGroup::default().is_expr_constant(&expr),
+                expected
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_bridge_groups() -> Result<()> {
