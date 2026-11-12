@@ -160,11 +160,12 @@ impl SharedWorkSource {
         source
     }
 
-    pub(super) fn stream(&self, partition: usize) -> SharedStream {
+    pub(super) fn stream(&self, partition: usize, independent: bool) -> SharedStream {
         SharedStream {
             source: self.clone(),
             id: partition,
             held: false,
+            independent,
         }
     }
 
@@ -214,6 +215,8 @@ pub(super) struct SharedStream {
     source: SharedWorkSource,
     id: usize,
     held: bool,
+    /// A selectively polled consumer cannot wait for a buffered sibling.
+    independent: bool,
 }
 
 impl SharedStream {
@@ -243,7 +246,8 @@ impl SharedStream {
             self.held = true;
             queue.waiters.remove(&self.id);
             Poll::Ready(Some(file))
-        } else if self.source.inner.publishing.load(Ordering::Acquire)
+        } else if !self.independent
+            && self.source.inner.publishing.load(Ordering::Acquire)
             && queue.has_owners()
         {
             queue.waiters.insert(self.id, cx.waker().clone());
@@ -334,8 +338,8 @@ mod tests {
         let source = SharedWorkSource::from_config(&config);
         let (_, waker) = waker();
         let mut cx = Context::from_waker(&waker);
-        let mut b = source.stream(1);
-        let mut a = source.stream(0);
+        let mut b = source.stream(1, false);
+        let mut a = source.stream(0, false);
         source.enable_publishing();
         source.publish([file("stolen-row-groups")]);
         assert_eq!(
@@ -378,7 +382,7 @@ mod tests {
         let source = SharedWorkSource::from_config(&config);
         let (_, waker) = waker();
         let mut cx = Context::from_waker(&waker);
-        let mut b = source.stream(1);
+        let mut b = source.stream(1, false);
         // Claim from the single global queue, even when partition 1 polls first.
         for expected in ["a", "c", "b"] {
             assert_eq!(
@@ -390,11 +394,36 @@ mod tests {
     }
 
     #[test]
+    fn independent_stream_does_not_wait_but_can_take_published_work() {
+        let source = SharedWorkSource::new([file("owned")], 2);
+        source.enable_publishing();
+        let mut owner = source.stream(0, true);
+        let mut idle = source.stream(1, true);
+        let (_, waker) = waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(
+            path(owner.poll_next_file(&mut cx)),
+            Poll::Ready(Some("owned".into()))
+        );
+        // The owner may now be blocked behind the selective consumer. An idle
+        // sibling must finish without requiring any further owner progress.
+        assert_eq!(path(idle.poll_next_file(&mut cx)), Poll::Ready(None));
+        assert_eq!(source.split_width(10), 1);
+        // Units already removed from a donor remain claimable exactly once.
+        source.publish([file("donated")]);
+        assert_eq!(
+            path(owner.poll_next_file(&mut cx)),
+            Poll::Ready(Some("donated".into()))
+        );
+        assert_eq!(path(owner.poll_next_file(&mut cx)), Poll::Ready(None));
+    }
+
+    #[test]
     fn dropping_last_active_owner_wakes_waiter_to_take_unopened_file() {
         let source = SharedWorkSource::new([file("a"), file("b")], 3);
         source.enable_publishing();
-        let mut a = source.stream(0);
-        let mut idle = source.stream(2);
+        let mut a = source.stream(0, false);
+        let mut idle = source.stream(2, false);
         let (wakes, waker) = waker();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(a.poll_next_file(&mut cx), Poll::Ready(Some(_))));
@@ -416,8 +445,8 @@ mod tests {
         let (wakes, waiting) = self::waker();
         let mut cx = Context::from_waker(&waker);
         let mut wait_cx = Context::from_waker(&waiting);
-        let mut a = source.stream(0);
-        let mut b = source.stream(1);
+        let mut a = source.stream(0, false);
+        let mut b = source.stream(1, false);
         assert!(matches!(a.poll_next_file(&mut cx), Poll::Ready(Some(_))));
         assert_eq!(path(b.poll_next_file(&mut wait_cx)), Poll::Pending);
         assert_eq!(source.split_width(12), 2);
@@ -439,8 +468,8 @@ mod tests {
         source.enable_publishing();
         let (_, waker) = waker();
         let mut cx = Context::from_waker(&waker);
-        let mut a = source.stream(0);
-        let mut b = source.stream(1);
+        let mut a = source.stream(0, false);
+        let mut b = source.stream(1, false);
         assert!(matches!(a.poll_next_file(&mut cx), Poll::Ready(Some(_))));
         assert!(matches!(b.poll_next_file(&mut cx), Poll::Ready(Some(_))));
         assert_eq!(source.split_width(12), 1);
@@ -463,7 +492,7 @@ mod tests {
         source.enable_publishing();
         let (_, waker) = waker();
         let mut cx = Context::from_waker(&waker);
-        let mut a = source.stream(0);
+        let mut a = source.stream(0, false);
         assert_eq!(
             path(a.poll_next_file(&mut cx)),
             Poll::Ready(Some("a".into()))
@@ -473,7 +502,7 @@ mod tests {
             Poll::Ready(Some("b".into()))
         );
         assert_eq!(path(a.poll_next_file(&mut cx)), Poll::Ready(None));
-        let mut b = source.stream(1);
+        let mut b = source.stream(1, false);
         assert_eq!(path(b.poll_next_file(&mut cx)), Poll::Ready(None));
     }
 
@@ -481,8 +510,8 @@ mod tests {
     fn idle_stream_can_claim_an_unopened_owner_before_it_is_polled() {
         let source = SharedWorkSource::new([file("a")], 2);
         source.enable_publishing();
-        let a = source.stream(0);
-        let mut b = source.stream(1);
+        let a = source.stream(0, false);
+        let mut b = source.stream(1, false);
         let (wakes, waker) = waker();
         let mut cx = Context::from_waker(&waker);
         assert_eq!(
@@ -498,8 +527,8 @@ mod tests {
     fn dropping_a_reading_or_planning_stream_releases_waiters() {
         let source = SharedWorkSource::new([file("a")], 2);
         source.enable_publishing();
-        let mut a = source.stream(0);
-        let mut b = source.stream(1);
+        let mut a = source.stream(0, false);
+        let mut b = source.stream(1, false);
         let (wakes, waker) = waker();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(a.poll_next_file(&mut cx), Poll::Ready(Some(_))));
@@ -514,8 +543,8 @@ mod tests {
         let source = SharedWorkSource::new([file("a")], 2);
         let (_, waker) = waker();
         let mut cx = Context::from_waker(&waker);
-        let mut a = source.stream(0);
-        let mut b = source.stream(1);
+        let mut a = source.stream(0, false);
+        let mut b = source.stream(1, false);
         assert!(matches!(a.poll_next_file(&mut cx), Poll::Ready(Some(_))));
         assert_eq!(path(b.poll_next_file(&mut cx)), Poll::Ready(None));
     }
@@ -531,7 +560,7 @@ mod tests {
                     scope.spawn(move || {
                         let (_, waker) = waker();
                         let mut cx = Context::from_waker(&waker);
-                        let mut stream = source.stream(partition);
+                        let mut stream = source.stream(partition, false);
                         let mut paths = Vec::new();
                         while let Poll::Ready(Some(file)) =
                             path(stream.poll_next_file(&mut cx))

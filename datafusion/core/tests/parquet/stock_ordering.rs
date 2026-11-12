@@ -231,3 +231,86 @@ async fn null_padded_constants_are_sorted() {
         assert_eq!(got, want, "join={join}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocking_sort_keeps_scan_work_sharing() {
+    let fixture = Fixture::new();
+    let ctx = fixture.session(3, true, 7).await;
+    let plan = ctx
+        .sql("SELECT id, v FROM raw ORDER BY id % 5, id DESC")
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let text = displayable(plan.as_ref()).indent(false).to_string();
+    assert!(text.contains("SortPreservingMergeExec"), "{text}");
+    assert!(text.contains("SortExec"), "{text}");
+    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .unwrap();
+    let ids: Vec<_> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    let mut expected: Vec<_> = (0..238).collect();
+    expected.sort_by(|a, b| (a % 5).cmp(&(b % 5)).then_with(|| b.cmp(a)));
+    assert_eq!(ids, expected);
+    fn counter(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        name: &str,
+    ) -> usize {
+        plan.metrics()
+            .and_then(|m| m.sum_by_name(name))
+            .map_or(0, |m| m.as_usize())
+            + plan
+                .children()
+                .iter()
+                .map(|p| counter(p, name))
+                .sum::<usize>()
+    }
+    assert_eq!(
+        counter(&plan, "file_stream_publication_waits_suppressed"),
+        0
+    );
+    assert!(
+        counter(&plan, "file_stream_work_sharing_enabled") > 0,
+        "blocking sort must retain scan sharing: {text}"
+    );
+}
+
+#[tokio::test]
+async fn cross_join_keeps_both_constants() {
+    use datafusion::physical_expr::expressions::{Column, lit};
+    use datafusion::physical_plan::{
+        ExecutionPlan, empty::EmptyExec, joins::CrossJoinExec, projection::ProjectionExec,
+    };
+    let source: Arc<dyn ExecutionPlan> =
+        Arc::new(EmptyExec::new(Arc::new(Schema::empty())));
+    let left: Arc<dyn ExecutionPlan> = Arc::new(
+        ProjectionExec::try_new(vec![(lit(1i64), "a".into())], Arc::clone(&source))
+            .unwrap(),
+    );
+    let right: Arc<dyn ExecutionPlan> =
+        Arc::new(ProjectionExec::try_new(vec![(lit(2i64), "b".into())], source).unwrap());
+    let join = CrossJoinExec::new(left, right);
+    for (name, idx) in [("a", 0), ("b", 1)] {
+        let col: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new(name, idx));
+        assert!(
+            join.properties()
+                .eq_properties
+                .eq_group()
+                .is_expr_constant(&col)
+                .is_some(),
+            "{name}"
+        );
+    }
+}

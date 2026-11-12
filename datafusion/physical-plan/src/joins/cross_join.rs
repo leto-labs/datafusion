@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -156,7 +158,9 @@ impl CrossJoinExec {
         let eq_properties = join_equivalence_properties(
             left.equivalence_properties().clone(),
             right.equivalence_properties().clone(),
-            &JoinType::Full,
+            // A Cartesian product NULL-pads neither input. With no join keys,
+            // Inner combines both sides' facts without adding equalities.
+            &JoinType::Inner,
             schema,
             &[false, false],
             None,

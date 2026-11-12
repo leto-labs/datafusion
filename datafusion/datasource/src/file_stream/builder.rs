@@ -37,6 +37,7 @@ pub struct FileStreamBuilder<'a> {
     metrics: Option<&'a ExecutionPlanMetricsSet>,
     on_error: OnError,
     shared_work_source: Option<SharedWorkSource>,
+    independent_partitions: bool,
 }
 
 impl<'a> FileStreamBuilder<'a> {
@@ -49,6 +50,7 @@ impl<'a> FileStreamBuilder<'a> {
             metrics: None,
             on_error: OnError::Fail,
             shared_work_source: None,
+            independent_partitions: false,
         }
     }
 
@@ -95,6 +97,13 @@ impl<'a> FileStreamBuilder<'a> {
         self
     }
 
+    /// Require progress without waiting for a sibling's future publication.
+    /// Planned files and units already published remain available for sharing.
+    pub(crate) fn with_independent_partitions(mut self, independent: bool) -> Self {
+        self.independent_partitions = independent;
+        self
+    }
+
     /// Build the configured [`FileStream`].
     pub fn build(self) -> Result<FileStream> {
         let Self {
@@ -104,6 +113,7 @@ impl<'a> FileStreamBuilder<'a> {
             metrics,
             on_error,
             shared_work_source,
+            independent_partitions,
         } = self;
 
         let Some(partition) = partition else {
@@ -122,7 +132,9 @@ impl<'a> FileStreamBuilder<'a> {
             );
         };
         let work_source = match shared_work_source {
-            Some(shared) => WorkSource::Shared(shared.stream(partition)),
+            Some(shared) => {
+                WorkSource::Shared(shared.stream(partition, independent_partitions))
+            }
             None => WorkSource::Local(file_group.into_inner().into()),
         };
 

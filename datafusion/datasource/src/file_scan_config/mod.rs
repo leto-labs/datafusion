@@ -719,8 +719,8 @@ impl DataSource for FileScanConfig {
         // units offered by eligible readers after pruning.
         let shared_work_source = sibling_state
             .as_ref()
-            // A selective consumer may require independent partitions even if
-            // this plan already initialized sibling state in another context.
+            // Honor session configuration even if sibling state was previously
+            // initialized while work sharing was enabled.
             .filter(|_| {
                 context
                     .session_config()
@@ -731,6 +731,19 @@ impl DataSource for FileScanConfig {
             .and_then(|state| state.downcast_ref::<SharedWorkSource>())
             .cloned();
 
+        datafusion_physical_plan::metrics::MetricBuilder::new(
+            &self.file_source.metrics(),
+        )
+        .counter("file_stream_publication_waits_suppressed", partition)
+        .add(usize::from(
+            sibling_state.is_some() && context.requires_independent_partitions(),
+        ));
+        datafusion_physical_plan::metrics::MetricBuilder::new(
+            &self.file_source.metrics(),
+        )
+        .counter("file_stream_work_sharing_enabled", partition)
+        .add(usize::from(shared_work_source.is_some()));
+
         let mut morselizer = source.create_morselizer(object_store, self, partition)?;
         if let Some(shared_work_source) = &shared_work_source {
             morselizer.attach_shared_work_source(shared_work_source);
@@ -739,6 +752,7 @@ impl DataSource for FileScanConfig {
         let stream = FileStreamBuilder::new(self)
             .with_partition(partition)
             .with_shared_work_source(shared_work_source)
+            .with_independent_partitions(context.requires_independent_partitions())
             .with_morselizer(morselizer)
             .with_metrics(source.metrics())
             .build()?;

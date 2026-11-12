@@ -66,6 +66,9 @@ pub struct TaskContext {
     aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
     /// Window functions associated with this task context
     window_functions: HashMap<String, Arc<WindowUDF>>,
+    /// A selective consumer can stop polling one partition while awaiting another.
+    /// Its demand-driven inputs must not wait on sibling work publication.
+    require_independent_partitions: bool,
     /// Runtime environment associated with this task context
     runtime: Arc<RuntimeEnv>,
 }
@@ -84,6 +87,7 @@ impl Default for TaskContext {
             aggregate_functions: HashMap::new(),
             window_functions: HashMap::new(),
             runtime,
+            require_independent_partitions: false,
         }
     }
 }
@@ -114,6 +118,28 @@ impl TaskContext {
             aggregate_functions,
             window_functions,
             runtime,
+            require_independent_partitions: false,
+        }
+    }
+
+    /// Whether this demand-driven pipeline requires partitions to make progress
+    /// without sibling work publication. This is an execution requirement, not
+    /// a session option. Operators that consume or close their inputs before
+    /// emitting can clear it at that boundary.
+    pub fn requires_independent_partitions(&self) -> bool {
+        self.require_independent_partitions
+    }
+
+    /// Scope partition independence to a pipeline, retaining runtime services,
+    /// function registries and session extensions (including attempt ownership).
+    pub fn with_partition_independence(self: &Arc<Self>, required: bool) -> Arc<Self> {
+        if self.require_independent_partitions == required {
+            Arc::clone(self)
+        } else {
+            Arc::new(Self {
+                require_independent_partitions: required,
+                ..self.as_ref().clone()
+            })
         }
     }
 

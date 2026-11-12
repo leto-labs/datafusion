@@ -384,27 +384,10 @@ impl ExecutionPlan for SortPreservingMergeExec {
                 }
             },
             _ => {
-                // A merge may stop polling a buffered sibling while it waits for
-                // another input's next row or EOF. Scan work sharing can wait
-                // for that sibling to publish more work, creating a cycle.
-                // Keep scan partitions independent below this selective consumer.
-                // Cloning retains the runtime and session extensions (including
-                // the attempt's task ownership scope).
-                let context = if context
-                    .session_config()
-                    .options()
-                    .execution
-                    .enable_file_stream_work_stealing
-                {
-                    let mut config = context.session_config().clone();
-                    config
-                        .options_mut()
-                        .execution
-                        .enable_file_stream_work_stealing = false;
-                    Arc::new(context.as_ref().clone().with_session_config(config))
-                } else {
-                    context
-                };
+                // An idle scan must not await publication by a sibling whose
+                // merge channel is full. Scope this requirement to the streaming
+                // input pipeline; blocking operators clear it before scanning.
+                let context = context.with_partition_independence(true);
                 let scope = AttemptTasks::from_task(&context);
                 let receivers = (0..input_partitions)
                     .map(|partition| {

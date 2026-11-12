@@ -28,6 +28,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::attempt_tasks::AttemptTasks;
+use crate::batch_memory::SharedBatchReservation;
 use crate::common::spawn_buffered_with_scope;
 use crate::execution_plan::{
     Boundedness, CardinalityEffect, EmissionType, has_same_children_properties,
@@ -50,7 +51,6 @@ use crate::spill::get_record_batch_memory_size;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::{GetSlicedSize, SpillManager};
 use crate::statistics::{ChildStats, StatisticsArgs};
-use crate::batch_memory::SharedBatchReservation;
 use crate::stream::{ObservedStream, RecordBatchStreamAdapter};
 use crate::topk::TopK;
 use crate::topk::TopKDynamicFilters;
@@ -772,11 +772,14 @@ impl ExternalSorter {
             // Sort the batch immediately and get all output batches
             let sorted_batches = sort_batch_chunked(&batch, &expressions, batch_size)?;
 
-            let reserved = SharedBatchReservation::reserve_all(reservation, sorted_batches)
-                .map_err(Self::err_with_oom_context)?;
+            let reserved =
+                SharedBatchReservation::reserve_all(reservation, sorted_batches)
+                    .map_err(Self::err_with_oom_context)?;
             Result::<_, DataFusionError>::Ok(Box::pin(RecordBatchStreamAdapter::new(
                 Arc::clone(&schema),
-                futures::stream::iter(reserved.into_iter().map(|batch| Ok(batch.into_batch()))),
+                futures::stream::iter(
+                    reserved.into_iter().map(|batch| Ok(batch.into_batch())),
+                ),
             )) as SendableRecordBatchStream)
         })
         .try_flatten();
@@ -1431,16 +1434,19 @@ impl ExecutionPlan for SortExec {
             context.task_id()
         );
 
-        let mut input = self.input.execute(partition, Arc::clone(&context))?;
-
-        let execution_options = &context.session_config().options().execution;
-
-        trace!("End SortExec's input.execute for partition: {partition}");
-
         let sort_satisfied = self
             .input
             .equivalence_properties()
             .ordering_satisfy(self.expr.clone())?;
+        // An actual sort consumes (or closes, for a prefix-limited TopK) its
+        // input before emitting. Its scans can therefore wait on one another
+        // without depending on downstream merge demand. A pass-through sort
+        // has no such boundary and must retain the requirement.
+        let context = context.with_partition_independence(
+            context.requires_independent_partitions() && sort_satisfied,
+        );
+        let mut input = self.input.execute(partition, Arc::clone(&context))?;
+        let execution_options = &context.session_config().options().execution;
 
         match (sort_satisfied, self.fetch.as_ref()) {
             (true, Some(fetch)) => Ok(Box::pin(LimitStream::new(

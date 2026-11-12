@@ -240,11 +240,18 @@ NULL-padded join facts, and prevent a merge's selective backpressure from
 waiting on sibling scan publication. Dependent Longbow feature:
 CORE-ORDERING-CORRECTNESS. Audit classification: UPSTREAMABLE.
 
-Multi-input SortPreservingMergeExec executes its input with scan work sharing
-disabled. A cloned task context retains runtime, function registries, identities
-and session extensions, including the attempt task scope. FileScanConfig honors
-this restriction even if sibling state already exists. Other consumers keep
-work sharing. This is a conservative bound on late-publication scheduling.
+Multi-input SortPreservingMergeExec marks its demand-driven input pipeline as
+requiring independent partitions. FileScanConfig suppresses waiting for future sibling publication only
+while this requirement reaches the scan. Planned files and already published
+units remain shareable. An actual SortExec consumes or closes
+its input before emitting, and clears the requirement before executing that
+input. A pass-through sort retains it. Thus ordinary sorted aggregation/TopK
+plans retain scan donation; a direct merge over streaming scans cannot await a
+buffered sibling's publication. The session work-sharing setting is unchanged.
+Task-context scoping retains runtime, function registries, identities and session
+extensions, including the attempt task scope. File scans honor the scoped
+requirement even if sibling state already exists. Native counters distinguish
+sharing enabled from publication waits suppressed by the consumer.
 
 A scan's declared output ordering always protects file order and Parquet limit
 pruning. This is the relevant backport of Apache #26434 (63af08da). Join classes
@@ -252,7 +259,9 @@ clear constants and computed members on NULL-padded sides, while keeping plain
 column equalities (Apache #26747, 99e723dd). Offsetting a preserved side retains
 its constant metadata, matching Apache main b5bcea88. Join ordering propagation
 also clears padded-side
-orderings. SEMI/ANTI facts remain on their emitted side.
+orderings. SEMI/ANTI facts remain on their emitted side. CrossJoin uses Inner
+semantics with no join keys, retaining both sides' constants without inventing
+join equalities or claiming either input's ordering.
 
 Native regressions cover all join types, known/unknown/partition-local/NULL
 constants, ordering facts and cleared scan flags. core/tests/parquet/stock_ordering.rs
