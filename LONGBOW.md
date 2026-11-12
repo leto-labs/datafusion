@@ -77,6 +77,18 @@ superseded experimental policy/configuration. The consumer owns conservative
 admission. Native heap ordering regressions and the consumer's semantic,
 codec, pool-refusal and drop tests qualify this family together.
 
+IB1 extends family N with allocation-identity accounting across all retained
+rank heaps and peer entries. Shared Arrow buffers (including slice offsets,
+validity and child buffers) are charged once per operator. Temporary accounting
+maps, cloned batch metadata and container growth remain reserved. Flat output
+uses a separate logical-value copy bound, so repeated references to one large
+value cannot under-reserve materialized output. Regressions cover shared sliced
+batches, dropping replaced buffers, repeated heap inputs, output admission and
+cancellation with live retained credits. Purpose: remove false Q67 admission
+failures without raising or bypassing the memory pool. Classification: KEEP;
+dependent feature: WINDOW-TOPK.
+
+
 ## Family BSC: bitmap short-circuit evaluation
 
 Purpose: avoid gathering whole batches for direct primitive comparisons when

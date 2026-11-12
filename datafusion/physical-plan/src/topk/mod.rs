@@ -1285,10 +1285,9 @@ struct TieEntry {
     /// Indices into `batch` of the rows tied at the (then-current)
     /// boundary. Always non-empty by construction.
     row_indices: Vec<u32>,
-    /// `get_record_batch_memory_size(&batch)` captured at push time so
-    /// `RankPartitionState::size()` doesn't recurse through `batch`'s
-    /// columns on every `try_resize` call.
-    batch_bytes: usize,
+    /// Per-reference metadata only. Shared arrays/buffers are charged once
+    /// by the owning rank operator, across all heaps and ties.
+    metadata_bytes: usize,
 }
 
 /// Per-partition state for `RANK()` semantics.
@@ -1309,7 +1308,7 @@ impl RankPartitionState {
         let ties_contents: usize = self
             .ties
             .iter()
-            .map(|t| t.row_indices.capacity() * size_of::<u32>() + t.batch_bytes)
+            .map(|t| t.row_indices.capacity() * size_of::<u32>() + t.metadata_bytes)
             .sum();
         self.heap.size() - self.heap.store.batches_size
             + self
@@ -1317,7 +1316,7 @@ impl RankPartitionState {
                 .store
                 .batches
                 .values()
-                .map(|entry| rank_memory::batch_bytes(&entry.batch))
+                .map(|entry| rank_memory::batch_reference_bytes(&entry.batch))
                 .sum::<usize>()
             + self.heap.store.batches.capacity()
                 * (size_of::<(u32, RecordBatchEntry)>() + 2)
@@ -1369,6 +1368,10 @@ pub(crate) struct PartitionedTopKRank {
     partition_scratch_rows: Rows,
     /// One rank state per distinct partition key seen so far.
     states: HashMap<OwnedRow, RankPartitionState>,
+    // Cached union of retained Arrow allocations. During insertion this
+    // conservatively includes the incoming batch until the final refresh.
+    array_bytes: usize,
+    array_metadata: usize,
     keep_peers: bool,
     k: usize,
     batch_size: usize,
@@ -1439,6 +1442,8 @@ impl PartitionedTopKRank {
             partition_converter,
             partition_scratch_rows,
             states: HashMap::new(),
+            array_bytes: 0,
+            array_metadata: 0,
             keep_peers: true,
             k,
             batch_size,
@@ -1462,16 +1467,29 @@ impl PartitionedTopKRank {
             return Ok(());
         }
 
-        // Reserve conversion/grouping scratch BEFORE allocating it. Only flat
-        // column keys are admitted, so evaluation cannot allocate hidden arrays.
-        let scratch = rank_memory::scratch_bound(self, batch)?;
-        rank_memory::reserve(self, scratch)?;
-
-        // Captured once so the per-tie push from this batch can reuse
-        // it (computing `get_record_batch_memory_size` is O(cols ×
-        // buffer walk) and we'd otherwise pay it per push and again
-        // per `try_resize` call).
-        let input_batch_bytes = rank_memory::batch_bytes(batch);
+        // Account the old + incoming allocation union once. Insertion only
+        // clones source arrays: evictions and ties allocate reference metadata,
+        // never another copy of their Arrow buffers. Charge the accountant's
+        // temporary maps before constructing them.
+        let workspace = rank_memory::counter_workspace(self.array_metadata, batch)?;
+        self.reservation.try_grow(workspace)?;
+        let arrays = rank_memory::retained_arrays(self, Some(batch));
+        // Keep a single reservation: returning a separate zero-sized credit
+        // must not signal that this operator has released its retained arrays.
+        // The accountant has dropped its temporary maps before this shrink.
+        self.reservation.shrink(workspace);
+        let arrays = arrays?;
+        let scratch =
+            rank_memory::add(rank_memory::scratch_bound(self, batch)?, workspace)?;
+        let target = rank_memory::add(
+            self.metadata_size(),
+            rank_memory::add(arrays.bytes, scratch)?,
+        )?;
+        self.reservation
+            .try_resize(target.max(self.reservation.size()))?;
+        self.array_bytes = arrays.bytes;
+        self.array_metadata = arrays.metadata;
+        let input_batch_metadata = rank_memory::batch_reference_bytes(batch);
 
         // 1. Evaluate + encode partition columns into the reusable
         //    scratch (cleared then appended).
@@ -1507,7 +1525,7 @@ impl PartitionedTopKRank {
         // 4. Per-partition: classify each row and dispatch.
         let k = self.k;
         let mut replacements: usize = 0;
-        let mut retained = self.size();
+        let mut retained = self.metadata_size();
 
         for (pk, indices) in groups {
             // The working bound covers hash-table/Vec growth (including both
@@ -1528,9 +1546,12 @@ impl PartitionedTopKRank {
                 pk.as_ref().len(),
                 &indices,
                 k,
-                input_batch_bytes,
+                input_batch_metadata,
             )?;
-            let target = rank_memory::add(retained, rank_memory::add(scratch, working)?)?;
+            let target = rank_memory::add(
+                rank_memory::add(retained, self.array_bytes)?,
+                rank_memory::add(scratch, working)?,
+            )?;
             self.reservation
                 .try_resize(target.max(self.reservation.size()))?;
             let state = self
@@ -1614,12 +1635,12 @@ impl PartitionedTopKRank {
                                 // Boundary unchanged — evicted row is tied
                                 // at the (unchanged) boundary; push as a
                                 // single-row entry.
-                                let batch_bytes =
-                                    rank_memory::batch_bytes(&evicted_batch);
+                                let metadata_bytes =
+                                    rank_memory::batch_reference_bytes(&evicted_batch);
                                 state.ties.push(TieEntry {
                                     batch: evicted_batch,
                                     row_indices: vec![evicted_index as u32],
-                                    batch_bytes,
+                                    metadata_bytes,
                                 });
                             }
                         }
@@ -1640,7 +1661,7 @@ impl PartitionedTopKRank {
                 state.ties.push(TieEntry {
                     batch: batch.clone(),
                     row_indices: equal_indices,
-                    batch_bytes: input_batch_bytes,
+                    metadata_bytes: input_batch_metadata,
                 });
             }
             let new_state_bytes = pk.as_ref().len() + state.size();
@@ -1655,7 +1676,14 @@ impl PartitionedTopKRank {
         drop(pk_arrays);
         drop(ob_arrays);
         // All per-batch scratch has gone before releasing its credits.
-        debug_assert_eq!(retained, self.size());
+        debug_assert_eq!(retained, self.metadata_size());
+        // The incoming-union bound also covers this counter's workspace.
+        // Release allocations no longer retained after every successful batch;
+        // never keep an ever-seen pointer set across dropped source buffers.
+        let arrays = rank_memory::retained_arrays(self, None)?;
+        self.array_bytes = arrays.bytes;
+        self.array_metadata = arrays.metadata;
+        let retained = rank_memory::add(retained, self.array_bytes)?;
         assert!(retained <= self.reservation.size(), "rank working bound");
         self.reservation.shrink(self.reservation.size() - retained);
         Ok(())
@@ -1666,8 +1694,13 @@ impl PartitionedTopKRank {
         rank_emit::emit(self)
     }
 
-    /// Total memory currently held, including all per-partition states.
+    /// Total memory currently held, including the unique allocation union.
     fn size(&self) -> usize {
+        self.metadata_size() + self.array_bytes
+    }
+
+    /// Owned reference/encoded-key metadata, excluding shared Arrow arrays.
+    fn metadata_size(&self) -> usize {
         size_of::<Self>()
             + self.expr.capacity() * size_of::<PhysicalSortExpr>()
             + self.partition_exprs.capacity() * size_of::<Arc<dyn PhysicalExpr>>()

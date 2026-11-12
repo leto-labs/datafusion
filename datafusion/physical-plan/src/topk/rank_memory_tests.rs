@@ -384,3 +384,98 @@ async fn rank_view_payload_emission_keeps_all_peers_in_bounded_slices() -> Resul
     assert_eq!(runtime.memory_pool.reserved(), 0);
     Ok(())
 }
+
+#[test]
+fn rank_shared_slices_charge_unique_buffers_across_heaps_and_ties() -> Result<()> {
+    use datafusion_common::utils::memory::RecordBatchMemoryCounter;
+    let (schema, runtime, mut state) = fixture(2 * 1024 * 1024 * 1024, 16);
+    let payload = "x".repeat(2048);
+    let source = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(
+                (0..4096)
+                    .map(|i| if i % 2 == 0 { "a" } else { "b" })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(vec![1; 4096])),
+            Arc::new(StringArray::from(vec![payload.as_str(); 4096])),
+        ],
+    )?;
+    let mut unique = RecordBatchMemoryCounter::new();
+    unique.count_batch(&source);
+    let unique_bytes = unique.memory_usage();
+    for i in 0..100 {
+        state.insert_batch(&source.slice((i % 16) * 128, 128))?;
+    }
+    let indices: usize = state
+        .states
+        .values()
+        .flat_map(|p| &p.ties)
+        .map(|entry| entry.row_indices.capacity() * size_of::<u32>())
+        .sum();
+    let charged = runtime.memory_pool.reserved();
+    assert!(
+        charged >= unique_bytes + indices,
+        "retained buffers/indices undercharged"
+    );
+    assert!(
+        charged < unique_bytes * 2,
+        "shared buffers multiplied: {charged} vs {unique_bytes}"
+    );
+
+    // Replacing both partition boundaries must release the old shared payload.
+    let better = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b"])),
+            Arc::new(Int64Array::from(vec![0, 0])),
+            Arc::new(StringArray::from(vec!["new", "new"])),
+        ],
+    )?;
+    state.insert_batch(&better)?;
+    assert!(runtime.memory_pool.reserved() < 1024 * 1024);
+    drop(state);
+    assert_eq!(runtime.memory_pool.reserved(), 0);
+    Ok(())
+}
+
+fn repeated_heap_fixture(
+    pool: usize,
+) -> Result<(Arc<RuntimeEnv>, PartitionedTopKRank, RecordBatch)> {
+    let (schema, runtime, mut state) = fixture(pool, 16);
+    // The first 32 rows fill a heap from distinct batch references to one buffer.
+    state.k = 32;
+    let source = batch(schema, "same", 1, 512 * 1024);
+    for _ in 0..64 {
+        state.insert_batch(&source)?;
+    }
+    Ok((runtime, state, source))
+}
+
+#[tokio::test]
+async fn rank_unique_storage_still_reserves_copied_output_growth() -> Result<()> {
+    use datafusion_common::utils::memory::RecordBatchMemoryCounter;
+    let (runtime, state, source) = repeated_heap_fixture(64 * 1024 * 1024)?;
+    let mut source_memory = RecordBatchMemoryCounter::new();
+    source_memory.count_batch(&source);
+    let mut stream = state.emit()?;
+    let output = stream.next().await.unwrap()?;
+    assert_eq!(output.num_rows(), 16);
+    let mut output_memory = RecordBatchMemoryCounter::new();
+    output_memory.count_batch(&output);
+    assert!(output_memory.memory_usage() >= 8 * 1024 * 1024);
+    assert!(
+        runtime.memory_pool.reserved()
+            >= source_memory.memory_usage() + output_memory.memory_usage()
+    );
+    drop(output);
+    drop(stream);
+    assert_eq!(runtime.memory_pool.reserved(), 0);
+
+    // Unique retained storage fits, but its materialized output does not.
+    let (runtime, state, _source) = repeated_heap_fixture(4 * 1024 * 1024)?;
+    assert!(state.emit().is_err());
+    assert_eq!(runtime.memory_pool.reserved(), 0);
+    Ok(())
+}

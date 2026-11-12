@@ -62,15 +62,32 @@ pub(super) fn emit(mut owner: PartitionedTopKRank) -> Result<SendableRecordBatch
     let mut largest = 0;
     let mut max_rows = 0;
     for state in owner.states.values() {
-        let mut heap_bytes = 0;
         max_rows = max_rows.max(state.heap.inner.len().min(owner.batch_size));
-        for entry in state.heap.store.batches.values() {
-            heap_bytes = add(heap_bytes, rank_memory::batch_bytes(&entry.batch))?;
+        if copy_flat {
+            let heap_bytes = state.heap.inner.iter().try_fold(0, |n, row| {
+                let batch = &state
+                    .heap
+                    .store
+                    .get(row.batch_id)
+                    .expect("retained rank batch")
+                    .batch;
+                add(n, rank_memory::output_row_bytes(batch, row.index)?)
+            })?;
+            largest = largest.max(heap_bytes);
         }
-        largest = largest.max(heap_bytes);
         for entry in &state.ties {
-            largest = largest.max(entry.batch_bytes);
             max_rows = max_rows.max(entry.row_indices.len().min(owner.batch_size));
+            if copy_flat {
+                for chunk in entry.row_indices.chunks(owner.batch_size) {
+                    let bytes = chunk.iter().try_fold(0, |n, row| {
+                        add(
+                            n,
+                            rank_memory::output_row_bytes(&entry.batch, *row as usize)?,
+                        )
+                    })?;
+                    largest = largest.max(bytes);
+                }
+            }
         }
     }
     // Both the consumed hash table and destination heap can be live while
@@ -80,7 +97,9 @@ pub(super) fn emit(mut owner: PartitionedTopKRank) -> Result<SendableRecordBatch
     // amplify logical data beyond the physical source-buffer bound.
     let ordering = mul(owner.states.len(), size_of::<Partition>())?;
     let refs = mul(max_rows, add(mul(owner.schema.fields().len(), 256)?, 64)?)?;
-    let output = add(mul(largest, 2)?, refs)?;
+    // Views/nested output uses slices: reserve wrapper metadata, not another
+    // copy of retained payload. Flat output additionally needs new value bytes.
+    let output = add(add(mul(largest, 2)?, refs)?, mul(owner.array_metadata, 2)?)?;
     rank_memory::reserve(&mut owner, add(add(ordering, output)?, 4096)?)?;
     let schema = Arc::clone(&owner.schema);
     let emitter = Emitter {
