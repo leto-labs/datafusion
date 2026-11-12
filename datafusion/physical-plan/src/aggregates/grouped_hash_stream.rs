@@ -37,7 +37,7 @@ use crate::metrics::{BaselineMetrics, MetricBuilder, MetricCategory, RecordOutpu
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::spill::spill_manager::{GetSlicedSize, SpillManager};
 use crate::stream::EmptyRecordBatchStream;
-use crate::{PhysicalExpr, aggregates, metrics};
+use crate::{InputOrderMode, PhysicalExpr, aggregates, metrics};
 use crate::{RecordBatchStream, SendableRecordBatchStream};
 
 use arrow::array::*;
@@ -385,6 +385,32 @@ impl GroupedHashAggregateStream {
         context: &Arc<TaskContext>,
         partition: usize,
     ) -> Result<Self> {
+        Self::new_internal(agg, context, partition, false)
+    }
+
+    /// Bounded retry for CG's replayable merge states. Duplicate partial groups
+    /// are safe: another state merge or the ordinary final aggregate consumes
+    /// them. Never use this for final scalar output or ordered aggregation.
+    pub(super) fn new_emitting_partial_states(
+        agg: &AggregateExec,
+        context: &Arc<TaskContext>,
+        partition: usize,
+    ) -> Result<Self> {
+        assert_or_internal_err!(
+            agg.mode == AggregateMode::PartialReduce
+                && agg.input_order_mode == InputOrderMode::Linear
+                && agg.limit_options.is_none(),
+            "Early state emission requires an unordered, unlimited partial reduce"
+        );
+        Self::new_internal(agg, context, partition, true)
+    }
+
+    fn new_internal(
+        agg: &AggregateExec,
+        context: &Arc<TaskContext>,
+        partition: usize,
+        emit_partial_states: bool,
+    ) -> Result<Self> {
         debug!("Creating GroupedHashAggregateStream");
         let agg_schema = Arc::clone(&agg.schema);
         let agg_group_by = Arc::clone(&agg.group_by);
@@ -492,6 +518,11 @@ impl GroupedHashAggregateStream {
         let name = format!("GroupedHashAggregateStream[{partition}] ({agg_fn_names})");
         let group_ordering = GroupOrdering::try_new(&agg.input_order_mode)?;
         let oom_mode = match (agg.mode, &group_ordering) {
+            (AggregateMode::PartialReduce, GroupOrdering::None)
+                if emit_partial_states =>
+            {
+                OutOfMemoryMode::EmitEarly
+            }
             // In partial aggregation mode, always prefer to emit incomplete results early.
             (AggregateMode::Partial, _) => OutOfMemoryMode::EmitEarly,
             // For non-partial aggregation modes, emitting incomplete results is not an option.

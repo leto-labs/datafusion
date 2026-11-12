@@ -126,9 +126,12 @@ Purpose: compute maximal requested grouping sets once and derive each coarser
 set from the smallest containing computed set. Dependent Longbow feature:
 CORE-AGGREGATION. Audit classification: UPSTREAMABLE.
 
-Only unordered, unlimited, nonvolatile built-in SUM, COUNT, MIN, MAX and AVG
+Only unordered, unlimited, nonvolatile built-in SUM, COUNT, nonfloating MIN/MAX and AVG
 without DISTINCT or ordered arguments are admitted. Group-only aggregates retain
-the native distinct/limit path. Native partial-state merges
+the native distinct/limit path. Floating MIN/MAX retain expansion because native
+NaN handling depends on input order. Floating SUM/AVG use native states and
+retain their usual floating-point reassociation, not bitwise sequential equivalence.
+Finite pools without temporary files retain native expansion. Partial-state merges
 retain AVG sum/count, grouping-ID width, duplicate ordinals and empty totals.
 Incomparable maximal sets share one raw-input aggregate. Each execution and
 partition owns its retained memory reservations and native spill files; no new
@@ -140,6 +143,9 @@ multiple partitions, finite pools, stream drop, cancellation during materializat
 and an empty one-shot exchange. Flushed fine states remain mergeable; the ordinary
 final aggregate completes that level. Coarser cached levels use hash grouping,
 without treating literal NULLs/IDs as useful ordering. Under a finite pool, a
-modern merge that exhausts memory releases its table and retries the native
-spilling kernel over retained states, never raw input.
+state merge that exhausts memory releases its table and retries a native
+PartialReduce kernel that emits incomplete states early. This avoids a sort
+reservation while its parent is retained. Later merges and the ordinary final
+aggregate combine duplicate states. The normal successful merge path is unchanged;
+raw input is never retried. Retained spilling uses the attempt task scope.
 The consumer adds independent DuckDB-authored SLT and TPC-DS answer checks.

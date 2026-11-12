@@ -20,7 +20,8 @@
 //! Partition-local grouping-set state reuse. Only maximal requested sets read
 //! raw rows. Each other set merges the smallest containing computed set. Native
 //! partial states remain mergeable even when a bounded partial flushes or skips;
-//! only coarser levels require completion before further reuse. AVG retains its
+//! coarser merges normally complete, but bounded retries may emit duplicate states.
+//! AVG retains its
 //! sum/count state through the entire chain.
 //!
 //! Nothing is shared between executions or partitions. Retained state owns a
@@ -33,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::compute::cast;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::utils::memory::RecordBatchMemoryCounter;
 use datafusion_common::{DataFusionError, Result, ScalarValue, internal_datafusion_err};
@@ -52,8 +53,9 @@ use datafusion_physical_expr_common::physical_expr::is_volatile;
 use futures::{StreamExt, TryStreamExt, stream};
 
 use super::{
-    AggregateExec, AggregateMode, PartialReduceHashAggregateStream, PhysicalGroupBy,
-    create_schema, group_id_array, max_duplicate_ordinal,
+    AggregateExec, AggregateMode, GroupedHashAggregateStream,
+    PartialReduceHashAggregateStream, PhysicalGroupBy, create_schema, group_id_array,
+    max_duplicate_ordinal,
 };
 use crate::empty::EmptyExec;
 use crate::execution_plan::EmissionType;
@@ -115,6 +117,13 @@ fn levels(groups: &[Vec<bool>]) -> Vec<Level> {
     result
 }
 
+fn floating_type(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, value) => floating_type(value),
+        other => other.is_floating(),
+    }
+}
+
 fn supported(agg: &AggregateExec) -> bool {
     if !agg.group_by.has_grouping_set
         || agg.group_by.groups.len() < 2
@@ -135,12 +144,13 @@ fn supported(agg: &AggregateExec) -> bool {
     agg.aggr_expr.iter().all(|expr| {
         let function = expr.fun().inner();
         !expr.is_distinct()
-            && expr.order_bys().is_empty()
+            && expr.stored_order_bys().is_empty()
             && !expr.expressions().iter().any(is_volatile)
             && (function.downcast_ref::<Sum>().is_some()
                 || function.downcast_ref::<Count>().is_some()
-                || function.downcast_ref::<Min>().is_some()
-                || function.downcast_ref::<Max>().is_some()
+                || ((function.downcast_ref::<Min>().is_some()
+                    || function.downcast_ref::<Max>().is_some())
+                    && !floating_type(expr.field().data_type()))
                 || function.downcast_ref::<Avg>().is_some())
     })
 }
@@ -150,7 +160,12 @@ pub(super) fn execute(
     partition: usize,
     context: Arc<TaskContext>,
 ) -> Result<Option<SendableRecordBatchStream>> {
-    if !supported(agg) {
+    // Without disk, retaining a level can exhaust a finite pool even when
+    // native Partial could emit it early. Keep that bounded native path.
+    if !supported(agg)
+        || (matches!(context.memory_pool().memory_limit(), MemoryLimit::Finite(_))
+            && !context.runtime_env().disk_manager.tmp_files_enabled())
+    {
         return Ok(None);
     }
     let levels = levels(&agg.group_by.groups);
@@ -494,12 +509,10 @@ impl State {
         &mut self,
         agg: &AggregateExec,
     ) -> Result<(Arc<dyn ExecutionPlan>, usize)> {
-        // The native selector conservatively disables the modern merge kernel
-        // for every finite pool because it cannot spill. Here the input is a
-        // replayable retained level, so an exhausted attempt can release its
-        // table and retry with the native spilling implementation. No raw
-        // source, volatile expression or aggregate filter is replayed.
-        if agg.mode == AggregateMode::PartialReduce
+        // Normal modern/native merges are unchanged. Only an exhausted state
+        // merge retries with bounded early emission: sort-spilling would need
+        // another reservation while the retained parent is still held.
+        let modern = agg.mode == AggregateMode::PartialReduce
             && agg.group_by.is_single()
             && agg.input_order_mode == InputOrderMode::Linear
             && self
@@ -511,39 +524,45 @@ impl State {
             && matches!(
                 self.context.memory_pool().memory_limit(),
                 MemoryLimit::Finite(_)
-            )
-        {
+            );
+        let attempt = if modern {
             MetricBuilder::new(&self.original.metrics)
                 .counter("chained_modern_merges", self.partition)
                 .add(1);
-            let attempt =
-                match PartialReduceHashAggregateStream::new(agg, &self.context, 0) {
-                    Ok(stream) => self.store(agg, Box::pin(stream)).await,
-                    Err(error) => Err(error),
-                };
-            match attempt {
-                Ok(result) => return Ok(result),
-                Err(error)
-                    if matches!(
+            match PartialReduceHashAggregateStream::new(agg, &self.context, 0) {
+                Ok(stream) => self.store(agg, Box::pin(stream)).await,
+                Err(error) => Err(error),
+            }
+        } else {
+            match agg.execute_typed(0, &self.context) {
+                Ok(stream) => self.store(agg, stream.into()).await,
+                Err(error) => Err(error),
+            }
+        };
+        match attempt {
+            Err(error)
+                if agg.mode == AggregateMode::PartialReduce
+                    && matches!(
                         error.find_root(),
                         DataFusionError::ResourcesExhausted(_)
                     ) =>
-                {
-                    self.add_compute(agg);
-                    MetricBuilder::new(&self.original.metrics)
-                        .counter("chained_merge_retries", self.partition)
-                        .add(1);
-                    // Keep failed-attempt time separate from the fresh fallback
-                    // metrics, so no computation is lost or counted twice.
-                    let fallback = agg.with_new_limit_options(None);
-                    let stream = fallback.execute_typed(0, &self.context)?.into();
-                    return self.store(&fallback, stream).await;
-                }
-                Err(error) => return Err(error),
+            {
+                // The failed stream, table, retained output and reservations
+                // have dropped before this retry. Never reopen raw input.
+                self.add_compute(agg);
+                MetricBuilder::new(&self.original.metrics)
+                    .counter("chained_merge_retries", self.partition)
+                    .add(1);
+                let fallback = agg.with_new_limit_options(None);
+                let stream = GroupedHashAggregateStream::new_emitting_partial_states(
+                    &fallback,
+                    &self.context,
+                    0,
+                )?;
+                self.store(&fallback, Box::pin(stream)).await
             }
+            result => result,
         }
-        let stream = agg.execute_typed(0, &self.context)?.into();
-        self.store(agg, stream).await
     }
 
     async fn store(
@@ -562,6 +581,7 @@ impl State {
             SpillMetrics::new(&self.original.metrics, self.partition),
             Arc::clone(&self.state_schema),
         )
+        .with_attempt_tasks(crate::attempt_tasks::AttemptTasks::from_task(&self.context))
         .with_compression_type(
             self.context
                 .session_config()
@@ -694,7 +714,23 @@ impl PartitionStream for Stored {
 
 #[cfg(test)]
 mod tests {
-    use super::levels;
+    use super::{floating_type, levels};
+    use arrow::datatypes::DataType;
+
+    #[test]
+    fn chained_grouping_sets_float_extrema_include_dictionary_values() {
+        assert!(floating_type(&DataType::Float16));
+        assert!(floating_type(&DataType::Float32));
+        assert!(floating_type(&DataType::Float64));
+        assert!(floating_type(&DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Float64),
+        )));
+        assert!(!floating_type(&DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Utf8),
+        )));
+    }
 
     #[test]
     fn chained_grouping_sets_choose_smallest_containing_parent() {

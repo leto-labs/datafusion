@@ -3155,6 +3155,8 @@ pub fn evaluate_group_by(
 
 #[cfg(test)]
 mod chained_grouping_sets_tests;
+#[cfg(test)]
+mod chained_grouping_sets_review_tests;
 
 #[cfg(test)]
 mod tests {
