@@ -345,6 +345,7 @@ pub(super) fn retained_arrays(
     Ok(counter.size)
 }
 
+#[cfg(test)]
 pub(super) fn batch_bytes(batch: &RecordBatch) -> usize {
     let mut counter = Counter::default();
     counter.batch(batch).expect("representable rank batch");
