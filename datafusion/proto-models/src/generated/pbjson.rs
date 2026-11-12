@@ -7021,6 +7021,9 @@ impl serde::Serialize for FileScanExecConf {
         if self.output_partitioning.is_some() {
             len += 1;
         }
+        if self.virtual_column_count != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.FileScanExecConf", len)?;
         if !self.file_groups.is_empty() {
             struct_ser.serialize_field("fileGroups", &self.file_groups)?;
@@ -7060,6 +7063,9 @@ impl serde::Serialize for FileScanExecConf {
         if let Some(v) = self.output_partitioning.as_ref() {
             struct_ser.serialize_field("outputPartitioning", v)?;
         }
+        if self.virtual_column_count != 0 {
+            struct_ser.serialize_field("virtualColumnCount", &self.virtual_column_count)?;
+        }
         struct_ser.end()
     }
 }
@@ -7089,6 +7095,8 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             "projectionExprs",
             "output_partitioning",
             "outputPartitioning",
+            "virtual_column_count",
+            "virtualColumnCount",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -7105,6 +7113,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             BatchSize,
             ProjectionExprs,
             OutputPartitioning,
+            VirtualColumnCount,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -7138,6 +7147,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                             "batchSize" | "batch_size" => Ok(GeneratedField::BatchSize),
                             "projectionExprs" | "projection_exprs" => Ok(GeneratedField::ProjectionExprs),
                             "outputPartitioning" | "output_partitioning" => Ok(GeneratedField::OutputPartitioning),
+                            "virtualColumnCount" | "virtual_column_count" => Ok(GeneratedField::VirtualColumnCount),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -7169,6 +7179,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                 let mut batch_size__ = None;
                 let mut projection_exprs__ = None;
                 let mut output_partitioning__ = None;
+                let mut virtual_column_count__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::FileGroups => {
@@ -7248,6 +7259,14 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                             }
                             output_partitioning__ = map_.next_value()?;
                         }
+                        GeneratedField::VirtualColumnCount => {
+                            if virtual_column_count__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("virtualColumnCount"));
+                            }
+                            virtual_column_count__ =
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(FileScanExecConf {
@@ -7263,6 +7282,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                     batch_size: batch_size__,
                     projection_exprs: projection_exprs__,
                     output_partitioning: output_partitioning__,
+                    virtual_column_count: virtual_column_count__.unwrap_or_default(),
                 })
             }
         }
@@ -17147,6 +17167,12 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
                             }
                             statistics__ = map_.next_value()?;
                         }
+                        GeneratedField::ArrowSchema => {
+                            if arrow_schema__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("arrowSchema"));
+                            }
+                            arrow_schema__ = map_.next_value()?;
+                        }
                         GeneratedField::ETag => {
                             if e_tag__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("eTag"));
@@ -17158,12 +17184,6 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
                                 return Err(serde::de::Error::duplicate_field("version"));
                             }
                             version__ = map_.next_value()?;
-                        }
-                        GeneratedField::ArrowSchema => {
-                            if arrow_schema__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("arrowSchema"));
-                            }
-                            arrow_schema__ = map_.next_value()?;
                         }
                     }
                 }

@@ -208,3 +208,20 @@ output schema. Native regressions bypass family CG and cover GROUPING SETS
 and ROLLUP with NULLs, duplicate sets, filtered AVG states, Partial early
 emission and Final disk spills. Capped results must equal uncapped results,
 multiple spill runs must merge, and pool reservations must return to zero.
+
+## Family RP: positional Parquet Top-N retrieval
+
+Purpose: resolve sorted file-row positions into per-row-group RowSelections
+after the opener obtains metadata, preserving disjoint byte-range ownership.
+Dependent Longbow feature: TOPN-POSITIONAL. Audit classification: UPSTREAMABLE.
+Conflicting access extensions, duplicate/unsorted positions and out-of-file
+positions fail explicitly; positional streams do not publish row groups to the
+shared work source.
+
+The generic file-scan codec carries virtual fields as an explicitly counted
+schema suffix after file and partition fields. It never infers a virtual role
+from Arrow extension metadata on a physical column. The generated protobuf and
+JSON codecs retain that count. Native regressions cover role reconstruction,
+invalid counts, group boundaries, empty selections and extension conflicts.
+The consumer owns the general rewrite, bounded native TopK and ordered payload
+retrieval, and changes its stage codec identity for these new plans.

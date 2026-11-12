@@ -1262,6 +1262,8 @@ message FileScanExecConf {
   reserved 14;
   reserved "partitioned_by_file_group";
   optional Partitioning output_partitioning = 15;
+  // Virtual fields form the suffix of schema, after file and partition fields.
+  uint32 virtual_column_count = 16;
 }
 
 message ParquetScanExecNode {

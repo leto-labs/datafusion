@@ -38,8 +38,9 @@ use crate::row_group_filter::RowGroupAccessPlanFilter;
 use crate::work_sharing::RowGroupSharing;
 use crate::{
     BloomFilterStatistics, Int96Coercer, ParquetAccessPlan, ParquetFileMetrics,
-    ParquetFileReaderFactory, ParquetRowSelection, ParquetVirtualColumn,
-    apply_file_schema_type_coercions, coerce_decimals_to_table_width,
+    ParquetFileReaderFactory, ParquetRowPositions, ParquetRowSelection,
+    ParquetVirtualColumn, apply_file_schema_type_coercions,
+    coerce_decimals_to_table_width,
 };
 use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
@@ -757,12 +758,12 @@ impl ParquetMorselizer {
     ) -> Result<PreparedParquetOpen> {
         let file_range = partitioned_file.range.clone();
         let extensions = partitioned_file.extensions.clone();
-        // A file-level external selection is not a row-group descriptor and
-        // cannot coexist with a published ParquetAccessPlan extension.
-        let shared_work_source = self
-            .shared_work_source
-            .clone()
-            .filter(|_| extensions.get::<ParquetRowSelection>().is_none());
+        // External file selections must not publish access-plan descriptors:
+        // the two selection extensions cannot be composed by the opener.
+        let shared_work_source = self.shared_work_source.clone().filter(|_| {
+            extensions.get::<ParquetRowSelection>().is_none()
+                && extensions.get::<ParquetRowPositions>().is_none()
+        });
         let file_name = partitioned_file.object_meta.location.to_string();
         let file_metrics =
             ParquetFileMetrics::new(self.partition_index, &file_name, &self.metrics);
@@ -1771,6 +1772,16 @@ fn create_initial_plan(
     rg_metadata: &[RowGroupMetaData],
 ) -> Result<ParquetAccessPlan> {
     let row_group_count = rg_metadata.len();
+    if let Some(positions) = extensions.get::<ParquetRowPositions>() {
+        if extensions.get::<ParquetAccessPlan>().is_some()
+            || extensions.get::<ParquetRowSelection>().is_some()
+        {
+            return exec_err!(
+                "Conflicting Parquet row-position access extension for {file_name}"
+            );
+        }
+        return positions.access_plan(rg_metadata);
+    }
     match (
         extensions.get::<ParquetAccessPlan>(),
         extensions.get::<ParquetRowSelection>(),
@@ -1970,6 +1981,29 @@ mod test {
                 "guard {guard}"
             );
         }
+    }
+
+    #[test]
+    fn create_initial_plan_from_row_positions_and_reject_conflicts() {
+        let metadata = row_group_metadata(&[10, 20, 30]);
+        let mut extensions = datafusion_datasource::FileExtensions::new();
+        extensions.insert(crate::ParquetRowPositions::new(vec![0, 59]));
+        let plan = create_initial_plan("test.parquet", &extensions, &metadata).unwrap();
+        assert_eq!(plan.row_group_indexes(), vec![0, 2]);
+        assert_eq!(
+            plan,
+            crate::ParquetRowPositions::new(vec![0, 59])
+                .access_plan(&metadata)
+                .unwrap()
+        );
+        extensions.insert(ParquetAccessPlan::new_all(3));
+        assert!(create_initial_plan("test.parquet", &extensions, &metadata).is_err());
+        let mut extensions = datafusion_datasource::FileExtensions::new();
+        extensions.insert(crate::ParquetRowPositions::new(vec![0]));
+        extensions.insert(ParquetRowSelection::new(
+            vec![parquet::arrow::arrow_reader::RowSelector::select(60)].into(),
+        ));
+        assert!(create_initial_plan("test.parquet", &extensions, &metadata).is_err());
     }
 
     #[test]

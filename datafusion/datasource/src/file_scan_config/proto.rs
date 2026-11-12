@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -27,8 +29,7 @@
 //! `FileSource::try_to_proto` hook (CSV, JSON, Arrow, Parquet, Avro) builds its
 //! `*ScanExecNode` around [`FileScanConfig::try_to_proto`] and decodes with
 //! [`FileScanConfig::try_from_proto`], keeping a single copy of the shared
-//! wire logic. The wire format is byte-for-byte identical to the old central
-//! serializer.
+//! wire logic. Virtual fields are carried explicitly as a schema suffix.
 //!
 //! Child physical expressions (sort orderings, hash/range partitioning, and
 //! projection expressions) are (de)serialized through `ctx.encode_expr` /
@@ -57,8 +58,8 @@ impl FileScanConfig {
     /// [`protobuf::FileScanExecConf`].
     ///
     /// Each concrete [`FileSource::try_to_proto`]
-    /// wraps the returned value in its own `*ScanExecNode`. Byte-compatible with
-    /// the former `serialize_file_scan_config` in `datafusion-proto`.
+    /// wraps the returned value in its own `*ScanExecNode`. Virtual columns are
+    /// appended after file and partition fields and counted explicitly.
     pub fn try_to_proto(
         &self,
         ctx: &ExecutionPlanEncodeCtx<'_>,
@@ -92,6 +93,10 @@ impl FileScanConfig {
             .cloned()
             .collect::<Vec<_>>();
         fields.extend(self.table_partition_cols().iter().cloned());
+        let virtual_columns = self.file_source().table_schema().virtual_columns();
+        fields.extend(virtual_columns.iter().cloned());
+        let virtual_column_count = u32::try_from(virtual_columns.len())
+            .map_err(|_| internal_datafusion_err!("too many virtual scan columns"))?;
         let schema =
             Schema::new(fields).with_metadata(self.file_schema().metadata.clone());
 
@@ -131,6 +136,7 @@ impl FileScanConfig {
             batch_size: self.batch_size.map(|s| s as u64),
             projection_exprs,
             output_partitioning,
+            virtual_column_count,
         })
     }
 
@@ -230,7 +236,7 @@ impl FileScanConfig {
         Ok(config_builder.build())
     }
 
-    /// Parse a [`TableSchema`] (file schema + partition columns) from a
+    /// Parse a [`TableSchema`] (file, partition and virtual columns) from a
     /// [`protobuf::FileScanExecConf`]. File sources use this to rebuild their
     /// concrete source before calling [`FileScanConfig::try_from_proto`].
     ///
@@ -239,6 +245,18 @@ impl FileScanConfig {
         conf: &protobuf::FileScanExecConf,
     ) -> Result<TableSchema> {
         let schema = parse_file_scan_schema(conf)?;
+
+        // Roles come from the declared table layout, never extension metadata:
+        // an extension-typed physical field is still stored in the file.
+        let virtual_count = conf.virtual_column_count as usize;
+        let virtual_start = schema
+            .fields()
+            .len()
+            .checked_sub(virtual_count)
+            .ok_or_else(|| {
+                internal_datafusion_err!("virtual scan column count exceeds schema width")
+            })?;
+        let virtual_columns = schema.fields()[virtual_start..].to_vec();
 
         // Reacquire the partition column types from the schema before removing
         // them below.
@@ -257,6 +275,7 @@ impl FileScanConfig {
                 schema
                     .fields()
                     .iter()
+                    .take(virtual_start)
                     .filter(|field| !table_partition_cols.contains(field))
                     .cloned()
                     .collect::<Vec<_>>(),
@@ -264,13 +283,22 @@ impl FileScanConfig {
             .with_metadata(schema.metadata.clone()),
         );
 
+        if table_partition_cols
+            .iter()
+            .any(|field| virtual_columns.contains(field))
+        {
+            return Err(internal_datafusion_err!(
+                "scan column cannot be both virtual and partitioned"
+            ));
+        }
         Ok(TableSchema::builder(file_schema)
             .with_table_partition_cols(table_partition_cols)
+            .with_virtual_columns(virtual_columns)
             .build())
     }
 }
 
-/// Parse the full (file + partition columns) schema off the base conf.
+/// Parse the full (file, partition and virtual columns) schema off the base conf.
 fn parse_file_scan_schema(conf: &protobuf::FileScanExecConf) -> Result<Arc<Schema>> {
     let schema: Schema = conf
         .schema
@@ -282,4 +310,76 @@ fn parse_file_scan_schema(conf: &protobuf::FileScanExecConf) -> Result<Arc<Schem
         })?
         .try_into()?;
     Ok(Arc::new(schema))
+}
+
+#[cfg(test)]
+mod virtual_column_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field};
+    use std::collections::HashMap;
+
+    fn extension_field(name: &str) -> Arc<Field> {
+        Arc::new(
+            Field::new(name, DataType::Int64, false).with_metadata(HashMap::from([(
+                "ARROW:extension:name".to_owned(),
+                "arrow.parquet.row_number".to_owned(),
+            )])),
+        )
+    }
+
+    #[test]
+    fn explicit_virtual_suffix_preserves_physical_extensions_and_partitions() {
+        let stored = extension_field("stored_position");
+        let value = Arc::new(Field::new("value", DataType::Utf8, true));
+        let partition = Arc::new(Field::new("file", DataType::UInt32, false));
+        let row = extension_field("row");
+        let metadata = HashMap::from([("source".to_owned(), "fixture".to_owned())]);
+        let schema = Schema::new(vec![
+            Arc::clone(&stored),
+            Arc::clone(&value),
+            Arc::clone(&partition),
+            Arc::clone(&row),
+        ])
+        .with_metadata(metadata.clone());
+        let conf = protobuf::FileScanExecConf {
+            schema: Some((&schema).try_into().unwrap()),
+            table_partition_cols: vec!["file".to_owned()],
+            virtual_column_count: 1,
+            ..Default::default()
+        };
+        let table = FileScanConfig::parse_table_schema_from_proto(&conf).unwrap();
+        assert_eq!(
+            table.file_schema().as_ref(),
+            &Schema::new(vec![stored, value]).with_metadata(metadata)
+        );
+        assert_eq!(table.table_partition_cols().as_ref(), &[partition]);
+        assert_eq!(table.virtual_columns().as_ref(), &[row]);
+        assert_eq!(table.table_schema().as_ref(), &schema);
+    }
+
+    #[test]
+    fn physical_extension_is_not_inferred_as_virtual() {
+        let schema = Schema::new(vec![extension_field("stored_position")]);
+        let conf = protobuf::FileScanExecConf {
+            schema: Some((&schema).try_into().unwrap()),
+            ..Default::default()
+        };
+        let table = FileScanConfig::parse_table_schema_from_proto(&conf).unwrap();
+        assert_eq!(table.file_schema().as_ref(), &schema);
+        assert!(table.virtual_columns().is_empty());
+    }
+
+    #[test]
+    fn invalid_virtual_suffix_and_overlapping_roles_are_rejected() {
+        let schema = Schema::new(vec![extension_field("row")]);
+        let mut conf = protobuf::FileScanExecConf {
+            schema: Some((&schema).try_into().unwrap()),
+            virtual_column_count: 2,
+            ..Default::default()
+        };
+        assert!(FileScanConfig::parse_table_schema_from_proto(&conf).is_err());
+        conf.virtual_column_count = 1;
+        conf.table_partition_cols.push("row".to_owned());
+        assert!(FileScanConfig::parse_table_schema_from_proto(&conf).is_err());
+    }
 }

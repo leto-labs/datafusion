@@ -1940,6 +1940,9 @@ pub struct FileScanExecConf {
     pub projection_exprs: ::core::option::Option<ProjectionExprs>,
     #[prost(message, optional, tag = "15")]
     pub output_partitioning: ::core::option::Option<Partitioning>,
+    /// Virtual fields form the suffix of schema, after file and partition fields.
+    #[prost(uint32, tag = "16")]
+    pub virtual_column_count: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParquetScanExecNode {
