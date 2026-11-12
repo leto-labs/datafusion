@@ -19,6 +19,7 @@
 
 //! Implementation of `InList` expressions: [`InListExpr`]
 
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -208,12 +209,17 @@ impl InListExpr {
         let expr_data_type = expr.data_type(schema)?;
         assert_inlist_data_types_match(&expr_data_type, array.data_type())?;
 
-        let list = (0..array.len())
-            .map(|i| {
-                let scalar = ScalarValue::try_from_array(array.as_ref(), i)?;
-                Ok(crate::expressions::lit(scalar) as Arc<dyn PhysicalExpr>)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Static filters already implement set membership. Keep the literal
+        // tree a set as well: dynamic join filters are rewritten for each
+        // Parquet file, and duplicate build keys must not multiply that work.
+        let mut seen = HashSet::new();
+        let mut list = Vec::new();
+        for i in 0..array.len() {
+            let scalar = ScalarValue::try_from_array(array.as_ref(), i)?;
+            if seen.insert(scalar.clone()) {
+                list.push(crate::expressions::lit(scalar) as Arc<dyn PhysicalExpr>);
+            }
+        }
         Ok(Self::new(
             expr,
             list,
@@ -1879,6 +1885,94 @@ mod tests {
             &schema
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_inlist_bounds_literal_tree_by_distinct_values() -> Result<()> {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        let mut values = vec![Some(1); 100_000];
+        values.extend([Some(2), None, Some(2), None]);
+        let array = Arc::new(Int32Array::from(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3), None])),
+                Arc::new(Int32Array::from(vec![Some(3), Some(1), None, Some(2)])),
+            ],
+        )?;
+        for negated in [false, true] {
+            let expr = InListExpr::try_new_from_array(
+                col("a", &schema)?,
+                Arc::clone(&array),
+                negated,
+                &schema,
+            )?;
+            // One probe plus the three distinct literal children, including NULL.
+            assert_eq!(expr.children().len(), 4);
+            let expected =
+                BooleanArray::from(vec![Some(!negated), Some(!negated), None, None]);
+            assert_eq!(
+                as_boolean_array(&expr.evaluate(&batch)?.into_array(4)?),
+                &expected
+            );
+            let mut children = expr.children().into_iter().cloned().collect::<Vec<_>>();
+            children[0] = col("b", &schema)?;
+            let rewritten = Arc::new(expr).with_new_children(children)?;
+            assert_eq!(rewritten.children().len(), 4);
+            let expected =
+                BooleanArray::from(vec![None, Some(!negated), None, Some(!negated)]);
+            assert_eq!(
+                as_boolean_array(&rewritten.evaluate(&batch)?.into_array(4)?),
+                &expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_inlist_compacts_duplicate_struct_literals() -> Result<()> {
+        let fields = Fields::from(vec![
+            Field::new("k", DataType::Int32, true),
+            Field::new("v", DataType::Utf8, true),
+        ]);
+        let array = Arc::new(StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(1),
+                    None,
+                    None,
+                    Some(1),
+                ])),
+                Arc::new(StringArray::from(vec!["x", "x", "x", "x", "y"])),
+            ],
+            None,
+        )) as ArrayRef;
+        let schema = Schema::new(vec![Field::new("a", DataType::Struct(fields), true)]);
+        let expr = InListExpr::try_new_from_array(
+            col("a", &schema)?,
+            Arc::clone(&array),
+            false,
+            &schema,
+        )?;
+        assert_eq!(expr.children().len(), 4);
+        let full_list = (0..array.len())
+            .map(|index| {
+                ScalarValue::try_from_array(array.as_ref(), index).map(|value| lit(value))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let reference =
+            InListExpr::try_new(col("a", &schema)?, full_list, false, &schema)?;
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![array])?;
+        assert_eq!(
+            as_boolean_array(&expr.evaluate(&batch)?.into_array(5)?),
+            as_boolean_array(&reference.evaluate(&batch)?.into_array(5)?)
+        );
         Ok(())
     }
 

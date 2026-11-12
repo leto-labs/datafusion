@@ -103,3 +103,19 @@ construction, so those validated inline words can be compared directly even in
 mixed inline/external arrays. Unlike stock's no-data-buffer fast path, this
 optimization relies on that invariant for every input array. Seeded IN/NOT IN
 properties cover lists both with and without NULL, including empty lists.
+
+## Family IL: compact dynamic IN-list literal trees
+
+Purpose: retain one literal per distinct array value when constructing an
+`InListExpr`. Hash-join pushdown chooses this representation using distinct-key
+count, so repeated build rows must not create a literal tree proportional to
+build cardinality. Parquet file rewrites otherwise repeat that oversized walk
+for every file. Dependent Longbow feature: DYNAMIC-INLIST-SCALING. Audit
+classification: UPSTREAMABLE.
+
+Evaluation retains the existing static filter and its source array. The literal
+children preserve first-occurrence order and one NULL. Native regressions bound
+tree size for 100,000 duplicate keys, check IN/NOT IN and column remapping, and
+check duplicate struct literals with inner NULLs. The consumer adds a correlated
+aggregate answer fixture with NULL store keys, NULL fees and duplicate rows.
+No configuration, planner heuristic, wire format or result identity changes.
