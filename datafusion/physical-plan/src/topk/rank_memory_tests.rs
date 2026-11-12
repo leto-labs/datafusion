@@ -388,7 +388,9 @@ async fn rank_view_payload_emission_keeps_all_peers_in_bounded_slices() -> Resul
 #[test]
 fn rank_shared_slices_charge_unique_buffers_across_heaps_and_ties() -> Result<()> {
     use datafusion_common::utils::memory::RecordBatchMemoryCounter;
-    let (schema, runtime, mut state) = fixture(2 * 1024 * 1024 * 1024, 16);
+    // A 16 MiB pool also bounds transient admission below twice the unique
+    // approximately 8.1 MiB payload, not just the final retained charge.
+    let (schema, runtime, mut state) = fixture(16 * 1024 * 1024, 16);
     let payload = "x".repeat(2048);
     let source = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -415,6 +417,7 @@ fn rank_shared_slices_charge_unique_buffers_across_heaps_and_ties() -> Result<()
         .map(|entry| entry.row_indices.capacity() * size_of::<u32>())
         .sum();
     let charged = runtime.memory_pool.reserved();
+    println!("unique={unique_bytes}, retained_charge={charged}, pool_limit=16777216");
     assert!(
         charged >= unique_bytes + indices,
         "retained buffers/indices undercharged"
