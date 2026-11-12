@@ -203,7 +203,7 @@ use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
 use datafusion_physical_expr::{
-    ConstExpr, EquivalenceProperties, physical_exprs_contains,
+    ConstExpr, EquivalenceProperties, Partitioning, physical_exprs_contains,
 };
 use datafusion_physical_expr_common::physical_expr::{PhysicalExpr, fmt_sql};
 use datafusion_physical_expr_common::sort_expr::{
@@ -1044,15 +1044,28 @@ impl AggregateExec {
         let group_expr_mapping =
             ProjectionMapping::try_new(group_by.expr.clone(), &input.schema())?;
 
-        let cache = Self::compute_properties(
-            &input,
-            Arc::clone(&schema),
-            &group_expr_mapping,
-            group_by.is_true_no_grouping(),
-            &mode,
-            &input_order_mode,
-            aggr_expr.as_ref(),
-        )?;
+        let cache = if group_by.has_grouping_set() {
+            // Expansion NULL-fills keys and adds grouping IDs. Input constants,
+            // equalities, ordering and hash partitioning cannot pass through.
+            PlanProperties::new(
+                EquivalenceProperties::new(Arc::clone(&schema)),
+                Partitioning::UnknownPartitioning(
+                    input.output_partitioning().partition_count(),
+                ),
+                EmissionType::Final,
+                input.boundedness(),
+            )
+        } else {
+            Self::compute_properties(
+                &input,
+                Arc::clone(&schema),
+                &group_expr_mapping,
+                group_by.is_true_no_grouping(),
+                &mode,
+                &input_order_mode,
+                aggr_expr.as_ref(),
+            )?
+        };
 
         let mut exec = AggregateExec {
             mode,
@@ -2144,6 +2157,24 @@ impl ExecutionPlan for AggregateExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        // Scalar and unordered final/single aggregates consume their input
+        // before output. Partial aggregates may flush or bypass aggregation,
+        // so their emission metadata alone does not establish this boundary.
+        let blocking = self.group_by.is_true_no_grouping()
+            || (self.input_order_mode == InputOrderMode::Linear
+                && self.limit_options.is_none()
+                && matches!(
+                    self.mode,
+                    AggregateMode::Final
+                        | AggregateMode::FinalPartitioned
+                        | AggregateMode::Single
+                        | AggregateMode::SinglePartitioned
+                ));
+        let context = if blocking {
+            context.with_partition_independence(false)
+        } else {
+            context
+        };
         if let Some(stream) =
             chained_grouping_sets::execute(self, partition, Arc::clone(&context))?
         {

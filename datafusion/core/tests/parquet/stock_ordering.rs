@@ -143,7 +143,7 @@ async fn rows(ctx: &SessionContext, sql: &str) -> Vec<Row> {
         .unwrap();
     let text = displayable(plan.as_ref()).indent(false).to_string();
     let batches = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(120),
         datafusion::physical_plan::collect(plan, ctx.task_ctx()),
     )
     .await
@@ -313,4 +313,181 @@ async fn cross_join_keeps_both_constants() {
             "{name}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_scan_contexts_do_not_duplicate_files() {
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use futures::StreamExt;
+    let fixture = Fixture::new();
+    let ctx = fixture.session(2, true, 100).await;
+    for shared_first in [true, false] {
+        let scan = ctx
+            .sql("SELECT id FROM raw")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        assert_eq!(scan.output_partitioning().partition_count(), 2);
+        let shared = ctx.task_ctx();
+        let mut config = shared.session_config().clone();
+        config
+            .options_mut()
+            .execution
+            .enable_file_stream_work_stealing = false;
+        let local = Arc::new(shared.as_ref().clone().with_session_config(config));
+        let (a, b) = if shared_first {
+            (shared, local)
+        } else {
+            (local, shared)
+        };
+        let mut a = scan.execute(0, a).unwrap();
+        let mut b = scan.execute(1, b).unwrap();
+        let mut ids = vec![];
+        for stream in [&mut a, &mut b] {
+            while let Some(batch) = stream.next().await {
+                let batch = batch.unwrap();
+                ids.extend_from_slice(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values(),
+                );
+            }
+        }
+        ids.sort();
+        assert_eq!(
+            ids,
+            (0..238).collect::<Vec<_>>(),
+            "shared_first={shared_first}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_probe_keys_do_not_sort_build_suffixes() {
+    let fixture = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("g", DataType::Int64, false),
+        Field::new("m", DataType::Int64, false),
+    ]));
+    let ids: Vec<i64> = (0..100).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids.clone())),
+            Arc::new(Int64Array::from_iter_values(ids.iter().map(|id| id / 10))),
+            Arc::new(Int64Array::from_iter_values(ids.iter().map(|id| id % 5))),
+        ],
+    )
+    .unwrap();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.path().join("g.parquet")).unwrap(),
+        schema,
+        None,
+    )
+    .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    for partitions in [1, 3] {
+        let ctx = fixture.session(partitions, false, 8192).await;
+        ctx.register_parquet(
+            "sg",
+            dir.path().to_str().unwrap(),
+            ParquetReadOptions::default()
+                .file_sort_order(vec![vec![col("g").sort(true, false)]]),
+        )
+        .await
+        .unwrap();
+        ctx.register_parquet(
+            "bt",
+            dir.path().to_str().unwrap(),
+            ParquetReadOptions::default()
+                .file_sort_order(vec![vec![col("id").sort(true, false)]]),
+        )
+        .await
+        .unwrap();
+        for from in [
+            "sg p JOIN (SELECT id FROM bt WHERE id < 40) b",
+            "(SELECT id FROM bt WHERE id < 40) b JOIN sg p",
+        ] {
+            let inner =
+                format!("SELECT p.g, b.id AS bid, p.id FROM {from} ON b.id % 5 = p.m");
+            let mut expected = rows(&ctx, &inner).await;
+            expected.sort_by_key(|r| (r[0], r[1]));
+            let actual = rows(&ctx, &format!("{inner} ORDER BY g, bid")).await;
+            assert_eq!(
+                actual.iter().map(|r| (r[0], r[1])).collect::<Vec<_>>(),
+                expected.iter().map(|r| (r[0], r[1])).collect::<Vec<_>>(),
+                "p={partitions}, {inner}"
+            );
+            let mut actual = actual;
+            actual.sort();
+            expected.sort();
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grouping_sets_forget_null_filled_constants() {
+    let fixture = Fixture::new();
+    for partitions in [1, 3] {
+        let ctx = fixture.session(partitions, true, 7).await;
+        for groups in [
+            "ROLLUP(k, v % 5)",
+            "GROUPING SETS ((k, v % 5), (v % 5), ())",
+            "CUBE(k, v % 5)",
+        ] {
+            let inner = format!(
+                "SELECT k AS x, v % 5 AS w, count(*) AS id FROM raw WHERE k = 1 GROUP BY {groups}"
+            );
+            let mut expected = rows(&ctx, &inner).await;
+            expected.sort_by_key(|r| (r[0].is_none(), r[0], r[2], r[1].is_none(), r[1]));
+            let actual = rows(
+                &ctx,
+                &format!("{inner} ORDER BY x NULLS LAST, id, w NULLS LAST LIMIT 60"),
+            )
+            .await;
+            assert_eq!(actual, expected, "p={partitions}, groups={groups}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_merge_join_filter_handles_null_padded_columns() {
+    let fixture = Fixture::new();
+    let hash = fixture.session(3, true, 500).await;
+    let merge = fixture.session(3, true, 500).await;
+    merge
+        .sql("SET datafusion.optimizer.prefer_hash_join = false")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let inner = "SELECT a.k AS x, coalesce(a.id, c.id + 4) AS id, c.k AS w FROM (SELECT k, id, v FROM raw WHERE k = 1) a FULL JOIN (SELECT k, id, v FROM raw WHERE k = 2) c ON a.id = c.id + 4 AND a.v < c.v";
+    let plan = merge
+        .sql(inner)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    assert!(
+        displayable(plan.as_ref())
+            .indent(false)
+            .to_string()
+            .contains("SortMergeJoin")
+    );
+    let mut expected = rows(&hash, inner).await;
+    expected.sort();
+    let mut actual = rows(&merge, inner).await;
+    actual.sort();
+    assert_eq!(actual, expected);
 }

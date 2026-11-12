@@ -719,15 +719,9 @@ impl DataSource for FileScanConfig {
         // units offered by eligible readers after pruning.
         let shared_work_source = sibling_state
             .as_ref()
-            // Honor session configuration even if sibling state was previously
-            // initialized while work sharing was enabled.
-            .filter(|_| {
-                context
-                    .session_config()
-                    .options()
-                    .execution
-                    .enable_file_stream_work_stealing
-            })
+            // The execution's queue owns the files once initialized. Every
+            // partition must claim from that same queue, even when task
+            // contexts differ; falling back to local groups duplicates work.
             .and_then(|state| state.downcast_ref::<SharedWorkSource>())
             .cloned();
 

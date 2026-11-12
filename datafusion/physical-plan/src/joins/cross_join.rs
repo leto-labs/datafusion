@@ -163,7 +163,6 @@ impl CrossJoinExec {
             &JoinType::Inner,
             schema,
             &[false, false],
-            None,
             &[],
         )?;
 
@@ -376,7 +375,9 @@ impl ExecutionPlan for CrossJoinExec {
             context.session_config().enforce_batch_size_in_joins();
 
         let left_fut = self.left_fut.try_once(|| {
-            let left_stream = self.left.execute(0, context)?;
+            let left_stream = self
+                .left
+                .execute(0, context.with_partition_independence(false))?;
 
             Ok(load_left_input(
                 left_stream,

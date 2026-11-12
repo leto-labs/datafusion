@@ -1064,7 +1064,6 @@ impl HashJoinExec {
             &join_type,
             Arc::clone(schema),
             &Self::maintains_input_order(join_type),
-            Some(Self::probe_side()),
             on,
         )?;
 
@@ -1490,9 +1489,11 @@ impl ExecutionPlan for HashJoinExec {
             .flatten()
             .flatten();
 
+        // Building consumes its input before any probe output is emitted.
+        let build_context = context.with_partition_independence(false);
         let left_fut = match self.mode {
             PartitionMode::CollectLeft => self.left_fut.try_once(|| {
-                let left_stream = self.left.execute(0, Arc::clone(&context))?;
+                let left_stream = self.left.execute(0, Arc::clone(&build_context))?;
 
                 let reservation =
                     MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
@@ -1513,7 +1514,8 @@ impl ExecutionPlan for HashJoinExec {
                 ))
             })?,
             PartitionMode::Partitioned => {
-                let left_stream = self.left.execute(partition, Arc::clone(&context))?;
+                let left_stream =
+                    self.left.execute(partition, Arc::clone(&build_context))?;
 
                 let reservation =
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))

@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -431,7 +433,6 @@ impl PiecewiseMergeJoinExec {
             &join_type,
             schema,
             &Self::maintains_input_order(join_type),
-            Some(Self::probe_side(&join_type)),
             std::slice::from_ref(join_on),
         )?;
 

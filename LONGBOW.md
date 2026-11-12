@@ -245,12 +245,18 @@ requiring independent partitions. FileScanConfig suppresses waiting for future s
 while this requirement reaches the scan. Planned files and already published
 units remain shareable. An actual SortExec consumes or closes
 its input before emitting, and clears the requirement before executing that
-input. A pass-through sort retains it. Thus ordinary sorted aggregation/TopK
+input. Scalar aggregates, unordered final/single aggregates without soft
+limits, and hash/cross-join build inputs also clear it because they finish
+consuming before output. Partial aggregation can flush early and retains the
+requirement. A pass-through sort retains it. Thus ordinary sorted aggregation/TopK
 plans retain scan donation; a direct merge over streaming scans cannot await a
 buffered sibling's publication. The session work-sharing setting is unchanged.
 Task-context scoping retains runtime, function registries, identities and session
-extensions, including the attempt task scope. File scans honor the scoped
-requirement even if sibling state already exists. Native counters distinguish
+extensions, including the attempt task scope. All scan partitions claim from the
+execution's initialized shared queue, even under differing task contexts. A
+per-context fallback to local file groups would duplicate queue-owned files.
+The scoped independence requirement changes only idle publication waits; it
+does not detach a partition from the queue. Native counters distinguish
 sharing enabled from publication waits suppressed by the consumer.
 
 A scan's declared output ordering always protects file order and Parquet limit
@@ -270,3 +276,14 @@ the Longbow consumer includes the same file in its stock_ordering integration
 test so its pinned Arrow/DataFusion dependency graph runs these regressions.
 The SO1 consumer report records the before/after evidence, upstream status,
 expanded differential harness and validation gates.
+
+The review follow-up removes lexicographic build-order suffixes from join
+properties. Repeated probe sort keys can restart build-key order for each probe
+row; only the maintained input order is established. The obsolete probe-side
+argument of join_equivalence_properties is removed from all callers.
+Grouping-set expansion starts with fresh equivalence/ordering/constraint facts
+and unknown partitioning, following Apache main's grouping-set properties.
+It can NULL-fill keys or duplicate sets, so ordinary projection rules do not
+apply. Deferred sort-merge filters use a schema that permits NULLs on the
+buffered side, also matching Apache main. Portable Parquet regressions cover
+these cases and mixed scan contexts; their query guard is 120 seconds.

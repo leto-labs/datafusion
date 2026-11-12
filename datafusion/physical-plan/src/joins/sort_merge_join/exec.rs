@@ -299,7 +299,6 @@ impl SortMergeJoinExec {
             &join_type,
             schema,
             &Self::maintains_input_order(join_type),
-            Some(Self::probe_side(&join_type)),
             join_on,
         )?;
 

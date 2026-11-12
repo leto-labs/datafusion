@@ -377,7 +377,6 @@ impl NestedLoopJoinExec {
             &join_type,
             Arc::clone(schema),
             &Self::maintains_input_order(join_type),
-            None,
             // No on columns in nested loop join
             &[],
         )?;
