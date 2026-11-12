@@ -21,6 +21,49 @@ use super::*;
 use crate::expressions::{Column, lit};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
+/// Exercise physical expressions with nonzero array offsets and enough columns
+/// to take the contiguous-comparison branch even at low selectivity.
+fn batch_layouts(batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+    let mut columns = batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(field, array)| (field.name().clone(), Arc::clone(array)))
+        .collect::<Vec<_>>();
+    for i in 0..30 {
+        columns.push((format!("unused_{i}"), Arc::clone(batch.column(1))));
+    }
+    let wide = RecordBatch::try_from_iter(columns)?;
+    let offset = batch.num_rows().min(7);
+    let len = batch.num_rows() - offset;
+    Ok(vec![
+        batch.clone(),
+        batch.slice(offset, len),
+        wide.clone(),
+        wide.slice(offset, len),
+    ])
+}
+
+#[test]
+fn scatter_rejects_wrong_rhs_length() {
+    let mask = BooleanArray::from((0..100).map(|i| i % 10 == 7).collect::<Vec<_>>());
+    for len in [0, 5, 9, 11, 100] {
+        let right = BooleanArray::from(vec![true; len]);
+        for fill in [false, true] {
+            let error = pre_selection_scatter(&mask, Some(&right), fill).unwrap_err();
+            assert!(matches!(
+                error,
+                datafusion_common::DataFusionError::Internal(_)
+            ));
+            assert!(
+                error.to_string().contains("expected 10 RHS rows"),
+                "{error}"
+            );
+        }
+    }
+}
+
 #[test]
 fn scatter_matches_row_reference() -> Result<()> {
     let mut rng = StdRng::seed_from_u64(0x00f2_2026_1111);
@@ -153,39 +196,43 @@ fn primitive_comparison_filters_match_kleene() -> Result<()> {
                 ("numbers", Arc::new(numbers) as ArrayRef),
                 ("other", Arc::new(other) as ArrayRef),
             ])?;
-            for comparison in [
-                Operator::Eq,
-                Operator::NotEq,
-                Operator::Lt,
-                Operator::LtEq,
-                Operator::Gt,
-                Operator::GtEq,
-            ] {
-                for operand in [
-                    lit(ScalarValue::Int32(Some(3))),
-                    lit(ScalarValue::Int32(None)),
-                    Arc::new(Column::new("other", 2)) as Arc<dyn PhysicalExpr>,
+            for batch in batch_layouts(&batch)? {
+                let len = batch.num_rows();
+                let left = batch.column(0).as_boolean();
+                for comparison in [
+                    Operator::Eq,
+                    Operator::NotEq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
                 ] {
-                    let rhs = Arc::new(BinaryExpr::new(
-                        Arc::new(Column::new("numbers", 1)),
-                        comparison,
-                        operand,
-                    ));
-                    let right = rhs.evaluate(&batch)?.into_array(len)?;
-                    for op in [Operator::And, Operator::Or] {
-                        let expected = if op == Operator::And {
-                            and_kleene(&left, right.as_boolean())?
-                        } else {
-                            or_kleene(&left, right.as_boolean())?
-                        };
-                        let actual = BinaryExpr::new(
-                            Arc::new(Column::new("left", 0)),
-                            op,
-                            Arc::<BinaryExpr>::clone(&rhs),
-                        )
-                        .evaluate(&batch)?
-                        .into_array(len)?;
-                        assert_eq!(actual.as_boolean(), &expected);
+                    for operand in [
+                        lit(ScalarValue::Int32(Some(3))),
+                        lit(ScalarValue::Int32(None)),
+                        Arc::new(Column::new("other", 2)) as Arc<dyn PhysicalExpr>,
+                    ] {
+                        let rhs = Arc::new(BinaryExpr::new(
+                            Arc::new(Column::new("numbers", 1)),
+                            comparison,
+                            operand,
+                        ));
+                        let right = rhs.evaluate(&batch)?.into_array(len)?;
+                        for op in [Operator::And, Operator::Or] {
+                            let expected = if op == Operator::And {
+                                and_kleene(left, right.as_boolean())?
+                            } else {
+                                or_kleene(left, right.as_boolean())?
+                            };
+                            let actual = BinaryExpr::new(
+                                Arc::new(Column::new("left", 0)),
+                                op,
+                                Arc::<BinaryExpr>::clone(&rhs),
+                            )
+                            .evaluate(&batch)?
+                            .into_array(len)?;
+                            assert_eq!(actual.as_boolean(), &expected);
+                        }
                     }
                 }
             }
@@ -241,6 +288,67 @@ fn primitive_edge_values_match_full_evaluation() -> Result<()> {
             ScalarValue::Date32(Some(0)),
         ),
     ];
+    let mut cases = cases;
+    cases.extend([
+        (
+            Arc::new(Float32Array::from(
+                (0..70)
+                    .map(|i| floats[i % floats.len()].map(|v| v as f32))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            ScalarValue::Float32(Some(-0.0)),
+        ),
+        (
+            Arc::new(
+                Decimal128Array::from(
+                    (0..70)
+                        .map(|i| {
+                            decimals[i % decimals.len()]
+                                .map(|v| i128::from(v) * 1_000_000_007)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .with_precision_and_scale(38, 10)?,
+            ),
+            ScalarValue::Decimal128(Some(0), 38, 10),
+        ),
+        (
+            Arc::new(UInt64Array::from(
+                (0..70)
+                    .map(|i| [Some(0), Some(1), Some(u64::MAX), None][i % 4])
+                    .collect::<Vec<_>>(),
+            )),
+            ScalarValue::UInt64(Some(1)),
+        ),
+        (
+            Arc::new(
+                TimestampNanosecondArray::from(
+                    (0..70)
+                        .map(|i| [Some(i64::MIN), Some(0), Some(i64::MAX), None][i % 4])
+                        .collect::<Vec<_>>(),
+                )
+                .with_timezone("+05:00"),
+            ),
+            ScalarValue::TimestampNanosecond(Some(0), Some("+05:00".into())),
+        ),
+        (
+            Arc::new(DurationMicrosecondArray::from(
+                (0..70)
+                    .map(|i| {
+                        [
+                            Some(i64::MIN),
+                            Some(-1),
+                            Some(0),
+                            Some(1),
+                            Some(i64::MAX),
+                            None,
+                        ][i % 6]
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            ScalarValue::DurationMicrosecond(Some(0)),
+        ),
+    ]);
     for (numbers, scalar) in cases {
         for op in [Operator::And, Operator::Or] {
             let left = BooleanArray::from(
@@ -252,71 +360,234 @@ fn primitive_edge_values_match_full_evaluation() -> Result<()> {
                 ("left", Arc::new(left.clone()) as ArrayRef),
                 ("numbers", Arc::clone(&numbers)),
             ])?;
-            for comparison in [
-                Operator::Eq,
-                Operator::NotEq,
-                Operator::Lt,
-                Operator::LtEq,
-                Operator::Gt,
-                Operator::GtEq,
-            ] {
-                let rhs = Arc::new(BinaryExpr::new(
-                    Arc::new(Column::new("numbers", 1)),
-                    comparison,
-                    lit(scalar.clone()),
-                ));
-                let right = rhs.evaluate(&batch)?.into_array(70)?;
-                let expected = if op == Operator::And {
-                    and_kleene(&left, right.as_boolean())?
-                } else {
-                    or_kleene(&left, right.as_boolean())?
-                };
-                let actual = BinaryExpr::new(Arc::new(Column::new("left", 0)), op, rhs)
-                    .evaluate(&batch)?
-                    .into_array(70)?;
-                assert_eq!(actual.as_boolean(), &expected);
+            for batch in batch_layouts(&batch)? {
+                let len = batch.num_rows();
+                let left = batch.column(0).as_boolean();
+                for scalar in
+                    [scalar.clone(), ScalarValue::try_from(numbers.data_type())?]
+                {
+                    for comparison in [
+                        Operator::Eq,
+                        Operator::NotEq,
+                        Operator::Lt,
+                        Operator::LtEq,
+                        Operator::Gt,
+                        Operator::GtEq,
+                    ] {
+                        let rhs = Arc::new(BinaryExpr::new(
+                            Arc::new(Column::new("numbers", 1)),
+                            comparison,
+                            lit(scalar.clone()),
+                        ));
+                        let right = rhs.evaluate(&batch)?.into_array(len)?;
+                        let expected = if op == Operator::And {
+                            and_kleene(left, right.as_boolean())?
+                        } else {
+                            or_kleene(left, right.as_boolean())?
+                        };
+                        let actual =
+                            BinaryExpr::new(Arc::new(Column::new("left", 0)), op, rhs)
+                                .evaluate(&batch)?
+                                .into_array(len)?;
+                        assert_eq!(actual.as_boolean(), &expected);
+                    }
+                }
             }
         }
     }
     Ok(())
 }
 
+fn fallible_rhs_cases(
+    batch: &RecordBatch,
+) -> Result<Vec<(&'static str, Arc<dyn PhysicalExpr>)>> {
+    use crate::expressions::cast::cast as cast_expr;
+    let col = |name, index| Arc::new(Column::new(name, index)) as Arc<dyn PhysicalExpr>;
+    let one = || lit(ScalarValue::Int32(Some(1)));
+    let bin = |left: Arc<dyn PhysicalExpr>, op, right: Arc<dyn PhysicalExpr>| {
+        Arc::new(BinaryExpr::new(left, op, right)) as Arc<dyn PhysicalExpr>
+    };
+    let division = || bin(one(), Operator::Divide, col("divisor", 1));
+    let checked_add = Arc::new(
+        BinaryExpr::new(col("big", 3), Operator::Plus, one()).with_fail_on_overflow(true),
+    );
+    Ok(vec![
+        ("division-left", bin(division(), Operator::Eq, one())),
+        ("division-right", bin(one(), Operator::Eq, division())),
+        (
+            "cast-left",
+            bin(
+                cast_expr(col("text", 2), &batch.schema(), DataType::Int32)?,
+                Operator::Eq,
+                one(),
+            ),
+        ),
+        (
+            "cast-right",
+            bin(
+                one(),
+                Operator::Eq,
+                cast_expr(col("text", 2), &batch.schema(), DataType::Int32)?,
+            ),
+        ),
+        ("checked-add", bin(checked_add, Operator::Eq, one())),
+        (
+            "nested-and",
+            bin(
+                lit(ScalarValue::Boolean(Some(true))),
+                Operator::And,
+                bin(division(), Operator::Eq, one()),
+            ),
+        ),
+        (
+            "nested-or",
+            bin(
+                lit(ScalarValue::Boolean(Some(false))),
+                Operator::Or,
+                bin(division(), Operator::Eq, one()),
+            ),
+        ),
+    ])
+}
+
 #[test]
-fn short_circuit_keeps_division_errors_suppressed() -> Result<()> {
+fn full_comparison_guard_rejects_indirect_or_nonprimitive_operands() -> Result<()> {
+    use crate::expressions::cast::cast as cast_expr;
+    use crate::scalar_function::ScalarFunctionExpr;
+    use datafusion_common::config::ConfigOptions;
+    use datafusion_expr::{Volatility, create_udf};
+    let values = Arc::new(Int32Array::from(vec![1; 100])) as ArrayRef;
+    let dictionary = DictionaryArray::<Int32Type>::try_new(
+        Int32Array::from(vec![0; 100]),
+        Arc::clone(&values),
+    )?;
+    let batch = RecordBatch::try_from_iter([
+        ("n", values),
+        ("dict", Arc::new(dictionary) as ArrayRef),
+        (
+            "text",
+            Arc::new(StringArray::from(vec!["1"; 100])) as ArrayRef,
+        ),
+        (
+            "big",
+            Arc::new(Int32Array::from(vec![i32::MAX; 100])) as ArrayRef,
+        ),
+    ])?;
+    let col = || Arc::new(Column::new("n", 0)) as Arc<dyn PhysicalExpr>;
+    let one = || lit(ScalarValue::Int32(Some(1)));
+    let compare = |left: Arc<dyn PhysicalExpr>, right: Arc<dyn PhysicalExpr>| {
+        Arc::new(BinaryExpr::new(left, Operator::Eq, right)) as Arc<dyn PhysicalExpr>
+    };
+    let direct = compare(col(), one());
+    assert!(cheap_comparison::prefer_full_comparison(
+        direct.as_ref(),
+        &batch,
+        10
+    ));
+    let udf = Arc::new(ScalarFunctionExpr::new(
+        "f2_guard_identity",
+        Arc::new(create_udf(
+            "f2_guard_identity",
+            vec![DataType::Int32],
+            DataType::Int32,
+            Volatility::Immutable,
+            Arc::new(|args| Ok(args[0].clone())),
+        )),
+        vec![col()],
+        Arc::new(Field::new("result", DataType::Int32, true)),
+        Arc::new(ConfigOptions::default()),
+    )) as Arc<dyn PhysicalExpr>;
+    let dictionary = compare(
+        Arc::new(Column::new("dict", 1)),
+        Arc::new(Column::new("dict", 1)),
+    );
+    let mut cases = fallible_rhs_cases(&batch)?;
+    cases.extend([
+        (
+            "cast-numeric-left",
+            compare(
+                cast_expr(col(), &batch.schema(), DataType::Int64)?,
+                lit(ScalarValue::Int64(Some(1))),
+            ),
+        ),
+        (
+            "cast-numeric-right",
+            compare(
+                lit(ScalarValue::Int64(Some(1))),
+                cast_expr(col(), &batch.schema(), DataType::Int64)?,
+            ),
+        ),
+        ("udf-left", compare(Arc::clone(&udf), one())),
+        ("udf-right", compare(one(), udf)),
+        ("dictionary", dictionary),
+    ]);
+    for batch in batch_layouts(&batch)? {
+        for (name, rhs) in &cases {
+            assert!(
+                !cheap_comparison::prefer_full_comparison(rhs.as_ref(), &batch, 10),
+                "{name}, columns={}",
+                batch.num_columns()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn short_circuit_keeps_fallible_rhs_errors_suppressed() -> Result<()> {
     for op in [Operator::And, Operator::Or] {
+        let selected = |i: usize| i % 10 == 7;
+        let left = BooleanArray::from(
+            (0..100)
+                .map(|i| selected(i) ^ (op == Operator::Or))
+                .collect::<Vec<_>>(),
+        );
         let batch = RecordBatch::try_from_iter([
+            ("left", Arc::new(left) as ArrayRef),
             (
-                "left",
-                Arc::new(BooleanArray::from(
+                "divisor",
+                Arc::new(Int32Array::from(
+                    (0..100).map(|i| i32::from(selected(i))).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ),
+            (
+                "text",
+                Arc::new(StringArray::from(
                     (0..100)
-                        .map(|i| (i % 10 == 7) ^ (op == Operator::Or))
+                        .map(|i| if selected(i) { "1" } else { "not-a-number" })
                         .collect::<Vec<_>>(),
                 )) as ArrayRef,
             ),
             (
-                "divisor",
+                "big",
                 Arc::new(Int32Array::from(
-                    (0..100).map(|i| i32::from(i % 10 == 7)).collect::<Vec<_>>(),
+                    (0..100)
+                        .map(|i| if selected(i) { 0 } else { i32::MAX })
+                        .collect::<Vec<_>>(),
                 )) as ArrayRef,
             ),
         ])?;
-        let division = Arc::new(BinaryExpr::new(
-            lit(ScalarValue::Int32(Some(1))),
-            Operator::Divide,
-            Arc::new(Column::new("divisor", 1)),
-        ));
-        let rhs = Arc::new(BinaryExpr::new(
-            division,
-            Operator::Eq,
-            lit(ScalarValue::Int32(Some(1))),
-        ));
-        assert!(rhs.evaluate(&batch).is_err());
-        let expr = BinaryExpr::new(Arc::new(Column::new("left", 0)), op, rhs);
-        let actual = expr.evaluate(&batch)?.into_array(100)?;
-        assert_eq!(
-            actual.as_boolean().true_count(),
-            if op == Operator::And { 10 } else { 100 }
-        );
+        for batch in batch_layouts(&batch)? {
+            let len = batch.num_rows();
+            let left = batch.column(0).as_boolean();
+            for (name, rhs) in fallible_rhs_cases(&batch)? {
+                assert!(rhs.evaluate(&batch).is_err(), "{name}: full RHS must fail");
+                let expected = if op == Operator::And {
+                    left.clone()
+                } else {
+                    BooleanArray::from(vec![true; len])
+                };
+                let actual = BinaryExpr::new(Arc::new(Column::new("left", 0)), op, rhs)
+                    .evaluate(&batch)?
+                    .into_array(len)?;
+                assert_eq!(
+                    actual.as_boolean(),
+                    &expected,
+                    "{name} {op}, columns={}",
+                    batch.num_columns()
+                );
+            }
+        }
     }
     Ok(())
 }

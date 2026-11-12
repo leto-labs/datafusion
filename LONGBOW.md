@@ -76,7 +76,11 @@ The type guard admits only comparisons of matching primitive columns/literals.
 Casts, arithmetic, functions, and unknown expressions keep their existing
 evaluation path and error suppression. No predicate reordering occurs. Native
 differential regressions cover sliced bitmaps, NULLs, Kleene logic, floating
-edge values, decimals, dates, and division errors on rejected rows.
+edge values, decimals, dates, timestamps with time zones, unsigned integers,
+Durations, and fallible casts/arithmetic on rejected rows. Direct guard tests
+reject indirect operands and dictionary columns on narrow, wide, and sliced
+batches. Scatter returns an internal error if the RHS length differs from the
+number of selected rows, including in release builds.
 
 ## Family SVC: short string-view constants
 

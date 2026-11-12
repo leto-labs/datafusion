@@ -41,7 +41,13 @@ pub(super) fn pre_selection_scatter(
             Some(NullBuffer::new(valid)),
         ))));
     };
-    debug_assert_eq!(right.len(), mask.true_count());
+    let selected_rows = mask.true_count();
+    if right.len() != selected_rows {
+        return internal_err!(
+            "Short-circuit scatter expected {selected_rows} RHS rows, got {}",
+            right.len()
+        );
+    }
     let mut values = BooleanBufferBuilder::new(mask.len());
     values.append_n(mask.len(), fill_value);
     let nulls = if right.null_count() == 0 {
