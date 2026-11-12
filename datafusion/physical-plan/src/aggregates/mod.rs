@@ -129,8 +129,8 @@
 //!
 //! ## 5. Partial-reduce hash aggregation
 //!
-//! This implementation will not be planned by DataFusion SQL interface, it must be
-//! manually constructed at [`ExecutionPlan`] level.
+//! This mode merges partial aggregate states. Chained grouping sets construct it
+//! internally; other uses can construct it at [`ExecutionPlan`] level.
 //!
 //! This mode is useful in a distributed setting.
 //!
@@ -142,6 +142,16 @@
 //! stream types above. It is being incrementally migrated to separate streams.
 //!
 //! See the issue for details: <https://github.com/apache/datafusion/issues/22710>
+//!
+//! ## 7. Chained grouping sets
+//!
+//! Unordered, unlimited grouping sets of built-in SUM, COUNT, MIN, MAX and AVG
+//! compute maximal requested sets from raw rows once per partition, then derive
+//! each coarser set from its smallest containing computed set. Native partial
+//! states preserve AVG sum/count and empty-input semantics. Retained state owns
+//! a memory reservation or spill file. Group IDs distinguish rolled-up NULLs,
+//! data NULLs and duplicate set ordinals. Group-only aggregates, DISTINCT, ordered/volatile expressions
+//! and unsupported aggregates retain the normal expanding implementation.
 #![expect(rustdoc::private_intra_doc_links)]
 
 use std::borrow::Cow;
@@ -209,6 +219,7 @@ use topk::heap::is_supported_heap_type;
 mod aggregate_hash_table;
 mod aggregate_stream;
 mod bounded_partial;
+mod chained_grouping_sets;
 pub mod group_values;
 mod grouped_hash_stream;
 mod grouped_topk_stream;
@@ -2126,6 +2137,11 @@ impl ExecutionPlan for AggregateExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        if let Some(stream) =
+            chained_grouping_sets::execute(self, partition, Arc::clone(&context))?
+        {
+            return Ok(stream);
+        }
         self.execute_typed(partition, &context)
             .map(|stream| stream.into())
     }
@@ -3138,6 +3154,9 @@ pub fn evaluate_group_by(
 }
 
 #[cfg(test)]
+mod chained_grouping_sets_tests;
+
+#[cfg(test)]
 mod tests {
     use std::task::{Context, Poll};
 
@@ -3412,8 +3431,20 @@ mod tests {
             Arc::clone(&input_schema),
         )?);
 
-        let result =
-            collect(partial_aggregate.execute(0, Arc::clone(&task_ctx))?).await?;
+        let partial_stream = if spill {
+            // This 500-byte snapshot tests legacy partial early emission,
+            // including deliberately incomplete groups. A chained aggregate
+            // completes its partial states and needs a merge's working memory.
+            // The final-result check below still uses the native dispatcher.
+            Box::pin(GroupedHashAggregateStream::new(
+                &partial_aggregate,
+                &task_ctx,
+                0,
+            )?) as SendableRecordBatchStream
+        } else {
+            partial_aggregate.execute(0, Arc::clone(&task_ctx))?
+        };
+        let result = collect(partial_stream).await?;
 
         if spill {
             // In spill mode, we test with the limited memory, if the mem usage exceeds,

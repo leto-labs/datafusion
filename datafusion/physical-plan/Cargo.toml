@@ -1,3 +1,5 @@
+# Modified by the Longbow authors; see third_party/README.md.
+
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -71,6 +73,7 @@ datafusion-common-runtime = { workspace = true, default-features = true }
 datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-functions = { workspace = true }
+datafusion-functions-aggregate = { workspace = true }
 datafusion-functions-aggregate-common = { workspace = true }
 datafusion-functions-window-common = { workspace = true }
 datafusion-physical-expr = { workspace = true, default-features = true }
@@ -93,7 +96,6 @@ tokio = { workspace = true }
 [dev-dependencies]
 arrow-data = { workspace = true }
 criterion = { workspace = true, features = ["async_futures"] }
-datafusion-functions-aggregate = { workspace = true }
 datafusion-functions-window = { workspace = true }
 insta = { workspace = true }
 rand = { workspace = true }
