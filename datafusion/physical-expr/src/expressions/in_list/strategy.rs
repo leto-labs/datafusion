@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -35,6 +37,7 @@ use super::branchless_filter::{
     BranchlessFilter, BranchlessFilterType, BranchlessNative,
 };
 use super::primitive_filter::*;
+use super::short_string_filter::ShortStringFilter;
 use super::static_filter::StaticFilter;
 
 type StaticFilterRef = Arc<dyn StaticFilter + Send + Sync>;
@@ -44,6 +47,10 @@ pub(super) fn instantiate_static_filter(in_array: ArrayRef) -> Result<StaticFilt
 
     if let Some(filter) = instantiate_branchless_filter(&in_array)? {
         return Ok(filter);
+    }
+
+    if let Some(filter) = ShortStringFilter::try_new(in_array.as_ref()) {
+        return Ok(Arc::new(filter));
     }
 
     instantiate_standard_filter(in_array)

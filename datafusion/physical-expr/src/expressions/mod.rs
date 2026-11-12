@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -33,6 +35,7 @@ mod literal;
 mod negative;
 mod no_op;
 mod not;
+mod short_string;
 mod try_cast;
 mod unknown_column;
 

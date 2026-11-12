@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -40,6 +42,7 @@ mod array_static_filter;
 mod branchless_filter;
 mod primitive_filter;
 mod result;
+mod short_string_filter;
 mod static_filter;
 mod strategy;
 

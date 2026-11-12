@@ -77,3 +77,17 @@ Casts, arithmetic, functions, and unknown expressions keep their existing
 evaluation path and error suppression. No predicate reordering occurs. Native
 differential regressions cover sliced bitmaps, NULLs, Kleene logic, floating
 edge values, decimals, dates, and division errors on rejected rows.
+
+## Family SVC: short string-view constants
+
+Purpose: compare inline string-view constants as exact view words, and use
+fixed comparison chains for short static string IN lists. Dependent Longbow
+feature: STATIC-FILTER-EVALUATION. Audit classification: UPSTREAMABLE.
+
+The scalar path handles equality and inequality with non-null Utf8View
+constants of at most twelve bytes. The IN strategy handles up to two non-null
+inline Utf8View constants, including dictionary inputs, with the existing
+NULL/NOT IN result builder. Utf8/LargeUtf8 inputs, longer constants/lists,
+and other types keep the general
+strategies. Native tests compare with Arrow and the generic static filter;
+the ignored short-string kernel screen runs two ABBA pairs in one process.
