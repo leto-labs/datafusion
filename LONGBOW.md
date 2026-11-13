@@ -327,3 +327,12 @@ external buffer reference. A forced-hash-collision fixture reproduces the old
 panic between an inline key and a long key. Complete byte equality, payload
 callbacks and insertion order stay unchanged. Feature: CORE-AGGREGATION.
 Classification: UPSTREAMABLE.
+
+## Family GD: per-group primitive distinct sets
+
+Purpose: hash distinct values in per-group tables without repeating the group
+index in every entry. Singleton groups keep their one value inline. State
+emission and prefix removal retain NULL/filter semantics and group identities.
+Dependent feature: GROUPED-DISTINCT-COUNT. Classification: UPSTREAMABLE.
+Allocation deltas keep size queries constant-time; only emitted sets are visited
+when releasing their tracked bytes.
