@@ -336,3 +336,11 @@ emission and prefix removal retain NULL/filter semantics and group identities.
 Dependent feature: GROUPED-DISTINCT-COUNT. Classification: UPSTREAMABLE.
 Allocation deltas keep size queries constant-time; only emitted sets are visited
 when releasing their tracked bytes.
+
+## Family IC: bounded inline grouping cache
+
+Purpose: reuse complete short-string grouping keys and their assigned group IDs
+for one- and two-column groups. Misses use the native interner, long strings keep
+its ordinary path, and cardinality above 16,384 releases and disables the cache.
+Prefix emission and clear invalidate all cached IDs. Dependent feature:
+CORE-AGGREGATION. Classification: UPSTREAMABLE.
