@@ -319,3 +319,11 @@ Extend AC's primitive reset fix to the string-view interner. Clearing the map
 also resets its group counter, so its next group's identity is zero and its
 length and emitted arrays agree. A native NULL/reuse regression fails before
 this correction. Feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
+
+## Family VM: byte-view collision layout validation
+
+Purpose: check length before interpreting a same-prefix colliding view as an
+external buffer reference. A forced-hash-collision fixture reproduces the old
+panic between an inline key and a long key. Complete byte equality, payload
+callbacks and insertion order stay unchanged. Feature: CORE-AGGREGATION.
+Classification: UPSTREAMABLE.
