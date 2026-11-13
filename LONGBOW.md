@@ -424,3 +424,13 @@ indices into empty columns and can panic. The vector operation buffers clear
 with those structures. Native regressions cover both streaming modes, prefix
 emission, full emission, NULL keys, complete key equality and reuse.
 Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
+
+## Family HC: reuse hash bucket candidate views during collection
+
+Purpose: avoid repeated hash-table probes for a batch's recurring grouping
+hashes. A 64-slot local cache retains the complete hash and its candidate view.
+Candidate views stay stable during collection. The following vector equality
+phase still checks complete keys, including colliding hashes. No cached view
+survives the method call. Native group tests cover collisions, NULLs, prefix
+emission, full emission and reuse in both streaming modes.
+Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.

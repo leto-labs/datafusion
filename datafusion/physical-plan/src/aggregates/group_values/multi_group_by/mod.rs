@@ -534,12 +534,28 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             .equal_to_group_indices
             .clear();
 
+        // A bucket's candidate view is stable during this collection phase.
+        // This caches only hash lookup. The later vectorized equality phase
+        // still checks every complete key, including hash collisions.
+        let mut recent: [Option<(u64, GroupIndexView)>; 64] = [None; 64];
         for (row, &target_hash) in batch_hashes.iter().enumerate() {
-            let entry = self
-                .map
-                .find(target_hash, |(exist_hash, _)| target_hash == *exist_hash);
+            let slot = target_hash as usize & (recent.len() - 1);
+            let entry = if let Some((hash, view)) = recent[slot]
+                && hash == target_hash
+            {
+                Some(view)
+            } else {
+                let entry = self
+                    .map
+                    .find(target_hash, |(exist_hash, _)| target_hash == *exist_hash)
+                    .map(|(_, view)| *view);
+                if let Some(view) = entry {
+                    recent[slot] = Some((target_hash, view));
+                }
+                entry
+            };
 
-            let Some((_, group_index_view)) = entry else {
+            let Some(group_index_view) = entry else {
                 // 1. Bucket not found case
                 // Build `new inlined group index view`
                 let current_group_idx = self.group_values[0].len()
@@ -554,6 +570,8 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                     |(hash, _)| *hash,
                     &mut self.map_size,
                 );
+
+                recent[slot] = Some((target_hash, group_index_view));
 
                 // Add row index to `vectorized_append_row_indices`
                 self.vectorized_operation_buffers
