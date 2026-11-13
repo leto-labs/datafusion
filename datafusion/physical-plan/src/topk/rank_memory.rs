@@ -223,6 +223,20 @@ fn visit_children(
 /// Include both per child; their payload buffers remain deduplicated separately.
 fn child_metadata(array: &dyn Array) -> Result<usize> {
     let mut bytes = 0;
+    if let DataType::Union(fields, _) = array.data_type() {
+        // UnionArray indexes its Option<ArrayRef> table by type id. The
+        // child visitor covers occupied slots; holes still own table storage.
+        let slots = fields.iter().try_fold(0, |n, (id, _)| -> Result<usize> {
+            let id = usize::try_from(id).map_err(|_| {
+                resources_datafusion_err!("PartitionedTopKRank negative union child id")
+            })?;
+            Ok(n.max(add(id, 1)?))
+        })?;
+        bytes = mul(
+            slots.saturating_sub(fields.len()),
+            size_of::<Option<ArrayRef>>(),
+        )?;
+    }
     visit_children(array, &mut |child| {
         bytes = add(
             bytes,

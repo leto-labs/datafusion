@@ -96,7 +96,9 @@ arrays are visited directly; shared descriptor lists are scanned once per
 accounting pass. Buffer ownership bookkeeping remains conservatively charged.
 A many-buffer StringView regression covers shared descriptor lists. Nested
 payload metadata also includes child reference vectors and Arc headers, with
-a null-child struct regression covering the lower bound.
+a null-child struct regression covering the lower bound. Sparse-union
+metadata includes unoccupied type-id-indexed child slots; a type-id-127
+regression checks their retained-size lower bound.
 
 
 

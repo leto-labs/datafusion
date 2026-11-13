@@ -569,3 +569,34 @@ fn rank_nested_payload_metadata_covers_child_references_and_owners() -> Result<(
     );
     Ok(())
 }
+
+#[test]
+fn rank_sparse_union_metadata_covers_unoccupied_child_slots() -> Result<()> {
+    use arrow::array::{NullArray, UnionArray};
+    use arrow::datatypes::UnionFields;
+    use datafusion_common::utils::memory::RecordBatchMemoryCounter;
+    // Arrow 59.3.2 indexes its child reference table by the union type id.
+    // One child at id 127 therefore owns 128 slots, not one slot.
+    let fields = UnionFields::try_new([127], [Field::new("only", DataType::Null, true)])?;
+    let array = UnionArray::try_new(
+        fields,
+        vec![127_i8].into(),
+        None,
+        vec![Arc::new(NullArray::new(1))],
+    )?;
+    let batch = RecordBatch::try_from_iter([("payload", Arc::new(array) as ArrayRef)])?;
+    let mut buffers = RecordBatchMemoryCounter::new();
+    buffers.count_batch(&batch);
+    let lower_bound = buffers.memory_usage()
+        + size_of::<RecordBatch>()
+        + size_of::<ArrayRef>()
+        + size_of::<UnionArray>()
+        + 2 * size_of::<usize>()
+        + 128 * size_of::<Option<ArrayRef>>()
+        + size_of::<NullArray>()
+        + 2 * size_of::<usize>();
+    let charged = rank_memory::batch_bytes(&batch);
+    println!("sparse union metadata lower bound={lower_bound}, charge={charged}");
+    assert!(charged >= lower_bound, "union child table undercharged");
+    Ok(())
+}
