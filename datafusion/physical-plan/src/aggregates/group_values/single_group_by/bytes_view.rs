@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -58,7 +60,6 @@ impl GroupValues for GroupValuesBytesView {
             arr,
             // called for each new group
             |_value| {
-                // assign new group index on each insert
                 let group_idx = self.num_groups;
                 self.num_groups += 1;
                 group_idx
@@ -126,5 +127,32 @@ impl GroupValues for GroupValuesBytesView {
         // in theory we could potentially avoid this reallocation and clear the
         // contents of the maps, but for now we just reset the map from the beginning
         self.map.take();
+        self.num_groups = 0;
+    }
+}
+
+#[cfg(test)]
+mod clear_tests {
+    use super::*;
+    use arrow::array::StringViewArray;
+    use std::sync::Arc;
+
+    #[test]
+    fn clear_shrink_resets_view_group_identity() -> datafusion_common::Result<()> {
+        let mut groups = GroupValuesBytesView::new(OutputType::Utf8View);
+        let mut indices = Vec::new();
+        let first =
+            Arc::new(StringViewArray::from(vec![Some("a"), None, Some("b")])) as ArrayRef;
+        groups.intern(&[first], &mut indices)?;
+        assert_eq!(groups.len(), 3);
+        groups.clear_shrink(0);
+        assert_eq!(groups.len(), 0);
+        assert!(groups.is_empty());
+        let next =
+            Arc::new(StringViewArray::from(vec![Some("c"), None, Some("c")])) as ArrayRef;
+        groups.intern(&[next], &mut indices)?;
+        assert_eq!(indices, vec![0, 1, 0]);
+        assert_eq!(groups.emit(EmitTo::All)?[0].len(), 2);
+        Ok(())
     }
 }

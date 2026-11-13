@@ -312,3 +312,10 @@ It can NULL-fill keys or duplicate sets, so ordinary projection rules do not
 apply. Deferred sort-merge filters use a schema that permits NULLs on the
 buffered side, also matching Apache main. Portable Parquet regressions cover
 these cases and mixed scan contexts; their query guard is 120 seconds.
+
+## Family AC: string-view group identity after clear
+
+Extend AC's primitive reset fix to the string-view interner. Clearing the map
+also resets its group counter, so its next group's identity is zero and its
+length and emitted arrays agree. A native NULL/reuse regression fails before
+this correction. Feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
