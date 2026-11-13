@@ -24,6 +24,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::decorrelate::PullUpCorrelatedExpr;
+use crate::eliminate_cross_join::EliminateCrossJoin;
 use crate::optimizer::ApplyOrder;
 use crate::utils::{NamePreserver, replace_qualified_name};
 use crate::{OptimizerConfig, OptimizerRule};
@@ -103,6 +104,26 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
         if !has_subquery(&filter.predicate) {
             return Ok(Transformed::no(LogicalPlan::Filter(filter)));
         }
+
+        // Construct the inner join graph while all WHERE keys are visible.
+        // A semi/anti/mark join would separate those keys from the FROM tree;
+        // later projection pruning can then freeze disconnected cross joins
+        // behind projections before EliminateCrossJoin can reassociate them.
+        let filter = if matches!(filter.input.as_ref(), LogicalPlan::Join(join)
+            if join.join_type == JoinType::Inner)
+        {
+            let plan = EliminateCrossJoin::new()
+                .rewrite(LogicalPlan::Filter(filter), config)?
+                .data;
+            match plan {
+                LogicalPlan::Filter(filter) if has_subquery(&filter.predicate) => filter,
+                // Removing common join keys from OR branches can also remove
+                // a redundant subquery. No decorrelation is needed then.
+                plan => return Ok(Transformed::yes(plan)),
+            }
+        } else {
+            filter
+        };
 
         let (with_subqueries, mut other_exprs): (Vec<_>, Vec<_>) =
             split_conjunction_owned(filter.predicate)
@@ -679,6 +700,39 @@ mod tests {
                 .project(vec![col("c")])?
                 .build()?,
         ))
+    }
+
+    #[test]
+    fn common_join_key_can_make_a_predicate_subquery_redundant() -> Result<()> {
+        for residual in [None, Some(col("t1.b").gt(lit(0u32)))] {
+            let key = col("t1.a").eq(col("t2.a"));
+            let predicate = key
+                .clone()
+                .or(key.and(in_subquery(col("t1.c"), test_subquery_with_name("sq")?)));
+            let predicate = match &residual {
+                Some(residual) => predicate.and(residual.clone()),
+                None => predicate,
+            };
+            let plan = LogicalPlanBuilder::from(test_table_scan_with_name("t1")?)
+                .cross_join(test_table_scan_with_name("t2")?)?
+                .filter(predicate)?
+                .build()?;
+            let actual = DecorrelatePredicateSubquery::new()
+                .rewrite(plan, &crate::optimizer::OptimizerContext::new())?
+                .data;
+            let mut expected = LogicalPlanBuilder::from(test_table_scan_with_name("t1")?)
+                .join(
+                    test_table_scan_with_name("t2")?,
+                    JoinType::Inner,
+                    (vec!["t1.a"], vec!["t2.a"]),
+                    None,
+                )?;
+            if let Some(residual) = residual {
+                expected = expected.filter(residual)?;
+            }
+            assert_eq!(actual, expected.build()?);
+        }
+        Ok(())
     }
 
     /// Test for several IN subquery expressions

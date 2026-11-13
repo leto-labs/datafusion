@@ -23,6 +23,22 @@ consumer's vendor tree. Longbow runs native regressions through a generated
 standalone harness with its pinned graph and Arrow patches. A standalone
 upstream-workspace build does not provide those Arrow extensions.
 
+## Family JP: join keys before predicate decorrelation
+
+Purpose: construct a connected inner FROM graph from its WHERE equalities
+before `IN`/`EXISTS` decorrelation inserts a semi, anti or mark join above it.
+Dependent Longbow feature: SQL-INNER-JOIN-CONSTRUCTION. Audit classification:
+UPSTREAMABLE.
+
+Later projection pruning can isolate a disconnected date cross join from its
+connector even though the equality predicates remain in the plan. Predicate
+decorrelation now invokes the existing cross-join rule while the complete
+predicate is still available. Its NULL-equality and boundary guards remain in
+force. The global optimizer schedule is unchanged. Native tests cover the
+default optimizer pipeline and a redundant subquery removed with a common OR
+key. The consumer tests physical shape and nullable duplicate answers for IN
+and EXISTS on five- and eighteen-table joins.
+
 ## Family UT: checked UTC time buckets
 
 Purpose: truncate explicit UTC hourly/daily timestamp arrays with the existing

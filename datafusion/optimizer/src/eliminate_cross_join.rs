@@ -430,7 +430,21 @@ fn find_inner_join(
 fn extract_possible_join_keys(expr: &Expr, join_keys: &mut JoinKeySet) {
     if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr {
         match op {
-            Operator::Eq => {
+            Operator::Eq
+                if !expr
+                    .exists(|expr| {
+                        Ok(matches!(
+                            expr,
+                            Expr::InSubquery(_)
+                                | Expr::Exists(_)
+                                | Expr::ScalarSubquery(_)
+                                | Expr::SetComparison(_)
+                        ))
+                    })
+                    .expect("exists closure is infallible") =>
+            {
+                // Subqueries must stay in the predicate until decorrelation;
+                // the join-key expression planner cannot execute them.
                 // insert handles ensuring  we don't add the same Join keys multiple times
                 join_keys.insert(left, right);
             }
@@ -514,6 +528,33 @@ mod tests {
     };
     use insta::assert_snapshot;
 
+    #[test]
+    fn subquery_expression_is_not_an_equi_join_key() -> Result<()> {
+        let selected = LogicalPlanBuilder::from(test_table_scan_with_name("selected")?)
+            .project(vec![col("selected.a")])?
+            .build()?;
+        for (subquery, other) in [
+            (
+                datafusion_expr::in_subquery(col("t1.a"), Arc::new(selected.clone())),
+                col("t2.b").gt(lit(0u32)),
+            ),
+            (
+                datafusion_expr::exists(Arc::new(selected.clone())),
+                col("t2.b").gt(lit(0u32)),
+            ),
+            (
+                datafusion_expr::scalar_subquery(Arc::new(selected.clone())),
+                col("t2.b"),
+            ),
+        ] {
+            let predicate = subquery.eq(other);
+            let mut keys = JoinKeySet::new();
+            extract_possible_join_keys(&predicate, &mut keys);
+            assert!(keys.is_empty(), "{predicate}");
+        }
+        Ok(())
+    }
+
     macro_rules! assert_optimized_plan_equal {
         (
             $plan:expr,
@@ -534,6 +575,52 @@ mod tests {
 
             Ok(())
         }};
+    }
+
+    #[test]
+    fn join_filter_equalities_connect_the_flattened_inputs_after_subquery_decorrelation()
+    -> Result<()> {
+        use crate::optimizer::Optimizer;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion_expr::in_subquery;
+
+        let schema = Schema::new(
+            ["a", "b", "c", "h", "v"]
+                .map(|name| Arc::new(Field::new(name, DataType::UInt32, true))),
+        );
+        let scan = |name| scan_empty(Some(name), &schema, None)?.build();
+        let selected = LogicalPlanBuilder::from(scan("selected")?)
+            .project(vec![col("selected.a")])?
+            .build()?;
+        let predicate = col("f.c")
+            .eq(col("s.a"))
+            .and(col("f.h").eq(col("c.a")))
+            .and(col("f.a").eq(col("r.a")))
+            .and(col("f.b").eq(col("r.b")))
+            .and(in_subquery(col("r.a"), Arc::new(selected)))
+            .and(col("c.b").eq(col("d.a")));
+        let plan = LogicalPlanBuilder::from(scan("f")?)
+            .cross_join(scan("r")?)?
+            .cross_join(scan("d")?)?
+            .cross_join(scan("s")?)?
+            .cross_join(scan("c")?)?
+            .filter(predicate)?
+            .project(vec![col("f.v"), col("d.v"), col("s.v")])?
+            .build()?;
+        let schema = Arc::clone(plan.schema());
+        let rewritten = Optimizer::new().optimize(
+            plan,
+            &OptimizerContext::new().with_skip_failing_rules(false),
+            |_, _| {},
+        )?;
+        assert_eq!(&schema, rewritten.schema());
+        rewritten.apply(|node| {
+            if let LogicalPlan::Join(join) = node {
+                assert!(!join.on.is_empty(), "{rewritten}");
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(())
     }
 
     #[test]
