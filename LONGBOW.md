@@ -366,6 +366,11 @@ Dependent feature: GROUPED-DISTINCT-COUNT. Classification: UPSTREAMABLE.
 Allocation deltas keep size queries constant-time; only emitted sets are visited
 when releasing their tracked bytes.
 
+The Many state also retains its last complete value. Exact equality skips a
+repeated hash insertion. A different value uses the native hash set. Emission
+moves or destroys both together. NULL and FILTER handling remain in the
+existing accumulation loop. Inline state accounting includes the extra value.
+
 ## Family IC: bounded inline grouping cache
 
 Purpose: reuse complete short-string grouping keys and their assigned group IDs

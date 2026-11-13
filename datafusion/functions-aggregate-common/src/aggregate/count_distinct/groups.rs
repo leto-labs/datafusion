@@ -35,7 +35,10 @@ use crate::aggregate::groups_accumulator::accumulate::accumulate;
 enum DistinctSet<N> {
     Empty,
     One(N),
-    Many(HashSet<N, RandomState>),
+    Many {
+        values: HashSet<N, RandomState>,
+        last: N,
+    },
 }
 impl<N: Copy + Eq + Hash> DistinctSet<N> {
     fn insert(&mut self, value: N) -> usize {
@@ -50,10 +53,19 @@ impl<N: Copy + Eq + Hash> DistinctSet<N> {
                 values.insert(*previous);
                 values.insert(value);
                 let allocated = values.allocation_size();
-                *self = Self::Many(values);
+                *self = Self::Many {
+                    values,
+                    last: value,
+                };
                 allocated
             }
-            Self::Many(values) => {
+            Self::Many { values, last } => {
+                // Repeated values in the same group need no hash lookup.
+                // This stores the complete value, not a hash fingerprint.
+                if *last == value {
+                    return 0;
+                }
+                *last = value;
                 let previous = values.allocation_size();
                 values.insert(value);
                 values.allocation_size() - previous
@@ -65,12 +77,12 @@ impl<N: Copy + Eq + Hash> DistinctSet<N> {
         match self {
             Self::Empty => 0,
             Self::One(_) => 1,
-            Self::Many(values) => values.len(),
+            Self::Many { values, .. } => values.len(),
         }
     }
     fn allocation_size(&self) -> usize {
         match self {
-            Self::Many(values) => values.allocation_size(),
+            Self::Many { values, .. } => values.allocation_size(),
             _ => 0,
         }
     }
@@ -157,7 +169,7 @@ where
             match set {
                 DistinctSet::Empty => {}
                 DistinctSet::One(value) => lists.values().append_value(value),
-                DistinctSet::Many(values) => {
+                DistinctSet::Many { values, .. } => {
                     lists.values().extend(values.into_iter().map(Some))
                 }
             }
@@ -228,6 +240,99 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::datatypes::Int32Type;
     use datafusion_common::Result;
+
+    #[test]
+    fn last_value_check_does_not_confuse_hash_collisions() {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        struct Colliding(i64);
+        impl Hash for Colliding {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                0_u64.hash(state);
+            }
+        }
+        let mut set = DistinctSet::Empty;
+        for value in [1, 2, 2, 1, 3, 3, 2, 4, 4] {
+            set.insert(Colliding(value));
+        }
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn repeated_distinct_values_do_not_grow_the_set() {
+        let mut set = DistinctSet::<i64>::Empty;
+        assert_eq!(set.insert(i64::MIN), 0);
+        assert_eq!(set.insert(i64::MIN), 0);
+        assert_eq!(set.len(), 1);
+        assert!(set.insert(i64::MAX) > 0);
+        let allocated = set.allocation_size();
+        for _ in 0..10_000 {
+            assert_eq!(set.insert(i64::MAX), 0);
+        }
+        assert_eq!(set.len(), 2);
+        assert_eq!(set.allocation_size(), allocated);
+        assert_eq!(set.insert(i64::MIN), 0);
+        assert_eq!(set.insert(i64::MIN), 0);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn repeated_values_prefix_emission_merge_and_reuse() -> Result<()> {
+        use arrow::array::UInt64Array;
+        use arrow::datatypes::{Int64Type, UInt64Type};
+        let mut acc = PrimitiveDistinctCountGroupsAccumulator::<UInt64Type>::new();
+        let input = Arc::new(UInt64Array::from(vec![
+            Some(0),
+            Some(u64::MAX),
+            Some(u64::MAX),
+            None,
+            Some(1),
+            Some(2),
+            Some(2),
+            Some(3),
+        ])) as ArrayRef;
+        let groups = [0, 0, 0, 0, 1, 1, 1, 1];
+        let filter = BooleanArray::from(vec![
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+            None,
+            Some(true),
+            Some(false),
+        ]);
+        for _ in 0..3 {
+            acc.update_batch(std::slice::from_ref(&input), &groups, Some(&filter), 2)?;
+        }
+        let state = acc.state(EmitTo::First(1))?;
+        let mut merged = PrimitiveDistinctCountGroupsAccumulator::<UInt64Type>::new();
+        for _ in 0..3 {
+            merged.merge_batch(&state, &[0], 1)?;
+        }
+        assert_eq!(
+            merged.evaluate(EmitTo::All)?.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![2])
+        );
+        // The old second group is now group zero. Its previous value must
+        // remain valid after removing the prefix, and newly inserted values
+        // must not be mistaken for a value in the removed group.
+        let input =
+            Arc::new(UInt64Array::from(vec![2, 2, u64::MAX, u64::MAX])) as ArrayRef;
+        acc.update_batch(&[input], &[0, 0, 0, 0], None, 1)?;
+        assert_eq!(
+            acc.evaluate(EmitTo::All)?.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![3])
+        );
+        assert_eq!(acc.hash_bytes, 0);
+        let input = Arc::new(UInt64Array::from(vec![u64::MAX, u64::MAX])) as ArrayRef;
+        acc.update_batch(&[input], &[0, 0], None, 1)?;
+        assert_eq!(
+            acc.evaluate(EmitTo::All)?.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![1])
+        );
+        assert_eq!(acc.hash_bytes, 0);
+        Ok(())
+    }
 
     #[test]
     fn convert_to_state_roundtrips_through_merge() -> Result<()> {
