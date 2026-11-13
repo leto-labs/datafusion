@@ -352,3 +352,13 @@ allocation and converter Arc clone per value. Large encodings use owned bytes;
 payload decoding uses the retaining converter's safe parser. Small heaps start
 with at most two slots, covered by retained and transient pool reservations.
 Dependent feature: WINDOW-TOPK. Classification: UPSTREAMABLE.
+
+## Family Y: bounded raw grouped integer AVG
+
+Extend exact integer AVG with a conservative cumulative raw-row bound. Up to
+i64::MAX input rows of at most 64 bits have sums that fit i128, including every
+intermediate group prefix and UInt64::MAX. This removes per-row checked branches
+only under that proof. Any imported partial state disables the proof; count and
+sum overflow checks remain for merges and subsequent raw updates. Emission does
+not weaken the cumulative bound. State format and evaluation stay unchanged.
+Feature: CORE-NUMERIC-RESULTS. Classification: UPSTREAMABLE.

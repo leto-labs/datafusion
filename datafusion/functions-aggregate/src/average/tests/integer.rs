@@ -382,3 +382,66 @@ fn integer_avg_state_survives_ipc_and_count_overflow_is_checked() -> Result<()> 
     );
     Ok(())
 }
+
+#[test]
+fn integer_avg_grouped_raw_batches_and_imported_overflow() -> Result<()> {
+    let mut acc = avg_groups_accumulator(&DataType::UInt64, &DataType::Float64)?;
+    let mut sums = [0_i128; 17];
+    let mut counts = [0_u64; 17];
+    for batch in 0..7 {
+        let values: Vec<Option<u64>> = (0..513)
+            .map(|i| (i % 19 != 0).then_some(u64::MAX - (i * 131 + batch) as u64))
+            .collect();
+        let groups: Vec<_> = (0..values.len()).map(|i| (i * 7 + batch) % 17).collect();
+        let filter = BooleanArray::from_iter(
+            (0..values.len()).map(|i| if i % 23 == 0 { None } else { Some(i % 11 != 0) }),
+        );
+        for (i, value) in values.iter().enumerate() {
+            if filter.is_valid(i)
+                && filter.value(i)
+                && let Some(value) = value
+            {
+                sums[groups[i]] += i128::from(*value);
+                counts[groups[i]] += 1;
+            }
+        }
+        acc.update_batch(
+            &[Arc::new(UInt64Array::from(values))],
+            &groups,
+            Some(&filter),
+            17,
+        )?;
+    }
+    let state = acc.state(EmitTo::First(6))?;
+    for i in 0..6 {
+        assert_eq!(state[0].as_primitive::<UInt64Type>().value(i), counts[i]);
+        assert_eq!(
+            state[1].as_fixed_size_binary().value(i),
+            sums[i].to_le_bytes()
+        );
+    }
+    let rest = acc.evaluate(EmitTo::All)?;
+    for i in 6..17 {
+        assert_eq!(
+            ScalarValue::try_from_array(rest.as_ref(), i - 6)?,
+            ScalarValue::Float64(Some(sums[i] as f64 / counts[i] as f64))
+        );
+    }
+    for (sum, count) in [(i128::MAX, 1), (0, u64::MAX)] {
+        let mut acc = avg_groups_accumulator(&DataType::UInt64, &DataType::Float64)?;
+        // Raw updates followed by arbitrary imported state must still check
+        // the next raw update, even when a prior emission emptied the group.
+        acc.update_batch(&[Arc::new(UInt64Array::from(vec![1]))], &[0], None, 1)?;
+        acc.evaluate(EmitTo::All)?;
+        let state = state_columns(&[vec![
+            ScalarValue::UInt64(Some(count)),
+            ScalarValue::FixedSizeBinary(16, Some(sum.to_le_bytes().to_vec())),
+        ]])?;
+        acc.merge_batch(&state, &[0], 1)?;
+        assert!(
+            acc.update_batch(&[Arc::new(UInt64Array::from(vec![1]))], &[0], None, 1)
+                .is_err()
+        );
+    }
+    Ok(())
+}

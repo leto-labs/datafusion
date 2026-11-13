@@ -170,6 +170,8 @@ where
 pub(super) struct IntegerAvgGroupsAccumulator<I: ArrowNumericType> {
     sums: Vec<i128>,
     counts: Vec<u64>,
+    // Conservative bound for raw input only; arbitrary merged state disables it.
+    raw_rows: Option<u64>,
     marker: PhantomData<I>,
 }
 
@@ -178,6 +180,7 @@ impl<I: ArrowNumericType> IntegerAvgGroupsAccumulator<I> {
         Self {
             sums: vec![],
             counts: vec![],
+            raw_rows: Some(0),
             marker: PhantomData,
         }
     }
@@ -202,6 +205,25 @@ where
         let values = values[0].as_primitive::<I>();
         assert_eq!(values.len(), groups.len());
         let mask = filtered_null_mask(filter, values);
+        self.raw_rows = self
+            .raw_rows
+            .and_then(|rows| rows.checked_add(values.len() as u64))
+            .filter(|&rows| rows <= i64::MAX as u64);
+        if size_of::<I::Native>() <= 8 && self.raw_rows.is_some() {
+            // At most i64::MAX raw rows of at most 64 bits have entered this
+            // accumulator. Every group and every intermediate prefix therefore
+            // fits i128, including UInt64::MAX. Counts also fit u64. Emission
+            // only reduces retained state; merging disables this proof.
+            for (index, (&value, &group)) in
+                values.values().iter().zip(groups).enumerate()
+            {
+                if mask.as_ref().is_none_or(|mask| mask.is_valid(index)) {
+                    self.sums[group] = self.sums[group].wrapping_add(value.into());
+                    self.counts[group] += 1;
+                }
+            }
+            return Ok(());
+        }
         for (index, (&value, &group)) in values.values().iter().zip(groups).enumerate() {
             if mask.as_ref().is_none_or(|mask| mask.is_valid(index)) {
                 add_total(
@@ -235,6 +257,7 @@ where
         groups: &[usize],
         total_groups: usize,
     ) -> Result<()> {
+        self.raw_rows = None;
         self.resize(total_groups);
         assert_eq!(values[0].len(), groups.len());
         for (row, &group) in state_rows(values).zip(groups) {
@@ -301,5 +324,42 @@ where
     }
     fn size(&self) -> usize {
         size_of_val(self) + self.values.size()
+    }
+}
+
+#[cfg(test)]
+mod raw_row_bound_tests {
+    use super::*;
+    use arrow::array::{Decimal128Array, UInt64Array};
+
+    #[test]
+    fn grouped_avg_bound_exhaustion_and_wide_native_keep_checked_arithmetic() -> Result<()>
+    {
+        let mut acc = IntegerAvgGroupsAccumulator::<UInt64Type>::new();
+        // A conservative bound can include arbitrarily many filtered-out rows.
+        // Crossing it must select the checked path without a huge fixture.
+        acc.raw_rows = Some(i64::MAX as u64 - 1);
+        acc.update_batch(
+            &[Arc::new(UInt64Array::from(vec![u64::MAX, u64::MAX]))],
+            &[0, 0],
+            None,
+            1,
+        )?;
+        assert!(acc.raw_rows.is_none());
+        assert_eq!(acc.sums, vec![2 * i128::from(u64::MAX)]);
+        assert_eq!(acc.counts, vec![2]);
+        // The factory uses <=64-bit integer types, but the generic implementation
+        // must not apply that proof to a wider Arrow numeric representation.
+        let mut wide = IntegerAvgGroupsAccumulator::<Decimal128Type>::new();
+        assert!(
+            wide.update_batch(
+                &[Arc::new(Decimal128Array::from(vec![i128::MAX, 1]))],
+                &[0, 0],
+                None,
+                1,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }
