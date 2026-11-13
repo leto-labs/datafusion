@@ -415,3 +415,12 @@ aggregate functions and opaque extensions are explicitly rejected on this
 path. Supporting those inputs requires a single-evaluation nullable mark join.
 Native structural tests and the consumer's DuckDB v2.0.0-derived SLT fixture
 cover NULLs, duplicates, empty sets, correlation, OR/AND and projected values.
+
+## Family AC: reset column groups after full emission
+
+Purpose: clear column interner hash buckets and their candidate-index lists
+when EmitTo::All replaces the key columns. Reuse otherwise follows stale group
+indices into empty columns and can panic. The vector operation buffers clear
+with those structures. Native regressions cover both streaming modes, prefix
+emission, full emission, NULL keys, complete key equality and reuse.
+Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
