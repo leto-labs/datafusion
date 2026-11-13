@@ -344,3 +344,11 @@ for one- and two-column groups. Misses use the native interner, long strings kee
 its ordinary path, and cardinality above 16,384 releases and disables the cache.
 Prefix emission and clear invalidate all cached IDs. Dependent feature:
 CORE-AGGREGATION. Classification: UPSTREAMABLE.
+
+## Family CR: inline owned ROW_NUMBER ranking bytes
+
+Purpose: retain short encoded ranking keys and payloads inline, without one
+allocation and converter Arc clone per value. Large encodings use owned bytes;
+payload decoding uses the retaining converter's safe parser. Small heaps start
+with at most two slots, covered by retained and transient pool reservations.
+Dependent feature: WINDOW-TOPK. Classification: UPSTREAMABLE.

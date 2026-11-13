@@ -5,10 +5,12 @@
 //! decode full output batches across group boundaries.
 use super::*;
 use rank_memory::{add, mul};
+mod compact_row;
+use compact_row::CompactRow;
 
 struct Entry {
-    order: OwnedRow,
-    payload: OwnedRow,
+    order: CompactRow,
+    payload: CompactRow,
 }
 impl PartialEq for Entry {
     fn eq(&self, other: &Self) -> bool {
@@ -27,7 +29,7 @@ impl Ord for Entry {
     }
 }
 
-type Groups = HashMap<OwnedRow, BinaryHeap<Entry>>;
+type Groups = HashMap<CompactRow, BinaryHeap<Entry>>;
 
 pub(crate) struct RowNumberTopK {
     schema: SchemaRef,
@@ -105,7 +107,7 @@ impl RowNumberTopK {
     fn retained(&self) -> Result<usize> {
         let table = mul(
             self.groups.capacity(),
-            2 * (size_of::<(OwnedRow, BinaryHeap<Entry>)>() + 16),
+            2 * (size_of::<(CompactRow, BinaryHeap<Entry>)>() + 16),
         )?;
         add(
             add(add(self.row_bytes, self.heap_bytes)?, table)?,
@@ -135,7 +137,7 @@ impl RowNumberTopK {
             scratch,
             mul(
                 self.groups.capacity(),
-                8 * (size_of::<(OwnedRow, BinaryHeap<Entry>)>() + 16),
+                8 * (size_of::<(CompactRow, BinaryHeap<Entry>)>() + 16),
             )?,
         )?;
         self.reservation
@@ -169,32 +171,41 @@ impl RowNumberTopK {
             let key = keys.row(i);
             let order = orders.row(i);
             let hash = self.groups.hasher().hash_one(key);
+            let mut fresh_heap_capacity = 0;
             let (_, heap) = self
                 .groups
                 .raw_entry_mut()
                 .from_hash(hash, |k| k.as_ref() == key.as_ref())
                 .or_insert_with(|| {
-                    self.row_bytes += key.as_ref().len();
-                    (key.owned(), BinaryHeap::new())
+                    let key = CompactRow::new(key.as_ref());
+                    self.row_bytes += key.allocated();
+                    // Most windows keep one or two rows. Starting with K would
+                    // over-allocate for large K and sparse groups.
+                    let heap = BinaryHeap::with_capacity(self.k.min(2));
+                    fresh_heap_capacity = heap.capacity();
+                    (key, heap)
                 });
+            self.heap_bytes = add(
+                self.heap_bytes,
+                mul(fresh_heap_capacity, size_of::<Entry>())?,
+            )?;
             if heap.len() == self.k
                 && order.as_ref() >= heap.peek().unwrap().order.as_ref()
             {
                 continue;
             }
             let payload = payloads.row(i);
+            let entry = Entry {
+                order: CompactRow::new(order.as_ref()),
+                payload: CompactRow::new(payload.as_ref()),
+            };
             self.row_bytes = add(
                 self.row_bytes,
-                add(order.as_ref().len(), payload.as_ref().len())?,
+                add(entry.order.allocated(), entry.payload.allocated())?,
             )?;
-            let entry = Entry {
-                order: order.owned(),
-                payload: payload.owned(),
-            };
             if heap.len() == self.k {
                 let mut worst = heap.peek_mut().unwrap();
-                self.row_bytes -=
-                    worst.order.as_ref().len() + worst.payload.as_ref().len();
+                self.row_bytes -= worst.order.allocated() + worst.payload.allocated();
                 *worst = entry;
             } else {
                 let old_capacity = heap.capacity();
@@ -227,7 +238,7 @@ impl RowNumberTopK {
         let extra = add(
             mul(
                 self.groups.len(),
-                size_of::<(OwnedRow, BinaryHeap<Entry>)>(),
+                size_of::<(CompactRow, BinaryHeap<Entry>)>(),
             )?,
             mul(self.batch_size, size_of::<Entry>())?,
         )?;
@@ -236,7 +247,7 @@ impl RowNumberTopK {
         let mut groups: Vec<_> = std::mem::take(&mut self.groups).into_iter().collect();
         groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         struct Emitter {
-            groups: std::vec::IntoIter<(OwnedRow, BinaryHeap<Entry>)>,
+            groups: std::vec::IntoIter<(CompactRow, BinaryHeap<Entry>)>,
             current: std::vec::IntoIter<Entry>,
             retained: usize,
             extra: usize,
@@ -277,10 +288,11 @@ impl RowNumberTopK {
             e.owner.reservation.try_resize(
                 add(add(e.retained, e.extra)?, output)?.max(e.owner.reservation.size()),
             )?;
+            let parser = e.owner.payload_converter.parser();
             let arrays = e
                 .owner
                 .payload_converter
-                .convert_rows(rows.iter().map(|r| r.payload.row()))?;
+                .convert_rows(rows.iter().map(|r| parser.parse(r.payload.as_ref())))?;
             let batch = RecordBatch::try_new(Arc::clone(&e.owner.schema), arrays)?;
             (&batch).record_output(&e.owner.metrics.baseline);
             drop(rows);
@@ -381,6 +393,54 @@ mod tests {
         let error = state.insert_batch(&batch).unwrap_err();
         assert!(error.to_string().contains("RowNumberTopK"), "{error}");
         drop(state);
+        assert_eq!(runtime.memory_pool.reserved(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_row_number_many_groups_match_sorted_values() -> Result<()> {
+        use arrow::array::Array;
+        let (mut state, runtime) = make_state(2, 128 * 1024 * 1024);
+        let mut expected = vec![Vec::<f64>::new(); 10_000];
+        for batch in 0..20 {
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for row in 0..4096 {
+                let key = (batch * 4096 + row) % expected.len();
+                let value = ((batch * 97 + row * 13) % 10_007) as f64;
+                expected[key].push(value);
+                keys.push(key as i64);
+                values.push(value);
+            }
+            let input = RecordBatch::try_new(
+                Arc::clone(&state.schema),
+                vec![
+                    Arc::new(Int64Array::from(keys)),
+                    Arc::new(Float64Array::from(values)),
+                ],
+            )?;
+            state.insert_batch(&input)?;
+        }
+        println!("row_number_10k_groups_retained_bytes={}", state.retained()?);
+        let output: Vec<_> = state.emit()?.try_collect().await?;
+        let mut actual = vec![Vec::<f64>::new(); expected.len()];
+        for batch in output {
+            let keys = batch
+                .column(0)
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let values = batch
+                .column(1)
+                .as_primitive::<arrow::datatypes::Float64Type>();
+            assert_eq!(keys.null_count(), 0);
+            for row in 0..batch.num_rows() {
+                actual[keys.value(row) as usize].push(values.value(row));
+            }
+        }
+        for values in &mut expected {
+            values.sort_by(|a, b| b.total_cmp(a));
+            values.truncate(2);
+        }
+        assert_eq!(actual, expected);
         assert_eq!(runtime.memory_pool.reserved(), 0);
         Ok(())
     }
