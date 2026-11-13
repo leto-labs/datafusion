@@ -434,3 +434,15 @@ phase still checks complete keys, including colliding hashes. No cached view
 survives the method call. Native group tests cover collisions, NULLs, prefix
 emission, full emission and reuse in both streaming modes.
 Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
+
+## Family RBC: owned rejection bound for ROW_NUMBER Top-K
+
+Purpose: reject a full group's worse rows without loading the heap root's
+encoded order. Each group owns a 15-byte prefix and a length marker. Short
+orders compare exactly. Equal truncated prefixes use the complete order.
+Accepted mutations refresh the prefix after the heap guard drops. The group
+entry's enlarged layout enters retained, scratch and emission accounting.
+Native regressions compare prefix decisions with full encoded orders and
+exercise long shared strings, NULLs, both directions, several k values,
+multiple batches and pool release. Dependent feature: WINDOW-TOPK.
+Classification: UPSTREAMABLE.

@@ -7,6 +7,8 @@ use super::*;
 use rank_memory::{add, mul};
 mod compact_row;
 use compact_row::CompactRow;
+mod order_prefix;
+use order_prefix::OrderPrefix;
 
 struct Entry {
     order: CompactRow,
@@ -29,7 +31,12 @@ impl Ord for Entry {
     }
 }
 
-type Groups = HashMap<CompactRow, BinaryHeap<Entry>>;
+struct GroupHeap {
+    worst: OrderPrefix,
+    heap: BinaryHeap<Entry>,
+}
+
+type Groups = HashMap<CompactRow, GroupHeap>;
 
 pub(crate) struct RowNumberTopK {
     schema: SchemaRef,
@@ -107,7 +114,7 @@ impl RowNumberTopK {
     fn retained(&self) -> Result<usize> {
         let table = mul(
             self.groups.capacity(),
-            2 * (size_of::<(CompactRow, BinaryHeap<Entry>)>() + 16),
+            2 * (size_of::<(CompactRow, GroupHeap)>() + 16),
         )?;
         add(
             add(add(self.row_bytes, self.heap_bytes)?, table)?,
@@ -137,7 +144,7 @@ impl RowNumberTopK {
             scratch,
             mul(
                 self.groups.capacity(),
-                8 * (size_of::<(CompactRow, BinaryHeap<Entry>)>() + 16),
+                8 * (size_of::<(CompactRow, GroupHeap)>() + 16),
             )?,
         )?;
         self.reservation
@@ -172,7 +179,7 @@ impl RowNumberTopK {
             let order = orders.row(i);
             let hash = self.groups.hasher().hash_one(key);
             let mut fresh_heap_capacity = 0;
-            let (_, heap) = self
+            let (_, group) = self
                 .groups
                 .raw_entry_mut()
                 .from_hash(hash, |k| k.as_ref() == key.as_ref())
@@ -183,14 +190,23 @@ impl RowNumberTopK {
                     // over-allocate for large K and sparse groups.
                     let heap = BinaryHeap::with_capacity(self.k.min(2));
                     fresh_heap_capacity = heap.capacity();
-                    (key, heap)
+                    (
+                        key,
+                        GroupHeap {
+                            worst: OrderPrefix::new(&[]),
+                            heap,
+                        },
+                    )
                 });
+            let heap = &mut group.heap;
             self.heap_bytes = add(
                 self.heap_bytes,
                 mul(fresh_heap_capacity, size_of::<Entry>())?,
             )?;
             if heap.len() == self.k
-                && order.as_ref() >= heap.peek().unwrap().order.as_ref()
+                && group.worst.compare(order.as_ref()).unwrap_or_else(|| {
+                    order.as_ref().cmp(heap.peek().unwrap().order.as_ref())
+                }) != Ordering::Less
             {
                 continue;
             }
@@ -216,6 +232,7 @@ impl RowNumberTopK {
                     mul(heap.capacity() - old_capacity, size_of::<Entry>())?,
                 )?;
             }
+            group.worst = OrderPrefix::new(heap.peek().unwrap().order.as_ref());
             replacements += 1;
         }
         self.metrics.row_replacements.add(replacements);
@@ -236,10 +253,7 @@ impl RowNumberTopK {
     pub(crate) fn emit(mut self) -> Result<SendableRecordBatchStream> {
         self.batch_size = self.batch_size.min(self.rows.max(1));
         let extra = add(
-            mul(
-                self.groups.len(),
-                size_of::<(CompactRow, BinaryHeap<Entry>)>(),
-            )?,
+            mul(self.groups.len(), size_of::<(CompactRow, GroupHeap)>())?,
             mul(self.batch_size, size_of::<Entry>())?,
         )?;
         let retained = self.retained()?;
@@ -247,7 +261,7 @@ impl RowNumberTopK {
         let mut groups: Vec<_> = std::mem::take(&mut self.groups).into_iter().collect();
         groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         struct Emitter {
-            groups: std::vec::IntoIter<(CompactRow, BinaryHeap<Entry>)>,
+            groups: std::vec::IntoIter<(CompactRow, GroupHeap)>,
             current: std::vec::IntoIter<Entry>,
             retained: usize,
             extra: usize,
@@ -270,7 +284,7 @@ impl RowNumberTopK {
                 if let Some(row) = e.current.next() {
                     rows.push(row);
                 } else if let Some((_, heap)) = e.groups.next() {
-                    e.current = heap.into_sorted_vec().into_iter();
+                    e.current = heap.heap.into_sorted_vec().into_iter();
                 } else {
                     break;
                 }
@@ -442,6 +456,92 @@ mod tests {
         }
         assert_eq!(actual, expected);
         assert_eq!(runtime.memory_pool.reserved(), 0);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn cached_worst_prefix_keeps_long_string_order_and_nulls() -> Result<()> {
+        use arrow::array::{Array, StringViewArray};
+        use arrow::compute::SortOptions;
+        for k in [1, 2, 5] {
+            for descending in [false, true] {
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("k", DataType::Int64, false),
+                    Field::new("v", DataType::Utf8View, true),
+                ]));
+                let runtime = RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::new(FairSpillPool::new(64 * 1024 * 1024)))
+                    .build_arc()?;
+                let orders = LexOrdering::new([PhysicalSortExpr {
+                    expr: col("v", &schema)?,
+                    options: SortOptions {
+                        descending,
+                        nulls_first: false,
+                    },
+                }])
+                .unwrap();
+                let mut state = RowNumberTopK::try_new(
+                    0,
+                    Arc::clone(&schema),
+                    vec![col("k", &schema)?],
+                    vec![SortField::new(DataType::Int64)],
+                    orders,
+                    k,
+                    7,
+                    &runtime,
+                    &ExecutionPlanMetricsSet::new(),
+                )?;
+                let mut expected = vec![Vec::new(); 3];
+                for batch in 0..4 {
+                    let mut keys = Vec::new();
+                    let mut strings = Vec::new();
+                    for row in 0..90 {
+                        let key = row % 3;
+                        let value = (row % 11 != 0).then(|| {
+                            format!(
+                                "this-is-a-common-prefix-longer-than-the-bound-{:04}",
+                                (batch * 97 + row * 13) % 101
+                            )
+                        });
+                        expected[key].push(value.clone());
+                        keys.push(key as i64);
+                        strings.push(value);
+                    }
+                    let input = RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![
+                            Arc::new(Int64Array::from(keys)),
+                            Arc::new(StringViewArray::from_iter(strings)),
+                        ],
+                    )?;
+                    state.insert_batch(&input)?;
+                }
+                let mut actual = vec![Vec::new(); 3];
+                let output: Vec<_> = state.emit()?.try_collect().await?;
+                for batch in output {
+                    let keys = batch
+                        .column(0)
+                        .as_primitive::<arrow::datatypes::Int64Type>();
+                    let values = batch.column(1).as_string_view();
+                    for row in 0..batch.num_rows() {
+                        actual[keys.value(row) as usize].push(
+                            values.is_valid(row).then(|| values.value(row).to_owned()),
+                        );
+                    }
+                }
+                for values in &mut expected {
+                    values.sort_by(|a, b| match (a, b) {
+                        (None, None) => Ordering::Equal,
+                        (None, Some(_)) => Ordering::Greater,
+                        (Some(_), None) => Ordering::Less,
+                        (Some(a), Some(b)) if descending => b.cmp(a),
+                        (Some(a), Some(b)) => a.cmp(b),
+                    });
+                    values.truncate(k);
+                }
+                assert_eq!(actual, expected);
+                assert_eq!(runtime.memory_pool.reserved(), 0);
+            }
+        }
         Ok(())
     }
 }
