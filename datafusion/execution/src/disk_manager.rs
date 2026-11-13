@@ -738,6 +738,9 @@ mod tests {
         // Drop the file
         drop(temp_file);
 
+        // An active writer still owns the path and its quota.
+        assert_eq!(dm.used_disk_space(), new_usage);
+        drop(writer);
         // Disk usage should return to 0
         assert_eq!(dm.used_disk_space(), 0);
 
@@ -840,6 +843,8 @@ mod tests {
         // Drop the last clone
         drop(clone3);
 
+        assert_eq!(dm.used_disk_space(), usage);
+        drop(writer);
         // Now disk usage should be 0
         assert_eq!(dm.used_disk_space(), 0);
 
@@ -873,12 +878,16 @@ mod tests {
         // Drop first file
         drop(file1);
 
+        assert_eq!(dm.used_disk_space(), usage1 + usage2);
+        drop(writer1);
         // Usage should only reflect second file
         assert_eq!(dm.used_disk_space(), usage2);
 
         // Drop second file
         drop(file2);
 
+        assert_eq!(dm.used_disk_space(), usage2);
+        drop(writer2);
         // Usage should be 0
         assert_eq!(dm.used_disk_space(), 0);
 
