@@ -513,7 +513,7 @@ impl SpillFile for RefCountedTempFile {
         &self,
     ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes>> + Send>>>
     {
-        let owner = self.owner.clone();
+        let owner = Arc::clone(&self.owner);
 
         let stream =
             futures::stream::once(async move {
