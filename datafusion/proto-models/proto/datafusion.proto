@@ -1225,7 +1225,7 @@ message FileGroup {
 
 message ScanLimit {
   // wrap into a message to make it optional
-  uint32 limit = 1;
+  uint64 limit = 1;
 }
 
 message PhysicalSortExprNodeCollection {
@@ -1264,6 +1264,8 @@ message FileScanExecConf {
   optional Partitioning output_partitioning = 15;
   // Virtual fields form the suffix of schema, after file and partition fields.
   uint32 virtual_column_count = 16;
+  // Raw intent is independent of stored output ordering.
+  bool preserve_order = 17;
 }
 
 message ParquetScanExecNode {
@@ -1275,6 +1277,9 @@ message ParquetScanExecNode {
   PhysicalExprNode predicate = 3;
 
   datafusion_common.TableParquetOptions parquet_options = 4;
+  bool reverse_row_groups = 5;
+  // Expressions use the full table schema, before scan projection.
+  optional PhysicalSortExprNodeCollection sort_order_for_reorder = 6;
 }
 
 message CsvScanExecNode {

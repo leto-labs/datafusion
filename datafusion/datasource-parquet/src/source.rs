@@ -542,9 +542,14 @@ impl ParquetSource {
         self.reverse_row_groups = reverse_row_groups;
         self
     }
-    #[cfg(test)]
-    pub(crate) fn reverse_row_groups(&self) -> bool {
+    /// Whether row groups are read in reverse order.
+    pub fn reverse_row_groups(&self) -> bool {
         self.reverse_row_groups
+    }
+
+    /// Advisory sort expressions in full table coordinates before projection.
+    pub fn sort_order_for_reorder(&self) -> Option<&LexOrdering> {
+        self.sort_order_for_reorder.as_ref()
     }
 }
 
@@ -1139,6 +1144,13 @@ impl FileSource for ParquetSource {
             base_conf: Some(base.try_to_proto(ctx)?),
             predicate,
             parquet_options: Some(self.table_parquet_options().try_into()?),
+            reverse_row_groups: self.reverse_row_groups,
+            sort_order_for_reorder: self.sort_order_for_reorder.as_ref().map(|order| {
+                use datafusion_physical_expr_common::sort_expr::sort_exprs_try_to_proto;
+                Ok::<_, DataFusionError>(protobuf::PhysicalSortExprNodeCollection {
+                    physical_sort_expr_nodes: sort_exprs_try_to_proto(order.iter(), &ctx.expr_ctx())?,
+                })
+            }).transpose()?,
         };
         Ok(Some(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::ParquetScan(node)),
@@ -1241,6 +1253,23 @@ impl ParquetSource {
         if let Some(predicate) = predicate {
             source = source.with_predicate(predicate);
         }
+        source.reverse_row_groups = scan.reverse_row_groups;
+        source.sort_order_for_reorder = scan
+            .sort_order_for_reorder
+            .as_ref()
+            .map(|order| {
+                use datafusion_physical_expr_common::sort_expr::sort_exprs_try_from_proto;
+                let expressions = sort_exprs_try_from_proto(
+                    &order.physical_sort_expr_nodes,
+                    &ctx.expr_ctx(source.table_schema.table_schema()),
+                )?;
+                LexOrdering::new(expressions).ok_or_else(|| {
+                    datafusion_common::internal_datafusion_err!(
+                        "ParquetScanExecNode reorder ordering must not be empty"
+                    )
+                })
+            })
+            .transpose()?;
         let base_config =
             FileScanConfig::try_from_proto(base_conf, ctx, Arc::new(source))?;
         Ok(DataSourceExec::from_data_source(base_config))

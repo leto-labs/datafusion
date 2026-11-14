@@ -1894,8 +1894,8 @@ pub struct FileGroup {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScanLimit {
     /// wrap into a message to make it optional
-    #[prost(uint32, tag = "1")]
-    pub limit: u32,
+    #[prost(uint64, tag = "1")]
+    pub limit: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalSortExprNodeCollection {
@@ -1943,6 +1943,9 @@ pub struct FileScanExecConf {
     /// Virtual fields form the suffix of schema, after file and partition fields.
     #[prost(uint32, tag = "16")]
     pub virtual_column_count: u32,
+    /// Raw intent is independent of stored output ordering.
+    #[prost(bool, tag = "17")]
+    pub preserve_order: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParquetScanExecNode {
@@ -1954,6 +1957,11 @@ pub struct ParquetScanExecNode {
     pub parquet_options: ::core::option::Option<
         super::datafusion_common::TableParquetOptions,
     >,
+    #[prost(bool, tag = "5")]
+    pub reverse_row_groups: bool,
+    /// Expressions use the full table schema, before scan projection.
+    #[prost(message, optional, tag = "6")]
+    pub sort_order_for_reorder: ::core::option::Option<PhysicalSortExprNodeCollection>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CsvScanExecNode {

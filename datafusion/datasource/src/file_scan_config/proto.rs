@@ -122,7 +122,16 @@ impl FileScanConfig {
         Ok(protobuf::FileScanExecConf {
             file_groups,
             statistics: Some((&self.statistics()).into()),
-            limit: self.limit.map(|l| protobuf::ScanLimit { limit: l as u32 }),
+            limit: self
+                .limit
+                .map(|limit| {
+                    Ok::<_, DataFusionError>(protobuf::ScanLimit {
+                        limit: u64::try_from(limit).map_err(|_| {
+                            internal_datafusion_err!("scan limit exceeds uint64")
+                        })?,
+                    })
+                })
+                .transpose()?,
             projection: vec![],
             schema: Some((&schema).try_into()?),
             table_partition_cols: self
@@ -137,6 +146,7 @@ impl FileScanConfig {
             projection_exprs,
             output_partitioning,
             virtual_column_count,
+            preserve_order: self.preserve_order,
         })
     }
 
@@ -144,7 +154,6 @@ impl FileScanConfig {
     /// and a `file_source` the caller has already rebuilt (typically from the
     /// table schema via [`FileScanConfig::parse_table_schema_from_proto`]).
     ///
-    /// Byte-compatible with the former `parse_protobuf_file_scan_config`.
     pub fn try_from_proto(
         conf: &protobuf::FileScanExecConf,
         ctx: &ExecutionPlanDecodeCtx<'_>,
@@ -229,11 +238,24 @@ impl FileScanConfig {
             .with_file_groups(file_groups)
             .with_constraints(constraints)
             .with_statistics(statistics)
-            .with_limit(conf.limit.as_ref().map(|sl| sl.limit as usize))
+            .with_limit(
+                conf.limit
+                    .as_ref()
+                    .map(|limit| {
+                        usize::try_from(limit.limit).map_err(|_| {
+                            internal_datafusion_err!("scan limit exceeds native usize")
+                        })
+                    })
+                    .transpose()?,
+            )
             .with_output_ordering(output_ordering)
             .with_output_partitioning(output_partitioning)
             .with_batch_size(conf.batch_size.map(|s| s as usize));
-        Ok(config_builder.build())
+        let mut config = config_builder.build();
+        // build() derives true from nonempty ordering. Preserve the raw encoded
+        // value after construction, including an explicitly ordered false.
+        config.preserve_order = conf.preserve_order;
+        Ok(config)
     }
 
     /// Parse a [`TableSchema`] (file, partition and virtual columns) from a

@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -586,10 +588,7 @@ impl CsvSource {
         ctx: &datafusion_physical_plan::proto::ExecutionPlanDecodeCtx<'_>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion_common::config::CsvOptions;
-        use datafusion_datasource::file_compression_type::FileCompressionType;
-        use datafusion_datasource::file_scan_config::{
-            FileScanConfig, FileScanConfigBuilder,
-        };
+        use datafusion_datasource::file_scan_config::FileScanConfig;
         use datafusion_datasource::source::DataSourceExec;
         use datafusion_proto_models::protobuf;
 
@@ -640,11 +639,9 @@ impl CsvSource {
 
         // The compression type is not on the wire; CSV scans always
         // deserialize as uncompressed.
-        let conf = FileScanConfigBuilder::from(FileScanConfig::try_from_proto(
-            base_conf, ctx, source,
-        )?)
-        .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
-        .build();
+        // Keep the decoded config directly: rebuilding would derive a new
+        // preserve_order value from output_ordering and overwrite raw intent.
+        let conf = FileScanConfig::try_from_proto(base_conf, ctx, source)?;
         Ok(DataSourceExec::from_data_source(conf))
     }
 }

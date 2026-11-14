@@ -23,6 +23,23 @@ consumer's vendor tree. Longbow runs native regressions through a generated
 standalone harness with its pinned graph and Arrow patches. A standalone
 upstream-workspace build does not provide those Arrow extensions.
 
+## Family FC: complete native file scan serialization
+
+Purpose: preserve raw file-scan order intent, Parquet reverse-row-group and
+reorder sort hints, and full-width scan limits through the native codec.
+Dependent Longbow feature: CORE-PLAN-FIDELITY. Audit classification: UPSTREAMABLE.
+
+FileScanExecConf carries preserve_order explicitly; decode assigns it after
+building so the builder cannot force an ordered-false state to true. CSV
+retains that decoded config directly instead of rebuilding it a second time.
+ParquetScanExecNode carries reverse_row_groups and an optional sort ordering.
+Sort expressions use the enclosing expression codec and full table schema before
+projection. ScanLimit is uint64 with checked native-width conversion. Portable
+native tests cover all order-intent states, both directions and NULL orders,
+reordered projection, large/zero/absent limits, and binary/JSON round trips.
+The Longbow consumer removes its false-only FileScanOrder patch and advances
+its exact plan codec identity. No query execution algorithm changes.
+
 ## Family PC: physical projection constraint lineage
 
 Purpose: preserve physical primary/unique keys only when every source key

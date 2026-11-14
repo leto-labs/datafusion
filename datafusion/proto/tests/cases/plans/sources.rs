@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -786,5 +788,148 @@ fn roundtrip_parquet_exec_range_output_partitioning() -> Result<()> {
         Some(output_partitioning)
     );
 
+    Ok(())
+}
+
+#[test]
+fn roundtrip_parquet_inexact_sort_settings_and_order_intent() -> Result<()> {
+    use datafusion_datasource::file::FileSource;
+    use datafusion_physical_expr::EquivalenceProperties;
+    use datafusion_physical_plan::SortOrderPushdownResult;
+    use datafusion_proto::bytes::{physical_plan_from_bytes, physical_plan_to_bytes};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int64, false),
+        Field::new("b", DataType::Int64, true),
+    ]));
+    for descending in [false, true] {
+        for nulls_first in [false, true] {
+            let order = vec![
+                PhysicalSortExpr {
+                    expr: Arc::new(Column::new("a", 0)),
+                    options: SortOptions {
+                        descending,
+                        nulls_first,
+                    },
+                },
+                PhysicalSortExpr {
+                    expr: Arc::new(Column::new("b", 1)),
+                    options: SortOptions {
+                        descending: !descending,
+                        nulls_first: !nulls_first,
+                    },
+                },
+            ];
+            let source = ParquetSource::new(Arc::clone(&schema));
+            let SortOrderPushdownResult::Inexact { inner: source } = source
+                .try_pushdown_sort(
+                    &order,
+                    &EquivalenceProperties::new(Arc::clone(&schema)),
+                )?
+            else {
+                panic!("expected inexact Parquet sort pushdown")
+            };
+            let mut config =
+                FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+                    .with_file(PartitionedFile::new("sort-settings.parquet", 1024))
+                    .with_projection_indices(Some(vec![1, 0]))?
+                    .with_limit(Some(17))
+                    .build();
+            config.preserve_order = true;
+            let planned: Arc<dyn ExecutionPlan> =
+                DataSourceExec::from_data_source(config);
+            let bytes = physical_plan_to_bytes(Arc::clone(&planned))?;
+            let decoded =
+                physical_plan_from_bytes(&bytes, &SessionContext::new().task_ctx())?;
+            let scan = |plan: &Arc<dyn ExecutionPlan>| {
+                plan.downcast_ref::<DataSourceExec>()
+                    .unwrap()
+                    .data_source()
+                    .downcast_ref::<FileScanConfig>()
+                    .unwrap()
+                    .clone()
+            };
+            let (a, b) = (scan(&planned), scan(&decoded));
+            let a_source = a.file_source().downcast_ref::<ParquetSource>().unwrap();
+            let b_source = b.file_source().downcast_ref::<ParquetSource>().unwrap();
+            assert_eq!(a_source.reverse_row_groups(), descending);
+            assert_eq!(b_source.reverse_row_groups(), a_source.reverse_row_groups());
+            assert_eq!(
+                a_source.sort_order_for_reorder().unwrap().as_ref(),
+                order.as_slice()
+            );
+            assert_eq!(
+                b_source.sort_order_for_reorder(),
+                a_source.sort_order_for_reorder()
+            );
+            #[cfg(feature = "json")]
+            {
+                let node = PhysicalPlanNode::decode(bytes.as_ref())
+                    .expect("encoded physical plan must decode");
+                let json = serde_json::to_string(&node).unwrap();
+                let from_json: PhysicalPlanNode = serde_json::from_str(&json).unwrap();
+                assert_eq!(from_json, node);
+            }
+            assert_eq!(a.preserve_order, b.preserve_order);
+            assert_eq!(physical_plan_to_bytes(decoded)?, bytes);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn parquet_reverse_without_reorder_and_malformed_reorder() -> Result<()> {
+    use datafusion_proto::bytes::{physical_plan_from_bytes, physical_plan_to_bytes};
+    use datafusion_proto::protobuf::{
+        PhysicalSortExprNodeCollection, physical_plan_node::PhysicalPlanType,
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let planned = DataSourceExec::from_data_source(
+        FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(ParquetSource::new(schema)),
+        )
+        .with_file(PartitionedFile::new("reverse-only.parquet", 1024))
+        .build(),
+    );
+    let bytes = physical_plan_to_bytes(planned)?;
+    let mut node = PhysicalPlanNode::decode(bytes.as_ref())
+        .expect("encoded physical plan must decode");
+    let Some(PhysicalPlanType::ParquetScan(scan)) = &mut node.physical_plan_type else {
+        panic!("expected Parquet scan")
+    };
+    scan.reverse_row_groups = true;
+    let reverse_bytes = node.encode_to_vec();
+    let ctx = SessionContext::new();
+    let decoded = physical_plan_from_bytes(&reverse_bytes, &ctx.task_ctx())?;
+    let config = decoded
+        .downcast_ref::<DataSourceExec>()
+        .unwrap()
+        .data_source()
+        .downcast_ref::<FileScanConfig>()
+        .unwrap();
+    let source = config
+        .file_source()
+        .downcast_ref::<ParquetSource>()
+        .unwrap();
+    assert!(source.reverse_row_groups());
+    assert!(source.sort_order_for_reorder().is_none());
+    assert_eq!(
+        physical_plan_to_bytes(decoded)?.as_ref(),
+        reverse_bytes.as_slice()
+    );
+
+    let Some(PhysicalPlanType::ParquetScan(scan)) = &mut node.physical_plan_type else {
+        unreachable!()
+    };
+    scan.sort_order_for_reorder = Some(PhysicalSortExprNodeCollection::default());
+    let error =
+        physical_plan_from_bytes(&node.encode_to_vec(), &ctx.task_ctx()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("reorder ordering must not be empty"),
+        "{error}"
+    );
     Ok(())
 }

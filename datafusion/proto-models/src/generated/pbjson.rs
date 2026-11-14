@@ -7024,6 +7024,9 @@ impl serde::Serialize for FileScanExecConf {
         if self.virtual_column_count != 0 {
             len += 1;
         }
+        if self.preserve_order {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.FileScanExecConf", len)?;
         if !self.file_groups.is_empty() {
             struct_ser.serialize_field("fileGroups", &self.file_groups)?;
@@ -7066,6 +7069,9 @@ impl serde::Serialize for FileScanExecConf {
         if self.virtual_column_count != 0 {
             struct_ser.serialize_field("virtualColumnCount", &self.virtual_column_count)?;
         }
+        if self.preserve_order {
+            struct_ser.serialize_field("preserveOrder", &self.preserve_order)?;
+        }
         struct_ser.end()
     }
 }
@@ -7097,6 +7103,8 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             "outputPartitioning",
             "virtual_column_count",
             "virtualColumnCount",
+            "preserve_order",
+            "preserveOrder",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -7114,6 +7122,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             ProjectionExprs,
             OutputPartitioning,
             VirtualColumnCount,
+            PreserveOrder,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -7148,6 +7157,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                             "projectionExprs" | "projection_exprs" => Ok(GeneratedField::ProjectionExprs),
                             "outputPartitioning" | "output_partitioning" => Ok(GeneratedField::OutputPartitioning),
                             "virtualColumnCount" | "virtual_column_count" => Ok(GeneratedField::VirtualColumnCount),
+                            "preserveOrder" | "preserve_order" => Ok(GeneratedField::PreserveOrder),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -7180,6 +7190,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                 let mut projection_exprs__ = None;
                 let mut output_partitioning__ = None;
                 let mut virtual_column_count__ = None;
+                let mut preserve_order__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::FileGroups => {
@@ -7267,6 +7278,12 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::PreserveOrder => {
+                            if preserve_order__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("preserveOrder"));
+                            }
+                            preserve_order__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(FileScanExecConf {
@@ -7283,6 +7300,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                     projection_exprs: projection_exprs__,
                     output_partitioning: output_partitioning__,
                     virtual_column_count: virtual_column_count__.unwrap_or_default(),
+                    preserve_order: preserve_order__.unwrap_or_default(),
                 })
             }
         }
@@ -16058,6 +16076,12 @@ impl serde::Serialize for ParquetScanExecNode {
         if self.parquet_options.is_some() {
             len += 1;
         }
+        if self.reverse_row_groups {
+            len += 1;
+        }
+        if self.sort_order_for_reorder.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.ParquetScanExecNode", len)?;
         if let Some(v) = self.base_conf.as_ref() {
             struct_ser.serialize_field("baseConf", v)?;
@@ -16067,6 +16091,12 @@ impl serde::Serialize for ParquetScanExecNode {
         }
         if let Some(v) = self.parquet_options.as_ref() {
             struct_ser.serialize_field("parquetOptions", v)?;
+        }
+        if self.reverse_row_groups {
+            struct_ser.serialize_field("reverseRowGroups", &self.reverse_row_groups)?;
+        }
+        if let Some(v) = self.sort_order_for_reorder.as_ref() {
+            struct_ser.serialize_field("sortOrderForReorder", v)?;
         }
         struct_ser.end()
     }
@@ -16083,6 +16113,10 @@ impl<'de> serde::Deserialize<'de> for ParquetScanExecNode {
             "predicate",
             "parquet_options",
             "parquetOptions",
+            "reverse_row_groups",
+            "reverseRowGroups",
+            "sort_order_for_reorder",
+            "sortOrderForReorder",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -16090,6 +16124,8 @@ impl<'de> serde::Deserialize<'de> for ParquetScanExecNode {
             BaseConf,
             Predicate,
             ParquetOptions,
+            ReverseRowGroups,
+            SortOrderForReorder,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -16114,6 +16150,8 @@ impl<'de> serde::Deserialize<'de> for ParquetScanExecNode {
                             "baseConf" | "base_conf" => Ok(GeneratedField::BaseConf),
                             "predicate" => Ok(GeneratedField::Predicate),
                             "parquetOptions" | "parquet_options" => Ok(GeneratedField::ParquetOptions),
+                            "reverseRowGroups" | "reverse_row_groups" => Ok(GeneratedField::ReverseRowGroups),
+                            "sortOrderForReorder" | "sort_order_for_reorder" => Ok(GeneratedField::SortOrderForReorder),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -16136,6 +16174,8 @@ impl<'de> serde::Deserialize<'de> for ParquetScanExecNode {
                 let mut base_conf__ = None;
                 let mut predicate__ = None;
                 let mut parquet_options__ = None;
+                let mut reverse_row_groups__ = None;
+                let mut sort_order_for_reorder__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::BaseConf => {
@@ -16156,12 +16196,26 @@ impl<'de> serde::Deserialize<'de> for ParquetScanExecNode {
                             }
                             parquet_options__ = map_.next_value()?;
                         }
+                        GeneratedField::ReverseRowGroups => {
+                            if reverse_row_groups__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("reverseRowGroups"));
+                            }
+                            reverse_row_groups__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::SortOrderForReorder => {
+                            if sort_order_for_reorder__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("sortOrderForReorder"));
+                            }
+                            sort_order_for_reorder__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(ParquetScanExecNode {
                     base_conf: base_conf__,
                     predicate: predicate__,
                     parquet_options: parquet_options__,
+                    reverse_row_groups: reverse_row_groups__.unwrap_or_default(),
+                    sort_order_for_reorder: sort_order_for_reorder__,
                 })
             }
         }
@@ -24631,7 +24685,9 @@ impl serde::Serialize for ScanLimit {
         }
         let mut struct_ser = serializer.serialize_struct("datafusion.ScanLimit", len)?;
         if self.limit != 0 {
-            struct_ser.serialize_field("limit", &self.limit)?;
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("limit", ToString::to_string(&self.limit).as_str())?;
         }
         struct_ser.end()
     }
