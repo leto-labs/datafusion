@@ -190,8 +190,10 @@ pub fn new_group_values(
                 return Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Utf8)));
             }
             DataType::Utf8View => {
-                return Ok(Box::new(batch_codes::BatchCodes::new(Box::new(
-                    GroupValuesBytesView::new(OutputType::Utf8View),
+                return Ok(Box::new(inline_cache::InlineCache::<1>::new(Box::new(
+                    batch_codes::BatchCodes::new(Box::new(GroupValuesBytesView::new(
+                        OutputType::Utf8View,
+                    ))),
                 ))));
             }
             DataType::Binary => {

@@ -504,3 +504,23 @@ Native differential tests include equal prefixes/suffixes with different middle
 bytes, different offsets for equal strings, NULLs, dictionary-buffer changes,
 collisions and scalar-checked spill/replay. Dependent feature: CORE-AGGREGATION.
 Classification: UPSTREAMABLE.
+
+
+## Family DC: canonical inline group codes before hashing
+
+Purpose: reuse canonical single-column inline group IDs in one pass, before
+hashing their complete values. A bounded direct-mapped front table compares the
+complete u128 key; collisions use the existing exact-key table. External views
+still fail the length guard before either cache can hit. The authoritative
+interner assigns every group ID. The shared factory composes the inline cache
+with batch-local value deduplication for long strings.
+
+The front table owns only complete inline bytes and group IDs. Both emission
+forms clear it before group IDs can shift. Cardinality disable and clear_shrink
+release its allocation. size() includes the vector metadata and capacity. The
+pair-key cache retains its existing lookup algorithm and allocates no front table.
+
+Native regressions cover deliberate front-slot collisions, NULLs, prefix/full
+emission and reuse, matching external descriptors with different buffers, unused
+buffers and cardinality disable. Removing front-key equality fails the collision
+regression. Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
