@@ -515,7 +515,8 @@ still fail the length guard before either cache can hit. The authoritative
 interner assigns every group ID. The shared factory composes the inline cache
 with batch-local value deduplication for long strings.
 
-The front table owns only complete inline bytes and group IDs. Both emission
+The front table is populated only for at most 512 groups; larger sets retain
+exact-table lookup without front storage. The front table owns only complete inline bytes and group IDs. Both emission
 forms clear it before group IDs can shift. Cardinality disable and clear_shrink
 release its allocation. size() includes the vector metadata and capacity. The
 pair-key cache retains its existing lookup algorithm and allocates no front table.

@@ -173,11 +173,16 @@ impl<const N: usize> GroupValues for InlineCache<N> {
             return Ok(());
         }
         if N == 1 {
-            self.front.resize(SLOTS, (0, usize::MAX));
+            if self.inner.len() <= SLOTS / 2 {
+                self.front.resize(SLOTS, (0, usize::MAX));
+            } else {
+                self.front.clear();
+                self.front.shrink_to_fit();
+            }
         }
         for (row, &group) in groups.iter().enumerate() {
             let key = Self::key(&arrays, row);
-            if N == 1 {
+            if N == 1 && !self.front.is_empty() {
                 self.front[BatchCodes::slot(key[0])] = (key[0], group);
             }
             let hash = self.hash_key(&key);
@@ -336,6 +341,21 @@ mod tests {
             }
         }
         compare_emit(&mut cache, reference.as_mut(), EmitTo::All);
+        Ok(())
+    }
+    #[test]
+    fn direct_front_budget_preserves_the_exact_key_cache() -> Result<()> {
+        let array = Arc::new(StringViewArray::from_iter_values(
+            (0..SLOTS / 2 + 1).map(|id| format!("k{id}")),
+        )) as ArrayRef;
+        let mut cache = InlineCache::<1>::new(base::<1>());
+        let (mut first, mut second) = (Vec::new(), Vec::new());
+        cache.intern(std::slice::from_ref(&array), &mut first)?;
+        assert!(cache.front.is_empty());
+        assert_eq!(cache.front.capacity(), 0);
+        assert_eq!(cache.cache.len(), SLOTS / 2 + 1);
+        cache.intern(&[array], &mut second)?;
+        assert_eq!(first, second);
         Ok(())
     }
     #[test]
