@@ -531,23 +531,25 @@ buffers and cardinality disable. Removing front-key equality fails the collision
 regression. Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
 
 
-## Family MK: compact mixed-key layout experiment
+## Family MK: withdrawn mixed layout and retained empty emission fix
 
-Purpose: select contiguous encoded rows for unordered grouping with one Utf8View
-key and at most 16 bytes of primitive keys. The factory rule uses schema widths,
-not query identity. Other grouping order modes retain their existing selection.
-Both Longbow engines use the factory. Screening determines retention.
+The schema rule selecting contiguous rows for unordered one-Utf8View plus at
+most 16 primitive bytes was withdrawn. The partitioned ClickBench screen made
+q19 1.508x slower (paired range 1.438–1.588), with large losses in q15/q17/q18.
+The frozen candidate and complete screen evidence remain available. The factory
+uses its previous column selection. No runtime option retains the experiment.
 
 Fresh row interners can emit empty keys before input and after clear. The old
-expectation panicked before an initial intern call; a failing characterization
-covers this case and empty-prefix emission, then verifies subsequent reuse.
+expectation panicked before an initial intern call. A direct Row regression
+covers empty full/prefix emission and subsequent reuse, independent of factory
+selection. This correctness fix remains for the existing generic row fallback.
 
 Differential tests compare row and column IDs and emitted keys across batches,
-NULLs, floating zero/NaN payloads and prefix/full emission. A shared scalar-sum spill fixture
-retains its 1 MiB single-key case and adds an 8 MiB mixed-key case. Source batches
-have 8,192 rows and replay batches 512. The mixed column reference exceeds 1 MiB
-at admission and 4 MiB during replay; its native string builder uses 2 MiB blocks.
-Both accepted fixtures must actually spill and match independent scalar sums.
+NULLs, floating zero/NaN payloads and prefix/full emission. A shared scalar-sum
+spill fixture retains its 1 MiB single-key case and 8 MiB mixed-key case. Source
+batches have 8,192 rows and replay batches have 512. The mixed column reference
+exceeds 1 MiB at admission and 4 MiB during replay because its string builder
+uses 2 MiB blocks. Both accepted fixtures must spill and match scalar sums.
 Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
 
 

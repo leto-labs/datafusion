@@ -70,14 +70,13 @@ fn compact_rows_match_column_keys_nulls_float_bits_and_emission() -> Result<()> 
 }
 
 #[test]
-fn compact_factory_emits_empty_keys_before_input_and_after_clear() -> Result<()> {
-    use super::{super::order::GroupOrdering, new_group_values};
+fn rows_emit_empty_keys_before_input_and_after_clear() -> Result<()> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("i", DataType::Int64, true),
         Field::new("f", DataType::Float64, true),
         Field::new("s", DataType::Utf8View, true),
     ]));
-    let mut candidate = new_group_values(Arc::clone(&schema), &GroupOrdering::None)?;
+    let mut candidate = GroupValuesRows::try_new(Arc::clone(&schema))?;
     let mut reference = GroupValuesColumn::<false>::try_new(schema)?;
     for _ in 0..3 {
         assert_eq!(reference.emit(EmitTo::All)?, candidate.emit(EmitTo::All)?);
