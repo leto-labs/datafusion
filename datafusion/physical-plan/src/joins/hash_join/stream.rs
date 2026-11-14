@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Longbow family SF: scope reports to tasks and preserve logical NULL keys.
+
 //! Stream implementation for Hash Join
 //!
 //! This module implements [`HashJoinStream`], the streaming engine for
@@ -59,6 +61,10 @@ use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_common::hash_utils::RandomState;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::{Stream, StreamExt, ready};
+
+fn build_keys_have_null(values: &[ArrayRef]) -> bool {
+    values.iter().any(|array| array.logical_null_count() > 0)
+}
 
 /// Represents build-side of hash join.
 pub(super) enum BuildSide {
@@ -195,7 +201,6 @@ enum BuildReportState {
 /// Owns the stream-side lifecycle for one partition's build-data report.
 struct BuildReportHandle {
     partition: usize,
-    mode: PartitionMode,
     build_accumulator: Option<Arc<SharedBuildAccumulator>>,
     waiter: Option<OnceFut<()>>,
     state: BuildReportState,
@@ -204,12 +209,10 @@ struct BuildReportHandle {
 impl BuildReportHandle {
     fn new(
         partition: usize,
-        mode: PartitionMode,
         build_accumulator: Option<Arc<SharedBuildAccumulator>>,
     ) -> Self {
         Self {
             partition,
-            mode,
             build_accumulator,
             waiter: None,
             state: BuildReportState::NotReported,
@@ -257,9 +260,7 @@ impl BuildReportHandle {
             return;
         }
 
-        if self.mode == PartitionMode::Partitioned
-            && let Some(build_accumulator) = &self.build_accumulator
-        {
+        if let Some(build_accumulator) = &self.build_accumulator {
             build_accumulator.report_canceled_partition(self.partition);
             self.state = BuildReportState::Canceled;
         } else {
@@ -510,7 +511,7 @@ impl HashJoinStream {
             probe_indices_buffer: Vec::with_capacity(batch_size),
             build_indices_buffer: Vec::with_capacity(batch_size),
             right_side_ordered,
-            build_report: BuildReportHandle::new(partition, mode, build_accumulator),
+            build_report: BuildReportHandle::new(partition, build_accumulator),
             mode,
             output_buffer,
             null_aware,
@@ -559,11 +560,9 @@ impl HashJoinStream {
             .bounds
             .clone()
             .unwrap_or_else(|| PartitionBounds::new(vec![]));
-        // Arrow tracks null counts per array, so this costs no data scan.
-        let keys_have_null = left_data
-            .values()
-            .iter()
-            .any(|array| array.null_count() > 0);
+        // SF: logical NULLs include NullArray and dictionary values whose
+        // physical validity buffer has no nulls.
+        let keys_have_null = build_keys_have_null(left_data.values());
 
         let build_data = match self.mode {
             PartitionMode::Partitioned => PartitionBuildData::Partitioned {
@@ -573,6 +572,7 @@ impl HashJoinStream {
                 keys_have_null,
             },
             PartitionMode::CollectLeft => PartitionBuildData::CollectLeft {
+                partition_id: self.partition,
                 pushdown,
                 bounds,
                 keys_have_null,
@@ -1078,6 +1078,30 @@ mod tests {
         make_partitioned_accumulator_for_test,
     };
 
+    #[test]
+    fn null_reports_include_logical_null_keys_without_a_validity_buffer() {
+        use arrow::array::{DictionaryArray, Int32Array, Int64Array, NullArray};
+        use arrow::datatypes::Int32Type;
+
+        let nulls = Arc::new(NullArray::new(1)) as ArrayRef;
+        assert_eq!(nulls.null_count(), 0);
+        assert!(build_keys_have_null(&[
+            nulls,
+            Arc::new(Int64Array::from(vec![1]))
+        ]));
+        let values = Arc::new(Int64Array::from(vec![None])) as ArrayRef;
+        let dictionary = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0]), values)
+                .unwrap(),
+        ) as ArrayRef;
+        assert_eq!(dictionary.null_count(), 0);
+        assert!(build_keys_have_null(&[dictionary]));
+        assert!(!build_keys_have_null(&[Arc::new(NullArray::new(0))]));
+        assert!(!build_keys_have_null(&[Arc::new(Int64Array::from(vec![
+            1
+        ]))]));
+    }
+
     fn empty_build_data(partition_id: usize) -> PartitionBuildData {
         PartitionBuildData::Partitioned {
             partition_id,
@@ -1088,7 +1112,7 @@ mod tests {
     }
 
     fn partitioned_handle(acc: &Arc<SharedBuildAccumulator>) -> BuildReportHandle {
-        BuildReportHandle::new(0, PartitionMode::Partitioned, Some(Arc::clone(acc)))
+        BuildReportHandle::new(0, Some(Arc::clone(acc)))
     }
 
     #[test]
@@ -1134,7 +1158,7 @@ mod tests {
 
     #[test]
     fn build_report_handle_no_accumulator_finalizes() {
-        let mut handle = BuildReportHandle::new(0, PartitionMode::Partitioned, None);
+        let mut handle = BuildReportHandle::new(0, None);
 
         handle.schedule(empty_build_data(0));
         handle.cancel_pending();

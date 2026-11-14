@@ -468,3 +468,21 @@ Native regressions compare prefix decisions with full encoded orders and
 exercise long shared strings, NULLs, both directions, several k values,
 multiple batches and pool release. Dependent feature: WINDOW-TOPK.
 Classification: UPSTREAMABLE.
+## Family SF: task-scoped join filters
+
+SF / SPLIT-JOIN-FILTERS / UPSTREAMABLE. `HashJoinExec` accepts the output
+partition range of a fresh execution instance before any stream runs.
+Accumulators deduplicate the assigned reports. Scoped streams publish complete
+build information without waiting for sibling streams, which can be scheduled
+serially on a smaller worker. Unreported, cancelled and excluded buckets keep
+all probe rows. CollectLeft uses the complete shared build; completion waits
+for every assigned report or cancellation. Dropping the last scoped accumulator
+owner closes observers when assigned partitions never started. Default
+whole-plan execution keeps its existing barrier. Original Apache notices remain intact.
+
+Build reports use logical NULL counts, including NullArray and dictionary values.
+NULL-only build keys retain their NULL-presence report even when ordinary
+membership is empty, so null-equal partitioned joins keep matching probe NULLs.
+
+Regression command in the Longbow consumer:
+`scripts/vendored-tests.py datafusion-physical-plan --release -E 'test(joins::hash_join::shared_bounds) | test(joins::hash_join::stream::tests)'`.

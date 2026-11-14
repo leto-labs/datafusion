@@ -792,6 +792,8 @@ struct HashJoinExecDynamicFilter {
     /// Build accumulator to collect build-side information (hash maps and/or bounds) from each partition.
     /// It is lazily initialized during execution to make sure we use the actual execution time partition counts.
     build_accumulator: OnceLock<Arc<SharedBuildAccumulator>>,
+    /// SF: output partitions executed by this fresh split-task instance.
+    execution_partitions: OnceLock<std::ops::Range<usize>>,
 }
 
 impl fmt::Debug for HashJoinExec {
@@ -988,6 +990,40 @@ impl HashJoinExec {
         self.dynamic_filter.as_ref().map(|df| &df.filter)
     }
 
+    /// Scope dynamic-filter reports to the output partitions executed by this
+    /// fresh plan instance. Call before any partition executes. Scoped reports
+    /// never wait for sibling streams: excluded and unfinished buckets retain
+    /// all rows until their complete build data is known.
+    pub fn set_dynamic_filter_partitions(
+        &self,
+        partitions: std::ops::Range<usize>,
+    ) -> Result<()> {
+        assert_or_internal_err!(
+            !partitions.is_empty()
+                && partitions.end <= self.right.output_partitioning().partition_count(),
+            "invalid dynamic-filter execution partitions {partitions:?}"
+        );
+        if let Some(df) = &self.dynamic_filter {
+            assert_or_internal_err!(
+                df.build_accumulator.get().is_none(),
+                "cannot scope an executing join dynamic filter"
+            );
+            if let Some(existing) = df.execution_partitions.get() {
+                assert_or_internal_err!(
+                    existing == &partitions,
+                    "conflicting dynamic-filter execution partitions"
+                );
+            } else {
+                df.execution_partitions.set(partitions).map_err(|_| {
+                    datafusion_common::internal_datafusion_err!(
+                        "concurrent dynamic-filter partition binding"
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Set the dynamic filter on this hash join.
     ///
     /// Resets any internal state that depends on any existing dynamic filter.
@@ -1007,6 +1043,7 @@ impl HashJoinExec {
             // Initialize with an empty accumulator which will be lazily populated
             // during execution.
             build_accumulator: OnceLock::new(),
+            execution_partitions: OnceLock::new(),
         });
         Ok(self)
     }
@@ -1473,16 +1510,21 @@ impl ExecutionPlan for HashJoinExec {
                         .map(|(_, right_expr)| Arc::clone(right_expr))
                         .collect::<Vec<_>>();
                     Some(Arc::clone(df.build_accumulator.get_or_init(|| {
-                        Arc::new(SharedBuildAccumulator::new_from_partition_mode(
-                            self.mode,
-                            self.left.as_ref(),
-                            self.right.as_ref(),
-                            filter,
-                            on_right,
-                            repartition_random_state,
-                            self.null_equality,
-                            self.null_aware,
-                        ))
+                        Arc::new(
+                            SharedBuildAccumulator::new_from_partition_mode(
+                                self.mode,
+                                self.left.as_ref(),
+                                self.right.as_ref(),
+                                filter,
+                                on_right,
+                                repartition_random_state,
+                                self.null_equality,
+                                self.null_aware,
+                            )
+                            .with_execution_partitions(
+                                df.execution_partitions.get().cloned(),
+                            ),
+                        )
                     })))
                 })
             })
@@ -1819,6 +1861,7 @@ impl ExecutionPlan for HashJoinExec {
                     .with_dynamic_filter(Some(HashJoinExecDynamicFilter {
                         filter: dynamic_filter,
                         build_accumulator: OnceLock::new(),
+                        execution_partitions: OnceLock::new(),
                     }))
                     .build_exec()?;
                 result = result.with_updated_node(new_node);
@@ -2874,6 +2917,7 @@ mod tests {
         join.dynamic_filter = Some(HashJoinExecDynamicFilter {
             filter: Arc::clone(&dynamic_filter),
             build_accumulator: OnceLock::new(),
+            execution_partitions: OnceLock::new(),
         });
 
         Ok((join, dynamic_filter))
