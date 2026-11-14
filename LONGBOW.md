@@ -362,3 +362,22 @@ only under that proof. Any imported partial state disables the proof; count and
 sum overflow checks remain for merges and subsequent raw updates. Emission does
 not weaken the cumulative bound. State format and evaluation stay unchanged.
 Feature: CORE-NUMERIC-RESULTS. Classification: UPSTREAMABLE.
+
+## Family NM: nullable membership decorrelation
+
+Purpose: preserve SQL's three-valued IN/NOT IN semantics under expressions and
+in projections. Dependent feature: CORE-SUBQUERIES. Classification: UPSTREAMABLE.
+
+One ordinary mark tests equality, another tests an unknown equality among rows
+that pass the subquery's correlation. CASE yields TRUE, NULL or FALSE in that
+priority; NOT IN negates that nullable result. Empty sets produce FALSE for IN,
+even for a NULL probe. Correlated NOT IN uses this path rather than applying a
+null-aware anti join to the combined correlation and membership filter. EXISTS
+and NOT EXISTS retain their two-valued marks. Projection names are preserved.
+
+The two scans require repeatable membership input. Volatile comparisons or
+subqueries, scalar subqueries in the comparison, LIMIT, windows, DISTINCT ON,
+aggregate functions and opaque extensions are explicitly rejected on this
+path. Supporting those inputs requires a single-evaluation nullable mark join.
+Native structural tests and the consumer's DuckDB v2.0.0-derived SLT fixture
+cover NULLs, duplicates, empty sets, correlation, OR/AND and projected values.

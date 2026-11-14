@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -15,14 +17,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! [`DecorrelatePredicateSubquery`] converts `IN`/`EXISTS` subquery predicates to `SEMI`/`ANTI` joins
+//! [`DecorrelatePredicateSubquery`] converts `IN`/`EXISTS` subqueries to semi, anti
+//! or mark joins, preserving nullable membership values in expressions.
 use std::collections::BTreeSet;
 use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::decorrelate::PullUpCorrelatedExpr;
 use crate::optimizer::ApplyOrder;
-use crate::utils::replace_qualified_name;
+use crate::utils::{NamePreserver, replace_qualified_name};
 use crate::{OptimizerConfig, OptimizerRule};
 
 use datafusion_common::alias::AliasGenerator;
@@ -36,13 +39,18 @@ use datafusion_expr::expr_rewriter::create_col_from_scalar_expr;
 use datafusion_expr::logical_plan::{JoinType, Subquery};
 use datafusion_expr::utils::{conjunction, expr_to_columns, split_conjunction_owned};
 use datafusion_expr::{
-    BinaryExpr, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, exists,
-    in_subquery, lit, not, not_exists, not_in_subquery,
+    BinaryExpr, Expr, ExprSchemable, Filter, LogicalPlan, LogicalPlanBuilder, Operator,
+    exists, in_subquery, lit, not, not_exists, not_in_subquery,
 };
 
 use log::debug;
 
-/// Optimizer rule for rewriting predicate(IN/EXISTS) subquery to left semi/anti joins
+mod membership;
+#[cfg(test)]
+mod membership_tests;
+use membership::MembershipTest;
+
+/// Optimizer rule for rewriting IN/EXISTS filters and projected values to joins.
 #[derive(Default, Debug)]
 pub struct DecorrelatePredicateSubquery {}
 
@@ -68,6 +76,25 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
                 subquery.transform_down(|p| self.rewrite(p, config))
             })?
             .data;
+
+        if let LogicalPlan::Projection(projection) = &plan
+            && projection.expr.iter().any(has_subquery)
+        {
+            let names = NamePreserver::new_for_projection();
+            let mut input = Arc::unwrap_or_clone(Arc::clone(&projection.input));
+            let mut expressions = Vec::with_capacity(projection.expr.len());
+            for expression in &projection.expr {
+                let name = names.save(expression);
+                let (new_input, new_expression) =
+                    rewrite_inner_subqueries(input, expression.clone(), config, true)?;
+                input = new_input;
+                expressions.push(name.restore(new_expression));
+            }
+            let rewritten = LogicalPlanBuilder::from(input)
+                .project(expressions)?
+                .build()?;
+            return Ok(Transformed::yes(rewritten));
+        }
 
         let LogicalPlan::Filter(filter) = plan else {
             return Ok(Transformed::no(plan));
@@ -104,7 +131,7 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
                 // The subquery expression is embedded within another expression
                 SubqueryPredicate::Embedded(expr) => {
                     let (plan, expr_without_subqueries) =
-                        rewrite_inner_subqueries(cur_input, expr, config)?;
+                        rewrite_filter_subqueries(cur_input, expr, config)?;
                     cur_input = plan;
                     other_exprs.push(expr_without_subqueries);
                 }
@@ -135,10 +162,41 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
     }
 }
 
+// A positive IN used only through filter AND/OR can collapse UNKNOWN to
+// FALSE: neither value can make the filter TRUE. Negation and every other
+// expression context can observe the difference and must retain UNKNOWN.
+fn rewrite_filter_subqueries(
+    outer: LogicalPlan,
+    expr: Expr,
+    config: &dyn OptimizerConfig,
+) -> Result<(LogicalPlan, Expr)> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: op @ (Operator::And | Operator::Or),
+            right,
+        }) => {
+            let (outer, left) = rewrite_filter_subqueries(outer, *left, config)?;
+            let (outer, right) = rewrite_filter_subqueries(outer, *right, config)?;
+            Ok((
+                outer,
+                Expr::BinaryExpr(BinaryExpr::new(Box::new(left), op, Box::new(right))),
+            ))
+        }
+        Expr::InSubquery(ref subquery)
+            if !subquery.negated && !has_subquery(&subquery.expr) =>
+        {
+            rewrite_inner_subqueries(outer, expr, config, false)
+        }
+        expr => rewrite_inner_subqueries(outer, expr, config, true),
+    }
+}
+
 fn rewrite_inner_subqueries(
     outer: LogicalPlan,
     expr: Expr,
     config: &dyn OptimizerConfig,
+    preserve_unknown: bool,
 ) -> Result<(LogicalPlan, Expr)> {
     let mut cur_input = outer;
     let alias = config.alias_generator();
@@ -146,7 +204,7 @@ fn rewrite_inner_subqueries(
         Expr::Exists(Exists {
             subquery: Subquery { subquery, .. },
             negated,
-        }) => match mark_join(&cur_input, &subquery, None, negated, alias)? {
+        }) => match mark_join(&cur_input, &subquery, None, negated, alias, false)? {
             Some((plan, exists_expr)) => {
                 cur_input = plan;
                 Ok(Transformed::yes(exists_expr))
@@ -159,18 +217,22 @@ fn rewrite_inner_subqueries(
             subquery: Subquery { subquery, .. },
             negated,
         }) => {
+            if expr.is_volatile() {
+                return plan_err!("NULL-aware IN subquery does not support a volatile comparison");
+            }
+            let nullable = expr.nullable(cur_input.schema())?
+                || subquery.schema().field(0).is_nullable();
             let in_predicate = subquery
                 .head_output_expr()?
                 .map_or(plan_err!("single expression required."), |output_expr| {
                     Ok(Expr::eq(*expr.clone(), output_expr))
                 })?;
-            match mark_join(&cur_input, &subquery, Some(&in_predicate), negated, alias)? {
+            match mark_join(&cur_input, &subquery, Some(&in_predicate), negated, alias, preserve_unknown && nullable)? {
                 Some((plan, exists_expr)) => {
                     cur_input = plan;
                     Ok(Transformed::yes(exists_expr))
                 }
-                None if negated => Ok(Transformed::no(not_in_subquery(*expr, subquery))),
-                None => Ok(Transformed::no(in_subquery(*expr, subquery))),
+                None => plan_err!("Cannot decorrelate NULL-aware IN subquery without changing its semantics"),
             }
         }
         _ => Ok(Transformed::no(e)),
@@ -273,6 +335,32 @@ fn build_join_top(
         })
         .map_or(Ok(None), |v| v.map(Some))?;
 
+    // A correlated NOT IN must ignore rows rejected by the subquery WHERE.
+    // NULL-aware anti joins over a combined membership/correlation filter do
+    // not distinguish those rows from an unknown membership comparison.
+    if query_info.negated
+        && !query_info.query.outer_ref_columns.is_empty()
+        && let Some(comparison) = &in_predicate_opt
+    {
+        let nullable = query_info
+            .where_in_expr
+            .as_ref()
+            .map(|expr| expr.nullable(left.schema()))
+            .transpose()?
+            .unwrap_or(false)
+            || query_info.query.subquery.schema().field(0).is_nullable();
+        return mark_join(
+            left,
+            &query_info.query.subquery,
+            Some(comparison),
+            true,
+            alias,
+            nullable,
+        )?
+        .map(|(plan, value)| LogicalPlanBuilder::from(plan).filter(value)?.build())
+        .transpose();
+    }
+
     let join_type = match query_info.negated {
         true => JoinType::LeftAnti,
         false => JoinType::LeftSemi,
@@ -285,6 +373,7 @@ fn build_join_top(
         in_predicate_opt.as_ref(),
         join_type,
         subquery_alias,
+        MembershipTest::Equal,
     )
 }
 
@@ -309,16 +398,31 @@ fn mark_join(
     in_predicate_opt: Option<&Expr>,
     negated: bool,
     alias_generator: &Arc<AliasGenerator>,
+    preserve_unknown: bool,
 ) -> Result<Option<(LogicalPlan, Expr)>> {
+    if preserve_unknown && let Some(comparison) = in_predicate_opt {
+        return membership::mark_join(
+            left,
+            subquery,
+            comparison,
+            negated,
+            alias_generator,
+        );
+    }
     let alias = alias_generator.next("__correlated_sq");
 
     let exists_col = Expr::Column(Column::new(Some(alias.clone()), "mark"));
     let exists_expr = if negated { !exists_col } else { exists_col };
 
-    Ok(
-        build_join(left, subquery, in_predicate_opt, JoinType::LeftMark, alias)?
-            .map(|plan| (plan, exists_expr)),
-    )
+    Ok(build_join(
+        left,
+        subquery,
+        in_predicate_opt,
+        JoinType::LeftMark,
+        alias,
+        MembershipTest::Equal,
+    )?
+    .map(|plan| (plan, exists_expr)))
 }
 
 /// Check if join keys in the join filter may contain NULL values
@@ -360,9 +464,13 @@ fn build_join(
     in_predicate_opt: Option<&Expr>,
     join_type: JoinType,
     alias: String,
+    membership_test: MembershipTest,
 ) -> Result<Option<LogicalPlan>> {
+    // Unknown membership must retain even a correlation equal to the original
+    // IN comparison: WHERE NULL is not an eligible subquery row.
+    let pull_up_predicate = in_predicate_opt.cloned().map(|e| membership_test.apply(e));
     let mut pull_up = PullUpCorrelatedExpr::new()
-        .with_in_predicate_opt(in_predicate_opt.cloned())
+        .with_in_predicate_opt(pull_up_predicate)
         .with_exists_sub_query(in_predicate_opt.is_none());
 
     let new_plan = subquery.clone().rewrite(&mut pull_up).data()?;
@@ -395,7 +503,8 @@ fn build_join(
             })),
         ) => {
             let right_col = create_col_from_scalar_expr(right.deref(), alias)?;
-            let in_predicate = Expr::eq(left.deref().clone(), Expr::Column(right_col));
+            let in_predicate = membership_test
+                .apply(Expr::eq(left.deref().clone(), Expr::Column(right_col)));
             in_predicate.and(join_filter)
         }
         (Some(join_filter), _) => join_filter,
@@ -409,7 +518,7 @@ fn build_join(
         ) => {
             let right_col = create_col_from_scalar_expr(right.deref(), alias)?;
 
-            Expr::eq(left.deref().clone(), Expr::Column(right_col))
+            membership_test.apply(Expr::eq(left.deref().clone(), Expr::Column(right_col)))
         }
         (None, None) => lit(true),
         _ => return Ok(None),
@@ -448,7 +557,8 @@ fn build_join(
             sub_query_alias.clone()
         };
 
-        // Mark joins don't use null-aware semantics (they use three-valued logic with mark column)
+        // Ordinary mark joins are two-valued existence tests. Membership combines
+        // equality and unknown-comparison marks into a nullable SQL value.
         let new_plan = LogicalPlanBuilder::from(left.clone())
             .join_on(right_projected, join_type, Some(join_filter))?
             .build()?;
