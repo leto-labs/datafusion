@@ -72,13 +72,21 @@ impl GroupValues for BatchCodes {
         if array.len() < SAMPLE || array.len() > u32::MAX as usize {
             return self.inner.intern(cols, groups);
         }
+        // Inline keys already have a one-pass canonical-code cache. Avoid
+        // another hashing sample when no external value appears in this
+        // sample. Later external values still use the canonical interner.
+        if array.data_buffers().is_empty()
+            || array.views()[..SAMPLE]
+                .iter()
+                .all(|&view| view as u32 <= 12)
+        {
+            return self.inner.intern(cols, groups);
+        }
         self.slots.resize(SLOTS, (0, EMPTY));
         self.slots.fill((0, EMPTY));
         let mut hits = 0;
         let mut seen_null = false;
-        let mut external = false;
         for row in 0..SAMPLE {
-            external |= array.views()[row] as u32 > 12;
             if array.is_null(row) {
                 hits += usize::from(seen_null);
                 seen_null = true;
@@ -94,8 +102,7 @@ impl GroupValues for BatchCodes {
             }
             *entry = (value, row);
         }
-        let minimum_hits = if external { SAMPLE / 4 } else { SAMPLE / 2 };
-        if hits < minimum_hits {
+        if hits < SAMPLE / 4 {
             return self.inner.intern(cols, groups);
         }
         self.slots.fill((0, EMPTY));
@@ -267,7 +274,10 @@ mod tests {
             })
             .unwrap();
         let array = Arc::new(StringViewArray::from_iter_values((0..8192).map(|row| {
-            if row / 128 % 2 == 0 {
+            if row == 255 {
+                // Keep reduction eligible while two inline keys collide.
+                "external-value-in-sample"
+            } else if row / 128 % 2 == 0 {
                 left.as_str()
             } else {
                 right.as_str()
@@ -281,7 +291,7 @@ mod tests {
         assert!(!candidate.codes.is_empty(), "must exercise code reduction");
         assert!(candidate.codes.len() < actual.len() / 4);
         assert_eq!(actual, expected);
-        assert_eq!(candidate.len(), 2);
+        assert_eq!(candidate.len(), 3);
         Ok(())
     }
     #[test]
@@ -307,6 +317,32 @@ mod tests {
         assert!(candidate.codes.len() < actual.len() / 4);
         assert_eq!(actual, expected);
         assert_eq!(candidate.len(), 2);
+        Ok(())
+    }
+    #[test]
+    fn batch_codes_match_keys_when_external_values_follow_the_sample() -> Result<()> {
+        let mut candidate = BatchCodes::new(base());
+        let mut reference = base();
+        for batch in 0..4 {
+            let array = Arc::new(StringViewArray::from_iter((0..8192).map(|row| {
+                if row % 13 == 0 {
+                    None
+                } else if row < SAMPLE {
+                    Some(format!("s{}", (row + batch) % 19))
+                } else {
+                    Some(format!("external-after-sample-{}", (row + batch) % 19))
+                }
+            }))) as ArrayRef;
+            let (mut actual, mut expected) = (Vec::new(), Vec::new());
+            candidate.intern(std::slice::from_ref(&array), &mut actual)?;
+            reference.intern(&[array], &mut expected)?;
+            assert_eq!(actual, expected);
+            assert_eq!(
+                candidate.emit(EmitTo::First(7))?,
+                reference.emit(EmitTo::First(7))?
+            );
+        }
+        assert_eq!(candidate.emit(EmitTo::All)?, reference.emit(EmitTo::All)?);
         Ok(())
     }
     #[test]

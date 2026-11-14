@@ -545,3 +545,13 @@ have 8,192 rows and replay batches 512. The mixed column reference exceeds 1 MiB
 at admission and 4 MiB during replay; its native string builder uses 2 MiB blocks.
 Both accepted fixtures must actually spill and match independent scalar sums.
 Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
+
+
+Family BC follow-up: inline-only samples use the canonical interner directly.
+The composed single-key inline cache already supplies one-pass group codes.
+A buffer-free array skips reduction immediately. Buffered arrays inspect view
+lengths before constructing any fingerprint table. External values after the
+sample remain correct through the canonical interner. The normal-slot inline
+collision fixture includes an external value to keep reduction eligible.
+A differential characterization covers external values after an inline sample,
+NULLs, changing batches and prefix emission.
