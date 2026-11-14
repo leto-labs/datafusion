@@ -17,6 +17,7 @@
 
 //! Execution [`RuntimeEnv`] environment that manages access to object
 //! store, memory manager, disk manager.
+// Modified by Longbow: FD reports the finite spill merge default.
 
 use crate::disk_manager::SpillingProgress;
 use crate::{
@@ -132,7 +133,7 @@ impl RuntimeConfigValues {
             ConfigEntry {
                 key: "datafusion.runtime.max_spill_merge_fan_in".to_string(),
                 value: max_spill_merge_fan_in,
-                description: "Maximum number of spill files opened by one external merge pass. Use 0 for unlimited. Values below 2 still use 2 so a merge can make progress.",
+                description: "Maximum number of spill files opened by one external merge pass. Zero uses the default of 8. Nonzero values below 2 use 2 so a merge can make progress.",
             },
             ConfigEntry {
                 key: "datafusion.runtime.temp_directory".to_string(),
@@ -451,7 +452,7 @@ impl RuntimeEnvBuilder {
 
     /// Limit the number of spill files opened by one external merge pass.
     ///
-    /// A value of 0 means unlimited.
+    /// A value of 0 uses the finite default of 8.
     pub fn with_max_spill_merge_fan_in(mut self, fan_in: usize) -> Self {
         let builder = self.disk_manager_builder.take().unwrap_or_default();
         self.with_disk_manager_builder(builder.with_max_spill_merge_fan_in(fan_in))
@@ -551,7 +552,9 @@ impl RuntimeEnvBuilder {
         RuntimeConfigValues {
             memory_limit: None,
             max_temp_directory_size: Some("100G".to_string()),
-            max_spill_merge_fan_in: Some("0".to_string()),
+            max_spill_merge_fan_in: Some(
+                crate::disk_manager::DEFAULT_MAX_SPILL_MERGE_FAN_IN.to_string(),
+            ),
             temp_directory: None,
             metadata_cache_limit: Some("50M".to_owned()),
             list_files_cache_limit: Some("1M".to_owned()),

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tempfile::{Builder, TempDir, TempPath};
 pub const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
-pub const DEFAULT_MAX_SPILL_MERGE_FAN_IN: usize = 0;
+pub const DEFAULT_MAX_SPILL_MERGE_FAN_IN: usize = 8;
 
 /// Builder pattern for the [DiskManager] structure
 #[derive(Clone)]
@@ -44,7 +44,7 @@ pub struct DiskManagerBuilder {
     /// Default to 100GB
     max_temp_directory_size: u64,
     /// Maximum number of spill files opened by one external merge pass.
-    /// A value of 0 means unlimited.
+    /// A value of 0 uses the finite default.
     max_spill_merge_fan_in: usize,
 }
 impl Debug for DiskManagerBuilder {
@@ -303,7 +303,7 @@ impl DiskManager {
 
     /// Returns the maximum number of spill files opened by one merge pass.
     ///
-    /// A value of 0 means unlimited.
+    /// A value of 0 uses the finite default.
     pub fn max_spill_merge_fan_in(&self) -> usize {
         self.max_spill_merge_fan_in.load(Ordering::Relaxed)
     }

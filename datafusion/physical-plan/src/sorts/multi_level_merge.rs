@@ -16,6 +16,7 @@
 // under the License.
 
 //! Create a stream that do a multi level merge stream
+// Modified by Longbow: FD bounds the default spill merge fan-in.
 
 use crate::metrics::BaselineMetrics;
 use crate::{EmptyRecordBatchStream, SpillManager};
@@ -705,7 +706,7 @@ fn split_batch_in_half(batch: RecordBatch) -> Vec<RecordBatch> {
 
 fn effective_spill_merge_fan_in(configured_fan_in: usize) -> usize {
     if configured_fan_in == 0 {
-        usize::MAX
+        datafusion_execution::disk_manager::DEFAULT_MAX_SPILL_MERGE_FAN_IN
     } else {
         configured_fan_in.max(2)
     }
@@ -1027,8 +1028,8 @@ mod tests {
     }
 
     #[test]
-    fn spill_merge_fan_in_is_unlimited_by_default() {
-        assert_eq!(effective_spill_merge_fan_in(0), usize::MAX);
+    fn spill_merge_fan_in_uses_a_finite_default() {
+        assert_eq!(effective_spill_merge_fan_in(0), 8);
     }
 
     #[test]
@@ -1095,6 +1096,55 @@ mod tests {
         assert_eq!(buffer_len, 1);
         assert_eq!(builder.sorted_spill_files.len(), 2);
 
+        Ok(())
+    }
+
+    #[test]
+    fn spill_merge_default_bounds_growing_run_counts() -> Result<()> {
+        for run_count in [16, 128] {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+            let runtime = RuntimeEnvBuilder::new().build_arc()?;
+            let spill_manager = SpillManager::new(
+                Arc::clone(&runtime),
+                SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+                Arc::clone(&schema),
+            );
+            let files = (0..run_count)
+                .map(|_| {
+                    Ok(SortedSpillFile {
+                        file: runtime.disk_manager.create_tmp_file("bounded default")?,
+                        max_record_batch_memory: 1,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let expr =
+                LexOrdering::new([PhysicalSortExpr::new_default(col("a", &schema)?)])
+                    .unwrap();
+            let reservation =
+                MemoryConsumer::new("bounded default").register(&runtime.memory_pool);
+            let mut builder = MultiLevelMergeBuilder::new(
+                spill_manager,
+                schema,
+                files,
+                vec![],
+                expr,
+                BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+                1024,
+                reservation,
+                None,
+                false,
+            );
+            let mut reservation = MemoryConsumer::new("bounded default phase")
+                .register(&runtime.memory_pool);
+            let phase =
+                builder.get_sorted_spill_files_to_merge(1, 2, &mut reservation)?;
+            let SpillFilesToMerge::Ready(files, _) = phase else {
+                panic!("unexpected skew split");
+            };
+            assert_eq!(files.len(), 8, "{run_count} runs must use a bounded phase");
+            assert_eq!(builder.sorted_spill_files.len(), run_count - 8);
+        }
         Ok(())
     }
 }
