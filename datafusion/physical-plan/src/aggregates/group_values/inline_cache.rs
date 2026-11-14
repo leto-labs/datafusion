@@ -82,6 +82,31 @@ impl<const N: usize> InlineCache<N> {
         })
     }
 
+    fn cached_groups<const CHECK_LENGTHS: bool>(
+        &self,
+        arrays: &[&StringViewArray; N],
+        groups: &mut Vec<usize>,
+    ) -> bool {
+        groups.clear();
+        for row in 0..arrays[0].len() {
+            let key = Self::key(arrays, row);
+            // Only complete inline keys can hit. NULL is its own complete key.
+            // Fuse this check with lookup when a decoder retains buffers.
+            if CHECK_LENGTHS && key.iter().any(|&key| key as u32 > 12 && key != NULL_KEY)
+            {
+                return false;
+            }
+            let hash = self.hash_key(&key);
+            if let Some((_, group)) = self.cache.find(hash, |(stored, _)| *stored == key)
+            {
+                groups.push(*group);
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
     fn reset(&mut self) {
         self.cache.clear();
         self.disabled = false;
@@ -95,29 +120,29 @@ impl<const N: usize> GroupValues for InlineCache<N> {
             return self.inner.intern(cols, groups);
         }
         let arrays = std::array::from_fn(|i| cols[i].as_string_view());
-        // A Parquet decoder can retain an unused page/dictionary buffer for
-        // entirely inline values. Inspect lengths only when buffers exist;
-        // a real out-of-line view contains a buffer identity, not a full key.
-        if arrays.iter().any(|a| {
-            !a.data_buffers().is_empty() && a.views().iter().any(|&view| view as u32 > 12)
-        }) {
-            return self.inner.intern(cols, groups);
-        }
-        groups.clear();
-        for row in 0..cols[0].len() {
-            let key = Self::key(&arrays, row);
-            let hash = self.hash_key(&key);
-            if let Some((_, group)) = self.cache.find(hash, |(stored, _)| *stored == key)
-            {
-                groups.push(*group);
-            } else {
-                break;
-            }
-        }
-        if groups.len() == cols[0].len() {
+        // Decoders can retain an unused dictionary buffer for inline keys.
+        // A hit needs one pass, including its length guard, rather than a
+        // separate full-array prescan. Buffer-free arrays need no guard.
+        let check_lengths = arrays.iter().any(|a| !a.data_buffers().is_empty());
+        let all_cached = if check_lengths {
+            self.cached_groups::<true>(&arrays, groups)
+        } else {
+            self.cached_groups::<false>(&arrays, groups)
+        };
+        if all_cached {
             return Ok(());
         }
         self.inner.intern(cols, groups)?;
+        // Misses can populate the cache only after proving every view inline.
+        // External buffer identities never become cache keys across batches.
+        if check_lengths
+            && arrays.iter().any(|a| {
+                !a.data_buffers().is_empty()
+                    && a.views().iter().any(|&view| view as u32 > 12)
+            })
+        {
+            return Ok(());
+        }
         if self.inner.len() > MAX_GROUPS {
             self.cache.clear();
             self.cache.shrink_to(0, |_| 0);
@@ -269,5 +294,41 @@ mod tests {
         let mut cache = InlineCache::<1>::new(base::<1>());
         cache.intern(&[array], &mut Vec::new()).unwrap();
         assert_eq!(cache.cache.len(), 2);
+    }
+
+    #[test]
+    fn buffered_short_keys_and_masked_long_views_keep_complete_key_identity() {
+        use arrow::buffer::{Buffer, NullBuffer};
+        fn check<const N: usize>() {
+            let mut cache = InlineCache::<N>::new(base::<N>());
+            let mut reference = base::<N>();
+            let short = StringViewArray::from(vec![None, Some("x"), Some("x")]);
+            let buffered = StringViewArray::try_new(
+                short.views().clone(),
+                vec![Buffer::from_vec(vec![0_u8; 128])],
+                short.nulls().cloned(),
+            )
+            .unwrap();
+            let long_a = StringViewArray::from(vec!["shared-long-prefix-A", "x", "x"]);
+            let long_b = StringViewArray::from(vec!["shared-long-prefix-B", "x", "x"]);
+            assert_eq!(long_a.views()[0], long_b.views()[0]);
+            let masked = StringViewArray::try_new(
+                long_a.views().clone(),
+                long_a.data_buffers().to_vec(),
+                Some(NullBuffer::from(vec![false, true, true])),
+            )
+            .unwrap();
+            for array in [buffered, masked, long_a, long_b, short] {
+                let array = Arc::new(array) as ArrayRef;
+                let cols = vec![array; N];
+                let (mut actual, mut expected) = (Vec::new(), Vec::new());
+                cache.intern(&cols, &mut actual).unwrap();
+                reference.intern(&cols, &mut expected).unwrap();
+                assert_eq!(actual, expected);
+            }
+            compare_emit(&mut cache, reference.as_mut(), EmitTo::All);
+        }
+        check::<1>();
+        check::<2>();
     }
 }

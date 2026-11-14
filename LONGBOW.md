@@ -379,6 +379,13 @@ its ordinary path, and cardinality above 16,384 releases and disables the cache.
 Prefix emission and clear invalidate all cached IDs. Dependent feature:
 CORE-AGGREGATION. Classification: UPSTREAMABLE.
 
+Cache hits fuse the external-view length guard with full-key lookup. Arrays
+without data buffers use the proven inline-only loop. A miss delegates the
+whole batch, then checks all views before population. External buffer
+identities never enter the cache. This removes a separate array scan when
+Parquet retains an unused dictionary buffer. Native regressions cover those
+buffers, masked long values and matching external view bits across arrays.
+
 ## Family CR: inline owned ROW_NUMBER ranking bytes
 
 Purpose: retain short encoded ranking keys and payloads inline, without one
