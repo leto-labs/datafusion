@@ -23,6 +23,19 @@ consumer's vendor tree. Longbow runs native regressions through a generated
 standalone harness with its pinned graph and Arrow patches. A standalone
 upstream-workspace build does not provide those Arrow extensions.
 
+## Family PC: physical projection constraint lineage
+
+Purpose: preserve physical primary/unique keys only when every source key
+column survives as a direct output column, with the correct output positions.
+Dependent Longbow feature: CORE-CONSTRAINT-CORRECTNESS. Audit classification:
+UPSTREAMABLE.
+
+Projection targets are grouped by source expression, and can include struct
+field accesses. Build an output-indexed source-column vector with holes for
+computed outputs; do not infer a key on a containing struct. Native regressions
+cover retained composite keys, false payload uniqueness, permutations, drops,
+duplicates, computed expressions and field-access mappings.
+
 ## Family JP: join keys before predicate decorrelation
 
 Purpose: construct a connected inner FROM graph from its WHERE equalities

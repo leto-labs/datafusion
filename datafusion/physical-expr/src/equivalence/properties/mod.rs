@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -14,6 +16,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
+#[cfg(test)]
+mod projection_tests;
 
 mod dependency; // Submodule containing DependencyMap and Dependencies
 mod joins; // Submodule containing join_equivalence_properties
@@ -1138,30 +1143,28 @@ impl EquivalenceProperties {
         orderings.chain(projected_orderings).collect()
     }
 
-    /// Projects constraints according to the given projection mapping.
+    /// Projects constraints through direct columns at their output positions.
     ///
-    /// This function takes a projection mapping and extracts column indices of
-    /// target columns. It then projects the constraints to only include
-    /// relationships between columns that exist in the projected output.
-    ///
-    /// # Parameters
-    ///
-    /// * `mapping` - A reference to the `ProjectionMapping` that defines the
-    ///   projection operation.
-    ///
-    /// # Returns
-    ///
-    /// Returns an optional `Constraints` object containing only the constraints
-    /// that are valid for the projected columns (if any exists).
-    fn projected_constraints(&self, mapping: &ProjectionMapping) -> Option<Constraints> {
-        let indices = mapping
-            .iter()
-            .flat_map(|(_, targets)| {
-                targets.iter().flat_map(|(target, _)| {
-                    target.downcast_ref::<Column>().map(|c| c.index())
-                })
-            })
-            .collect::<Vec<_>>();
+    /// `Constraints::project` expects source indices in output order. Computed
+    /// outputs have no source column, and a field-access target does not make
+    /// its containing output column unique. Keep holes for both rather than
+    /// shifting the positions of later direct columns.
+    fn projected_constraints(
+        &self,
+        mapping: &ProjectionMapping,
+        output_width: usize,
+    ) -> Option<Constraints> {
+        // No valid source column has this index.
+        let mut indices = vec![usize::MAX; output_width];
+        for (source, targets) in mapping.iter() {
+            if let Some(source) = source.downcast_ref::<Column>() {
+                for (target, _) in targets.iter() {
+                    if let Some(target) = target.downcast_ref::<Column>() {
+                        indices[target.index()] = source.index();
+                    }
+                }
+            }
+        }
         self.constraints.project(&indices)
     }
 
@@ -1178,7 +1181,9 @@ impl EquivalenceProperties {
         Self {
             oeq_cache: OrderingEquivalenceCache::new(normal_orderings),
             oeq_class: OrderingEquivalenceClass::new(orderings),
-            constraints: self.projected_constraints(mapping).unwrap_or_default(),
+            constraints: self
+                .projected_constraints(mapping, output_schema.fields().len())
+                .unwrap_or_default(),
             schema: output_schema,
             eq_group,
         }
