@@ -486,3 +486,16 @@ membership is empty, so null-equal partitioned joins keep matching probe NULLs.
 
 Regression command in the Longbow consumer:
 `scripts/vendored-tests.py datafusion-physical-plan --release -E 'test(joins::hash_join::shared_bounds) | test(joins::hash_join::stream::tests)'`.
+
+
+## Family FR: positional and bounded filter routing
+
+FR / SPLIT-JOIN-FILTERS / UPSTREAMABLE. Physical filters address columns by
+position. Identity boundaries preserve positions, while joins, projections,
+embedded filter projections and direct aggregate keys supply explicit mappings.
+Repeated names cannot redirect a predicate to a nullable sibling column.
+Computed aggregate keys and computed cross-side semi-join keys remain boundaries.
+Rejected volatile parent predicates never reach an absorbing node handler.
+Fetch boundaries reject parent predicates while retaining their own predicates.
+Native positional regressions and Longbow NULL, alias, volatile and fetch
+execution regressions cover these rules. Original license notices remain intact.

@@ -31,6 +31,8 @@
 //!
 //! [`FilterDescription`]: datafusion_physical_plan::filter_pushdown::FilterDescription
 
+// Longbow family FR: keep rejected parent predicates outside node handlers.
+
 use std::sync::Arc;
 
 use crate::PhysicalOptimizerRule;
@@ -452,7 +454,9 @@ fn push_down_filters(
     let children = node.children();
 
     // Filter out expressions that are not allowed for pushdown
-    let parent_filtered = FilteredVec::new(&parent_predicates, allow_pushdown_for_expr);
+    let parent_filtered = FilteredVec::new(&parent_predicates, |expr| {
+        node.fetch().is_none() && allow_pushdown_for_expr(expr)
+    });
 
     let filter_description = node.gather_filters_for_pushdown(
         phase,
@@ -582,14 +586,17 @@ fn push_down_filters(
     let mut res = updated_node.handle_child_pushdown_result(
         phase,
         ChildPushdownResult {
-            parent_filters: parent_predicates
-                .into_iter()
+            parent_filters: parent_filtered
+                .items()
+                .iter()
+                .cloned()
                 .enumerate()
                 .map(
                     |(parent_filter_idx, parent_filter)| ChildFilterPushdownResult {
                         filter: parent_filter,
-                        child_results: parent_filter_pushdown_supports[parent_filter_idx]
-                            .clone(),
+                        child_results: parent_filter_pushdown_supports
+                            [parent_filtered.trace_to_original_index(parent_filter_idx)]
+                        .clone(),
                     },
                 )
                 .collect(),
@@ -597,6 +604,15 @@ fn push_down_filters(
         },
         config,
     )?;
+    assert_eq_or_internal_err!(
+        res.filters.len(),
+        parent_filtered.len(),
+        "Filter pushdown expected one handler result per eligible parent filter for {}",
+        node.name()
+    );
+    // Rejected predicates must remain at their owner, even when a node can absorb
+    // predicates which its children did not accept (for example FilterExec).
+    res.filters = parent_filtered.map_results_to_original(res.filters, PushedDown::No);
     // Compare pointers for new_node and node, if they are different we must replace
     // ourselves because of changes in our children.
     if res.updated_node.is_none() && !Arc::ptr_eq(&updated_node, node) {

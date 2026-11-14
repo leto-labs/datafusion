@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Longbow family FR: route physical filters by column position, not field name.
+
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -33,7 +35,7 @@ use crate::common::can_project;
 use crate::execution_plan::{CardinalityEffect, replace_children_if_necessary};
 use crate::filter_pushdown::{
     ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
-    FilterPushdownPropagation, PushedDown,
+    FilterPushdownPropagation, FilterRemapper, PushedDown,
 };
 use crate::limit::LocalLimitExec;
 use crate::metrics::{MetricBuilder, MetricType};
@@ -66,7 +68,7 @@ use datafusion_physical_expr::expressions::{
     BinaryExpr, Column, IsNotNullExpr, Literal, lit,
 };
 use datafusion_physical_expr::intervals::utils::check_support;
-use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
+use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{
     AcrossPartitions, AnalysisContext, ConstExpr, ExprBoundaries, PhysicalExpr, analyze,
     conjunction, split_conjunction,
@@ -312,6 +314,16 @@ impl FilterExec {
     /// Projection
     pub fn projection(&self) -> &Option<ProjectionRef> {
         &self.projection
+    }
+
+    fn parent_filter_remapper(&self) -> FilterRemapper {
+        match &self.projection {
+            None => FilterRemapper::new(self.input.schema()),
+            Some(projection) => FilterRemapper::with_mapping(
+                self.input.schema(),
+                projection.iter().copied().enumerate().collect(),
+            ),
+        }
     }
 
     /// Calculates `Statistics` for `FilterExec` by applying the filter's
@@ -681,19 +693,20 @@ impl ExecutionPlan for FilterExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
+        let child = ChildFilterDescription::remap_filters(
+            &parent_filters,
+            &self.parent_filter_remapper(),
+        )?;
         if phase != FilterPushdownPhase::Pre {
-            let child =
-                ChildFilterDescription::from_child(&parent_filters, self.input())?;
             return Ok(FilterDescription::new().with_child(child));
         }
 
-        let child = ChildFilterDescription::from_child(&parent_filters, self.input())?
-            .with_self_filters(
-                split_conjunction(&self.predicate)
-                    .into_iter()
-                    .cloned()
-                    .collect(),
-            );
+        let child = child.with_self_filters(
+            split_conjunction(&self.predicate)
+                .into_iter()
+                .cloned()
+                .collect(),
+        );
 
         Ok(FilterDescription::new().with_child(child))
     }
@@ -707,25 +720,20 @@ impl ExecutionPlan for FilterExec {
         if phase != FilterPushdownPhase::Pre {
             return Ok(FilterPushdownPropagation::if_all(child_pushdown_result));
         }
-        // We absorb any parent filters that were not handled by our children
-        let mut unsupported_parent_filters: Vec<Arc<dyn PhysicalExpr>> =
-            child_pushdown_result
-                .parent_filters
-                .iter()
-                .filter_map(|f| {
-                    matches!(f.all(), PushedDown::No).then_some(Arc::clone(&f.filter))
-                })
-                .collect();
-
-        // If this FilterExec has a projection, the unsupported parent filters
-        // are in the output schema (after projection) coordinates. We need to
-        // remap them to the input schema coordinates before combining with self filters.
-        if self.projection.is_some() {
-            let input_schema = self.input().schema();
-            unsupported_parent_filters = unsupported_parent_filters
-                .into_iter()
-                .map(|expr| reassign_expr_columns(expr, &input_schema))
-                .collect::<Result<Vec<_>>>()?;
+        let remapper = self.parent_filter_remapper();
+        let mut unsupported_parent_filters = Vec::new();
+        let mut parent_support = Vec::new();
+        for result in &child_pushdown_result.parent_filters {
+            if matches!(result.all(), PushedDown::Yes) {
+                parent_support.push(PushedDown::Yes);
+            } else if let Some(input_filter) = remapper.try_remap(&result.filter)? {
+                unsupported_parent_filters.push(input_filter);
+                parent_support.push(PushedDown::Yes);
+            } else {
+                // An unmapped output reference stays with its parent, in
+                // the original output coordinates.
+                parent_support.push(PushedDown::No);
+            }
         }
 
         let unsupported_self_filters = child_pushdown_result
@@ -810,7 +818,7 @@ impl ExecutionPlan for FilterExec {
         };
 
         Ok(FilterPushdownPropagation {
-            filters: vec![PushedDown::Yes; child_pushdown_result.parent_filters.len()],
+            filters: parent_support,
             updated_node,
         })
     }
