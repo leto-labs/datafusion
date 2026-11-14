@@ -32,6 +32,9 @@ use datafusion_expr::EmitTo;
 
 pub mod multi_group_by;
 
+mod batch_codes;
+#[cfg(test)]
+mod batch_codes_spill;
 mod inline_cache;
 mod row;
 pub use row::GroupValuesRows;
@@ -187,7 +190,7 @@ pub fn new_group_values(
                 return Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Utf8)));
             }
             DataType::Utf8View => {
-                return Ok(Box::new(inline_cache::InlineCache::<1>::new(Box::new(
+                return Ok(Box::new(batch_codes::BatchCodes::new(Box::new(
                     GroupValuesBytesView::new(OutputType::Utf8View),
                 ))));
             }

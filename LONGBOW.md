@@ -468,3 +468,22 @@ Native regressions compare prefix decisions with full encoded orders and
 exercise long shared strings, NULLs, both directions, several k values,
 multiple batches and pool release. Dependent feature: WINDOW-TOPK.
 Classification: UPSTREAMABLE.
+
+
+## Family BC: batch-local byte-view grouping codes
+
+Purpose: recover a short-lived dictionary from repeated complete view descriptors
+before string hashing and interning. A bounded direct-mapped table compares full
+128-bit descriptors within one array. Only the canonical value interner owns
+cross-batch equality and group IDs. NULL has a separate code. Collisions add
+representatives; they never assert equality. Representatives retain first-seen
+order and their group IDs expand over the original rows. Small or mostly distinct
+batches use the value interner directly. Added scratch capacities enter size(),
+and clear_shrink releases them. Existing emission and spill formats remain.
+The shared factory serves partitioned and morsel aggregates.
+
+Native differential checks cover reordered dictionary views, changed buffers,
+NULLs, slices, empty and distinct inputs, forced descriptor collisions and reuse
+after prefix/full emission. A bounded-pool spill fixture compares with independent
+scalar sums. The normal-hash collision test rejects an equality-check mutation.
+Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
