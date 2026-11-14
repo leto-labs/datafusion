@@ -85,8 +85,7 @@ pub struct GroupValuesRows {
 
 impl GroupValuesRows {
     pub fn try_new(schema: SchemaRef) -> Result<Self> {
-        // Print a debugging message, so it is clear when the (slower) fallback
-        // GroupValuesRows is used.
+        // Record selection of the contiguous encoded-key layout.
         debug!("Creating GroupValuesRows for schema: {schema}");
         let row_converter = RowConverter::new(
             schema
@@ -208,7 +207,7 @@ impl GroupValues for GroupValuesRows {
         let mut group_values = self
             .group_values
             .take()
-            .expect("Can not emit from empty rows");
+            .unwrap_or_else(|| self.row_converter.empty_rows(0, 0));
 
         let mut output = match emit_to {
             EmitTo::All => {

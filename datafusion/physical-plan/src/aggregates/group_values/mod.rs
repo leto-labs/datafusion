@@ -35,6 +35,8 @@ pub mod multi_group_by;
 mod batch_codes;
 #[cfg(test)]
 mod batch_codes_spill;
+#[cfg(test)]
+mod compact_mixed_tests;
 mod inline_cache;
 mod row;
 pub use row::GroupValuesRows;
@@ -223,6 +225,27 @@ pub fn new_group_values(
             GroupValuesColumn::<false>::try_new(schema)?,
         ))));
     }
+    // Compact mixed keys avoid separate builders and virtual appends for
+    // each small fixed-width component beside one variable-width string.
+    let mut view_keys = 0;
+    let fixed_bytes = schema.fields().iter().try_fold(0usize, |bytes, field| {
+        if field.data_type() == &DataType::Utf8View {
+            view_keys += 1;
+            Some(bytes)
+        } else {
+            field
+                .data_type()
+                .primitive_width()
+                .and_then(|width| bytes.checked_add(width))
+        }
+    });
+    if matches!(group_ordering, GroupOrdering::None)
+        && view_keys == 1
+        && fixed_bytes.is_some_and(|bytes| bytes > 0 && bytes <= 16)
+    {
+        return Ok(Box::new(GroupValuesRows::try_new(schema)?));
+    }
+
     if multi_group_by::supported_schema(schema.as_ref()) {
         if matches!(group_ordering, GroupOrdering::None) {
             Ok(Box::new(GroupValuesColumn::<false>::try_new(schema)?))

@@ -525,3 +525,23 @@ Native regressions cover deliberate front-slot collisions, NULLs, prefix/full
 emission and reuse, matching external descriptors with different buffers, unused
 buffers and cardinality disable. Removing front-key equality fails the collision
 regression. Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
+
+
+## Family MK: compact mixed-key layout experiment
+
+Purpose: select contiguous encoded rows for unordered grouping with one Utf8View
+key and at most 16 bytes of primitive keys. The factory rule uses schema widths,
+not query identity. Other grouping order modes retain their existing selection.
+Both Longbow engines use the factory. Screening determines retention.
+
+Fresh row interners can emit empty keys before input and after clear. The old
+expectation panicked before an initial intern call; a failing characterization
+covers this case and empty-prefix emission, then verifies subsequent reuse.
+
+Differential tests compare row and column IDs across batches, NULLs, floating
+zero/NaN payloads and prefix/full emission. A shared scalar-sum spill fixture
+retains its 1 MiB single-key case and adds an 8 MiB mixed-key case. Source batches
+have 8,192 rows and replay batches 512. The mixed column reference exceeds 1 MiB
+at admission and 4 MiB during replay; its native string builder uses 2 MiB blocks.
+Both accepted fixtures must actually spill and match independent scalar sums.
+Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.

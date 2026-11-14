@@ -10,7 +10,7 @@ use crate::{
     test::TestMemoryExec,
 };
 use arrow::{
-    array::{Array, AsArray, Int64Array, StringViewArray},
+    array::{Array, ArrayRef, AsArray, Int64Array, StringViewArray},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -25,11 +25,24 @@ use std::{collections::HashMap, sync::Arc};
 
 #[tokio::test]
 async fn batch_code_grouping_spill_matches_scalar_sums() -> Result<()> {
-    let schema = Arc::new(Schema::new(vec![
+    spill_matches_scalar_sums(false).await
+}
+
+#[tokio::test]
+async fn compact_mixed_grouping_spill_matches_scalar_sums() -> Result<()> {
+    spill_matches_scalar_sums(true).await
+}
+
+async fn spill_matches_scalar_sums(mixed: bool) -> Result<()> {
+    let mut fields = vec![
         Field::new("k", DataType::Utf8View, true),
         Field::new("v", DataType::Int64, true),
-    ]));
-    let mut expected = HashMap::<Option<String>, i64>::new();
+    ];
+    if mixed {
+        fields.insert(1, Field::new("d", DataType::Int64, true));
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let mut expected = HashMap::<(Option<String>, Option<i64>), i64>::new();
     let mut batches = Vec::new();
     for batch in 0..128 {
         let keys: Vec<_> = (0..8192)
@@ -44,8 +57,11 @@ async fn batch_code_grouping_spill_matches_scalar_sums() -> Result<()> {
         let values: Vec<_> = (0..8192)
             .map(|row| (row % 7 != 0).then_some(row as i64 % 19 - 9))
             .collect();
-        for (key, value) in keys.iter().zip(&values) {
-            *expected.entry(key.clone()).or_default() += value.unwrap_or(0);
+        let fixed: Vec<_> = (0..8192)
+            .map(|row| (mixed && row % 23 != 0).then_some((row / 128 % 13) as i64))
+            .collect();
+        for ((key, fixed), value) in keys.iter().zip(&fixed).zip(&values) {
+            *expected.entry((key.clone(), *fixed)).or_default() += value.unwrap_or(0);
         }
         let dict = StringViewArray::from_iter_values(
             (0..128).map(|id| format!("dictionary-key-{}", id + batch * 128)),
@@ -60,20 +76,22 @@ async fn batch_code_grouping_spill_matches_scalar_sums() -> Result<()> {
                 keys.iter().map(Option::is_some).collect::<Vec<_>>(),
             )),
         )?;
-        batches.push(RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(views), Arc::new(Int64Array::from(values))],
-        )?);
+        let mut columns: Vec<ArrayRef> =
+            vec![Arc::new(views), Arc::new(Int64Array::from(values))];
+        if mixed {
+            columns.insert(1, Arc::new(Int64Array::from(fixed)));
+        }
+        batches.push(RecordBatch::try_new(Arc::clone(&schema), columns)?);
     }
     let input = TestMemoryExec::try_new_exec(&[batches], Arc::clone(&schema), None)?;
+    let mut group_keys = vec![(col("k", &schema)?, "k".into())];
+    if mixed {
+        group_keys.push((col("d", &schema)?, "d".into()));
+    }
+    let mask = vec![false; group_keys.len()];
     let aggregate = AggregateExec::try_new(
         AggregateMode::Single,
-        PhysicalGroupBy::new(
-            vec![(col("k", &schema)?, "k".into())],
-            vec![],
-            vec![vec![false]],
-            false,
-        ),
+        PhysicalGroupBy::new(group_keys, vec![], vec![mask], false),
         vec![Arc::new(
             AggregateExprBuilder::new(sum_udaf(), vec![col("v", &schema)?])
                 .schema(Arc::clone(&schema))
@@ -84,14 +102,20 @@ async fn batch_code_grouping_spill_matches_scalar_sums() -> Result<()> {
         input,
         schema,
     )?;
-    let mut config = SessionConfig::new().with_batch_size(8192);
+    // Mixed replay needs headroom for the column reference's 2 MiB string
+    // blocks. Both finite pools must still spill this dataset.
+    let mut config = SessionConfig::new().with_batch_size(512);
     config.options_mut().execution.sort_spill_reservation_bytes = 4096;
     let context = Arc::new(
         TaskContext::default()
             .with_session_config(config)
             .with_runtime(
                 RuntimeEnvBuilder::new()
-                    .with_memory_pool(Arc::new(FairSpillPool::new(1024 * 1024)))
+                    .with_memory_pool(Arc::new(FairSpillPool::new(if mixed {
+                        8 * 1024 * 1024
+                    } else {
+                        1024 * 1024
+                    })))
                     .build_arc()?,
             ),
     );
@@ -100,12 +124,20 @@ async fn batch_code_grouping_spill_matches_scalar_sums() -> Result<()> {
     for batch in &output {
         let keys = batch.column(0).as_string_view();
         let values = batch
-            .column(1)
+            .column(1 + usize::from(mixed))
             .as_primitive::<arrow::datatypes::Int64Type>();
         for row in 0..batch.num_rows() {
             let key = keys.is_valid(row).then(|| keys.value(row).to_owned());
+            let fixed = if mixed {
+                let a = batch
+                    .column(1)
+                    .as_primitive::<arrow::datatypes::Int64Type>();
+                a.is_valid(row).then(|| a.value(row))
+            } else {
+                None
+            };
             assert!(
-                actual.insert(key, values.value(row)).is_none(),
+                actual.insert((key, fixed), values.value(row)).is_none(),
                 "duplicate emitted group"
             );
         }
