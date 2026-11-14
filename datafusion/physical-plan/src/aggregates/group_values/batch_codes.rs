@@ -249,7 +249,7 @@ mod tests {
         let mut candidate = BatchCodes::new(base());
         let mut reference = base();
         let (mut actual, mut expected) = (Vec::new(), Vec::new());
-        candidate.intern(&[array.clone()], &mut actual)?;
+        candidate.intern(std::slice::from_ref(&array), &mut actual)?;
         reference.intern(&[array], &mut expected)?;
         assert!(!candidate.codes.is_empty(), "must exercise code reduction");
         assert!(candidate.codes.len() < actual.len() / 4);

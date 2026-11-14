@@ -61,11 +61,11 @@ async fn batch_code_grouping_spill_matches_scalar_sums() -> Result<()> {
             )),
         )?;
         batches.push(RecordBatch::try_new(
-            schema.clone(),
+            Arc::clone(&schema),
             vec![Arc::new(views), Arc::new(Int64Array::from(values))],
         )?);
     }
-    let input = TestMemoryExec::try_new_exec(&[batches], schema.clone(), None)?;
+    let input = TestMemoryExec::try_new_exec(&[batches], Arc::clone(&schema), None)?;
     let aggregate = AggregateExec::try_new(
         AggregateMode::Single,
         PhysicalGroupBy::new(
@@ -76,7 +76,7 @@ async fn batch_code_grouping_spill_matches_scalar_sums() -> Result<()> {
         ),
         vec![Arc::new(
             AggregateExprBuilder::new(sum_udaf(), vec![col("v", &schema)?])
-                .schema(schema.clone())
+                .schema(Arc::clone(&schema))
                 .alias("sum")
                 .build()?,
         )],
