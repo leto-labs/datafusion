@@ -425,14 +425,12 @@ with those structures. Native regressions cover both streaming modes, prefix
 emission, full emission, NULL keys, complete key equality and reuse.
 Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
 
-## Family HC: reuse hash bucket candidate views during collection
+## Family HC: withdrawn grouping probe-cache experiment
 
-Purpose: avoid repeated hash-table probes for a batch's recurring grouping
-hashes. A 64-slot local cache retains the complete hash and its candidate view.
-Candidate views stay stable during collection. The following vector equality
-phase still checks complete keys, including colliding hashes. No cached view
-survives the method call. Native group tests cover collisions, NULLs, prefix
-emission, full emission and reuse in both streaming modes.
+The batch-local complete-hash candidate-view cache was removed after its q19
+confirmation screen was flat. The initial small gain did not reproduce.
+Full key equality stayed authoritative throughout the experiment. Its commits
+and evidence remain available for review. No HC cache exists in this pin.
 Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
 
 ## Family RBC: owned rejection bound for ROW_NUMBER Top-K
