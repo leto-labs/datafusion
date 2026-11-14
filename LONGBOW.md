@@ -538,8 +538,8 @@ Fresh row interners can emit empty keys before input and after clear. The old
 expectation panicked before an initial intern call; a failing characterization
 covers this case and empty-prefix emission, then verifies subsequent reuse.
 
-Differential tests compare row and column IDs across batches, NULLs, floating
-zero/NaN payloads and prefix/full emission. A shared scalar-sum spill fixture
+Differential tests compare row and column IDs and emitted keys across batches,
+NULLs, floating zero/NaN payloads and prefix/full emission. A shared scalar-sum spill fixture
 retains its 1 MiB single-key case and adds an 8 MiB mixed-key case. Source batches
 have 8,192 rows and replay batches 512. The mixed column reference exceeds 1 MiB
 at admission and 4 MiB during replay; its native string builder uses 2 MiB blocks.

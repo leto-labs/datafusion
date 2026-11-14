@@ -62,10 +62,10 @@ fn compact_rows_match_column_keys_nulls_float_bits_and_emission() -> Result<()> 
             } else {
                 EmitTo::All
             };
-            rows.emit(emit)?;
-            columns.emit(emit)?;
+            assert_eq!(rows.emit(emit)?, columns.emit(emit)?);
         }
     }
+    assert_eq!(rows.emit(EmitTo::All)?, columns.emit(EmitTo::All)?);
     Ok(())
 }
 
