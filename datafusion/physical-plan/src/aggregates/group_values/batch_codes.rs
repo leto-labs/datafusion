@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 the Longbow authors.
 
-//! Batch-local dictionary codes for repeated byte-view descriptors. Only the
-//! underlying interner compares values across batches and owns group identity.
+//! Batch-local dictionary codes for repeated byte-view values. Fingerprints
+//! select candidates, complete bytes prove equality, and the underlying
+//! interner owns cross-batch equality and group identity.
 
 use super::GroupValues;
 use arrow::{
-    array::{Array, ArrayRef, AsArray, UInt32Array},
+    array::{Array, ArrayRef, AsArray, StringViewArray, UInt32Array},
     compute::take,
 };
 use datafusion_common::Result;
@@ -31,6 +32,23 @@ impl BatchCodes {
             rows: Vec::new(),
             codes: Vec::new(),
         }
+    }
+    fn fingerprint(array: &StringViewArray, row: usize) -> u128 {
+        let view = array.views()[row];
+        if view as u32 <= 12 {
+            return view;
+        }
+        let bytes = array.value(row).as_bytes();
+        let tail = u64::from_le_bytes(
+            bytes[bytes.len() - 8..]
+                .try_into()
+                .expect("external view has at least eight bytes"),
+        );
+        u128::from(view as u64) | (u128::from(tail) << 64)
+    }
+    fn equal(array: &StringViewArray, left: usize, right: usize) -> bool {
+        array.views()[left] == array.views()[right]
+            || array.value(left) == array.value(right)
     }
     fn slot(key: u128) -> usize {
         #[cfg(feature = "force_hash_collisions")]
@@ -58,20 +76,26 @@ impl GroupValues for BatchCodes {
         self.slots.fill((0, EMPTY));
         let mut hits = 0;
         let mut seen_null = false;
+        let mut external = false;
         for row in 0..SAMPLE {
+            external |= array.views()[row] as u32 > 12;
             if array.is_null(row) {
                 hits += usize::from(seen_null);
                 seen_null = true;
                 continue;
             }
-            let value = array.views()[row];
+            let value = Self::fingerprint(array, row);
             let entry = &mut self.slots[Self::slot(value)];
-            if entry.1 != EMPTY && entry.0 == value {
+            if entry.1 != EMPTY
+                && entry.0 == value
+                && (value as u32 <= 12 || Self::equal(array, row, entry.1))
+            {
                 hits += 1;
             }
-            *entry = (value, 0);
+            *entry = (value, row);
         }
-        if hits < SAMPLE / 2 {
+        let minimum_hits = if external { SAMPLE / 4 } else { SAMPLE / 2 };
+        if hits < minimum_hits {
             return self.inner.intern(cols, groups);
         }
         self.slots.fill((0, EMPTY));
@@ -88,9 +112,13 @@ impl GroupValues for BatchCodes {
                 self.codes.push(code);
                 continue;
             }
-            let value = array.views()[row];
+            let value = Self::fingerprint(array, row);
             let entry = &mut self.slots[Self::slot(value)];
-            let code = if entry.1 != EMPTY && entry.0 == value {
+            let code = if entry.1 != EMPTY
+                && entry.0 == value
+                && (value as u32 <= 12
+                    || Self::equal(array, row, self.rows[entry.1] as usize))
+            {
                 entry.1
             } else {
                 let code = self.rows.len();
@@ -100,9 +128,8 @@ impl GroupValues for BatchCodes {
             };
             self.codes.push(code);
         }
-        // Equal descriptors in one immutable array name the same complete
-        // bytes. Collisions or different descriptors for equal bytes merely
-        // produce extra representatives; the canonical interner unifies them.
+        // Fingerprints only select candidates: complete bytes prove equality.
+        // Collisions add representatives for the canonical interner to unify.
         let values = take(
             array,
             &UInt32Array::from(std::mem::take(&mut self.rows)),
@@ -252,6 +279,31 @@ mod tests {
         candidate.intern(std::slice::from_ref(&array), &mut actual)?;
         reference.intern(&[array], &mut expected)?;
         assert!(!candidate.codes.is_empty(), "must exercise code reduction");
+        assert!(candidate.codes.len() < actual.len() / 4);
+        assert_eq!(actual, expected);
+        assert_eq!(candidate.len(), 2);
+        Ok(())
+    }
+    #[test]
+    fn value_codes_compare_middle_bytes_and_deduplicate_different_offsets() -> Result<()>
+    {
+        let left = "same-prefix-first-middle-same-suffix";
+        let right = "same-prefix-other-middle-same-suffix";
+        assert_eq!(left.len(), right.len());
+        let array = StringViewArray::from_iter_values(
+            (0..8192).map(|row| if row / 128 % 2 == 0 { left } else { right }),
+        );
+        assert_eq!(
+            BatchCodes::fingerprint(&array, 0),
+            BatchCodes::fingerprint(&array, 128)
+        );
+        let array = Arc::new(array) as ArrayRef;
+        let mut candidate = BatchCodes::new(base());
+        let mut reference = base();
+        let (mut actual, mut expected) = (Vec::new(), Vec::new());
+        candidate.intern(std::slice::from_ref(&array), &mut actual)?;
+        reference.intern(&[array], &mut expected)?;
+        assert!(!candidate.codes.is_empty());
         assert!(candidate.codes.len() < actual.len() / 4);
         assert_eq!(actual, expected);
         assert_eq!(candidate.len(), 2);

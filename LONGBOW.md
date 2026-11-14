@@ -487,3 +487,20 @@ NULLs, slices, empty and distinct inputs, forced descriptor collisions and reuse
 after prefix/full emission. A bounded-pool spill fixture compares with independent
 scalar sums. The normal-hash collision test rejects an equality-check mutation.
 Dependent feature: CORE-AGGREGATION. Classification: UPSTREAMABLE.
+
+
+## Family VD: value deduplication before string hashing
+
+Purpose: share batch-local codes for equal external strings whose descriptors
+use different offsets. Length, four prefix bytes and eight suffix bytes select
+candidates. Complete bytes prove equality before a code is reused. Inline
+fingerprints remain complete keys. NULL keeps a separate code. Fingerprints and
+representative indices never define equality across arrays or survive emission
+as lookup state. A sample selects reduction only when duplicates can amortize it.
+No wire state, output schema or additional retained field changes.
+
+The shared single-string grouping factory serves partitioned and morsel engines.
+Native differential tests include equal prefixes/suffixes with different middle
+bytes, different offsets for equal strings, NULLs, dictionary-buffer changes,
+collisions and scalar-checked spill/replay. Dependent feature: CORE-AGGREGATION.
+Classification: UPSTREAMABLE.
