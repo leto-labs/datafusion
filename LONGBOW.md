@@ -515,11 +515,15 @@ still fail the length guard before either cache can hit. The authoritative
 interner assigns every group ID. The shared factory composes the inline cache
 with batch-local value deduplication for long strings.
 
-The front table is populated only for at most 512 groups; larger sets retain
-exact-table lookup without front storage. The front table owns only complete inline bytes and group IDs. Both emission
-forms clear it before group IDs can shift. Cardinality disable and clear_shrink
-release its allocation. size() includes the vector metadata and capacity. The
-pair-key cache retains its existing lookup algorithm and allocates no front table.
+The front table is populated on an all-inline miss only when the canonical
+interner has at most 512 groups. It caches at most 512 distinct keys in 1,024
+slots. An external-value fallback can grow the global group set while retaining
+old valid entries. A later all-inline miss above the threshold releases front
+storage. Entries own complete inline bytes and canonical group IDs. Both
+emission forms clear cached IDs before they can shift. Cardinality disable and
+clear_shrink release the allocation. size() includes vector metadata and
+capacity. The pair-key cache retains its existing lookup algorithm and allocates
+no front table.
 
 Native regressions cover deliberate front-slot collisions, NULLs, prefix/full
 emission and reuse, matching external descriptors with different buffers, unused
