@@ -490,12 +490,30 @@ impl SharedBuildAccumulator {
     /// builds before probing would prevent later partitions from ever starting.
     /// The state lock serializes publication, so an older permissive snapshot
     /// cannot overwrite a newer one. Unknown buckets always keep their rows.
-    fn publish_task_snapshot(&self, state: &mut AccumulatorState) -> Result<()> {
+    ///
+    /// `changed` is false when the report adds no build information to the
+    /// last published snapshot: a cancellation (unknown stays TRUE) or a
+    /// repeated CollectLeft report of the one shared build. Such a report only
+    /// records completion; it does not rebuild the predicate or advance its
+    /// generation, so consumers keep their compiled form.
+    fn publish_task_snapshot(
+        &self,
+        state: &mut AccumulatorState,
+        changed: bool,
+    ) -> Result<()> {
         if let CompletionState::Ready(Err(error)) = &state.completion {
             return Err(DataFusionError::Shared(Arc::clone(error)));
         }
         let reports = state.task_reports.as_ref().expect("scoped accumulator");
         let complete = reports.reported.iter().all(|reported| *reported);
+        if !changed {
+            if complete {
+                self.dynamic_filter.mark_complete();
+                state.completion = CompletionState::Ready(Ok(()));
+                self.completion_notify.notify_waiters();
+            }
+            return Ok(());
+        }
         let known_or_unknown = |status: &PartitionStatus| match status {
             PartitionStatus::Pending => PartitionStatus::CanceledUnknown,
             status => status.clone(),
@@ -555,8 +573,17 @@ impl SharedBuildAccumulator {
                     return Ok(());
                 }
                 *reported = true;
+                // Every CollectLeft stream reports the same complete shared
+                // build; only the first report changes the predicate.
+                let changed = !matches!(
+                    &guard.data,
+                    AccumulatedBuildData::CollectLeft {
+                        data: PartitionStatus::Reported(_),
+                        ..
+                    }
+                );
                 self.store_build_data(&mut guard, data)?;
-                return self.publish_task_snapshot(&mut guard);
+                return self.publish_task_snapshot(&mut guard, changed);
             }
             self.store_build_data(&mut guard, data)?;
             self.take_finalize_input_if_ready(&mut guard)
@@ -584,7 +611,9 @@ impl SharedBuildAccumulator {
                 *reported = true;
                 self.store_canceled_partition(&mut guard, partition_id);
                 // The result is retained in completion and read by later reports.
-                let _ = self.publish_task_snapshot(&mut guard);
+                // An unknown bucket keeps TRUE, as Pending did in the published
+                // snapshot, so cancellation only records completion.
+                let _ = self.publish_task_snapshot(&mut guard, false);
                 return;
             }
             self.store_canceled_partition(&mut guard, partition_id);
@@ -1730,11 +1759,39 @@ mod tests {
         task_report(&acc, data(1)).await?;
         assert_eq!(task_filter_values(&acc, vec![7, 8]), [true, false]);
         assert!(!task_filter_complete(&acc));
+        let published = acc.dynamic_filter.snapshot_generation();
         // A duplicate report cannot stand in for partition 2.
         task_report(&acc, data(1)).await?;
         assert!(!task_filter_complete(&acc));
         task_report(&acc, data(2)).await?;
         assert!(task_filter_complete(&acc));
+        // The second stream reports the same shared build: it completes the
+        // filter without publishing a new generation for consumers to compile.
+        assert_eq!(acc.dynamic_filter.snapshot_generation(), published);
+        assert_eq!(task_filter_values(&acc, vec![7, 8]), [true, false]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_cancellation_completes_without_republishing() -> Result<()> {
+        let acc = make_partitioned_expr_accumulator_for_test(4)
+            .with_execution_partitions(Some(1..3));
+        task_report(
+            &acc,
+            PartitionBuildData::Partitioned {
+                partition_id: 1,
+                pushdown: PushdownStrategy::Empty,
+                bounds: no_bounds(),
+                keys_have_null: false,
+            },
+        )
+        .await?;
+        let published = acc.dynamic_filter.snapshot_generation();
+        let before = task_filter_values(&acc, (0..64).collect());
+        acc.report_canceled_partition(2);
+        assert!(task_filter_complete(&acc));
+        assert_eq!(acc.dynamic_filter.snapshot_generation(), published);
+        assert_eq!(task_filter_values(&acc, (0..64).collect()), before);
         Ok(())
     }
 
