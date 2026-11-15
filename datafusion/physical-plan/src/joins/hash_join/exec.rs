@@ -923,9 +923,26 @@ impl HashJoinExec {
             self.right.output_partitioning(),
         ) {
             (
-                Partitioning::Hash(_, left_partition_count),
-                Partitioning::Hash(_, right_partition_count),
-            ) => left_partition_count == right_partition_count,
+                Partitioning::Hash(left_exprs, left_partition_count),
+                Partitioning::Hash(right_exprs, right_partition_count),
+            ) => {
+                // The filter routes probe rows with `hash(on_right) % N` and
+                // trusts partition `p` of the build to hold every build row
+                // with `hash(on_left) % N == p`. Equal counts alone do not
+                // prove that: both inputs must be hashed by the join keys, in
+                // the same order (up to each input's equivalences).
+                left_partition_count == right_partition_count
+                    && hash_routes_by_keys(
+                        &self.left,
+                        left_exprs,
+                        self.on.iter().map(|(left, _)| left),
+                    )
+                    && hash_routes_by_keys(
+                        &self.right,
+                        right_exprs,
+                        self.on.iter().map(|(_, right)| right),
+                    )
+            }
             (Partitioning::Range(_), Partitioning::Range(_)) => {
                 let children = [self.left.as_ref(), self.right.as_ref()];
                 matches!(
@@ -1228,6 +1245,26 @@ impl HashJoinExec {
             reorder_output_after_swap(Arc::new(new_join), &left.schema(), &right.schema())
         }
     }
+}
+
+/// FR/SF: true when `exprs`, the hash partitioning of `input`, are `keys` in
+/// order, up to `input`'s equivalence classes. Partitioned dynamic filters
+/// route with the join keys and require exactly this layout.
+fn hash_routes_by_keys<'a>(
+    input: &Arc<dyn ExecutionPlan>,
+    exprs: &[PhysicalExprRef],
+    keys: impl ExactSizeIterator<Item = &'a PhysicalExprRef>,
+) -> bool {
+    if exprs.len() != keys.len() {
+        return false;
+    }
+    let equivalences = input.equivalence_properties();
+    let group = equivalences.eq_group();
+    exprs.iter().zip(keys).all(|(expr, key)| {
+        expr.eq(key)
+            || group.normalize_expr(Arc::clone(expr))
+                == group.normalize_expr(Arc::clone(key))
+    })
 }
 
 impl DisplayAs for HashJoinExec {
@@ -7323,6 +7360,47 @@ mod tests {
             .preserve_file_partitions = 1;
         assert!(range_join.allow_join_dynamic_filter_pushdown(session_config.options()));
 
+        Ok(())
+    }
+
+    // FR/SF: equal Hash counts are not enough. The filter routes with the
+    // join keys, so an input hashed by another column must be refused.
+    #[test]
+    fn test_partitioned_dynamic_filter_pushdown_rejects_hash_by_non_key() -> Result<()> {
+        let (range_join, on) = range_partitioned_dynamic_filter_test_join(10, 10)?;
+        let mut session_config = SessionConfig::default();
+        session_config
+            .options_mut()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown = true;
+        let hashed = |left: &str, right: &str| -> Result<HashJoinExec> {
+            let column = |schema: &SchemaRef, name: &str| -> Result<PhysicalExprRef> {
+                Ok(Arc::new(Column::new_with_schema(name, schema)?) as _)
+            };
+            range_join
+                .builder()
+                .with_new_children(vec![
+                    Arc::new(PartitionedTestExec::try_new(
+                        range_join.left().schema(),
+                        Partitioning::Hash(
+                            vec![column(&range_join.left().schema(), left)?],
+                            2,
+                        ),
+                    )?),
+                    Arc::new(PartitionedTestExec::try_new(
+                        range_join.right().schema(),
+                        Partitioning::Hash(
+                            vec![column(&range_join.right().schema(), right)?],
+                            2,
+                        ),
+                    )?),
+                ])?
+                .build()
+        };
+        assert!(on.len() == 1);
+        assert!(hashed("b1", "b1")?.allow_join_dynamic_filter_pushdown(session_config.options()));
+        assert!(!hashed("b1", "a2")?.allow_join_dynamic_filter_pushdown(session_config.options()));
+        assert!(!hashed("a1", "b1")?.allow_join_dynamic_filter_pushdown(session_config.options()));
         Ok(())
     }
 
