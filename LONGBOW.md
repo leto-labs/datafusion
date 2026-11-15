@@ -575,6 +575,12 @@ for every assigned report or cancellation. Dropping the last scoped accumulator
 owner closes observers when assigned partitions never started. Default
 whole-plan execution keeps its existing barrier. Original Apache notices remain intact.
 
+A scoped report republishes only when it adds build information. Repeated
+CollectLeft reports of the one shared build and cancellations only record
+completion, so consumers do not recompile an unchanged predicate. Partitioned
+routing requires both inputs to be hash partitioned by the join keys, in order,
+up to each input's equivalences; equal counts alone are not enough.
+
 Build reports use logical NULL counts, including NullArray and dictionary values.
 NULL-only build keys retain their NULL-presence report even when ordinary
 membership is empty, so null-equal partitioned joins keep matching probe NULLs.
