@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Longbow family FR: route physical filters by column position, not field name.
+
 //! Defines the projection execution plan. A projection determines which columns or expressions
 //! are returned from a query. The SQL statement `SELECT a, b, a+b FROM t1` is an example
 //! of a projection on table `t1` where the expressions `a`, `b`, and `a+b` are the
@@ -49,7 +51,7 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
-use datafusion_common::{DataFusionError, JoinSide, Result, internal_err, plan_err};
+use datafusion_common::{JoinSide, Result, internal_err, plan_err};
 use datafusion_execution::TaskContext;
 use datafusion_expr::ExpressionPlacement;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
@@ -269,23 +271,17 @@ impl ProjectionExec {
     /// The result hash map is a map from aliased Column in parent to original expr.
     fn collect_reverse_alias(
         &self,
-    ) -> Result<datafusion_common::HashMap<Column, Arc<dyn PhysicalExpr>>> {
-        let mut alias_map = datafusion_common::HashMap::new();
-        for projection in self.projection_expr().iter() {
-            let (aliased_index, _output_field) = self
-                .projector
-                .output_schema()
-                .column_with_name(&projection.alias)
-                .ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "Expr {} with alias {} not found in output schema",
-                        projection.expr, projection.alias
-                    ))
-                })?;
-            let aliased_col = Column::new(&projection.alias, aliased_index);
-            alias_map.insert(aliased_col, Arc::clone(&projection.expr));
-        }
-        Ok(alias_map)
+    ) -> datafusion_common::HashMap<Column, Arc<dyn PhysicalExpr>> {
+        self.projection_expr()
+            .iter()
+            .enumerate()
+            .map(|(index, projection)| {
+                (
+                    Column::new(&projection.alias, index),
+                    Arc::clone(&projection.expr),
+                )
+            })
+            .collect()
     }
 }
 
@@ -486,7 +482,7 @@ impl ExecutionPlan for ProjectionExec {
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
         // expand alias column to original expr in parent filters
-        let invert_alias_map = self.collect_reverse_alias()?;
+        let invert_alias_map = self.collect_reverse_alias();
         let output_schema = self.schema();
         let remapper = FilterRemapper::new(output_schema);
         let mut child_parent_filters = Vec::with_capacity(parent_filters.len());

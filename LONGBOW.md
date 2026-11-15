@@ -561,3 +561,36 @@ sample remain correct through the canonical interner. The normal-slot inline
 collision fixture includes an external value to keep reduction eligible.
 A differential characterization covers external values after an inline sample,
 NULLs, changing batches and prefix emission.
+
+
+## Family SF: task-scoped join filters
+
+SF / SPLIT-JOIN-FILTERS / UPSTREAMABLE. `HashJoinExec` accepts the output
+partition range of a fresh execution instance before any stream runs.
+Accumulators deduplicate the assigned reports. Scoped streams publish complete
+build information without waiting for sibling streams, which can be scheduled
+serially on a smaller worker. Unreported, cancelled and excluded buckets keep
+all probe rows. CollectLeft uses the complete shared build; completion waits
+for every assigned report or cancellation. Dropping the last scoped accumulator
+owner closes observers when assigned partitions never started. Default
+whole-plan execution keeps its existing barrier. Original Apache notices remain intact.
+
+Build reports use logical NULL counts, including NullArray and dictionary values.
+NULL-only build keys retain their NULL-presence report even when ordinary
+membership is empty, so null-equal partitioned joins keep matching probe NULLs.
+
+Regression command in the Longbow consumer:
+`scripts/vendored-tests.py datafusion-physical-plan --release -E 'test(joins::hash_join::shared_bounds) | test(joins::hash_join::stream::tests)'`.
+
+
+## Family FR: positional and bounded filter routing
+
+FR / SPLIT-JOIN-FILTERS / UPSTREAMABLE. Physical filters address columns by
+position. Identity boundaries preserve positions, while joins, projections,
+embedded filter projections and direct aggregate keys supply explicit mappings.
+Repeated names cannot redirect a predicate to a nullable sibling column.
+Computed aggregate keys and computed cross-side semi-join keys remain boundaries.
+Rejected volatile parent predicates never reach an absorbing node handler.
+Fetch boundaries reject parent predicates while retaining their own predicates.
+Native positional regressions and Longbow NULL, alias, volatile and fetch
+execution regressions cover these rules. Original license notices remain intact.

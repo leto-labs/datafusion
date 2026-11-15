@@ -17,6 +17,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Longbow family FR: route physical filters by column position, not field name.
+
 //! Aggregate functionality
 //!
 //! # Aggregate planning
@@ -2246,9 +2248,18 @@ impl ExecutionPlan for AggregateExec {
         let mut child_desc = if may_emit_on_empty_input {
             ChildFilterDescription::all_unsupported(&parent_filters)
         } else {
-            ChildFilterDescription::from_child_with_allowed_indices(
+            let mapping = allowed_indices
+                .into_iter()
+                .filter_map(|index| {
+                    self.group_by.expr()[index]
+                        .0
+                        .downcast_ref::<Column>()
+                        .map(|column| (index, column.index()))
+                })
+                .collect();
+            ChildFilterDescription::from_child_with_mapping(
                 &parent_filters,
-                allowed_indices,
+                mapping,
                 child,
             )?
         };

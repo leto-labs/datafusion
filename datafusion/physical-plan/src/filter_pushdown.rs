@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Longbow family FR: route physical filters by column position, not field name.
+
 //! Filter Pushdown Optimization Process
 //!
 //! The filter pushdown mechanism involves four key steps:
@@ -34,7 +36,7 @@
 //!
 //! See also datafusion/physical-optimizer/src/filter_pushdown.rs.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
@@ -312,56 +314,39 @@ pub struct ChildFilterDescription {
     pub(crate) self_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
-/// Validates and remaps filter column references to a target schema in one step.
-///
-/// When pushing filters from a parent to a child node, we need to:
-/// 1. Verify that all columns referenced by the filter exist in the target
-/// 2. Remap column indices to match the target schema
-///
-/// `allowed_indices` controls which column indices (in the parent schema) are
-/// considered valid. For single-input nodes this defaults to
-/// `0..child_schema.len()` (all columns are reachable). For join nodes it is
-/// restricted to the subset of output columns that map to the target child,
-/// which is critical when different sides have same-named columns.
+/// Remaps parent output positions to child input positions.
+/// Identity operators preserve indices even when field names repeat. Joins,
+/// aggregates and projected filters supply an explicit mapping instead.
 pub(crate) struct FilterRemapper {
     /// The target schema to remap column indices into.
     child_schema: SchemaRef,
-    /// Only columns at these indices (in the *parent* schema) are considered
-    /// valid. For non-join nodes this defaults to `0..child_schema.len()`.
-    allowed_indices: HashSet<usize>,
+    /// Parent output positions mapped to child input positions.
+    /// None means that this operator preserves column positions.
+    mapping: Option<HashMap<usize, usize>>,
 }
 
 impl FilterRemapper {
-    /// Create a remapper that accepts any column whose index falls within
-    /// `0..child_schema.len()` and whose name exists in the target schema.
+    /// Preserve column positions, canonicalizing their child field names.
     pub(crate) fn new(child_schema: SchemaRef) -> Self {
-        let allowed_indices = (0..child_schema.fields().len()).collect();
         Self {
             child_schema,
-            allowed_indices,
+            mapping: None,
         }
     }
 
-    /// Create a remapper that only accepts columns at the given indices.
-    /// This is used by join nodes to restrict pushdown to one side of the
-    /// join when both sides have same-named columns.
-    fn with_allowed_indices(
+    /// Map only the listed parent positions to child input positions.
+    pub(crate) fn with_mapping(
         child_schema: SchemaRef,
-        allowed_indices: HashSet<usize>,
+        mapping: HashMap<usize, usize>,
     ) -> Self {
         Self {
             child_schema,
-            allowed_indices,
+            mapping: Some(mapping),
         }
     }
 
-    /// Try to remap a filter's column references to the target schema.
-    ///
-    /// Validates and remaps in a single tree traversal: for each column,
-    /// checks that its index is in the allowed set and that
-    /// its name exists in the target schema, then remaps the index.
-    /// Returns `Some(remapped)` if all columns are valid, or `None` if any
-    /// column fails validation.
+    /// Replace each referenced parent column once. A missing mapping rejects
+    /// the whole predicate.
     pub(crate) fn try_remap(
         &self,
         filter: &Arc<dyn PhysicalExpr>,
@@ -369,13 +354,14 @@ impl FilterRemapper {
         let mut all_valid = true;
         let transformed = Arc::clone(filter).transform_down(|expr| {
             if let Some(col) = expr.downcast_ref::<Column>() {
-                if self.allowed_indices.contains(&col.index())
-                    && let Ok(new_index) = self.child_schema.index_of(col.name())
+                let index = match &self.mapping {
+                    Some(mapping) => mapping.get(&col.index()).copied(),
+                    None => Some(col.index()),
+                };
+                if let Some(index) = index
+                    && let Some(field) = self.child_schema.fields().get(index)
                 {
-                    Ok(Transformed::yes(Arc::new(Column::new(
-                        col.name(),
-                        new_index,
-                    ))))
+                    Ok(Transformed::yes(Arc::new(Column::new(field.name(), index))))
                 } else {
                     all_valid = false;
                     Ok(Transformed::complete(expr))
@@ -389,14 +375,75 @@ impl FilterRemapper {
     }
 }
 
+#[cfg(test)]
+mod positional_tests {
+    use super::*;
+    use arrow::array::{Array, BooleanArray, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr::expressions::{BinaryExpr, lit};
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+        ]))
+    }
+
+    fn admits(expr: Arc<dyn PhysicalExpr>) -> bool {
+        let input = RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(Int64Array::from(vec![Some(2)])),
+            ],
+        )
+        .unwrap();
+        let result = expr.evaluate(&input).unwrap().into_array(1).unwrap();
+        let result = result.as_any().downcast_ref::<BooleanArray>().unwrap();
+        result.is_valid(0) && result.value(0)
+    }
+
+    fn equals(index: usize, value: i64) -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("x", index)),
+            Operator::Eq,
+            lit(value),
+        ))
+    }
+
+    #[test]
+    fn identity_keeps_the_second_same_named_column() {
+        let mapped = FilterRemapper::new(schema())
+            .try_remap(&equals(1, 2))
+            .unwrap()
+            .unwrap();
+        assert!(admits(mapped), "the first x is NULL, the second x is 2");
+    }
+
+    #[test]
+    fn child_mapping_keeps_offsets_and_rejects_other_sides() {
+        let mapper = FilterRemapper::with_mapping(schema(), HashMap::from([(3, 1)]));
+        assert!(admits(mapper.try_remap(&equals(3, 2)).unwrap().unwrap()));
+        assert!(mapper.try_remap(&equals(0, 2)).unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_positions_support_aliases_and_reordering() {
+        let mapper =
+            FilterRemapper::with_mapping(schema(), HashMap::from([(0, 1), (1, 0)]));
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("group_alias", 0)),
+            Operator::Eq,
+            lit(2i64),
+        ));
+        assert!(admits(mapper.try_remap(&predicate).unwrap().unwrap()));
+    }
+}
+
 impl ChildFilterDescription {
-    /// Build a child filter description by analyzing which parent filters can be pushed to a specific child.
-    ///
-    /// This method performs column analysis to determine which filters can be pushed down:
-    /// - If all columns referenced by a filter exist in the child's schema, it can be pushed down
-    /// - Otherwise, it cannot be pushed down to that child
-    ///
-    /// See [`FilterDescription::from_children`] for more details
+    /// Push filters through a child that preserves output column positions.
     pub fn from_child(
         parent_filters: &[Arc<dyn PhysicalExpr>],
         child: &Arc<dyn crate::ExecutionPlan>,
@@ -405,29 +452,19 @@ impl ChildFilterDescription {
         Self::remap_filters(parent_filters, &remapper)
     }
 
-    /// Like [`Self::from_child`], but restricts which parent-level columns are
-    /// considered reachable through this child.
-    ///
-    /// `allowed_indices` is the set of column indices (in the *parent*
-    /// schema) that map to this child's side of a join. A filter is only
-    /// eligible for pushdown when **every** column index it references
-    /// appears in `allowed_indices`.
-    ///
-    /// This prevents incorrect pushdown when different join sides have
-    /// columns with the same name: matching on index ensures a filter
-    /// referencing the right side's `k@2` is not pushed to the left side
-    /// which also has a column named `k` but at a different index.
-    pub fn from_child_with_allowed_indices(
+    /// Map parent positions to columns in this child's schema. Every
+    /// referenced parent position must have a mapping. Names do not select
+    /// columns: multiple input fields can have the same name.
+    pub fn from_child_with_mapping(
         parent_filters: &[Arc<dyn PhysicalExpr>],
-        allowed_indices: HashSet<usize>,
+        mapping: HashMap<usize, usize>,
         child: &Arc<dyn crate::ExecutionPlan>,
     ) -> Result<Self> {
-        let remapper =
-            FilterRemapper::with_allowed_indices(child.schema(), allowed_indices);
+        let remapper = FilterRemapper::with_mapping(child.schema(), mapping);
         Self::remap_filters(parent_filters, &remapper)
     }
 
-    fn remap_filters(
+    pub(crate) fn remap_filters(
         parent_filters: &[Arc<dyn PhysicalExpr>],
         remapper: &FilterRemapper,
     ) -> Result<Self> {
