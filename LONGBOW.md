@@ -23,6 +23,22 @@ consumer's vendor tree. Longbow runs native regressions through a generated
 standalone harness with its pinned graph and Arrow patches. A standalone
 upstream-workspace build does not provide those Arrow extensions.
 
+## Family PSN: retain positional key partitions during sort pushdown
+
+Purpose: keep the key input of Longbow's `PositionalFetchExec` local while
+its consumer owns the final merge above payload retrieval. Dependent Longbow
+feature: TOPN-POSITIONAL-SPLIT. Audit classification: KEEP (the optimizer
+recognizes the Longbow consumer by its execution-plan name).
+
+Only the direct bounded partition-preserving key sort under this two-input
+consumer takes the existing explicit-merge optimization path, after which the
+consumer retains the local input. This preserves a local limit for exact
+sources and a local TopK for inexact sources. Every other standalone sort
+retains upstream fix #23301, including its global merge and fetch. Upstream
+core tests cover both plan shape and global rows; native consumer-scoped tests
+cover exact and inexact sources, and Longbow's split tests exercise the full
+optimizer schedule, codec and stage cut.
+
 ## Family FC: complete native file scan serialization
 
 Purpose: preserve raw file-scan order intent, Parquet reverse-row-group and

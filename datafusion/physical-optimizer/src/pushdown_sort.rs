@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -62,6 +64,7 @@ use datafusion_common::tree_node::{
 };
 use datafusion_physical_plan::SortOrderPushdownResult;
 use datafusion_physical_plan::buffer::BufferExec;
+use datafusion_physical_plan::execution_plan::replace_children_if_necessary;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
@@ -96,6 +99,36 @@ impl PhysicalOptimizerRule for PushdownSort {
         // Use transform_down to find and optimize all SortExec nodes (including nested ones)
         // Also handles SPM → SortExec pattern to insert BufferExec when sort is eliminated
         plan.transform_down(|plan: Arc<dyn ExecutionPlan>| {
+            // Longbow's positional consumer owns the global merge above payload
+            // retrieval. Its first input must retain local key candidates. Use
+            // the explicit-merge optimization path, then keep only its local
+            // input. All other standalone sorts retain upstream #23301 behavior.
+            if plan.name() == "PositionalFetchExec"
+                && let [keys, payload] = plan.children().as_slice()
+                && let Some(sort) = keys.downcast_ref::<SortExec>()
+                && sort.preserve_partitioning()
+                && sort.fetch().is_some()
+            {
+                let merge = Arc::new(
+                    SortPreservingMergeExec::new(sort.expr().clone(), Arc::clone(keys))
+                        .with_fetch(sort.fetch()),
+                );
+                let optimized = self.optimize(merge, config)?;
+                let merge = optimized
+                    .downcast_ref::<SortPreservingMergeExec>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "sort pushdown lost its explicit merge"
+                        )
+                    })?;
+                let payload = self.optimize(Arc::clone(payload), config)?;
+                let rebuilt = replace_children_if_necessary(
+                    plan,
+                    vec![Arc::clone(merge.input()), payload],
+                )?;
+                return Ok(Transformed::new(rebuilt, true, TreeNodeRecursion::Jump));
+            }
+
             // Pattern 1: SPM → SortExec(preserve_partitioning)
             // When we eliminate the SortExec, SPM loses its memory buffer and reads
             // directly from I/O-bound sources. Insert a BufferExec to compensate.
@@ -227,5 +260,248 @@ impl PhysicalOptimizerRule for PushdownSort {
 
     fn schema_check(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod partition_scope_tests {
+    use super::*;
+    use std::fmt;
+
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_execution::TaskContext;
+    use datafusion_physical_expr::expressions::Column;
+    use datafusion_physical_expr::{
+        EquivalenceProperties, LexOrdering, PhysicalExpr, PhysicalSortExpr,
+    };
+    use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion_physical_plan::test::TestMemoryExec;
+    use datafusion_physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties,
+        SendableRecordBatchStream,
+    };
+
+    #[derive(Debug, Clone)]
+    struct SortableInput {
+        input: Arc<dyn ExecutionPlan>,
+        properties: Arc<PlanProperties>,
+        exact: bool,
+    }
+
+    impl DisplayAs for SortableInput {
+        fn fmt_as(&self, _: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "SortableInput: exact={}", self.exact)
+        }
+    }
+
+    impl ExecutionPlan for SortableInput {
+        fn name(&self) -> &str {
+            "SortableInput"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn apply_expressions(
+            &self,
+            _: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            self.input.execute(partition, context)
+        }
+
+        fn try_pushdown_sort(
+            &self,
+            _: &[PhysicalSortExpr],
+        ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+            let inner = Arc::new(self.clone()) as Arc<dyn ExecutionPlan>;
+            Ok(if self.exact {
+                SortOrderPushdownResult::Exact { inner }
+            } else {
+                SortOrderPushdownResult::Inexact { inner }
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PositionalConsumer {
+        keys: Arc<dyn ExecutionPlan>,
+        payload: Arc<dyn ExecutionPlan>,
+    }
+
+    impl DisplayAs for PositionalConsumer {
+        fn fmt_as(&self, _: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "PositionalFetchExec")
+        }
+    }
+
+    impl ExecutionPlan for PositionalConsumer {
+        fn name(&self) -> &str {
+            "PositionalFetchExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.keys.properties()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.keys, &self.payload]
+        }
+        fn apply_expressions(
+            &self,
+            _: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                keys: Arc::clone(&children[0]),
+                payload: Arc::clone(&children[1]),
+            }))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            self.keys.execute(partition, context)
+        }
+    }
+
+    async fn check_scope(exact: bool, preserve: bool, merge: bool) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(
+            Column::new("v", 0),
+        ))])
+        .unwrap();
+        let parts = if preserve { 2 } else { 1 };
+        let values: Vec<_> = (0..parts)
+            .map(|p| {
+                let mut values = if p == 0 {
+                    vec![8, 5, 7, 6]
+                } else {
+                    vec![4, 1, 3, 2]
+                };
+                if exact {
+                    values.sort_unstable();
+                }
+                values
+            })
+            .collect();
+        let batches = values
+            .iter()
+            .map(|values| {
+                Ok(vec![RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int32Array::from(values.clone()))],
+                )?])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let input = TestMemoryExec::try_new_exec(&batches, Arc::clone(&schema), None)?;
+        let eq = if exact {
+            EquivalenceProperties::new_with_orderings(schema, [ordering.clone()])
+        } else {
+            EquivalenceProperties::new(schema)
+        };
+        let input = Arc::new(SortableInput {
+            input,
+            properties: Arc::new(PlanProperties::new(
+                eq,
+                datafusion_physical_expr::Partitioning::UnknownPartitioning(parts),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )),
+            exact,
+        }) as Arc<dyn ExecutionPlan>;
+        let sort = Arc::new(
+            SortExec::new(ordering.clone(), Arc::clone(&input))
+                .with_fetch(Some(2))
+                .with_preserve_partitioning(preserve),
+        ) as Arc<dyn ExecutionPlan>;
+        let plan = if merge {
+            Arc::new(SortPreservingMergeExec::new(ordering, sort).with_fetch(Some(2)))
+                as Arc<dyn ExecutionPlan>
+        } else if preserve {
+            Arc::new(PositionalConsumer {
+                keys: sort,
+                payload: input,
+            }) as Arc<dyn ExecutionPlan>
+        } else {
+            sort
+        };
+        let optimized = PushdownSort::new().optimize(plan, &ConfigOptions::default())?;
+        assert_eq!(
+            optimized.output_partitioning().partition_count(),
+            if merge { 1 } else { parts }
+        );
+        let context = Arc::new(TaskContext::default());
+        for partition in 0..optimized.output_partitioning().partition_count() {
+            let batches = datafusion_physical_plan::common::collect(
+                optimized.execute(partition, Arc::clone(&context))?,
+            )
+            .await?;
+            let actual: Vec<i32> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            assert_eq!(
+                actual,
+                if merge || partition == 1 {
+                    vec![1, 2]
+                } else {
+                    vec![5, 6]
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn positional_consumer_keeps_inexact_partition_topk_scope() -> Result<()> {
+        check_scope(false, true, false).await
+    }
+
+    #[tokio::test]
+    async fn positional_consumer_keeps_exact_partition_limit_scope() -> Result<()> {
+        check_scope(true, true, false).await
+    }
+
+    #[tokio::test]
+    async fn global_topk_keeps_its_explicit_merge_or_single_partition() -> Result<()> {
+        for exact in [false, true] {
+            check_scope(exact, true, true).await?;
+            check_scope(exact, false, false).await?;
+        }
+        Ok(())
     }
 }
