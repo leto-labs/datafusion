@@ -60,6 +60,17 @@ impl PreparedParquetScan {
                     "page index must be loaded before sharing prepared state"
                 )
             })?;
+            // The pruner must not retain the superseded footer. Its new
+            // generations restart, so no earlier verdict may survive.
+            file.verdicts.iter().for_each(|verdict| {
+                verdict.store(0, std::sync::atomic::Ordering::Relaxed)
+            });
+            file.pruner = runtime_pruner(
+                file.dynamic,
+                file.predicate.as_ref(),
+                &file.physical_schema,
+                &metadata,
+            );
             file.metadata = metadata;
         }
         Ok(self)
@@ -75,6 +86,14 @@ pub struct PreparedParquetFile {
     projection: DecoderProjection,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     dynamic: bool,
+    /// One runtime row-group pruner for every caller of this shared file.
+    /// It rebuilds its pruning predicate only when a watched dynamic filter
+    /// changes; `None` when the predicate has no dynamic filter.
+    pruner: Option<std::sync::Mutex<RowGroupPruner>>,
+    /// The last verdict for each physical row group: `generation << 1 | keep`
+    /// of the predicate that decided it, or zero.
+    verdicts: Vec<std::sync::atomic::AtomicU64>,
+    evaluation_errors: Count,
     physical_schema: SchemaRef,
     metrics: ParquetFileMetrics,
     reorder: bool,
@@ -288,22 +307,56 @@ impl PreparedParquetFile {
     /// Recheck live DataFusion dynamic predicates against this row group.
     /// Static predicates were already consumed by the prepared access plan.
     pub fn keep_row_group(&self, group: usize) -> bool {
-        let Some(predicate) = &self.predicate else {
+        use std::sync::atomic::Ordering;
+        let Some(pruner) = &self.pruner else {
             return true;
         };
-        if !self.dynamic {
+        // Hold the lock only to refresh the predicate for the current filter
+        // generation. Drivers of the same file evaluate it concurrently.
+        let (generation, current) = pruner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current();
+        let Some(pruning) = current else {
             return true;
+        };
+        // A row group is checked before its read and again by each of its
+        // units. One verdict serves every check under the same predicate.
+        let verdict = self.verdicts.get(group);
+        if let Some(verdict) = verdict {
+            let known = verdict.load(Ordering::Acquire);
+            if known >> 1 == generation {
+                return known & 1 == 1;
+            }
         }
-        !RowGroupPruner::new(
-            Arc::clone(predicate),
-            Arc::clone(&self.physical_schema),
-            Arc::clone(self.metadata.metadata()),
-            Count::new(),
-            Count::new(),
-            usize::MAX,
-        )
-        .should_prune(&[group])
+        let keep = !crate::push_decoder::prune_row_groups(
+            &pruning,
+            self.metadata.metadata(),
+            &self.physical_schema,
+            &[group],
+            &self.evaluation_errors,
+        );
+        if let Some(verdict) = verdict {
+            verdict.fetch_max(generation << 1 | u64::from(keep), Ordering::AcqRel);
+        }
+        keep
     }
+}
+fn runtime_pruner(
+    dynamic: bool,
+    predicate: Option<&Arc<dyn PhysicalExpr>>,
+    schema: &SchemaRef,
+    metadata: &ArrowReaderMetadata,
+) -> Option<std::sync::Mutex<RowGroupPruner>> {
+    let predicate = predicate.filter(|_| dynamic)?;
+    Some(std::sync::Mutex::new(RowGroupPruner::new(
+        Arc::clone(predicate),
+        Arc::clone(schema),
+        Arc::clone(metadata.metadata()),
+        Count::new(),
+        Count::new(),
+        usize::MAX,
+    )))
 }
 // Match Arrow's predicate-cache quantization without decoding any values.
 // Arrow keeps its equivalent helper private. All filter generations may use
@@ -391,6 +444,15 @@ impl crate::source::ParquetSource {
                     let dynamic = prepared.predicate.as_ref().is_some_and(|p| {
                         DynamicFilterTracking::classify(p).contains_dynamic_filter()
                     });
+                    let verdicts = std::iter::repeat_with(Default::default)
+                        .take(metadata.metadata().num_row_groups())
+                        .collect();
+                    let pruner = runtime_pruner(
+                        dynamic,
+                        prepared.predicate.as_ref(),
+                        &prepared.physical_file_schema,
+                        &metadata,
+                    );
                     let file = Arc::new(PreparedParquetFile {
                         metadata,
                         access,
@@ -398,6 +460,9 @@ impl crate::source::ParquetSource {
                         projection,
                         predicate: prepared.predicate,
                         dynamic,
+                        verdicts,
+                        pruner,
+                        evaluation_errors: Count::new(),
                         physical_schema: prepared.physical_file_schema,
                         metrics: prepared.file_metrics,
                         reorder: prepared.reorder_predicates,
@@ -575,3 +640,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "prepared_tests.rs"]
+mod runtime_pruning_tests;
