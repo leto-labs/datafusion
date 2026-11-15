@@ -7406,7 +7406,8 @@ mod tests {
     #[tokio::test]
     async fn float_keys_produce_no_dynamic_filter() -> Result<()> {
         use arrow::array::Float64Array;
-        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Float64, true)]));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("k", DataType::Float64, true)]));
         let batch = |values: Vec<f64>| {
             RecordBatch::try_new(
                 Arc::clone(&schema),
@@ -7439,7 +7440,10 @@ mod tests {
             false,
         )?;
         let mut config = SessionConfig::default();
-        config.options_mut().optimizer.enable_join_dynamic_filter_pushdown = true;
+        config
+            .options_mut()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown = true;
         assert!(!join.allow_join_dynamic_filter_pushdown(config.options()));
         // The join itself matches -0.0 with 0.0: the filter would have to keep it.
         let context = Arc::new(TaskContext::default());
@@ -7488,9 +7492,18 @@ mod tests {
                 .build()
         };
         assert!(on.len() == 1);
-        assert!(hashed("b1", "b1")?.allow_join_dynamic_filter_pushdown(session_config.options()));
-        assert!(!hashed("b1", "a2")?.allow_join_dynamic_filter_pushdown(session_config.options()));
-        assert!(!hashed("a1", "b1")?.allow_join_dynamic_filter_pushdown(session_config.options()));
+        assert!(
+            hashed("b1", "b1")?
+                .allow_join_dynamic_filter_pushdown(session_config.options())
+        );
+        assert!(
+            !hashed("b1", "a2")?
+                .allow_join_dynamic_filter_pushdown(session_config.options())
+        );
+        assert!(
+            !hashed("a1", "b1")?
+                .allow_join_dynamic_filter_pushdown(session_config.options())
+        );
         Ok(())
     }
 
