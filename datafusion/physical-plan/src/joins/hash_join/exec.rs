@@ -874,6 +874,22 @@ impl HashJoinExec {
             return false;
         }
 
+        // Longbow FZ: the join matches floating-point keys by its hash
+        // equality, under which `-0.0` equals `0.0`. The pushed bounds and
+        // IN-list predicates compare by total order, under which `-0.0 < 0.0`,
+        // so they would remove a probe `-0.0` that matches a build `0.0`.
+        // Floating-point keys therefore produce no dynamic filter.
+        if self.on.iter().any(|(build_key, probe_key)| {
+            [
+                build_key.data_type(&self.left.schema()),
+                probe_key.data_type(&self.right.schema()),
+            ]
+            .iter()
+            .any(|data_type| data_type.as_ref().map_or(true, contains_floating_point))
+        }) {
+            return false;
+        }
+
         // A null-aware anti join emits a build-side NULL only when the probe
         // is truly empty. The pushed filter can empty the probe by pruning
         // every row, which would surface that NULL wrongly. A NOT NULL build
@@ -1244,6 +1260,28 @@ impl HashJoinExec {
         } else {
             reorder_output_after_swap(Arc::new(new_join), &left.schema(), &right.schema())
         }
+    }
+}
+
+/// Longbow FZ: whether a key of this type compares any floating-point value.
+fn contains_floating_point(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => true,
+        DataType::Dictionary(_, value) => contains_floating_point(value.as_ref()),
+        DataType::RunEndEncoded(_, value) => contains_floating_point(value.data_type()),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => contains_floating_point(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_floating_point(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| contains_floating_point(field.data_type())),
+        _ => false,
     }
 }
 
@@ -7360,6 +7398,58 @@ mod tests {
             .preserve_file_partitions = 1;
         assert!(range_join.allow_join_dynamic_filter_pushdown(session_config.options()));
 
+        Ok(())
+    }
+
+    // Longbow FZ: a probe -0.0 matches a build 0.0, but bounds and IN-list
+    // predicates compare floats by total order. No filter for float keys.
+    #[tokio::test]
+    async fn float_keys_produce_no_dynamic_filter() -> Result<()> {
+        use arrow::array::Float64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Float64, true)]));
+        let batch = |values: Vec<f64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Float64Array::from(values)) as ArrayRef],
+            )
+        };
+        let build = TestMemoryExec::try_new_exec(
+            &[vec![batch(vec![0.0, 1.5])?]],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let probe = TestMemoryExec::try_new_exec(
+            &[vec![batch(vec![-0.0, 0.0, 2.0])?]],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let on: JoinOn = vec![(
+            Arc::new(Column::new_with_schema("k", &schema)?) as _,
+            Arc::new(Column::new_with_schema("k", &schema)?) as _,
+        )];
+        let join = HashJoinExec::try_new(
+            build,
+            probe,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        let mut config = SessionConfig::default();
+        config.options_mut().optimizer.enable_join_dynamic_filter_pushdown = true;
+        assert!(!join.allow_join_dynamic_filter_pushdown(config.options()));
+        // The join itself matches -0.0 with 0.0: the filter would have to keep it.
+        let context = Arc::new(TaskContext::default());
+        let batches = common::collect(join.execute(0, context)?).await?;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        assert!(!contains_floating_point(&DataType::Int64));
+        assert!(contains_floating_point(&DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Float32)
+        )));
         Ok(())
     }
 

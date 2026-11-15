@@ -594,3 +594,20 @@ Rejected volatile parent predicates never reach an absorbing node handler.
 Fetch boundaries reject parent predicates while retaining their own predicates.
 Native positional regressions and Longbow NULL, alias, volatile and fetch
 execution regressions cover these rules. Original license notices remain intact.
+
+
+## Family FZ: no join dynamic filters on floating-point keys
+
+FZ / NATIVE-DYNAMIC-FILTERS / UPSTREAMABLE. A hash join matches floating-point
+keys by its hash equality, under which `-0.0` equals `0.0`. The pushed bounds
+and IN-list predicates compare by total order, under which `-0.0 < 0.0`, so a
+probe `-0.0` that matches a build `0.0` was removed: stock 55.2 with Parquet
+`pushdown_filters`, Longbow whole-plan residuals and split tasks all lost such
+rows. A join whose key on either side contains a floating-point type (including
+dictionary, list, map, struct and union members) now produces no dynamic filter.
+The join remains the equality authority. Integer, decimal, string and temporal
+keys are unchanged.
+
+Native regression: `joins::hash_join::exec::tests::float_keys_produce_no_dynamic_filter`.
+Consumer reproducer: `longbow-testkit` integration test
+`rle13_float_keys::rle13_float_key_filters_keep_every_matching_probe_row`.
