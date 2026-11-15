@@ -17,7 +17,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+// Longbow family FR: route physical filters by column position, not field name.
+
 use std::fmt;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -792,6 +793,8 @@ struct HashJoinExecDynamicFilter {
     /// Build accumulator to collect build-side information (hash maps and/or bounds) from each partition.
     /// It is lazily initialized during execution to make sure we use the actual execution time partition counts.
     build_accumulator: OnceLock<Arc<SharedBuildAccumulator>>,
+    /// SF: output partitions executed by this fresh split-task instance.
+    execution_partitions: OnceLock<std::ops::Range<usize>>,
 }
 
 impl fmt::Debug for HashJoinExec {
@@ -871,6 +874,22 @@ impl HashJoinExec {
             return false;
         }
 
+        // Longbow FZ: the join matches floating-point keys by its hash
+        // equality, under which `-0.0` equals `0.0`. The pushed bounds and
+        // IN-list predicates compare by total order, under which `-0.0 < 0.0`,
+        // so they would remove a probe `-0.0` that matches a build `0.0`.
+        // Floating-point keys therefore produce no dynamic filter.
+        if self.on.iter().any(|(build_key, probe_key)| {
+            [
+                build_key.data_type(&self.left.schema()),
+                probe_key.data_type(&self.right.schema()),
+            ]
+            .iter()
+            .any(|data_type| data_type.as_ref().map_or(true, contains_floating_point))
+        }) {
+            return false;
+        }
+
         // A null-aware anti join emits a build-side NULL only when the probe
         // is truly empty. The pushed filter can empty the probe by pruning
         // every row, which would surface that NULL wrongly. A NOT NULL build
@@ -920,9 +939,26 @@ impl HashJoinExec {
             self.right.output_partitioning(),
         ) {
             (
-                Partitioning::Hash(_, left_partition_count),
-                Partitioning::Hash(_, right_partition_count),
-            ) => left_partition_count == right_partition_count,
+                Partitioning::Hash(left_exprs, left_partition_count),
+                Partitioning::Hash(right_exprs, right_partition_count),
+            ) => {
+                // The filter routes probe rows with `hash(on_right) % N` and
+                // trusts partition `p` of the build to hold every build row
+                // with `hash(on_left) % N == p`. Equal counts alone do not
+                // prove that: both inputs must be hashed by the join keys, in
+                // the same order (up to each input's equivalences).
+                left_partition_count == right_partition_count
+                    && hash_routes_by_keys(
+                        &self.left,
+                        left_exprs,
+                        self.on.iter().map(|(left, _)| left),
+                    )
+                    && hash_routes_by_keys(
+                        &self.right,
+                        right_exprs,
+                        self.on.iter().map(|(_, right)| right),
+                    )
+            }
             (Partitioning::Range(_), Partitioning::Range(_)) => {
                 let children = [self.left.as_ref(), self.right.as_ref()];
                 matches!(
@@ -988,6 +1024,40 @@ impl HashJoinExec {
         self.dynamic_filter.as_ref().map(|df| &df.filter)
     }
 
+    /// Scope dynamic-filter reports to the output partitions executed by this
+    /// fresh plan instance. Call before any partition executes. Scoped reports
+    /// never wait for sibling streams: excluded and unfinished buckets retain
+    /// all rows until their complete build data is known.
+    pub fn set_dynamic_filter_partitions(
+        &self,
+        partitions: std::ops::Range<usize>,
+    ) -> Result<()> {
+        assert_or_internal_err!(
+            !partitions.is_empty()
+                && partitions.end <= self.right.output_partitioning().partition_count(),
+            "invalid dynamic-filter execution partitions {partitions:?}"
+        );
+        if let Some(df) = &self.dynamic_filter {
+            assert_or_internal_err!(
+                df.build_accumulator.get().is_none(),
+                "cannot scope an executing join dynamic filter"
+            );
+            if let Some(existing) = df.execution_partitions.get() {
+                assert_or_internal_err!(
+                    existing == &partitions,
+                    "conflicting dynamic-filter execution partitions"
+                );
+            } else {
+                df.execution_partitions.set(partitions).map_err(|_| {
+                    datafusion_common::internal_datafusion_err!(
+                        "concurrent dynamic-filter partition binding"
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Set the dynamic filter on this hash join.
     ///
     /// Resets any internal state that depends on any existing dynamic filter.
@@ -1007,6 +1077,7 @@ impl HashJoinExec {
             // Initialize with an empty accumulator which will be lazily populated
             // during execution.
             build_accumulator: OnceLock::new(),
+            execution_partitions: OnceLock::new(),
         });
         Ok(self)
     }
@@ -1190,6 +1261,48 @@ impl HashJoinExec {
             reorder_output_after_swap(Arc::new(new_join), &left.schema(), &right.schema())
         }
     }
+}
+
+/// Longbow FZ: whether a key of this type compares any floating-point value.
+fn contains_floating_point(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => true,
+        DataType::Dictionary(_, value) => contains_floating_point(value.as_ref()),
+        DataType::RunEndEncoded(_, value) => contains_floating_point(value.data_type()),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => contains_floating_point(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_floating_point(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| contains_floating_point(field.data_type())),
+        _ => false,
+    }
+}
+
+/// FR/SF: true when `exprs`, the hash partitioning of `input`, are `keys` in
+/// order, up to `input`'s equivalence classes. Partitioned dynamic filters
+/// route with the join keys and require exactly this layout.
+fn hash_routes_by_keys<'a>(
+    input: &Arc<dyn ExecutionPlan>,
+    exprs: &[PhysicalExprRef],
+    keys: impl ExactSizeIterator<Item = &'a PhysicalExprRef>,
+) -> bool {
+    if exprs.len() != keys.len() {
+        return false;
+    }
+    let equivalences = input.equivalence_properties();
+    let group = equivalences.eq_group();
+    exprs.iter().zip(keys).all(|(expr, key)| {
+        expr.eq(key)
+            || group.normalize_expr(Arc::clone(expr))
+                == group.normalize_expr(Arc::clone(key))
+    })
 }
 
 impl DisplayAs for HashJoinExec {
@@ -1473,16 +1586,21 @@ impl ExecutionPlan for HashJoinExec {
                         .map(|(_, right_expr)| Arc::clone(right_expr))
                         .collect::<Vec<_>>();
                     Some(Arc::clone(df.build_accumulator.get_or_init(|| {
-                        Arc::new(SharedBuildAccumulator::new_from_partition_mode(
-                            self.mode,
-                            self.left.as_ref(),
-                            self.right.as_ref(),
-                            filter,
-                            on_right,
-                            repartition_random_state,
-                            self.null_equality,
-                            self.null_aware,
-                        ))
+                        Arc::new(
+                            SharedBuildAccumulator::new_from_partition_mode(
+                                self.mode,
+                                self.left.as_ref(),
+                                self.right.as_ref(),
+                                filter,
+                                on_right,
+                                repartition_random_state,
+                                self.null_equality,
+                                self.null_aware,
+                            )
+                            .with_execution_partitions(
+                                df.execution_partitions.get().cloned(),
+                            ),
+                        )
                     })))
                 })
             })
@@ -1690,15 +1808,12 @@ impl ExecutionPlan for HashJoinExec {
         //
         // We apply the same two-level logic here:
         // 1. `lr_is_preserved` gates whether a side is eligible at all.
-        // 2. For each filter, we check that all column references belong to the
-        //    target child (using `column_indices` to map output column positions
-        //    to join sides). This is critical for correctness: name-based matching
-        //    alone (as done by `ChildFilterDescription::from_child`) can incorrectly
-        //    push filters when different join sides have columns with the same name
-        //    (e.g. nested mark joins both producing "mark" columns).
+        // 2. Output positions map explicitly to child positions. Names
+        //    cannot identify a column in a projected or nested join: several
+        //    fields can share a name, including nullable outer-join fields.
         let (left_preserved, right_preserved) = lr_is_preserved(self.join_type);
 
-        // Build the set of allowed column indices for each side
+        // Retain each output column's original child position.
         let column_indices: Vec<ColumnIndex> = match self.projection.as_ref() {
             Some(projection) => projection
                 .iter()
@@ -1707,59 +1822,52 @@ impl ExecutionPlan for HashJoinExec {
             None => self.column_indices.clone(),
         };
 
-        let (mut left_allowed, mut right_allowed) = (HashSet::new(), HashSet::new());
-        column_indices
-            .iter()
-            .enumerate()
-            .for_each(|(output_idx, ci)| {
-                match ci.side {
-                    JoinSide::Left => left_allowed.insert(output_idx),
-                    JoinSide::Right => right_allowed.insert(output_idx),
-                    // Mark columns - don't allow pushdown to either side
-                    JoinSide::None => false,
-                };
-            });
+        let mut left_mapping = std::collections::HashMap::new();
+        let mut right_mapping = std::collections::HashMap::new();
+        for (output_idx, ci) in column_indices.iter().enumerate() {
+            match ci.side {
+                JoinSide::Left => {
+                    left_mapping.insert(output_idx, ci.index);
+                }
+                JoinSide::Right => {
+                    right_mapping.insert(output_idx, ci.index);
+                }
+                JoinSide::None => {}
+            }
+        }
 
-        // For semi joins, filters on output join keys can also be pushed to the
-        // non-output side: every emitted row has an equal key there. This is not
-        // true for anti joins, whose emitted rows have no match.
-        match self.join_type {
-            JoinType::LeftSemi => {
-                let left_key_indices: HashSet<usize> = self
-                    .on
-                    .iter()
-                    .filter_map(|(left_key, _)| {
-                        left_key.downcast_ref::<Column>().map(|c| c.index())
-                    })
-                    .collect();
-                for (output_idx, ci) in column_indices.iter().enumerate() {
-                    if ci.side == JoinSide::Left && left_key_indices.contains(&ci.index) {
-                        right_allowed.insert(output_idx);
+        // A semi join's emitted key equals the opposite-side column key.
+        // Computed keys remain a boundary; names never select an input.
+        for (build_key, probe_key) in &self.on {
+            let (Some(build_key), Some(probe_key)) = (
+                build_key.downcast_ref::<Column>(),
+                probe_key.downcast_ref::<Column>(),
+            ) else {
+                continue;
+            };
+            match self.join_type {
+                JoinType::LeftSemi => {
+                    for (output_idx, ci) in column_indices.iter().enumerate() {
+                        if ci.side == JoinSide::Left && ci.index == build_key.index() {
+                            right_mapping.insert(output_idx, probe_key.index());
+                        }
                     }
                 }
-            }
-            JoinType::RightSemi => {
-                let right_key_indices: HashSet<usize> = self
-                    .on
-                    .iter()
-                    .filter_map(|(_, right_key)| {
-                        right_key.downcast_ref::<Column>().map(|c| c.index())
-                    })
-                    .collect();
-                for (output_idx, ci) in column_indices.iter().enumerate() {
-                    if ci.side == JoinSide::Right && right_key_indices.contains(&ci.index)
-                    {
-                        left_allowed.insert(output_idx);
+                JoinType::RightSemi => {
+                    for (output_idx, ci) in column_indices.iter().enumerate() {
+                        if ci.side == JoinSide::Right && ci.index == probe_key.index() {
+                            left_mapping.insert(output_idx, build_key.index());
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
 
         let left_child = if left_preserved {
-            ChildFilterDescription::from_child_with_allowed_indices(
+            ChildFilterDescription::from_child_with_mapping(
                 &parent_filters,
-                left_allowed,
+                left_mapping,
                 self.left(),
             )?
         } else {
@@ -1767,9 +1875,9 @@ impl ExecutionPlan for HashJoinExec {
         };
 
         let mut right_child = if right_preserved {
-            ChildFilterDescription::from_child_with_allowed_indices(
+            ChildFilterDescription::from_child_with_mapping(
                 &parent_filters,
-                right_allowed,
+                right_mapping,
                 self.right(),
             )?
         } else {
@@ -1819,6 +1927,7 @@ impl ExecutionPlan for HashJoinExec {
                     .with_dynamic_filter(Some(HashJoinExecDynamicFilter {
                         filter: dynamic_filter,
                         build_accumulator: OnceLock::new(),
+                        execution_partitions: OnceLock::new(),
                     }))
                     .build_exec()?;
                 result = result.with_updated_node(new_node);
@@ -2874,6 +2983,7 @@ mod tests {
         join.dynamic_filter = Some(HashJoinExecDynamicFilter {
             filter: Arc::clone(&dynamic_filter),
             build_accumulator: OnceLock::new(),
+            execution_partitions: OnceLock::new(),
         });
 
         Ok((join, dynamic_filter))
@@ -7288,6 +7398,112 @@ mod tests {
             .preserve_file_partitions = 1;
         assert!(range_join.allow_join_dynamic_filter_pushdown(session_config.options()));
 
+        Ok(())
+    }
+
+    // Longbow FZ: a probe -0.0 matches a build 0.0, but bounds and IN-list
+    // predicates compare floats by total order. No filter for float keys.
+    #[tokio::test]
+    async fn float_keys_produce_no_dynamic_filter() -> Result<()> {
+        use arrow::array::Float64Array;
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("k", DataType::Float64, true)]));
+        let batch = |values: Vec<f64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Float64Array::from(values)) as ArrayRef],
+            )
+        };
+        let build = TestMemoryExec::try_new_exec(
+            &[vec![batch(vec![0.0, 1.5])?]],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let probe = TestMemoryExec::try_new_exec(
+            &[vec![batch(vec![-0.0, 0.0, 2.0])?]],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let on: JoinOn = vec![(
+            Arc::new(Column::new_with_schema("k", &schema)?) as _,
+            Arc::new(Column::new_with_schema("k", &schema)?) as _,
+        )];
+        let join = HashJoinExec::try_new(
+            build,
+            probe,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        let mut config = SessionConfig::default();
+        config
+            .options_mut()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown = true;
+        assert!(!join.allow_join_dynamic_filter_pushdown(config.options()));
+        // The join itself matches -0.0 with 0.0: the filter would have to keep it.
+        let context = Arc::new(TaskContext::default());
+        let batches = common::collect(join.execute(0, context)?).await?;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        assert!(!contains_floating_point(&DataType::Int64));
+        assert!(contains_floating_point(&DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Float32)
+        )));
+        Ok(())
+    }
+
+    // FR/SF: equal Hash counts are not enough. The filter routes with the
+    // join keys, so an input hashed by another column must be refused.
+    #[test]
+    fn test_partitioned_dynamic_filter_pushdown_rejects_hash_by_non_key() -> Result<()> {
+        let (range_join, on) = range_partitioned_dynamic_filter_test_join(10, 10)?;
+        let mut session_config = SessionConfig::default();
+        session_config
+            .options_mut()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown = true;
+        let hashed = |left: &str, right: &str| -> Result<HashJoinExec> {
+            let column = |schema: &SchemaRef, name: &str| -> Result<PhysicalExprRef> {
+                Ok(Arc::new(Column::new_with_schema(name, schema)?) as _)
+            };
+            range_join
+                .builder()
+                .with_new_children(vec![
+                    Arc::new(PartitionedTestExec::try_new(
+                        range_join.left().schema(),
+                        Partitioning::Hash(
+                            vec![column(&range_join.left().schema(), left)?],
+                            2,
+                        ),
+                    )?),
+                    Arc::new(PartitionedTestExec::try_new(
+                        range_join.right().schema(),
+                        Partitioning::Hash(
+                            vec![column(&range_join.right().schema(), right)?],
+                            2,
+                        ),
+                    )?),
+                ])?
+                .build()
+        };
+        assert!(on.len() == 1);
+        assert!(
+            hashed("b1", "b1")?
+                .allow_join_dynamic_filter_pushdown(session_config.options())
+        );
+        assert!(
+            !hashed("b1", "a2")?
+                .allow_join_dynamic_filter_pushdown(session_config.options())
+        );
+        assert!(
+            !hashed("a1", "b1")?
+                .allow_join_dynamic_filter_pushdown(session_config.options())
+        );
         Ok(())
     }
 

@@ -561,3 +561,59 @@ sample remain correct through the canonical interner. The normal-slot inline
 collision fixture includes an external value to keep reduction eligible.
 A differential characterization covers external values after an inline sample,
 NULLs, changing batches and prefix emission.
+
+
+## Family SF: task-scoped join filters
+
+SF / SPLIT-JOIN-FILTERS / UPSTREAMABLE. `HashJoinExec` accepts the output
+partition range of a fresh execution instance before any stream runs.
+Accumulators deduplicate the assigned reports. Scoped streams publish complete
+build information without waiting for sibling streams, which can be scheduled
+serially on a smaller worker. Unreported, cancelled and excluded buckets keep
+all probe rows. CollectLeft uses the complete shared build; completion waits
+for every assigned report or cancellation. Dropping the last scoped accumulator
+owner closes observers when assigned partitions never started. Default
+whole-plan execution keeps its existing barrier. Original Apache notices remain intact.
+
+A scoped report republishes only when it adds build information. Repeated
+CollectLeft reports of the one shared build and cancellations only record
+completion, so consumers do not recompile an unchanged predicate. Partitioned
+routing requires both inputs to be hash partitioned by the join keys, in order,
+up to each input's equivalences; equal counts alone are not enough.
+
+Build reports use logical NULL counts, including NullArray and dictionary values.
+NULL-only build keys retain their NULL-presence report even when ordinary
+membership is empty, so null-equal partitioned joins keep matching probe NULLs.
+
+Regression command in the Longbow consumer:
+`scripts/vendored-tests.py datafusion-physical-plan --release -E 'test(joins::hash_join::shared_bounds) | test(joins::hash_join::stream::tests)'`.
+
+
+## Family FR: positional and bounded filter routing
+
+FR / SPLIT-JOIN-FILTERS / UPSTREAMABLE. Physical filters address columns by
+position. Identity boundaries preserve positions, while joins, projections,
+embedded filter projections and direct aggregate keys supply explicit mappings.
+Repeated names cannot redirect a predicate to a nullable sibling column.
+Computed aggregate keys and computed cross-side semi-join keys remain boundaries.
+Rejected volatile parent predicates never reach an absorbing node handler.
+Fetch boundaries reject parent predicates while retaining their own predicates.
+Native positional regressions and Longbow NULL, alias, volatile and fetch
+execution regressions cover these rules. Original license notices remain intact.
+
+
+## Family FZ: no join dynamic filters on floating-point keys
+
+FZ / NATIVE-DYNAMIC-FILTERS / UPSTREAMABLE. A hash join matches floating-point
+keys by its hash equality, under which `-0.0` equals `0.0`. The pushed bounds
+and IN-list predicates compare by total order, under which `-0.0 < 0.0`, so a
+probe `-0.0` that matches a build `0.0` was removed: stock 55.2 with Parquet
+`pushdown_filters`, Longbow whole-plan residuals and split tasks all lost such
+rows. A join whose key on either side contains a floating-point type (including
+dictionary, list, map, struct and union members) now produces no dynamic filter.
+The join remains the equality authority. Integer, decimal, string and temporal
+keys are unchanged.
+
+Native regression: `joins::hash_join::exec::tests::float_keys_produce_no_dynamic_filter`.
+Consumer reproducer: `longbow-testkit` integration test
+`rle13_float_keys::rle13_float_key_filters_keep_every_matching_probe_row`.
