@@ -255,6 +255,16 @@ impl RowNumberTopK {
         self.rows
     }
 
+    /// Bytes reserved in the pool for what the state retains.
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.reservation.size()
+    }
+
+    /// The partition's `output_rows` metric, which emission records.
+    pub(crate) fn output_rows(&self) -> Count {
+        self.metrics.baseline.output_rows().clone()
+    }
+
     pub(crate) fn emit(mut self) -> Result<SendableRecordBatchStream> {
         self.batch_size = self.batch_size.min(self.rows.max(1));
         let extra = add(

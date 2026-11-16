@@ -1699,6 +1699,16 @@ impl PartitionedTopKRank {
         rank_emit::emit(self)
     }
 
+    /// Bytes reserved in the pool for what the state retains.
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.reservation.size()
+    }
+
+    /// The partition's `output_rows` metric, which emission records.
+    pub(crate) fn output_rows(&self) -> Count {
+        self.metrics.baseline.output_rows().clone()
+    }
+
     /// Rows that `emit` would return now: every heap row and boundary peer.
     pub(crate) fn retained_rows(&self) -> usize {
         self.states

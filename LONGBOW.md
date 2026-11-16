@@ -34,13 +34,20 @@ Audit classification: UPSTREAMABLE.
 output order; `Final` is the operator as it was. A row with rank at most K in
 its window partition has rank at most K in any subset of it, so the partial
 heap removes only rows that the final heap, the window and its filter would
-remove. A partial partition that retains more than one row in four after
-65,536 input rows (many window partitions, or many boundary peers) emits its
-heaps and passes the rest of its input through; the check repeats at each
-doubling. The display names the mode only when it is partial. Native tests
+remove. A partial partition emits its heaps and passes the rest of its input
+through in three cases: it retains more than one row in four (checked every
+65,536 input rows: many window partitions, or many boundary peers); its heaps
+reserve more than its part of a bounded pool (the partitions of one operator
+together at most a quarter, checked after every batch); or less than an eighth
+of a bounded pool is free (checked before every batch, so that a refused
+reservation cannot fail the query for an optimization). Passed rows count in
+the partition's one `output_rows` metric, and `partial_peak_bytes` reports
+what the heaps reserved. The display names the mode only when it is partial. Native tests
 compare partial-then-final with final alone for RANK and ROW_NUMBER, with
 NULL keys, boundary peers and pass-through, and check the properties, metrics
-and released memory. The Longbow consumer places the partial operator and
+and released memory. ROW_NUMBER with a payload column and equal rows at the
+K-th position is checked for a valid order prefix, not for equality. Two
+bounded-pool tests cover the byte share and the nearly full pool. The Longbow consumer places the partial operator and
 carries the mode in its stage codec.
 
 ## Family PSN: retain positional key partitions during sort pushdown

@@ -41,6 +41,7 @@ use arrow::row::SortField;
 use datafusion_common::Result;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::MemoryLimit;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -88,18 +89,33 @@ pub enum PartitionedTopKMode {
     Final,
     /// Any input distribution. The output is a superset of the rows that the
     /// final operator keeps, in no declared order. When the input does not
-    /// reduce (see [`PARTIAL_MIN_REDUCTION`]), the operator emits what it holds
-    /// and passes the remaining input through unchanged.
+    /// reduce (see [`PARTIAL_MIN_REDUCTION`]), or the heaps would take too much
+    /// of a bounded pool (see [`PARTIAL_POOL_SHARE`] and
+    /// [`PARTIAL_POOL_HEADROOM`]), the operator emits what it holds and passes
+    /// the remaining input through unchanged.
     Partial,
 }
 
-/// Input rows of one partial operator partition before its first reduction
-/// check. The check repeats each time the row count doubles.
+/// Input rows of one partial operator partition between two reduction checks,
+/// and before the first one.
 pub const PARTIAL_PROBE_ROWS: usize = 1 << 16;
 
 /// A partial operator keeps reducing only while it retains at most one row in
 /// this many input rows.
 pub const PARTIAL_MIN_REDUCTION: usize = 4;
+
+/// The partial partitions of one operator together reserve at most one part in
+/// this many of a bounded memory pool. The final operator holds its heaps at
+/// the same time and neither spills, so the partial heaps must stay a small
+/// part of what the plan may use. Checked after every input batch.
+pub const PARTIAL_POOL_SHARE: usize = 4;
+
+/// A partial partition stops reducing when less than one part in this many of
+/// a bounded memory pool is free: the heaps are an optimization, and must not
+/// take the memory that another operator of the plan needs. Checked before
+/// every input batch, so that a refused reservation cannot fail the query in
+/// the middle of a batch.
+pub const PARTIAL_POOL_HEADROOM: usize = 8;
 
 /// Per-partition Top-K operator for window function queries.
 ///
@@ -536,6 +552,7 @@ impl ExecutionPlan for PartitionedTopKExec {
         let fetch = self.fetch;
         let fn_kind = self.fn_kind;
         let mode = self.mode;
+        let partitions = self.cache.output_partitioning().partition_count();
         let batch_size = context.session_config().batch_size();
         let runtime = Arc::clone(&context.runtime_env());
         let metrics_set = self.metrics_set.clone();
@@ -551,6 +568,7 @@ impl ExecutionPlan for PartitionedTopKExec {
                 fetch,
                 fn_kind,
                 mode,
+                partitions,
                 batch_size,
                 runtime,
                 metrics_set,
@@ -589,12 +607,79 @@ impl TopKState {
         }
     }
 
+    /// Bytes that the state has reserved in the pool for what it retains.
+    fn reserved_bytes(&self) -> usize {
+        match self {
+            Self::RowNumber(state) => state.reserved_bytes(),
+            Self::Rank(state) => state.reserved_bytes(),
+        }
+    }
+
+    /// The partition's one `output_rows` metric, which `emit` also records.
+    fn output_rows(&self) -> crate::metrics::Count {
+        match self {
+            Self::RowNumber(state) => state.output_rows(),
+            Self::Rank(state) => state.output_rows(),
+        }
+    }
+
     fn emit(self) -> Result<SendableRecordBatchStream> {
         match self {
             Self::RowNumber(state) => state.emit(),
             Self::Rank(state) => state.emit(),
         }
     }
+}
+
+/// The memory bounds of one partial partition in a bounded pool.
+struct PartialBounds {
+    /// The pool's limit.
+    pool: usize,
+    /// The most bytes that this partition's heaps may reserve.
+    partition: usize,
+}
+
+impl PartialBounds {
+    /// The bounds of one of `partitions` partial partitions in `runtime`'s
+    /// pool; `None` for a pool without a known limit, which cannot refuse.
+    fn of(runtime: &RuntimeEnv, partitions: usize) -> Option<Self> {
+        match runtime.memory_pool.memory_limit() {
+            MemoryLimit::Finite(pool) => Some(Self {
+                pool,
+                partition: pool / PARTIAL_POOL_SHARE / partitions.max(1),
+            }),
+            MemoryLimit::Infinite | MemoryLimit::Unknown => None,
+        }
+    }
+
+    /// Whether the pool has less than its headroom free.
+    fn pool_is_tight(&self, runtime: &RuntimeEnv) -> bool {
+        runtime.memory_pool.reserved() > self.pool - self.pool / PARTIAL_POOL_HEADROOM
+    }
+}
+
+/// Ends the reduction of a partial partition: the stream of what `state`
+/// holds, then `pending` (a batch that was not inserted), then the rest of
+/// `input`, unchanged. Passed rows count in the partition's `output_rows`.
+fn pass_through(
+    state: TopKState,
+    pending: Option<arrow::record_batch::RecordBatch>,
+    input: SendableRecordBatchStream,
+    schema: SchemaRef,
+    partition_id: usize,
+    metrics_set: &ExecutionPlanMetricsSet,
+) -> Result<SendableRecordBatchStream> {
+    MetricBuilder::new(metrics_set)
+        .counter("partial_passthrough", partition_id)
+        .add(1);
+    let passed = state.output_rows();
+    let rest = futures::stream::iter(pending.map(Ok))
+        .chain(input)
+        .inspect_ok(move |batch| passed.add(batch.num_rows()));
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        state.emit()?.chain(rest),
+    )))
 }
 
 /// Read all input, feed each batch into a per-partition top-K state
@@ -615,12 +700,15 @@ impl TopKState {
 ///    `RANK`, boundary-tied rows are materialized and emitted after
 ///    each partition's heap rows.
 ///
-/// A partial operator checks its reduction after [`PARTIAL_PROBE_ROWS`] input
-/// rows and again at each doubling. When it retains more than one row in
-/// [`PARTIAL_MIN_REDUCTION`], the heaps cost more than they remove (many
-/// window partitions, or many boundary peers): it emits what it holds and
-/// passes the remaining input through. Every passed row is a row the final
-/// operator would have received without the partial operator.
+/// A partial operator checks its reduction every [`PARTIAL_PROBE_ROWS`] input
+/// rows. When it retains more than one row in [`PARTIAL_MIN_REDUCTION`], the
+/// heaps cost more than they remove (many window partitions, or many boundary
+/// peers): it emits what it holds and passes the remaining input through. It
+/// does the same when its heaps reserve more than its share of a bounded pool
+/// ([`PARTIAL_POOL_SHARE`], after every batch), and before it inserts a batch
+/// into a pool that is nearly full ([`PARTIAL_POOL_HEADROOM`]). Every passed
+/// row is a row the final operator would have received without the partial
+/// operator, so each of these only gives up the reduction.
 ///
 /// # Cost
 ///
@@ -638,6 +726,7 @@ async fn do_partitioned_topk(
     fetch: usize,
     fn_kind: WindowFnKind,
     mode: PartitionedTopKMode,
+    partitions: usize,
     batch_size: usize,
     runtime: Arc<RuntimeEnv>,
     metrics_set: ExecutionPlanMetricsSet,
@@ -680,26 +769,51 @@ async fn do_partitioned_topk(
         rank.retain_peers(fn_kind == WindowFnKind::Rank);
         TopKState::Rank(rank)
     };
+    if mode == PartitionedTopKMode::Final {
+        while let Some(batch) = input.next().await {
+            state.insert_batch(&batch?)?;
+            tokio::task::yield_now().await;
+        }
+        drop(input);
+        return state.emit();
+    }
+    let bounds = PartialBounds::of(&runtime, partitions);
+    let peak = MetricBuilder::new(&metrics_set)
+        .peak_memory_usage("partial_peak_bytes", partition_id);
     let mut seen: usize = 0;
     let mut next_check = PARTIAL_PROBE_ROWS;
     while let Some(batch) = input.next().await {
         let batch = batch?;
+        if bounds
+            .as_ref()
+            .is_some_and(|bounds| bounds.pool_is_tight(&runtime))
+        {
+            // Nothing of this batch is in the heaps yet: forward it whole.
+            return pass_through(
+                state,
+                Some(batch),
+                input,
+                schema,
+                partition_id,
+                &metrics_set,
+            );
+        }
         seen = seen.saturating_add(batch.num_rows());
         state.insert_batch(&batch)?;
         drop(batch);
-        if mode == PartitionedTopKMode::Partial && seen >= next_check {
-            if state.retained_rows().saturating_mul(PARTIAL_MIN_REDUCTION) > seen {
-                MetricBuilder::new(&metrics_set)
-                    .counter("partial_passthrough", partition_id)
-                    .add(1);
-                let passed = MetricBuilder::new(&metrics_set).output_rows(partition_id);
-                let rest = input.inspect_ok(move |batch| passed.add(batch.num_rows()));
-                return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                    schema,
-                    state.emit()?.chain(rest),
-                )));
-            }
-            next_check = next_check.saturating_mul(2);
+        let reserved = state.reserved_bytes();
+        peak.set_max(reserved);
+        let over_share = bounds
+            .as_ref()
+            .is_some_and(|bounds| reserved > bounds.partition);
+        let mut not_reducing = false;
+        if seen >= next_check {
+            not_reducing =
+                state.retained_rows().saturating_mul(PARTIAL_MIN_REDUCTION) > seen;
+            next_check = seen.saturating_add(PARTIAL_PROBE_ROWS);
+        }
+        if over_share || not_reducing {
+            return pass_through(state, None, input, schema, partition_id, &metrics_set);
         }
         tokio::task::yield_now().await;
     }

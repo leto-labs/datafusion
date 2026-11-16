@@ -84,7 +84,20 @@ fn final_topk(
     kind: WindowFnKind,
     partial: bool,
 ) -> Arc<dyn ExecutionPlan> {
-    let expr = keys(&input, true);
+    final_topk_ordered(input, fetch, kind, partial, true)
+}
+
+/// The final heap over a hash exchange on `k`, with or without the partial
+/// heap below the exchange; `v` descending with NULLs first, or ascending
+/// with NULLs last.
+fn final_topk_ordered(
+    input: Arc<dyn ExecutionPlan>,
+    fetch: usize,
+    kind: WindowFnKind,
+    partial: bool,
+    descending: bool,
+) -> Arc<dyn ExecutionPlan> {
+    let expr = keys(&input, descending);
     let input: Arc<dyn ExecutionPlan> = if partial {
         Arc::new(
             PartitionedTopKExec::try_new_with_mode(
@@ -278,6 +291,8 @@ async fn partial_passes_input_through_when_it_does_not_reduce() {
                     .sum::<usize>()
             )
         );
+        // Passed rows count in the partition's one `output_rows` metric.
+        assert_eq!(output_rows_metrics(&partial), 2, "{kind:?}");
         // The final result is the one without the partial operator.
         let expected = rows(
             final_topk(source(2, total, groups, 1_000_000, payload), 2, kind, false),
@@ -296,4 +311,288 @@ async fn partial_passes_input_through_when_it_does_not_reduce() {
         );
         assert_eq!(context.runtime_env().memory_pool.reserved(), 0);
     }
+}
+
+/// How many `output_rows` metrics `plan` has registered.
+fn output_rows_metrics(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    plan.metrics()
+        .unwrap()
+        .iter()
+        .filter(|metric| {
+            matches!(metric.value(), crate::metrics::MetricValue::OutputRows(_))
+        })
+        .count()
+}
+
+type Triple = (Option<String>, Option<i64>, i64);
+
+/// `(k, v, w)` of every row; `w` is unique in the input.
+fn triples(batches: &[RecordBatch]) -> Vec<Triple> {
+    use arrow::array::Array;
+    let mut rows = Vec::new();
+    for batch in batches {
+        let k = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let v = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let w = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((
+                k.is_valid(i).then(|| k.value(i).to_owned()),
+                v.is_valid(i).then(|| v.value(i)),
+                w.value(i),
+            ));
+        }
+    }
+    rows
+}
+
+/// Fails unless `actual` is a valid `ROW_NUMBER <= fetch` answer over `input`:
+/// every row is a distinct input row, and each window partition has
+/// `min(fetch, its size)` rows whose order values are a prefix of that
+/// partition's sorted order values. Which of several equal rows at the
+/// boundary are kept is free.
+fn assert_valid_row_number_prefix(
+    input: &[Triple],
+    actual: &[Triple],
+    fetch: usize,
+    descending: bool,
+) {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    // `v DESC NULLS FIRST`, or `v ASC NULLS LAST`.
+    let rank = |v: &Option<i64>| match (v, descending) {
+        (None, true) => (0, 0),
+        (Some(v), true) => (1, -*v),
+        (Some(v), false) => (0, *v),
+        (None, false) => (1, 0),
+    };
+    let by_id: HashMap<i64, &Triple> = input.iter().map(|row| (row.2, row)).collect();
+    assert_eq!(by_id.len(), input.len(), "the fixture's payload is unique");
+    let mut seen = HashSet::new();
+    for row in actual {
+        assert!(seen.insert(row.2), "row {} is returned twice", row.2);
+        assert_eq!(by_id.get(&row.2), Some(&row), "not an input row");
+    }
+    let mut expected: BTreeMap<Option<String>, Vec<(i32, i64)>> = BTreeMap::new();
+    for row in input {
+        expected
+            .entry(row.0.clone())
+            .or_default()
+            .push(rank(&row.1));
+    }
+    let mut kept: BTreeMap<Option<String>, Vec<(i32, i64)>> = BTreeMap::new();
+    for row in actual {
+        kept.entry(row.0.clone()).or_default().push(rank(&row.1));
+    }
+    assert_eq!(
+        kept.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>(),
+        "every window partition is present"
+    );
+    let mut boundary_ties = 0;
+    for (key, mut values) in expected {
+        values.sort_unstable();
+        let prefix = &values[..fetch.min(values.len())];
+        if values.len() > fetch && values[fetch] == values[fetch - 1] {
+            boundary_ties += 1;
+        }
+        let mut actual = kept.remove(&key).unwrap();
+        actual.sort_unstable();
+        assert_eq!(actual, prefix, "partition {key:?}");
+    }
+    assert!(
+        boundary_ties > 0,
+        "the fixture has equal rows at the boundary"
+    );
+}
+
+#[tokio::test]
+async fn row_number_with_payload_keeps_a_valid_prefix_across_boundary_ties() {
+    // A payload column takes the batch-referencing heap with peers off. Three
+    // order values (and NULLs) put many equal rows at every K-th position, so
+    // the partial and the final heap are free to keep different ones.
+    for descending in [true, false] {
+        for fetch in [1, 5, 40] {
+            let context = Arc::new(TaskContext::default());
+            let input = triples(
+                &crate::collect(source(4, 3000, 4, 3, true), Arc::clone(&context))
+                    .await
+                    .unwrap(),
+            );
+            for partial in [false, true] {
+                let plan = final_topk_ordered(
+                    source(4, 3000, 4, 3, true),
+                    fetch,
+                    WindowFnKind::RowNumber,
+                    partial,
+                    descending,
+                );
+                let actual =
+                    triples(&crate::collect(plan, Arc::clone(&context)).await.unwrap());
+                assert_eq!(actual.len(), 4 * fetch, "partial={partial}");
+                assert_valid_row_number_prefix(&input, &actual, fetch, descending);
+            }
+            assert_eq!(context.runtime_env().memory_pool.reserved(), 0);
+        }
+    }
+}
+
+/// `partitions` input partitions of `batches` batches of 1,000 rows with a
+/// 1 KiB payload each, so that a retained row pins about 1 MiB of its batch.
+fn wide_source(partitions: usize, batches: usize) -> Arc<dyn ExecutionPlan> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Utf8, true),
+        Field::new("v", DataType::Int64, true),
+        Field::new("w", DataType::Int64, false),
+        Field::new("pad", DataType::Utf8, false),
+    ]));
+    let data: Vec<Vec<RecordBatch>> = (0..partitions)
+        .map(|p| {
+            (0..batches)
+                .map(|b| {
+                    let row = |i: usize| (p * batches + b) * 1000 + i;
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![
+                            Arc::new(StringArray::from_iter_values(
+                                (0..1000).map(|i| format!("g{}", row(i) % 5)),
+                            )),
+                            Arc::new(Int64Array::from_iter_values(
+                                (0..1000)
+                                    .map(|i| ((row(i) * 2654435761) % 1_000_003) as i64),
+                            )),
+                            Arc::new(Int64Array::from_iter_values(
+                                (0..1000).map(|i| row(i) as i64),
+                            )),
+                            Arc::new(StringArray::from_iter_values(
+                                (0..1000).map(|i| format!("{:01024}", row(i))),
+                            )),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect()
+        })
+        .collect();
+    TestMemoryExec::try_new_exec(&data, schema, None).unwrap()
+}
+
+fn bounded_context(bytes: usize) -> Arc<TaskContext> {
+    use datafusion_execution::memory_pool::GreedyMemoryPool;
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(GreedyMemoryPool::new(bytes)))
+        .build_arc()
+        .unwrap();
+    Arc::new(TaskContext::default().with_runtime(runtime))
+}
+
+fn partial_rank(input: Arc<dyn ExecutionPlan>, fetch: usize) -> Arc<dyn ExecutionPlan> {
+    let expr = keys(&input, false);
+    Arc::new(
+        PartitionedTopKExec::try_new_with_mode(
+            input,
+            expr,
+            1,
+            fetch,
+            WindowFnKind::Rank,
+            PartitionedTopKMode::Partial,
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn partial_stays_within_its_share_of_a_small_pool() {
+    // Two partitions of 12 MiB. The heaps keep 1,000 rows of each of five
+    // window partitions, which pins every source batch: without a byte bound
+    // each partial partition would hold all 12 MiB until its input ends.
+    const POOL: usize = 64 << 20;
+    let share = POOL / PARTIAL_POOL_SHARE / 2;
+    let context = bounded_context(POOL);
+    let partial = partial_rank(wide_source(2, 12), 1000);
+    let batches = crate::collect_partitioned(Arc::clone(&partial), Arc::clone(&context))
+        .await
+        .unwrap();
+    assert_eq!(metric(&partial, "partial_passthrough"), 2);
+    // Each partition stopped at the first batch that took it over its share.
+    let peak = metric(&partial, "partial_peak_bytes");
+    assert!(peak > 2 * share, "{peak}");
+    assert!(peak < 2 * (share + (2 << 20)), "{peak}");
+    for partition in &batches {
+        let rows: usize = partition.iter().map(RecordBatch::num_rows).sum();
+        assert!(rows > 5000 && rows <= 12_000, "{rows}");
+    }
+    assert_eq!(output_rows_metrics(&partial), 2);
+    drop(batches);
+    assert_eq!(context.runtime_env().memory_pool.reserved(), 0);
+
+    // The whole plan succeeds in the pool and returns the rows of the plan
+    // without the partial heap.
+    let plan = |with_partial| {
+        final_topk_ordered(
+            wide_source(2, 12),
+            1000,
+            WindowFnKind::Rank,
+            with_partial,
+            false,
+        )
+    };
+    let sorted = |mut rows: Vec<Triple>| {
+        rows.sort();
+        rows
+    };
+    let expected = sorted(triples(
+        &crate::collect(plan(false), Arc::clone(&context))
+            .await
+            .unwrap(),
+    ));
+    let actual = sorted(triples(
+        &crate::collect(plan(true), Arc::clone(&context))
+            .await
+            .unwrap(),
+    ));
+    assert_eq!(expected.len(), 5000);
+    assert!(expected == actual, "the byte bound changed the final rows");
+    assert_eq!(context.runtime_env().memory_pool.reserved(), 0);
+}
+
+#[tokio::test]
+async fn partial_passes_through_when_the_pool_is_nearly_full() {
+    use datafusion_execution::memory_pool::MemoryConsumer;
+    const POOL: usize = 64 << 20;
+    let context = bounded_context(POOL);
+    // Another operator of the plan holds all but a sixteenth of the pool.
+    let other = MemoryConsumer::new("other").register(&context.runtime_env().memory_pool);
+    other.try_grow(POOL - POOL / 16).unwrap();
+    let partial = partial_rank(wide_source(2, 3), 10);
+    let batches = crate::collect_partitioned(Arc::clone(&partial), Arc::clone(&context))
+        .await
+        .unwrap();
+    // No batch entered a heap, so no reservation could be refused, and every
+    // input row is forwarded once.
+    assert_eq!(metric(&partial, "partial_passthrough"), 2);
+    assert_eq!(metric(&partial, "partial_peak_bytes"), 0);
+    let mut ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|partition| triples(partition))
+        .map(|row| row.2)
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, (0..6000).collect::<Vec<i64>>());
+    assert_eq!(partial.metrics().unwrap().output_rows(), Some(6000));
+    assert_eq!(output_rows_metrics(&partial), 2);
+    drop(batches);
+    drop(other);
+    assert_eq!(context.runtime_env().memory_pool.reserved(), 0);
 }
