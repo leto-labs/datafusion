@@ -361,6 +361,17 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
     pub(in crate::aggregates) fn take_state_batch(
         &mut self,
     ) -> Result<Option<RecordBatch>> {
+        self.take_state_batch_retaining(0)
+    }
+
+    /// Emit all states and reset the table, keeping at most the requested map
+    /// capacity where the group-value implementation supports it. In 56,
+    /// `clear_shrink` can release all capacity (for example bytes-view keys).
+    /// Correctness depends only on resetting group indices, never retention.
+    pub(in crate::aggregates) fn take_state_batch_retaining(
+        &mut self,
+        retain_groups: usize,
+    ) -> Result<Option<RecordBatch>> {
         let state_schema = Arc::clone(&self.state_schema);
         let accumulator_metrics = Arc::clone(&self.aggregate_accumulator_metrics);
         let group_by_metrics = self.group_by_metrics.clone();
@@ -387,9 +398,11 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         // `emit(EmitTo::All)` resets accumulator state. Explicitly shrink the
         // key/index buffers and accumulator scratch too so the memory
         // reservation can be released before the batch is sorted for spilling.
-        state.group_values.clear_shrink(0);
+        state.group_values.clear_shrink(retain_groups);
         state.batch_group_indices.clear();
-        state.batch_group_indices.shrink_to_fit();
+        if retain_groups == 0 {
+            state.batch_group_indices.shrink_to_fit();
+        }
         for acc in &mut state.accumulators {
             acc.shrink_to_fit();
         }

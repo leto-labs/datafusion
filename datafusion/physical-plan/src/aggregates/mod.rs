@@ -200,6 +200,7 @@ pub use order::GroupClusteringMode;
 mod aggregate_argument;
 mod aggregate_hash_table;
 mod aggregate_stream;
+mod bounded_partial;
 mod clustered_final_stream;
 mod clustered_partial_stream;
 mod clustered_single_stream;
@@ -6056,7 +6057,10 @@ mod tests {
             input,
             Arc::clone(&schema),
         )?;
-        assert_eq!(aggregate.group_clustering_mode(), &GroupClusteringMode::None);
+        assert_eq!(
+            aggregate.group_clustering_mode(),
+            &GroupClusteringMode::None
+        );
         let output = collect(aggregate.execute(0, new_migrated_hash_ctx(2))?).await?;
         assert_snapshot!(batches_to_sort_string(&output), @r"
 +------+-----+----------+
