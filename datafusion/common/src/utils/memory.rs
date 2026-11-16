@@ -4,6 +4,9 @@
 
 //! This module provides a function to estimate the memory size of a HashTable prior to allocation
 
+mod retained;
+pub use retained::RetainedBatchMemoryTracker;
+
 use crate::error::_exec_datafusion_err;
 use crate::hash_map::Entry;
 use crate::{HashMap, HashSet, Result};

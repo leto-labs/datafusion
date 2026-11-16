@@ -4,6 +4,8 @@
 
 //! TopK: Combination of Sort / LIMIT
 
+mod memory;
+
 use arrow::{
     array::{Array, AsArray},
     compute::{
@@ -25,7 +27,7 @@ use crate::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 
 use arrow::array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
 use arrow::datatypes::{FieldRef, Schema, SchemaRef};
-use datafusion_common::utils::memory::RecordBatchMemoryTracker;
+use datafusion_common::utils::memory::RetainedBatchMemoryTracker;
 use datafusion_common::{
     HashMap, Result, ScalarValue, internal_datafusion_err, internal_err,
 };
@@ -459,7 +461,7 @@ impl TopK {
         rows.clear();
         self.row_converter.append(rows, &sort_keys)?;
 
-        let mut batch_entry = self.heap.register_batch(batch);
+        let mut batch_entry = self.heap.register_batch(batch)?;
 
         let replacements = match selected_rows {
             Some(filter) => {
@@ -967,7 +969,7 @@ impl TopKHeap {
 
     /// Register a [`RecordBatch`] with the heap, returning the
     /// appropriate entry
-    pub fn register_batch(&mut self, batch: RecordBatch) -> RecordBatchEntry {
+    pub fn register_batch(&mut self, batch: RecordBatch) -> Result<RecordBatchEntry> {
         self.store.register(batch)
     }
 
@@ -1093,9 +1095,10 @@ impl TopKHeap {
 
         // clear all old entries in store (this invalidates all
         // store_ids in `inner`)
+        self.store.check_ids(1)?;
         self.store.clear();
 
-        let mut batch_entry = self.register_batch(new_batch);
+        let mut batch_entry = self.register_batch(new_batch)?;
         batch_entry.uses = num_rows;
 
         // rewrite all existing entries to use the new batch, and
@@ -1205,7 +1208,7 @@ struct RecordBatchStore {
     /// Counts the buffers of the stored batches. Stored input batches can be
     /// zero-copy slices of one larger batch, which keep all of its buffers
     /// alive, so each shared buffer is counted once.
-    batch_memory: RecordBatchMemoryTracker,
+    batch_memory: RetainedBatchMemoryTracker,
     /// total size of all record batches tracked by this store
     batches_size: usize,
     /// row count of all the batches
@@ -1217,7 +1220,7 @@ impl RecordBatchStore {
         Self {
             next_id: 0,
             batches: HashMap::new(),
-            batch_memory: RecordBatchMemoryTracker::new(),
+            batch_memory: RetainedBatchMemoryTracker::new(),
             batches_size: 0,
             total_rows: 0,
         }
@@ -1225,10 +1228,25 @@ impl RecordBatchStore {
 
     /// Register this batch with the store and assign an ID. No
     /// attempt is made to compare this batch to other batches
-    pub fn register(&mut self, batch: RecordBatch) -> RecordBatchEntry {
+    pub fn register(&mut self, batch: RecordBatch) -> Result<RecordBatchEntry> {
+        self.check_ids(1)?;
         let id = self.next_id;
         self.next_id += 1;
-        RecordBatchEntry { id, batch, uses: 0 }
+        Ok(RecordBatchEntry { id, batch, uses: 0 })
+    }
+
+    fn check_ids(&self, count: usize) -> Result<()> {
+        let count = u32::try_from(count).map_err(|_| {
+            datafusion_common::resources_datafusion_err!(
+                "PartitionedTopK batch ID overflow"
+            )
+        })?;
+        self.next_id.checked_add(count).ok_or_else(|| {
+            datafusion_common::resources_datafusion_err!(
+                "PartitionedTopK batch ID overflow"
+            )
+        })?;
+        Ok(())
     }
 
     /// The id the next [`Self::register`] call will assign.
@@ -1289,7 +1307,7 @@ impl RecordBatchStore {
             return Ok(());
         }
         let gather_idx = UInt32Array::from_iter_values(rows.iter().copied());
-        let mut entry = self.register(take_record_batch(batch, &gather_idx)?);
+        let mut entry = self.register(take_record_batch(batch, &gather_idx)?)?;
         debug_assert_eq!(
             entry.id, id,
             "the id handed to the slots must be the id the gather got"
@@ -1302,7 +1320,7 @@ impl RecordBatchStore {
     /// Clear all values in this store, invalidating all previous batch ids
     fn clear(&mut self) {
         self.batches.clear();
-        self.batch_memory = RecordBatchMemoryTracker::new();
+        self.batch_memory = RetainedBatchMemoryTracker::new();
         self.batches_size = 0;
         self.total_rows = 0;
     }
@@ -1368,8 +1386,9 @@ impl RecordBatchStore {
     /// referenced `RecordBatch`es, in bytes
     pub fn size(&self) -> usize {
         size_of::<Self>()
-            + self.batches.capacity() * (size_of::<u32>() + size_of::<RecordBatchEntry>())
-            + self.batches_size
+            .saturating_add(self.batches.allocation_size())
+            .saturating_add(self.batches_size)
+            .saturating_add(self.batch_memory.allocated_size())
     }
 
     /// Rewrite the store to hold only the rows `partitions` still reference,
@@ -1395,10 +1414,9 @@ impl RecordBatchStore {
     /// released only when its last slot is evicted, so a single batch of every
     /// live row would free nothing until every partition has churned.
     ///
-    /// Peak residency is the old store plus the new one — chunks are built
-    /// before the old entries drop, and the reservation is not resized until
-    /// `insert_batch` returns — so a pool sized at the steady-state bound can be
-    /// exceeded transiently without erroring.
+    /// Peak residency is the old store plus the new one. Chunks are built
+    /// before old entries drop; index and copy workspace are fallibly
+    /// admitted before the copy, so the pool also bounds this transient peak.
     ///
     /// All-or-nothing: plan the move and interleave, which is the only fallible
     /// step, before rewriting the slots and the store. A failing interleave
@@ -1409,13 +1427,26 @@ impl RecordBatchStore {
         partitions: &mut HashMap<Vec<u8>, P>,
         live_slots: usize,
         batch_size: usize,
+        reservation: &MemoryReservation,
     ) -> Result<()> {
-        if self.total_rows <= live_slots * STORE_COMPACTION_RATIO {
+        if self.total_rows <= memory::mul(live_slots, STORE_COMPACTION_RATIO)? {
             return Ok(());
         }
 
         // Scoped so the borrows of the old batches end before the store is
         // rewritten.
+        self.check_ids(live_slots.div_ceil(batch_size))?;
+        let index_work =
+            memory::add(memory::mul(live_slots, 128)?, memory::mul(self.len(), 128)?)?;
+        if reservation
+            .try_grow(memory::add(
+                index_work,
+                memory::mul(self.batch_memory.allocated_size(), 2)?,
+            )?)
+            .is_err()
+        {
+            return Ok(());
+        }
         let first_id = self.next_batch_id();
         // The slot's old place in walk order, so debug builds can check the
         // repoint walk below visits the slots in the same order.
@@ -1453,6 +1484,15 @@ impl RecordBatchStore {
                 "two slots must not share a store row"
             );
 
+            // Every output chunk remains held until repointing finishes.
+            // Admit each chunk's owners and minimum Arrow allocations, rather
+            // than treating all coordinates as one large output allocation.
+            let copy_work = coords.chunks(batch_size).try_fold(0, |bytes, chunk| {
+                memory::add(bytes, memory::copy_rows(&old, chunk)?)
+            })?;
+            if reservation.try_grow(copy_work).is_err() {
+                return Ok(());
+            }
             let mut chunks: Vec<(RecordBatch, usize)> =
                 Vec::with_capacity(coords.len().div_ceil(batch_size));
             let mut remap = vec![usize::MAX; old.len()];
@@ -1484,7 +1524,7 @@ impl RecordBatchStore {
         debug_assert_eq!(moved_to, live_slots, "repoint must visit every slot");
         self.clear();
         for (chunk_idx, (batch, uses)) in chunks.into_iter().enumerate() {
-            let mut entry = self.register(batch);
+            let mut entry = self.register(batch)?;
             debug_assert_eq!(
                 entry.id,
                 first_id + chunk_idx as u32,
@@ -1649,6 +1689,20 @@ impl PartitionHeap {
         self.inner.peek().map(|worst| worst.key.as_slice())
     }
 
+    /// Whether replacing the root with a strictly better key leaves the old
+    /// boundary in the heap. Any other occurrence of the maximum must have a
+    /// root child with that same key, so checking two children is sufficient.
+    fn boundary_is_tied(&self) -> bool {
+        self.inner.peek().is_some_and(|worst| {
+            self.inner
+                .as_slice()
+                .iter()
+                .skip(1)
+                .take(2)
+                .any(|slot| slot.key == worst.key)
+        })
+    }
+
     /// Retain `key`, with its output columns at `at` in the store, evicting
     /// the worst retained row if the heap is already full.
     ///
@@ -1706,6 +1760,17 @@ impl PartitionHeap {
         let evicted = std::mem::replace(&mut worst.at, at);
         drop(worst);
         (evicted, grown)
+    }
+
+    fn admission_growth(&self, k: usize, rows: usize) -> Result<usize> {
+        if self.inner.len() == k {
+            return Ok(0);
+        }
+        memory::vector_growth::<PartitionSlot>(
+            self.inner.len(),
+            self.inner.capacity(),
+            rows,
+        )
     }
 
     /// The retained slots, in unspecified order.
@@ -1778,7 +1843,6 @@ struct PartitionedTopKCore<S> {
     /// re-derive the same values over this operator's output.
     emit_ranks: bool,
     metrics: TopKMetrics,
-    reservation: MemoryReservation,
     /// ORDER BY expressions (excludes PARTITION BY).
     expr: LexOrdering,
     /// Encoder for the ORDER BY columns, whose encoding is the heap key.
@@ -1847,6 +1911,8 @@ struct PartitionedTopKCore<S> {
     index_bytes: usize,
     k: usize,
     batch_size: usize,
+    // Rust drops fields in declaration order. Release owned arrays and keys first.
+    reservation: MemoryReservation,
 }
 
 impl<S: StoreSlots> PartitionedTopKCore<S> {
@@ -1867,19 +1933,24 @@ impl<S: StoreSlots> PartitionedTopKCore<S> {
         metrics: &ExecutionPlanMetricsSet,
         ranked_schema: Option<SchemaRef>,
     ) -> Result<Self> {
-        assert!(k > 0, "{name} requires k > 0");
+        memory::dimensions(k, batch_size)?;
         let reservation = MemoryConsumer::new(format!("{name}[{partition_id}]"))
             .register(&runtime.memory_pool);
 
         // Both encoders are shared by every partition, and each scratch buffer
         // is sized to hold a whole batch so an `insert_batch` pass encodes once
         // per column set with no regrowth.
+        reservation.try_grow(memory::initial_bytes(
+            batch_size,
+            partition_sort_fields.len() + order_expr.len(),
+        )?)?;
         let order_sort_fields = build_sort_fields(&order_expr, schema)?;
         let row_converter = RowConverter::new(order_sort_fields)?;
         let scratch_rows =
             row_converter.empty_rows(batch_size, ESTIMATED_BYTES_PER_ROW * batch_size);
 
-        let partition_converter = RowConverter::new(partition_sort_fields)?;
+        let partition_converter =
+            RowConverter::new(memory::partition_fields(partition_sort_fields))?;
         let partition_scratch_rows = partition_converter
             .empty_rows(batch_size, ESTIMATED_BYTES_PER_ROW * batch_size);
 
@@ -1916,6 +1987,7 @@ impl<S: StoreSlots> PartitionedTopKCore<S> {
             .iter()
             .map(|e| e.evaluate(batch).and_then(|v| v.into_array(num_rows)))
             .collect::<Result<_>>()?;
+        let pk_arrays = memory::partition_arrays(pk_arrays, num_rows);
         self.partition_scratch_rows.clear();
         self.partition_converter
             .append(&mut self.partition_scratch_rows, &pk_arrays)?;
@@ -1948,14 +2020,22 @@ impl<S: StoreSlots> PartitionedTopKCore<S> {
         batch: &RecordBatch,
         pending: PendingEntry,
         replacements: usize,
+        insertion: Result<()>,
     ) -> Result<()> {
         self.store
             .insert_rows(batch, &self.admitted_rows, pending)?;
         if replacements > 0 {
             self.metrics.row_replacements.add(replacements);
         }
-        self.store
-            .compact(&mut self.partitions, self.live_slots, self.batch_size)
+        // Keep any successfully admitted prefix owned and charged on refusal,
+        // but do not allocate compaction workspace after the insertion failed.
+        insertion?;
+        self.store.compact(
+            &mut self.partitions,
+            self.live_slots,
+            self.batch_size,
+            &self.reservation,
+        )
     }
 
     /// Drain every partition in partition-key order, each through `drain` into
@@ -1973,6 +2053,20 @@ impl<S: StoreSlots> PartitionedTopKCore<S> {
         self,
         drain: impl FnMut(S) -> I,
     ) -> Result<SendableRecordBatchStream> {
+        let extra = memory::add(
+            4096,
+            memory::add(
+                memory::mul(self.partitions.len(), 2 * size_of::<(Vec<u8>, S)>())?,
+                memory::add(
+                    memory::mul(self.live_slots, 64)?,
+                    memory::emission_batches(
+                        self.store.len(),
+                        self.output_schema.fields().len(),
+                    )?,
+                )?,
+            )?,
+        )?;
+        self.reservation.try_grow(extra)?;
         let Self {
             output_schema,
             emit_ranks,
@@ -1982,8 +2076,24 @@ impl<S: StoreSlots> PartitionedTopKCore<S> {
             store,
             live_slots,
             batch_size,
+            admitted_rows,
+            expr,
+            partition_exprs,
+            row_converter,
+            partition_converter,
+            scratch_rows,
+            partition_scratch_rows,
             ..
         } = self;
+        drop((
+            admitted_rows,
+            expr,
+            partition_exprs,
+            row_converter,
+            partition_converter,
+            scratch_rows,
+            partition_scratch_rows,
+        ));
 
         // Map order is arbitrary, so partition-key order has to be recovered
         // explicitly here.
@@ -2002,29 +2112,66 @@ impl<S: StoreSlots> PartitionedTopKCore<S> {
             metrics,
             reservation,
             batch_size,
-            &store,
+            store,
             slots,
             live_slots,
         )
     }
 
-    /// The bytes these shared fields hold on the heap, beyond the operator
-    /// struct itself: encoders, scratch buffers, the partition map and its
-    /// keys, every heap, and every batch the store still pins.
-    ///
-    /// Every term is O(1): this runs on every batch, so the per-partition
-    /// contributions are the running totals `heaps_bytes` and `index_bytes`
-    /// rather than a sum over partitions.
+    /// Hash tables that could grow while this batch is admitted. Key copies
+    /// and new entries have per-input-row bounds; existing heaps are considered
+    /// separately once the encoded partition keys identify the touched states.
+    fn growth_size(&self, rows: usize) -> usize {
+        let partitions =
+            if self.partitions.len().saturating_add(rows) > self.partitions.capacity() {
+                self.partitions.allocation_size()
+            } else {
+                0
+            };
+        let batches = if self.store.batches.len() == self.store.batches.capacity() {
+            self.store.batches.allocation_size()
+        } else {
+            0
+        };
+        partitions
+            .saturating_add(batches)
+            .saturating_add(self.store.batch_memory.allocated_size())
+    }
+
+    fn admission_work(&self, batch: &RecordBatch) -> Result<usize> {
+        memory::input_rows(batch.num_rows())?;
+        self.store.check_ids(1)?;
+        memory::add(
+            memory::batch_work(
+                batch,
+                self.partition_exprs
+                    .iter()
+                    .cloned()
+                    .chain(self.expr.iter().map(|e| Arc::clone(&e.expr))),
+            )?,
+            memory::add(
+                memory::partition_work::<S>(batch.num_rows())?,
+                memory::mul(self.growth_size(batch.num_rows()), 2)?,
+            )?,
+        )
+    }
+
+    /// Heap storage beyond the operator struct. Per-partition contributions
+    /// use running totals so this remains O(1) on every input batch.
     fn allocated_size(&self) -> usize {
-        self.row_converter.size()
-            + self.partition_converter.size()
-            + self.scratch_rows.size()
-            + self.partition_scratch_rows.size()
-            + self.admitted_rows.allocated_size()
-            + self.partitions.capacity() * (size_of::<Vec<u8>>() + size_of::<S>())
-            + self.heaps_bytes
-            + self.index_bytes
-            + self.store.size()
+        [
+            self.row_converter.size(),
+            self.partition_converter.size(),
+            self.scratch_rows.size(),
+            self.partition_scratch_rows.size(),
+            self.admitted_rows.allocated_size(),
+            self.partitions.allocation_size(),
+            self.heaps_bytes,
+            self.index_bytes,
+            self.store.size(),
+        ]
+        .into_iter()
+        .fold(0, usize::saturating_add)
     }
 }
 
@@ -2067,7 +2214,7 @@ impl PartitionedTopK {
         metrics: &ExecutionPlanMetricsSet,
         ranked_schema: Option<SchemaRef>,
     ) -> Result<Self> {
-        Ok(Self {
+        let state = Self {
             core: PartitionedTopKCore::try_new(
                 "PartitionedTopK",
                 partition_id,
@@ -2081,7 +2228,29 @@ impl PartitionedTopK {
                 metrics,
                 ranked_schema,
             )?,
-        })
+        };
+        state.core.reservation.try_resize(state.size())?;
+        Ok(state)
+    }
+
+    pub(crate) fn try_admit_batch(
+        &self,
+        batch: &RecordBatch,
+        limit: Option<usize>,
+    ) -> Result<bool> {
+        let work = self.core.admission_work(batch)?;
+        // Optional Partial filtering reserves worst-case existing vector growth
+        // before touching retained rows. A refusal forwards this entire batch.
+        memory::admit(
+            &self.core.reservation,
+            self.size(),
+            work,
+            memory::add(
+                memory::mul(self.core.heaps_bytes, 2)?,
+                memory::mul(batch.num_rows(), 4 * size_of::<PartitionSlot>())?,
+            )?,
+            limit,
+        )
     }
 
     /// Encode the partition and ORDER BY columns once each for the whole batch,
@@ -2096,6 +2265,22 @@ impl PartitionedTopK {
             return Ok(());
         }
 
+        memory::input_rows(num_rows)?;
+        let work = self.core.admission_work(batch)?;
+        let mut growth = memory::AdmissionGrowth::new(self.size(), work)?;
+        let admission = self.core.reservation.try_resize(
+            memory::add(self.size(), work)?.max(self.core.reservation.size()),
+        );
+        if admission.is_err() && num_rows > 1 {
+            // No state changed: retry with halving chunks, including when the
+            // input is already at/below the configured output batch size.
+            let chunk = (num_rows / 2).min(self.core.batch_size).max(1);
+            for start in (0..num_rows).step_by(chunk) {
+                self.insert_batch(&batch.slice(start, chunk.min(num_rows - start)))?;
+            }
+            return Ok(());
+        }
+        admission?;
         // 1. Encode both column sets once for the whole batch.
         self.core.encode(batch)?;
 
@@ -2118,7 +2303,7 @@ impl PartitionedTopK {
         // The gathered batch does not exist yet, but its id does, so a slot can
         // point at it during the pass with no back-patching afterwards.
         let mut pending = core.store.pending();
-        {
+        let insertion = {
             let pk_rows = &core.partition_scratch_rows;
             let ob_rows = &core.scratch_rows;
             let heaps = &mut core.partitions;
@@ -2130,50 +2315,55 @@ impl PartitionedTopK {
             let mut admitted_bytes = 0usize;
             let mut new_slots = 0usize;
 
-            for row in 0..num_rows {
-                let pk = pk_rows.row(row);
-                // One probe per row, and `entry_ref` owns the key only on
-                // Vacant, so a key is allocated once per partition for the
-                // operator's lifetime — not once per row.
-                let mut interned = false;
-                let heap = heaps.entry_ref(pk.as_ref()).or_insert_with(|| {
-                    interned = true;
-                    PartitionHeap::default()
-                });
-                if interned {
-                    // The map has just taken the only copy of this key.
-                    interned_bytes += pk.as_ref().len();
+            let insertion = (|| -> Result<()> {
+                for row in 0..num_rows {
+                    let pk = pk_rows.row(row);
+                    // One probe per row, and `entry_ref` owns the key only on
+                    // Vacant, so a key is allocated once per partition for the
+                    // operator's lifetime — not once per row.
+                    let mut interned = false;
+                    let heap = heaps.entry_ref(pk.as_ref()).or_insert_with(|| {
+                        interned = true;
+                        PartitionHeap::default()
+                    });
+                    if interned {
+                        // The map has just taken the only copy of this key.
+                        interned_bytes += pk.as_ref().len();
+                    }
+                    let key = ob_rows.row(row);
+                    if !heap.qualifies(k, key.as_ref()) {
+                        continue;
+                    }
+                    // An admission's row in the gathered batch is its position in
+                    // `admitted_rows`, because the gather preserves that order.
+                    let at = StoreRef {
+                        batch_id: pending.id,
+                        row: admitted_rows.len() as u32,
+                    };
+                    growth.reserve(&core.reservation, heap.admission_growth(k, 1)?)?;
+                    pending.uses += 1;
+                    let (evicted, grown) = heap.add(k, key.as_ref(), at);
+                    admitted_bytes += grown;
+                    match evicted {
+                        Some(evicted) => store.release(&mut pending, evicted.batch_id),
+                        // The heap was not yet full, so this slot is a new
+                        // reference into the store rather than a replaced one.
+                        None => new_slots += 1,
+                    }
+                    admitted_rows.push(row as u32);
+                    replacements += 1;
                 }
-                let key = ob_rows.row(row);
-                if !heap.qualifies(k, key.as_ref()) {
-                    continue;
-                }
-                // An admission's row in the gathered batch is its position in
-                // `admitted_rows`, because the gather preserves that order.
-                let at = StoreRef {
-                    batch_id: pending.id,
-                    row: admitted_rows.len() as u32,
-                };
-                pending.uses += 1;
-                let (evicted, grown) = heap.add(k, key.as_ref(), at);
-                admitted_bytes += grown;
-                match evicted {
-                    Some(evicted) => store.release(&mut pending, evicted.batch_id),
-                    // The heap was not yet full, so this slot is a new
-                    // reference into the store rather than a replaced one.
-                    None => new_slots += 1,
-                }
-                admitted_rows.push(row as u32);
-                replacements += 1;
-            }
 
+                Ok(())
+            })();
             core.index_bytes += interned_bytes;
             core.heaps_bytes += admitted_bytes;
             core.live_slots += new_slots;
-        }
+            insertion
+        };
 
         // 3. Gather this batch's admissions into the store, then compact it.
-        core.finish_batch(batch, pending, replacements)?;
+        core.finish_batch(batch, pending, replacements, insertion)?;
         self.core.reservation.try_resize(self.size())?;
         Ok(())
     }
@@ -2208,7 +2398,7 @@ impl PartitionedTopK {
     /// per-partition heaps and every batch the store still pins. O(1), see
     /// [`PartitionedTopKCore::allocated_size`].
     fn size(&self) -> usize {
-        size_of::<Self>() + self.core.allocated_size()
+        size_of::<Self>().saturating_add(self.core.allocated_size())
     }
 }
 
@@ -2218,15 +2408,6 @@ struct EmitState {
     /// The input's columns, plus the ranking column when `ranks` is set.
     output_schema: SchemaRef,
     metrics: TopKMetrics,
-    /// Covers the pinned batches, `ordered` and `ranks` for as long as they
-    /// are held.
-    ///
-    /// Carried here rather than dropped at the end of `emit` so the bytes stay
-    /// accounted for until the stream is, and released by this struct's drop.
-    /// Never resized: the store's batches are pinned until the last chunk, so
-    /// there is nothing to hand back as chunks are emitted. Underscored because
-    /// it is held only for that drop, as in `HashJoinStream` and `AsofJoinStream`.
-    _reservation: MemoryReservation,
     batch_size: usize,
     /// The store's batches, positionally indexed by `ordered`.
     batches: Vec<RecordBatch>,
@@ -2237,6 +2418,21 @@ struct EmitState {
     /// Scratch for [`interleave_referenced`], one entry per batch.
     remap: Vec<usize>,
     pos: usize,
+    base_bytes: usize,
+    /// Covers the pinned batches, `ordered` and `ranks` for as long as they
+    /// are held.
+    ///
+    /// Carried here rather than dropped at the end of `emit` so the bytes stay
+    /// accounted for until the stream is, and released by this struct's drop.
+    /// The maximum output workspace is admitted before returning the stream
+    /// and checked again before each interleave. The store stays pinned until
+    /// the stream drops. Declared last so arrays are released before credits.
+    reservation: MemoryReservation,
+}
+
+struct EmissionOwner {
+    store: RecordBatchStore,
+    reservation: MemoryReservation,
 }
 
 impl EmitState {
@@ -2252,14 +2448,15 @@ impl EmitState {
         metrics: TopKMetrics,
         reservation: MemoryReservation,
         batch_size: usize,
-        store: &RecordBatchStore,
+        store: RecordBatchStore,
         slots: impl Iterator<Item = (StoreRef, u64)>,
         len: usize,
     ) -> Result<SendableRecordBatchStream> {
+        let mut owner = EmissionOwner { store, reservation };
         let timer = metrics.baseline.elapsed_compute().timer();
         // Cloned, an `Arc` bump per column, because the batches outlive the
         // store, which the caller drops as `emit` returns.
-        let (batches, batch_id_array_pos) = store.positional();
+        let (batches, batch_id_array_pos) = owner.store.positional();
         let batches: Vec<RecordBatch> = batches.into_iter().cloned().collect();
 
         // Flattened in output order, so the emit itself is a slice walk.
@@ -2276,6 +2473,7 @@ impl EmitState {
             }
         }
         drop(timer);
+        drop(batch_id_array_pos);
 
         // What survives this function is the store's batches — pinned until the
         // returned stream is dropped — plus `ordered`, one 16-byte pair per
@@ -2287,23 +2485,43 @@ impl EmitState {
         // here: releasing it while the store is still pinned would stop
         // accounting for bytes that are still held, which is the one direction
         // that matters.
-        reservation.try_resize(
-            size_of::<EmitState>()
-                + store.batches_size
-                + batches.capacity() * size_of::<RecordBatch>()
-                + ordered.capacity() * size_of::<(usize, usize)>()
-                + ranks
-                    .as_ref()
-                    .map_or(0, |r| r.capacity() * size_of::<u64>())
-                + batches.len() * size_of::<usize>(),
+        let remap = vec![usize::MAX; batches.len()];
+        let mut workspace = 0;
+        for chunk in ordered.chunks(batch_size) {
+            workspace = workspace.max(memory::copy_rows(&batches, chunk)?);
+        }
+        let base_bytes = memory::add(
+            size_of::<EmitState>(),
+            memory::add(
+                owner.store.batches_size,
+                memory::add(
+                    memory::mul(batches.capacity(), size_of::<RecordBatch>())?,
+                    memory::add(
+                        memory::mul(ordered.capacity(), size_of::<(usize, usize)>())?,
+                        memory::add(
+                            ranks
+                                .as_ref()
+                                .map_or(0, |r| r.capacity() * size_of::<u64>()),
+                            remap.capacity() * size_of::<usize>(),
+                        )?,
+                    )?,
+                )?,
+            )?,
         )?;
+        // Clones in batches now own every retained array. Drop the store's
+        // index/accountant before returning their credits, including on error.
+        drop(std::mem::replace(&mut owner.store, RecordBatchStore::new()));
+        owner
+            .reservation
+            .try_resize(memory::add(base_bytes, workspace)?)?;
 
         let state = EmitState {
             output_schema: Arc::clone(&output_schema),
             metrics,
-            _reservation: reservation,
+            reservation: owner.reservation,
             batch_size,
-            remap: vec![usize::MAX; batches.len()],
+            remap,
+            base_bytes,
             batches,
             ordered,
             ranks,
@@ -2330,6 +2548,10 @@ impl EmitState {
         let end = (start + self.batch_size).min(self.ordered.len());
         self.pos = end;
 
+        let work = memory::copy_rows(&self.batches, &self.ordered[start..end])?;
+        self.reservation.try_resize(
+            memory::add(self.base_bytes, work)?.max(self.reservation.size()),
+        )?;
         let batch = interleave_referenced(
             &self.batches,
             &self.ordered[start..end],
@@ -2433,7 +2655,6 @@ impl StoreSlots for RankPartitionState {
 ///   old ties no longer satisfy `rk ≤ K`, and they are released along with
 ///   the evicted row.
 pub(crate) struct PartitionedTopKRank {
-    core: PartitionedTopKCore<RankPartitionState>,
     /// The key of the row an admission just evicted, so the new boundary can
     /// be compared against it. Trades buffers with the heap root on every
     /// strictly-better admission, so its capacity is counted in
@@ -2444,6 +2665,8 @@ pub(crate) struct PartitionedTopKRank {
     /// held many ties does not keep their capacity for the operator's
     /// lifetime; this shrinks with it.
     ties_bytes: usize,
+    // The shared reservation is the last field dropped, including the evicted key.
+    core: PartitionedTopKCore<RankPartitionState>,
 }
 
 impl PartitionedTopKRank {
@@ -2470,7 +2693,7 @@ impl PartitionedTopKRank {
         metrics: &ExecutionPlanMetricsSet,
         ranked_schema: Option<SchemaRef>,
     ) -> Result<Self> {
-        Ok(Self {
+        let state = Self {
             core: PartitionedTopKCore::try_new(
                 "PartitionedTopKRank",
                 partition_id,
@@ -2486,7 +2709,32 @@ impl PartitionedTopKRank {
             )?,
             evicted_key: Vec::new(),
             ties_bytes: 0,
-        })
+        };
+        state.core.reservation.try_resize(state.size())?;
+        Ok(state)
+    }
+
+    pub(crate) fn try_admit_batch(
+        &self,
+        batch: &RecordBatch,
+        limit: Option<usize>,
+    ) -> Result<bool> {
+        let work = self.core.admission_work(batch)?;
+        // Optional Partial filtering reserves worst-case existing vector growth
+        // before touching retained rows. A refusal forwards this entire batch.
+        memory::admit(
+            &self.core.reservation,
+            self.size(),
+            work,
+            memory::add(
+                memory::mul(self.core.heaps_bytes.saturating_add(self.ties_bytes), 2)?,
+                memory::mul(
+                    batch.num_rows(),
+                    4 * (size_of::<PartitionSlot>() + size_of::<StoreRef>()),
+                )?,
+            )?,
+            limit,
+        )
     }
 
     /// Encode the partition and ORDER BY columns once each for the whole batch,
@@ -2501,6 +2749,22 @@ impl PartitionedTopKRank {
             return Ok(());
         }
 
+        memory::input_rows(num_rows)?;
+        let work = self.core.admission_work(batch)?;
+        let mut growth = memory::AdmissionGrowth::new(self.size(), work)?;
+        let admission = self.core.reservation.try_resize(
+            memory::add(self.size(), work)?.max(self.core.reservation.size()),
+        );
+        if admission.is_err() && num_rows > 1 {
+            // No state changed: retry with halving chunks, including when the
+            // input is already at/below the configured output batch size.
+            let chunk = (num_rows / 2).min(self.core.batch_size).max(1);
+            for start in (0..num_rows).step_by(chunk) {
+                self.insert_batch(&batch.slice(start, chunk.min(num_rows - start)))?;
+            }
+            return Ok(());
+        }
+        admission?;
         // 1. Encode both column sets once for the whole batch.
         self.core.encode(batch)?;
 
@@ -2517,7 +2781,7 @@ impl PartitionedTopKRank {
         // The gathered batch's id is known before the batch exists, so slots
         // can point at it during the pass.
         let mut pending = core.store.pending();
-        {
+        let insertion = {
             let pk_rows = &core.partition_scratch_rows;
             let ob_rows = &core.scratch_rows;
             let states = &mut core.partitions;
@@ -2532,83 +2796,113 @@ impl PartitionedTopKRank {
             let mut new_slots = 0usize;
             let mut released_slots = 0usize;
 
-            for row in 0..num_rows {
-                let pk = pk_rows.row(row);
-                let mut interned = false;
-                let state = states.entry_ref(pk.as_ref()).or_insert_with(|| {
-                    interned = true;
-                    RankPartitionState::default()
-                });
-                if interned {
-                    interned_bytes += pk.as_ref().len();
-                }
-                let key = ob_rows.row(row);
-                let key = key.as_ref();
-                // An admission's row in the gathered batch is its position in
-                // `admitted_rows`, because the gather preserves that order.
-                let at = StoreRef {
-                    batch_id: pending.id,
-                    row: admitted_rows.len() as u32,
-                };
-                match state.heap.classify(k, key) {
-                    // Strictly worse than the boundary: drop the row.
-                    Some(Ordering::Greater) => continue,
-                    Some(Ordering::Equal) => {
-                        ties_grown += state.push_tie(at);
-                        new_slots += 1;
+            let insertion = (|| -> Result<()> {
+                for row in 0..num_rows {
+                    let pk = pk_rows.row(row);
+                    let mut interned = false;
+                    let state = states.entry_ref(pk.as_ref()).or_insert_with(|| {
+                        interned = true;
+                        RankPartitionState::default()
+                    });
+                    if interned {
+                        interned_bytes += pk.as_ref().len();
                     }
-
-                    None => {
-                        let (evicted, grown) = state.heap.add(k, key, at);
-                        debug_assert!(
-                            evicted.is_none(),
-                            "a heap that is not full evicts nothing"
-                        );
-                        admitted_bytes += grown;
-                        new_slots += 1;
-                    }
-                    Some(Ordering::Less) => {
-                        // The old root's key comes back in `evicted_key`, to
-                        // tell whether the boundary moved.
-                        let (evicted, grown) =
-                            state.heap.replace_worst(key, at, evicted_key);
-                        admitted_bytes += grown;
-                        if state.heap.worst_key() == Some(evicted_key.as_slice()) {
-                            // Boundary unchanged: the evicted row is still
-                            // tied at it. Its slot moves to the tie list, and
-                            // its store use with it — no gather, no release.
-                            ties_grown += state.push_tie(evicted);
+                    let key = ob_rows.row(row);
+                    let key = key.as_ref();
+                    // An admission's row in the gathered batch is its position in
+                    // `admitted_rows`, because the gather preserves that order.
+                    let at = StoreRef {
+                        batch_id: pending.id,
+                        row: admitted_rows.len() as u32,
+                    };
+                    match state.heap.classify(k, key) {
+                        // Strictly worse than the boundary: drop the row.
+                        Some(Ordering::Greater) => continue,
+                        Some(Ordering::Equal) => {
+                            growth.reserve(
+                                &core.reservation,
+                                memory::vector_growth::<StoreRef>(
+                                    state.ties.len(),
+                                    state.ties.capacity(),
+                                    1,
+                                )?,
+                            )?;
+                            ties_grown += state.push_tie(at);
                             new_slots += 1;
-                        } else {
-                            // Boundary moved up: the evicted row and every tie
-                            // (from this batch or earlier ones) now rank
-                            // below K.
-                            store.release(&mut pending, evicted.batch_id);
-                            for tie in &state.ties {
-                                store.release(&mut pending, tie.batch_id);
+                        }
+
+                        None => {
+                            growth.reserve(
+                                &core.reservation,
+                                state.heap.admission_growth(k, 1)?,
+                            )?;
+                            let (evicted, grown) = state.heap.add(k, key, at);
+                            debug_assert!(
+                                evicted.is_none(),
+                                "a heap that is not full evicts nothing"
+                            );
+                            admitted_bytes += grown;
+                            new_slots += 1;
+                        }
+                        Some(Ordering::Less) => {
+                            // Reserve before replacing the root: on refusal all
+                            // existing slots must still reference admitted rows.
+                            // A unique boundary moves, so it needs no tie slot.
+                            if state.heap.boundary_is_tied() {
+                                growth.reserve(
+                                    &core.reservation,
+                                    memory::vector_growth::<StoreRef>(
+                                        state.ties.len(),
+                                        state.ties.capacity(),
+                                        1,
+                                    )?,
+                                )?;
                             }
-                            released_slots += state.ties.len();
-                            ties_freed += state.ties.capacity() * size_of::<StoreRef>();
-                            state.ties = Vec::new();
+                            // The old root's key comes back in `evicted_key`, to
+                            // tell whether the boundary moved.
+                            let (evicted, grown) =
+                                state.heap.replace_worst(key, at, evicted_key);
+                            admitted_bytes += grown;
+                            if state.heap.worst_key() == Some(evicted_key.as_slice()) {
+                                // Boundary unchanged: the evicted row is still
+                                // tied at it. Its slot moves to the tie list, and
+                                // its store use with it — no gather, no release.
+                                ties_grown += state.push_tie(evicted);
+                                new_slots += 1;
+                            } else {
+                                // Boundary moved up: the evicted row and every tie
+                                // (from this batch or earlier ones) now rank
+                                // below K.
+                                store.release(&mut pending, evicted.batch_id);
+                                for tie in &state.ties {
+                                    store.release(&mut pending, tie.batch_id);
+                                }
+                                released_slots += state.ties.len();
+                                ties_freed +=
+                                    state.ties.capacity() * size_of::<StoreRef>();
+                                state.ties = Vec::new();
+                            }
                         }
                     }
+                    // Every arm but `Greater` admitted the row, to the heap or to
+                    // ties, so each counts, as every admission does in
+                    // `PartitionedTopK`.
+                    pending.uses += 1;
+                    admitted_rows.push(row as u32);
+                    replacements += 1;
                 }
-                // Every arm but `Greater` admitted the row, to the heap or to
-                // ties, so each counts, as every admission does in
-                // `PartitionedTopK`.
-                pending.uses += 1;
-                admitted_rows.push(row as u32);
-                replacements += 1;
-            }
 
+                Ok(())
+            })();
             core.index_bytes += interned_bytes;
             core.heaps_bytes += admitted_bytes;
             self.ties_bytes = self.ties_bytes + ties_grown - ties_freed;
             core.live_slots = core.live_slots + new_slots - released_slots;
-        }
+            insertion
+        };
 
         // 3. Gather this batch's admissions into the store, then compact it.
-        core.finish_batch(batch, pending, replacements)?;
+        core.finish_batch(batch, pending, replacements, insertion)?;
         self.core.reservation.try_resize(self.size())?;
         Ok(())
     }
@@ -2651,7 +2945,9 @@ impl PartitionedTopKRank {
     /// partition's heap and ties and every batch the store still pins. O(1),
     /// see [`PartitionedTopKCore::allocated_size`].
     fn size(&self) -> usize {
-        size_of::<Self>() + self.core.allocated_size() + self.ties_bytes
+        size_of::<Self>()
+            .saturating_add(self.core.allocated_size())
+            .saturating_add(self.ties_bytes)
     }
 }
 
@@ -2702,20 +2998,30 @@ struct DenseRankPartitionState {
     /// test checks this against a full recompute after a randomized
     /// workload.
     contents_bytes: usize,
+    /// The per-key entry vectors' capacities, already included in
+    /// `contents_bytes`. Kept separately to bound admission growth in O(1).
+    entry_vectors_bytes: usize,
 }
 
 impl DenseRankPartitionState {
     fn size(&self) -> usize {
-        let table_overhead = self.groups.capacity()
-            * (size_of::<Vec<u8>>() + size_of::<Vec<GroupEntry>>());
+        let table_overhead = self.groups.allocation_size();
         // The heap's backing Vec: one `Vec<u8>` slot per reserved element.
         let keys_overhead = self.keys.capacity() * size_of::<Vec<u8>>();
-        table_overhead + self.contents_bytes + keys_overhead
+        table_overhead
+            .saturating_add(self.contents_bytes)
+            .saturating_add(keys_overhead)
     }
 
     /// Bytes owned by one entry's `row_indices` buffer.
     fn entry_bytes(entry: &GroupEntry) -> usize {
         entry.row_indices.capacity() * size_of::<u32>()
+    }
+
+    fn admission_vectors_size(&self) -> usize {
+        self.groups.allocation_size()
+            + self.keys.capacity() * size_of::<Vec<u8>>()
+            + self.entry_vectors_bytes
     }
 
     /// Track a previously unseen ob value, holding `run_indices` as its
@@ -2724,12 +3030,14 @@ impl DenseRankPartitionState {
     /// `keys` and `groups` each own a copy of the key bytes; the clone's
     /// capacity is read after the fact rather than assumed equal to the
     /// original's, so the charge matches what was really allocated.
+    /// Returns the growth of `admission_vectors_size` for the operator's total.
     fn insert_new_group(
         &mut self,
         ob_key: Vec<u8>,
         run_indices: Vec<u32>,
         batch_id: u32,
-    ) {
+    ) -> usize {
+        let before = self.admission_vectors_size();
         let key_copy = ob_key.clone();
         self.contents_bytes += key_copy.capacity() + ob_key.capacity();
         self.keys.push(key_copy);
@@ -2740,8 +3048,11 @@ impl DenseRankPartitionState {
         };
         self.contents_bytes += Self::entry_bytes(&entry);
         let entries = vec![entry];
-        self.contents_bytes += entries.capacity() * size_of::<GroupEntry>();
+        let entry_bytes = entries.capacity() * size_of::<GroupEntry>();
+        self.contents_bytes += entry_bytes;
+        self.entry_vectors_bytes += entry_bytes;
         self.groups.insert(ob_key, entries);
+        self.admission_vectors_size() - before
     }
 
     /// The value [`Self::contents_bytes`] must hold, computed the slow
@@ -2800,7 +3111,6 @@ impl DenseRankPartitionState {
 ///   - `ob_key >= max` → drop the whole run; no map mutation.
 pub(crate) struct PartitionedTopKDenseRank {
     metrics: TopKMetrics,
-    reservation: MemoryReservation,
     /// ORDER BY expressions (excludes PARTITION BY).
     expr: LexOrdering,
     /// Encoder for ORDER BY columns. Reused across partitions.
@@ -2821,6 +3131,9 @@ pub(crate) struct PartitionedTopKDenseRank {
     /// `entry_ref` — allocating a key only on first sight of a partition
     /// rather than once per row.
     states: HashMap<Vec<u8>, DenseRankPartitionState>,
+    /// Sum of every state's `admission_vectors_size`, updated at mutation
+    /// sites so preflight does not walk all retained groups on every batch.
+    vectors_bytes: usize,
     /// Scratch map reused across `insert_batch` calls to group a batch's
     /// row indices by partition key. Drained (not reallocated) each batch
     /// so its backing table is allocated once, not per batch.
@@ -2844,6 +3157,8 @@ pub(crate) struct PartitionedTopKDenseRank {
     output_schema: SchemaRef,
     k: usize,
     batch_size: usize,
+    // Rust drops fields in declaration order. Release owned arrays and keys first.
+    reservation: MemoryReservation,
 }
 
 impl PartitionedTopKDenseRank {
@@ -2876,21 +3191,26 @@ impl PartitionedTopKDenseRank {
         metrics: &ExecutionPlanMetricsSet,
         ranked_schema: Option<SchemaRef>,
     ) -> Result<Self> {
-        assert!(k > 0, "PartitionedTopKDenseRank requires k > 0");
+        memory::dimensions(k, batch_size)?;
         let reservation =
             MemoryConsumer::new(format!("PartitionedTopKDenseRank[{partition_id}]"))
                 .register(&runtime.memory_pool);
 
+        reservation.try_grow(memory::initial_bytes(
+            batch_size,
+            partition_sort_fields.len() + order_expr.len(),
+        )?)?;
         let order_sort_fields = build_sort_fields(&order_expr, schema)?;
         let row_converter = RowConverter::new(order_sort_fields)?;
         let scratch_rows =
             row_converter.empty_rows(batch_size, ESTIMATED_BYTES_PER_ROW * batch_size);
 
-        let partition_converter = RowConverter::new(partition_sort_fields)?;
+        let partition_converter =
+            RowConverter::new(memory::partition_fields(partition_sort_fields))?;
         let partition_scratch_rows = partition_converter
             .empty_rows(batch_size, ESTIMATED_BYTES_PER_ROW * batch_size);
 
-        Ok(Self {
+        let state = Self {
             emit_ranks: ranked_schema.is_some(),
             output_schema: ranked_schema.unwrap_or_else(|| Arc::clone(schema)),
             metrics: TopKMetrics::new(metrics, partition_id),
@@ -2902,12 +3222,82 @@ impl PartitionedTopKDenseRank {
             partition_converter,
             partition_scratch_rows,
             states: HashMap::new(),
+            vectors_bytes: 0,
             partition_groups: HashMap::new(),
             ob_runs: HashMap::new(),
             store: RecordBatchStore::new(),
             k,
             batch_size,
-        })
+        };
+        state.reservation.try_resize(state.size())?;
+        Ok(state)
+    }
+
+    fn admission_work(&self, batch: &RecordBatch) -> Result<usize> {
+        memory::input_rows(batch.num_rows())?;
+        self.store.check_ids(1)?;
+        let work = memory::batch_work(
+            batch,
+            self.partition_exprs
+                .iter()
+                .cloned()
+                .chain(self.expr.iter().map(|e| Arc::clone(&e.expr))),
+        )?;
+        // Per new partition: primary map/heap, minimum four-bucket group map,
+        // one GroupEntry and a minimum u32 row-index vector. Existing immutable
+        // retained row-index buffers are never reserved again.
+        let fresh = memory::add(
+            memory::partition_work::<DenseRankPartitionState>(batch.num_rows())?,
+            memory::mul(
+                batch.num_rows(),
+                4 * (size_of::<(Vec<u8>, Vec<GroupEntry>)>() + 1)
+                    + size_of::<GroupEntry>()
+                    + 4 * size_of::<u32>(),
+            )?,
+        )?;
+        let table = if self.states.len().saturating_add(batch.num_rows())
+            > self.states.capacity()
+        {
+            self.states.allocation_size()
+        } else {
+            0
+        };
+        // DenseRank retains the input; sliced fallback batches can share all
+        // payload buffers with entries already in the store.
+        let held = self.store.batch_memory.additional_batch_memory(batch);
+        memory::add(
+            work,
+            memory::add(
+                fresh,
+                memory::add(
+                    held,
+                    memory::mul(
+                        table.saturating_add(self.store.batch_memory.allocated_size()),
+                        2,
+                    )?,
+                )?,
+            )?,
+        )
+    }
+    pub(crate) fn try_admit_batch(
+        &self,
+        batch: &RecordBatch,
+        limit: Option<usize>,
+    ) -> Result<bool> {
+        let work = self.admission_work(batch)?;
+        memory::admit(
+            &self.reservation,
+            self.size(),
+            work,
+            memory::add(
+                memory::mul(self.vectors_bytes, 2)?,
+                memory::mul(
+                    batch.num_rows(),
+                    4 * (size_of::<Vec<u8>>() + size_of::<(Vec<u8>, Vec<GroupEntry>)>()),
+                )?,
+            )?,
+            limit,
+        )
     }
 
     /// Encode PARTITION BY and ORDER BY columns once, demultiplex the
@@ -2923,12 +3313,26 @@ impl PartitionedTopKDenseRank {
             return Ok(());
         }
 
+        let work = self.admission_work(batch)?;
+        let mut growth = memory::AdmissionGrowth::new(self.size(), work)?;
+        let admission = self
+            .reservation
+            .try_resize(memory::add(self.size(), work)?.max(self.reservation.size()));
+        if admission.is_err() && num_rows > 1 {
+            let chunk = (num_rows / 2).min(self.batch_size).max(1);
+            for start in (0..num_rows).step_by(chunk) {
+                self.insert_batch(&batch.slice(start, chunk.min(num_rows - start)))?;
+            }
+            return Ok(());
+        }
+        admission?;
+
         // Register this batch with the store up front. `uses` is bumped
         // once per `GroupEntry` created below but lives on this local
         // entry, so the store sees a single insert per batch rather than
         // one per group — and `insert` drops batches that retained
         // nothing without ever charging for them.
-        let mut batch_entry = self.store.register(batch.clone());
+        let mut batch_entry = self.store.register(batch.clone())?;
         let batch_id = batch_entry.id;
 
         // 1. Encode partition columns.
@@ -2937,6 +3341,7 @@ impl PartitionedTopKDenseRank {
             .iter()
             .map(|e| e.evaluate(batch).and_then(|v| v.into_array(num_rows)))
             .collect::<Result<_>>()?;
+        let pk_arrays = memory::partition_arrays(pk_arrays, num_rows);
         self.partition_scratch_rows.clear();
         self.partition_converter
             .append(&mut self.partition_scratch_rows, &pk_arrays)?;
@@ -2975,118 +3380,157 @@ impl PartitionedTopKDenseRank {
         // 4. Per-partition: bucket this batch's rows by distinct ob value
         //    (within-call accumulation), then merge each bucket into the
         //    partition state as a single `GroupEntry`.
-        for (pk, indices) in groups.drain() {
-            let state = self
-                .states
-                .entry(pk)
-                .or_insert_with(DenseRankPartitionState::default);
+        let insertion = (|| -> Result<()> {
+            for (pk, indices) in groups.drain() {
+                let state = self
+                    .states
+                    .entry(pk)
+                    .or_insert_with(DenseRankPartitionState::default);
 
-            // Bucket by ob key. `ob_runs` is a reused scratch map (taken
-            // out and drained below) so its backing table is allocated
-            // once, not once per distinct partition key. `entry_ref` owns
-            // the key only on Vacant, so repeated rows of the same ob
-            // value don't re-allocate.
-            let mut runs = std::mem::take(&mut self.ob_runs);
-            runs.clear();
-            // Once the partition holds its full K distinct ob values, the
-            // largest of them is the bar a new value must beat, and that bar
-            // only ever gets stricter: with K values held there is no free
-            // slot left for a new (possibly larger) one, and the only way in
-            // from here is to evict that largest and put something strictly
-            // smaller in its place. So a row worse than today's bar is worse
-            // than every later bar too — it is not held now and can never be
-            // admitted — and can be dropped before it costs a bucket. Rows
-            // *equal* to the bar must still go through: that value is one of
-            // the K being held, so its rows belong to a live group.
-            let boundary: Option<&[u8]> = if state.groups.len() == k {
-                state.keys.peek().map(Vec::as_slice)
-            } else {
-                None
-            };
-            for &orig_idx in &indices {
-                let ob_row = self.scratch_rows.row(orig_idx as usize);
-                if boundary.is_some_and(|b| ob_row.as_ref() > b) {
-                    continue;
-                }
-                runs.entry_ref(ob_row.as_ref()).or_default().push(orig_idx);
-            }
-
-            for (ob_key, run_indices) in runs.drain() {
-                // Case A: ob already tracked — push this batch's run as a
-                // new `GroupEntry` (one entry per contributing batch).
-                if let Some(entries) = state.groups.get_mut(&ob_key) {
-                    batch_entry.uses += 1;
-                    let before = entries.capacity() * size_of::<GroupEntry>();
-                    let entry = GroupEntry {
-                        row_indices: run_indices,
-                        batch_id,
-                    };
-                    state.contents_bytes += DenseRankPartitionState::entry_bytes(&entry);
-                    entries.push(entry);
-                    // The push may have grown the buffer.
-                    state.contents_bytes +=
-                        entries.capacity() * size_of::<GroupEntry>() - before;
-                    continue;
-                }
-
-                // Case B: new ob, room available.
-                if state.groups.len() < k {
-                    batch_entry.uses += 1;
-                    state.insert_new_group(ob_key, run_indices, batch_id);
-                    continue;
-                }
-
-                // Case C: new ob, at K distinct keys. The largest tracked
-                // ob value is the admission boundary.
-                let max_key = state.keys.peek().expect("state.groups has k >= 1 keys");
-                if ob_key.as_slice() < max_key.as_slice() {
-                    // Evict the entire max-key group, from both the map
-                    // and its ordered mirror. `keys` and `groups` own
-                    // separate copies of the key bytes, so both are
-                    // uncharged — with their own capacities, which is why
-                    // `remove_entry` is used to recover the map's copy
-                    // rather than assuming it matches the popped one.
-                    let evicted_key = state.keys.pop().expect("max key present");
-                    let (map_key, evicted) = state
-                        .groups
-                        .remove_entry(&evicted_key)
-                        .expect("keys mirrors groups");
-                    state.contents_bytes -= evicted_key.capacity()
-                        + map_key.capacity()
-                        + evicted.capacity() * size_of::<GroupEntry>()
-                        + evicted
-                            .iter()
-                            .map(DenseRankPartitionState::entry_bytes)
-                            .sum::<usize>();
-                    for e in &evicted {
-                        replacements += e.row_indices.len();
-                        if e.batch_id == batch_id {
-                            // Admitted earlier in this same call, so the
-                            // store has not seen `batch_entry` yet — drop
-                            // the pending use rather than calling `unuse`,
-                            // which panics on an unregistered id.
-                            batch_entry.uses -= 1;
-                        } else {
-                            self.store.unuse(e.batch_id);
-                        }
+                // Bucket by ob key. `ob_runs` is a reused scratch map (taken
+                // out and drained below) so its backing table is allocated
+                // once, not once per distinct partition key. `entry_ref` owns
+                // the key only on Vacant, so repeated rows of the same ob
+                // value don't re-allocate.
+                let mut runs = std::mem::take(&mut self.ob_runs);
+                runs.clear();
+                // Once the partition holds its full K distinct ob values, the
+                // largest of them is the bar a new value must beat, and that bar
+                // only ever gets stricter: with K values held there is no free
+                // slot left for a new (possibly larger) one, and the only way in
+                // from here is to evict that largest and put something strictly
+                // smaller in its place. So a row worse than today's bar is worse
+                // than every later bar too — it is not held now and can never be
+                // admitted — and can be dropped before it costs a bucket. Rows
+                // *equal* to the bar must still go through: that value is one of
+                // the K being held, so its rows belong to a live group.
+                let boundary: Option<&[u8]> = if state.groups.len() == k {
+                    state.keys.peek().map(Vec::as_slice)
+                } else {
+                    None
+                };
+                for &orig_idx in &indices {
+                    let ob_row = self.scratch_rows.row(orig_idx as usize);
+                    if boundary.is_some_and(|b| ob_row.as_ref() > b) {
+                        continue;
                     }
-                    batch_entry.uses += 1;
-                    state.insert_new_group(ob_key, run_indices, batch_id);
+                    runs.entry_ref(ob_row.as_ref()).or_default().push(orig_idx);
                 }
-                // else: ob >= max — drop the whole run.
+
+                for (ob_key, run_indices) in runs.drain() {
+                    // Case A: ob already tracked — push this batch's run as a
+                    // new `GroupEntry` (one entry per contributing batch).
+                    if let Some(entries) = state.groups.get_mut(&ob_key) {
+                        growth.reserve(
+                            &self.reservation,
+                            memory::vector_growth::<GroupEntry>(
+                                entries.len(),
+                                entries.capacity(),
+                                1,
+                            )?,
+                        )?;
+                        batch_entry.uses += 1;
+                        let before = entries.capacity() * size_of::<GroupEntry>();
+                        let entry = GroupEntry {
+                            row_indices: run_indices,
+                            batch_id,
+                        };
+                        state.contents_bytes +=
+                            DenseRankPartitionState::entry_bytes(&entry);
+                        entries.push(entry);
+                        // The push may have grown the buffer.
+                        let grown = entries.capacity() * size_of::<GroupEntry>() - before;
+                        state.contents_bytes += grown;
+                        state.entry_vectors_bytes += grown;
+                        self.vectors_bytes += grown;
+                        continue;
+                    }
+
+                    // Case B: new ob, room available.
+                    if state.groups.len() < k {
+                        let map_growth = if state.groups.len() == state.groups.capacity()
+                        {
+                            memory::mul(state.groups.allocation_size(), 2)?
+                        } else {
+                            0
+                        };
+                        growth.reserve(
+                            &self.reservation,
+                            memory::add(
+                                map_growth,
+                                memory::vector_growth::<Vec<u8>>(
+                                    state.keys.len(),
+                                    state.keys.capacity(),
+                                    1,
+                                )?,
+                            )?,
+                        )?;
+
+                        batch_entry.uses += 1;
+                        self.vectors_bytes +=
+                            state.insert_new_group(ob_key, run_indices, batch_id);
+                        continue;
+                    }
+
+                    // Case C: new ob, at K distinct keys. The largest tracked
+                    // ob value is the admission boundary.
+                    let max_key =
+                        state.keys.peek().expect("state.groups has k >= 1 keys");
+                    if ob_key.as_slice() < max_key.as_slice() {
+                        // Evict the entire max-key group, from both the map
+                        // and its ordered mirror. `keys` and `groups` own
+                        // separate copies of the key bytes, so both are
+                        // uncharged — with their own capacities, which is why
+                        // `remove_entry` is used to recover the map's copy
+                        // rather than assuming it matches the popped one.
+                        let evicted_key = state.keys.pop().expect("max key present");
+                        let (map_key, evicted) = state
+                            .groups
+                            .remove_entry(&evicted_key)
+                            .expect("keys mirrors groups");
+                        let freed = evicted.capacity() * size_of::<GroupEntry>();
+                        state.entry_vectors_bytes -= freed;
+                        self.vectors_bytes -= freed;
+                        state.contents_bytes -= evicted_key.capacity()
+                            + map_key.capacity()
+                            + evicted.capacity() * size_of::<GroupEntry>()
+                            + evicted
+                                .iter()
+                                .map(DenseRankPartitionState::entry_bytes)
+                                .sum::<usize>();
+                        for e in &evicted {
+                            replacements += e.row_indices.len();
+                            if e.batch_id == batch_id {
+                                // Admitted earlier in this same call, so the
+                                // store has not seen `batch_entry` yet — drop
+                                // the pending use rather than calling `unuse`,
+                                // which panics on an unregistered id.
+                                batch_entry.uses -= 1;
+                            } else {
+                                self.store.unuse(e.batch_id);
+                            }
+                        }
+                        batch_entry.uses += 1;
+                        self.vectors_bytes +=
+                            state.insert_new_group(ob_key, run_indices, batch_id);
+                    }
+                    // else: ob >= max — drop the whole run.
+                }
+
+                // Return the drained scratch map (capacity retained) for the
+                // next partition to reuse.
+                self.ob_runs = runs;
             }
 
-            // Return the drained scratch map (capacity retained) for the
-            // next partition to reuse.
-            self.ob_runs = runs;
-        }
-
+            Ok(())
+        })();
         // Return the drained scratch map (capacity retained) for the next
         // batch to reuse.
         self.partition_groups = groups;
 
         // Charges `batch` once if any group retained rows from it.
         self.store.insert(batch_entry);
+        insertion?;
 
         if replacements > 0 {
             self.metrics.row_replacements.add(replacements);
@@ -3101,154 +3545,103 @@ impl PartitionedTopKDenseRank {
     /// ob keys are sorted (byte-comparable encoding == sort order) so
     /// emitted rows are in ob-sorted order.
     pub(crate) fn emit(self) -> Result<SendableRecordBatchStream> {
+        let rows = self.retained_rows();
+        let extra = memory::add(
+            4096,
+            memory::add(
+                memory::add(
+                    memory::mul(rows, 64)?,
+                    memory::emission_batches(
+                        self.store.len(),
+                        self.output_schema.fields().len(),
+                    )?,
+                )?,
+                memory::mul(
+                    self.states.len(),
+                    2 * size_of::<(Vec<u8>, DenseRankPartitionState)>(),
+                )?,
+            )?,
+        )?;
+        self.reservation.try_grow(extra)?;
         let Self {
             output_schema,
             emit_ranks,
             metrics,
-            reservation: _,
-            expr: _,
-            row_converter: _,
-            scratch_rows: _,
-            partition_exprs: _,
-            partition_converter: _,
-            partition_scratch_rows: _,
-            mut states,
-            partition_groups: _,
-            ob_runs: _,
+            reservation,
+            states,
             store,
-            k: _,
             batch_size,
+            partition_groups,
+            ob_runs,
+            expr,
+            partition_exprs,
+            row_converter,
+            partition_converter,
+            scratch_rows,
+            partition_scratch_rows,
+            ..
         } = self;
-        let _timer = metrics.baseline.elapsed_compute().timer();
-
-        let mut sorted_pks: Vec<Vec<u8>> = states.keys().cloned().collect();
-        sorted_pks.sort();
-
-        let mut out: Vec<Result<RecordBatch>> = Vec::new();
-
-        // Gather every retained row with a single `interleave_record_batch`
-        // per output batch rather than one `take_record_batch` per
-        // `GroupEntry`. A group entry holds only the rows one source batch
-        // contributed at one ob value, so entries are numerous and tiny —
-        // with P partitions, K distinct ob values and B contributing
-        // batches there are up to P × K × B of them, and gathering each
-        // one separately builds and tears down that many `RecordBatch`es.
-        // `interleave` takes `(batch_pos, row)` pairs across *different*
-        // source batches in one call, which is exactly the shape here.
-        //
-        // The pairs are pushed in emit order — partitions in sorted key
-        // order, ob values ascending within a partition, entries in
-        // insertion order within an ob value — so the interleaved output
-        // is already ordered and needs no post-sort.
-        //
-        // `batch_refs` holds only the batches the current chunk references
-        // and is rebuilt per chunk: for Dictionary columns `interleave`
-        // does work for every input array it is handed, referenced or not,
-        // so passing the whole store to each chunk made emit
-        // O(chunks × store batches). A batch's slot is resolved once per
-        // entry, not per row.
-        let mut batch_refs: Vec<&RecordBatch> = Vec::new();
-        let mut batch_id_pos: HashMap<u32, usize> = HashMap::new();
-        let mut indices: Vec<(usize, usize)> = Vec::with_capacity(batch_size);
-        let mut sorted_obs: Vec<(Vec<u8>, Vec<GroupEntry>)> = Vec::new();
-        // Parallel to `indices`: each row's `DENSE_RANK()`, when emitted.
-        let mut ranks: Option<Vec<u64>> =
-            emit_ranks.then(|| Vec::with_capacity(batch_size));
-
-        // Chunk at `batch_size` so the operator emits the same batch sizes
-        // as before and no single `interleave` output exceeds `batch_size`.
-        for pk in sorted_pks {
-            let DenseRankPartitionState {
-                groups,
-                keys: _,
-                contents_bytes: _,
-            } = states.remove(&pk).expect("key from states.keys()");
-            // Sort the <= K distinct ob keys so rows emit ascending
-            // (byte-comparable encoding == sort order).
-            sorted_obs.extend(groups);
-            sorted_obs.sort_by(|a, b| a.0.cmp(&b.0));
-            // `DENSE_RANK` is the 1-based index of a row's distinct ob value
-            // within its partition, and the state holds exactly the K
-            // distinct-smallest values — so the loop counter *is* the rank,
-            // shared by every row of the group.
-            for (dense_rank, (_ob, entries)) in (1u64..).zip(sorted_obs.drain(..)) {
+        drop((
+            partition_groups,
+            ob_runs,
+            expr,
+            partition_exprs,
+            row_converter,
+            partition_converter,
+            scratch_rows,
+            partition_scratch_rows,
+        ));
+        let mut sorted: Vec<_> = states.into_iter().collect();
+        sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut slots = Vec::with_capacity(rows);
+        for (_, state) in sorted {
+            let mut groups: Vec<_> = state.groups.into_iter().collect();
+            groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            for (rank, (_, entries)) in (1u64..).zip(groups) {
                 for entry in entries {
-                    let batch = &store
-                        .get(entry.batch_id)
-                        .expect("retained batch_id present in store")
-                        .batch;
-                    // Resolved lazily so a chunk boundary inside the entry
-                    // re-registers its batch in the next chunk's slice.
-                    let mut array_pos = None;
-                    for row in entry.row_indices {
-                        let pos = *array_pos.get_or_insert_with(|| {
-                            *batch_id_pos.entry(entry.batch_id).or_insert_with(|| {
-                                batch_refs.push(batch);
-                                batch_refs.len() - 1
-                            })
-                        });
-                        indices.push((pos, row as usize));
-                        if let Some(ranks) = &mut ranks {
-                            ranks.push(dense_rank);
-                        }
-                        if indices.len() == batch_size {
-                            let b = interleave_record_batch(&batch_refs, &indices)?;
-                            let ranks = ranks.as_mut().map(|r| r.drain(..));
-                            out.push(Ok(finish_chunk(
-                                b,
-                                ranks,
-                                &output_schema,
-                                &metrics,
-                            )?));
-                            indices.clear();
-                            batch_refs.clear();
-                            batch_id_pos.clear();
-                            array_pos = None;
-                        }
-                    }
+                    slots.extend(entry.row_indices.into_iter().map(|row| {
+                        (
+                            StoreRef {
+                                batch_id: entry.batch_id,
+                                row,
+                            },
+                            rank,
+                        )
+                    }));
                 }
             }
         }
-        if !indices.is_empty() {
-            let b = interleave_record_batch(&batch_refs, &indices)?;
-            let ranks = ranks.as_mut().map(|r| r.drain(..));
-            out.push(Ok(finish_chunk(b, ranks, &output_schema, &metrics)?));
-        }
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        EmitState::stream(
             output_schema,
-            futures::stream::iter(out),
-        )))
+            emit_ranks,
+            metrics,
+            reservation,
+            batch_size,
+            store,
+            slots.into_iter(),
+            rows,
+        )
     }
 
     /// Total memory currently held, including all per-partition states.
     fn size(&self) -> usize {
-        // Per partition: the state itself plus the encoded partition key
-        // owned by the map. The key bytes are a heap allocation the table
-        // slot doesn't cover, and with wide or numerous partition keys
-        // they dominate the fixed-size slots.
-        let states_contents: usize = self
-            .states
-            .iter()
-            .map(|(pk, state)| pk.capacity() + state.size())
-            .sum();
-        // `partition_groups` and `ob_runs` are drained, not dropped, so
-        // their backing tables outlive every `insert_batch` call. Both are
-        // empty by the time `size()` runs (drained above), so only the
-        // retained capacity is charged.
-        let scratch_tables = self.partition_groups.capacity()
-            * (size_of::<Vec<u8>>() + size_of::<Vec<u32>>())
-            + self.ob_runs.capacity() * (size_of::<Vec<u8>>() + size_of::<Vec<u32>>());
-        size_of::<Self>()
-            + self.row_converter.size()
-            + self.partition_converter.size()
-            + self.scratch_rows.size()
-            + self.partition_scratch_rows.size()
-            + states_contents
-            + self.states.capacity()
-                * (size_of::<Vec<u8>>() + size_of::<DenseRankPartitionState>())
-            + scratch_tables
-            + self.store.size()
+        let states_contents = self.states.iter().fold(0usize, |n, (pk, state)| {
+            n.saturating_add(pk.capacity()).saturating_add(state.size())
+        });
+        [
+            size_of::<Self>(),
+            self.row_converter.size(),
+            self.partition_converter.size(),
+            self.scratch_rows.size(),
+            self.partition_scratch_rows.size(),
+            states_contents,
+            self.states.allocation_size(),
+            self.partition_groups.allocation_size(),
+            self.ob_runs.allocation_size(),
+            self.store.size(),
+        ]
+        .into_iter()
+        .fold(0, usize::saturating_add)
     }
 }
 
@@ -3293,13 +3686,30 @@ mod tests {
             uses: 1,
         };
 
+        let expected = retained_batch_bytes(&record_batch_entry.batch);
+        assert!(
+            expected > 60,
+            "array/owner metadata must augment payload bytes"
+        );
         // when insert record batch entry
         record_batch_store.insert(record_batch_entry);
-        assert_eq!(record_batch_store.batches_size, 60);
+        assert_eq!(record_batch_store.batches_size, expected);
 
         // when unuse record batch entry
         record_batch_store.unuse(0);
         assert_eq!(record_batch_store.batches_size, 0);
+    }
+
+    fn retained_batch_bytes(batch: &RecordBatch) -> usize {
+        RetainedBatchMemoryTracker::new().count_batch(batch)
+    }
+
+    fn retained_store_buffers(store: &RecordBatchStore) -> usize {
+        let mut counter = RecordBatchMemoryCounter::new();
+        for entry in store.batches.values() {
+            counter.count_batch(&entry.batch);
+        }
+        counter.memory_usage()
     }
 
     fn make_ab_schema() -> SchemaRef {
@@ -4919,14 +5329,15 @@ mod tests {
         let batch = pk_val_batch(&schema, vec![1; 1000], vals)?;
 
         rk.insert_batch(&batch)?;
-        let after_first = rk.size();
+        let after_first = retained_store_buffers(&rk.core.store);
         for _ in 0..7 {
             rk.insert_batch(&batch)?;
         }
-        let after_eight = rk.size();
+        let after_eight = retained_store_buffers(&rk.core.store);
 
-        // Seven more batches retain seven more single rows. Correct growth is
-        // ~8 bytes per batch (~56 total, just the tie-list slots); the bug grew
+        // Compare payload growth: array/owner metadata and accountant tables
+        // are now charged too. Seven more gathers retain seven single rows;
+        // the bug grew
         // by a whole ~8 KB batch each time (~56 KB total). A 2000-byte bar sits
         // between the two with more than an order of magnitude of clearance on
         // each side.
@@ -5496,7 +5907,7 @@ mod tests {
         // 3. The store's two running totals are exact, not estimates.
         let rows: usize = store.batches.values().map(|e| e.batch.num_rows()).sum();
         assert_eq!(rows, store.total_rows, "{label}: store.total_rows drifted");
-        let mut counter = RecordBatchMemoryCounter::new();
+        let mut counter = RetainedBatchMemoryTracker::new();
         let bytes: usize = store
             .batches
             .values()
@@ -5860,7 +6271,25 @@ mod tests {
                         partition.recompute_contents_bytes(),
                         "seed {seed}, partition {pk:?}: {shape}"
                     );
+                    assert_eq!(
+                        partition.entry_vectors_bytes,
+                        partition
+                            .groups
+                            .values()
+                            .map(|entries| entries.capacity() * size_of::<GroupEntry>())
+                            .sum::<usize>(),
+                        "seed {seed}, partition {pk:?}: {shape}"
+                    );
                 }
+                assert_eq!(
+                    state.vectors_bytes,
+                    state
+                        .states
+                        .values()
+                        .map(DenseRankPartitionState::admission_vectors_size)
+                        .sum::<usize>(),
+                    "seed {seed}: {shape}"
+                );
             }
             saw_eviction |= state.metrics.row_replacements.value() > 0;
         }
@@ -7969,7 +8398,7 @@ mod tests {
             vec![1, 1, 1, 1, 2, 2, 2, 2],
             vec![1, 2, 3, 4, 10, 20, 30, 40],
         )?;
-        let batch_bytes = get_record_batch_memory_size(&batch);
+        let batch_bytes = retained_batch_bytes(&batch);
         state.insert_batch(&batch)?;
 
         assert_eq!(dense_rank_entry_count(&state), 6);
@@ -7991,7 +8420,7 @@ mod tests {
         // Both values beat {50, 60}, so every group from `first` is
         // evicted and only `second` remains charged.
         let second = pk_val_batch(&schema, vec![1, 1], vec![5, 6])?;
-        let second_bytes = get_record_batch_memory_size(&second);
+        let second_bytes = retained_batch_bytes(&second);
         state.insert_batch(&second)?;
 
         assert_eq!(state.store.len(), 1);
@@ -8024,7 +8453,7 @@ mod tests {
         let (schema, mut state) = build_partitioned_topk_dense_rank(2)?;
 
         let first = pk_val_batch(&schema, vec![1, 1], vec![5, 6])?;
-        let first_bytes = get_record_batch_memory_size(&first);
+        let first_bytes = retained_batch_bytes(&first);
         state.insert_batch(&first)?;
         assert_eq!(state.store.len(), 1);
 
@@ -8121,9 +8550,8 @@ mod tests {
         assert_eq!(state.states.len(), PARTITIONS);
 
         let key_bytes: usize = state.states.keys().map(|pk| pk.capacity()).sum();
-        let scratch_bytes = state.partition_groups.capacity()
-            * (size_of::<Vec<u8>>() + size_of::<Vec<u32>>())
-            + state.ob_runs.capacity() * (size_of::<Vec<u8>>() + size_of::<Vec<u32>>());
+        let scratch_bytes =
+            state.partition_groups.allocation_size() + state.ob_runs.allocation_size();
         assert!(key_bytes >= PARTITIONS * KEY_WIDTH, "key bytes {key_bytes}");
         assert!(scratch_bytes > 0, "scratch tables never allocated");
 
@@ -8138,8 +8566,7 @@ mod tests {
             + state.partition_scratch_rows.size()
             + key_bytes
             + state.states.values().map(|s| s.size()).sum::<usize>()
-            + state.states.capacity()
-                * (size_of::<Vec<u8>>() + size_of::<DenseRankPartitionState>())
+            + state.states.allocation_size()
             + scratch_bytes
             + state.store.size();
         assert_eq!(state.size(), expected);
@@ -8161,7 +8588,7 @@ mod tests {
         let pks = vec![1; 32];
         let vals: Vec<i32> = (0..32).rev().collect();
         let batch = pk_val_batch(&schema, pks, vals)?;
-        let batch_bytes = get_record_batch_memory_size(&batch);
+        let batch_bytes = retained_batch_bytes(&batch);
         state.insert_batch(&batch)?;
 
         assert_eq!(dense_rank_entry_count(&state), 1);
@@ -8185,3 +8612,15 @@ mod tests {
 
 #[cfg(test)]
 mod correctness_tests;
+
+#[cfg(test)]
+mod rank_drop_tests;
+
+#[cfg(test)]
+mod rank_memory_tests;
+
+#[cfg(test)]
+mod row_number_tests;
+
+#[cfg(test)]
+mod global_partitioned_topk_tests;

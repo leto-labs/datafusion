@@ -319,6 +319,14 @@ impl PartitionedTopKExec {
                 "Top-K requires positive K and a valid ordering suffix"
             );
         }
+        if expr
+            .iter()
+            .any(|e| e.expr.downcast_ref::<Column>().is_none())
+        {
+            return datafusion_common::plan_err!(
+                "PartitionedTopK requires materialized column keys"
+            );
+        }
         let cache = Self::compute_properties(
             &input,
             expr.clone(),
@@ -698,6 +706,17 @@ impl TopKState {
             Self::DenseRank(s) => s.insert_batch(batch),
         }
     }
+    fn try_admit_batch(
+        &self,
+        batch: &arrow::record_batch::RecordBatch,
+        limit: Option<usize>,
+    ) -> Result<bool> {
+        match self {
+            Self::RowNumber(s) => s.try_admit_batch(batch, limit),
+            Self::Rank(s) => s.try_admit_batch(batch, limit),
+            Self::DenseRank(s) => s.try_admit_batch(batch, limit),
+        }
+    }
     fn retained_rows(&self) -> usize {
         match self {
             Self::RowNumber(s) => s.retained_rows(),
@@ -773,10 +792,13 @@ fn pass_through(
     let rest = futures::stream::iter(pending.map(Ok))
         .chain(input)
         .inspect_ok(move |batch| passed.add(batch.num_rows()));
-    Ok(Box::pin(RecordBatchStreamAdapter::new(
-        schema,
-        state.emit()?.chain(rest),
-    )))
+    let stream = if state.retained_rows() == 0 {
+        drop(state);
+        rest.boxed()
+    } else {
+        state.emit()?.chain(rest).boxed()
+    };
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
 }
 
 /// Reduce a prefix, then release it before forwarding the remaining input.
@@ -797,33 +819,9 @@ async fn do_partitioned_topk(
     metrics_set: ExecutionPlanMetricsSet,
     ranked_schema: Option<SchemaRef>,
 ) -> Result<SendableRecordBatchStream> {
-    let mut state = match fn_kind {
-        WindowFnKind::RowNumber => TopKState::RowNumber(PartitionedTopK::try_new(
-            partition_id,
-            &schema,
-            partition_exprs,
-            partition_sort_fields,
-            order_expr,
-            fetch,
-            batch_size,
-            &runtime,
-            &metrics_set,
-            ranked_schema,
-        )?),
-        WindowFnKind::Rank => TopKState::Rank(PartitionedTopKRank::try_new(
-            partition_id,
-            &schema,
-            partition_exprs,
-            partition_sort_fields,
-            order_expr,
-            fetch,
-            batch_size,
-            &runtime,
-            &metrics_set,
-            ranked_schema,
-        )?),
-        WindowFnKind::DenseRank => {
-            TopKState::DenseRank(PartitionedTopKDenseRank::try_new(
+    let initial = (|| -> Result<_> {
+        Ok(match fn_kind {
+            WindowFnKind::RowNumber => TopKState::RowNumber(PartitionedTopK::try_new(
                 partition_id,
                 &schema,
                 partition_exprs,
@@ -834,8 +832,46 @@ async fn do_partitioned_topk(
                 &runtime,
                 &metrics_set,
                 ranked_schema,
-            )?)
+            )?),
+            WindowFnKind::Rank => TopKState::Rank(PartitionedTopKRank::try_new(
+                partition_id,
+                &schema,
+                partition_exprs,
+                partition_sort_fields,
+                order_expr,
+                fetch,
+                batch_size,
+                &runtime,
+                &metrics_set,
+                ranked_schema,
+            )?),
+            WindowFnKind::DenseRank => {
+                TopKState::DenseRank(PartitionedTopKDenseRank::try_new(
+                    partition_id,
+                    &schema,
+                    partition_exprs,
+                    partition_sort_fields,
+                    order_expr,
+                    fetch,
+                    batch_size,
+                    &runtime,
+                    &metrics_set,
+                    ranked_schema,
+                )?)
+            }
+        })
+    })();
+    let mut state = match initial {
+        Ok(state) => state,
+        Err(datafusion_common::DataFusionError::ResourcesExhausted(_))
+            if mode == PartitionedTopKMode::Partial =>
+        {
+            MetricBuilder::new(&metrics_set)
+                .counter("partial_passthrough", partition_id)
+                .add(1);
+            return Ok(input);
         }
+        Err(error) => return Err(error),
     };
     if mode == PartitionedTopKMode::Final {
         while let Some(batch) = input.next().await {
@@ -857,6 +893,19 @@ async fn do_partitioned_topk(
             .is_some_and(|bounds| bounds.pool_is_tight(&runtime))
         {
             // Nothing of this batch is in the heaps yet: forward it whole.
+            return pass_through(
+                state,
+                Some(batch),
+                input,
+                schema,
+                partition_id,
+                &metrics_set,
+            );
+        }
+        // Pure admission check: no encoded scratch or retained rows changed.
+        // In particular, never forward a batch after chunked insertion applied
+        // a prefix of it: that would emit duplicate rows.
+        if !state.try_admit_batch(&batch, bounds.as_ref().map(|b| b.partition))? {
             return pass_through(
                 state,
                 Some(batch),
@@ -1038,3 +1087,7 @@ mod tests {
 #[cfg(test)]
 #[path = "partitioned_topk_partial_tests.rs"]
 mod partial_tests;
+
+#[cfg(test)]
+#[path = "partitioned_topk_v3_tests.rs"]
+mod v3_tests;

@@ -252,7 +252,11 @@ impl WindowTopN {
         // `order_by()` alone does not catch the second case — it reports
         // `[pk]` even though no order key survives past the partition
         // prefix — so guard on the effective order-key count instead.
-        if expr.len() <= partition_prefix_len {
+        if expr.len() <= partition_prefix_len
+            || expr
+                .iter()
+                .any(|e| e.expr.downcast_ref::<Column>().is_none())
+        {
             return None;
         }
 

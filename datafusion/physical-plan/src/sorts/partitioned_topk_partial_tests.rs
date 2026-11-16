@@ -539,10 +539,10 @@ async fn partial_stays_within_its_share_of_a_small_pool() {
         .await
         .unwrap();
     assert_eq!(metric(&partial, "partial_passthrough"), 2);
-    // Each partition stopped at the first batch that took it over its share.
+    // Admission now stops before applying the batch that would exceed its
+    // share. The retained state must remain below both partitions' shares.
     let peak = metric(&partial, "partial_peak_bytes");
-    assert!(peak > 2 * share, "{peak}");
-    assert!(peak < 2 * (share + (2 << 20)), "{peak}");
+    assert!(peak > 0 && peak <= 2 * share, "{peak}");
     for partition in &batches {
         let rows: usize = partition.iter().map(RecordBatch::num_rows).sum();
         assert!(rows > 5000 && rows <= 12_000, "{rows}");

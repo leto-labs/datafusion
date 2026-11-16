@@ -1330,3 +1330,19 @@ async fn custom_udwf_sibling_with_ranking_name_blocks_rewrite() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn computed_window_keys_keep_window_fallback() -> Result<()> {
+    let ctx =
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    ctx.sql("SET datafusion.optimizer.enable_window_topn = true")
+        .await?
+        .collect()
+        .await?;
+    let df=ctx.sql("SELECT * FROM (SELECT column1, ROW_NUMBER() OVER (PARTITION BY column1 + 1 ORDER BY column2 + 1) AS rn FROM (VALUES (1, 3), (1, 2), (2, 1))) WHERE rn <= 1").await?;
+    let plan = df.create_physical_plan().await?;
+    assert!(!plan_str(plan.as_ref()).contains("PartitionedTopKExec"));
+    let batches = collect(plan, ctx.task_ctx()).await?;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    Ok(())
+}
