@@ -36,8 +36,7 @@ use crate::spill::get_record_batch_memory_size;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::{GetSlicedSize, SpillManager};
 use crate::statistics::{ChildStats, StatisticsArgs, with_per_partition_fetch};
-use crate::stream::ReservationStream;
-use crate::stream::{ObservedStream, RecordBatchStreamAdapter};
+use crate::stream::{ObservedStream, RecordBatchStreamAdapter, ReservationStream};
 use crate::topk::TopK;
 use crate::topk::TopKDynamicFilters;
 use crate::{
@@ -1064,21 +1063,33 @@ impl ExternalSorter {
 
             // Sort the batch immediately and get all output batches
             let sorted_batches = sort_batch_chunked(&batch, &expressions, batch_size)?;
+            // Retire the unsorted owner before replacing its charge by the
+            // retained output capacity. Shared view/dictionary buffers remain
+            // owned by sorted_batches and are counted below.
+            drop(batch);
 
             // Chunked output can retain shared buffers in every batch and
-            // exceed the input estimate. Borrow only already-reserved spill
-            // workspace; any remainder still uses the original sort consumer.
-            let total_sorted_size: usize = sorted_batches
-                .iter()
-                .map(get_record_batch_memory_size)
-                .sum();
+            // exceed the input estimate. Charge each shared buffer once and
+            // release it with the last chunk that retains it. Borrow only
+            // already-reserved spill workspace; any remainder still uses the
+            // original sort consumer.
+            let release_sizes = release_sizes_in_order(&sorted_batches);
+            let total_sorted_size: usize = release_sizes.iter().sum();
             let mut workspace =
                 merge_pool.borrow(total_sorted_size.saturating_sub(reservation.size()));
             reservation
                 .try_resize(total_sorted_size - workspace.size())
                 .map_err(Self::err_with_oom_context)?;
 
-            if workspace.size() == 0 {
+            // Preserve the upstream stream for outputs with independent
+            // buffers. Only shared chunks need the unique release schedule.
+            if workspace.size() == 0
+                && total_sorted_size
+                    == sorted_batches
+                        .iter()
+                        .map(get_record_batch_memory_size)
+                        .sum::<usize>()
+            {
                 return Ok(Box::pin(ReservationStream::new(
                     Arc::clone(&schema),
                     Box::pin(RecordBatchStreamAdapter::new(
@@ -1091,13 +1102,14 @@ impl ExternalSorter {
 
             // Return borrowed workspace first so the merge's cursors can reuse
             // it immediately. Both reservations also release on stream drop.
-            let batches = sorted_batches.into_iter().map(move |batch| {
-                let size = get_record_batch_memory_size(&batch);
-                let borrowed = size.min(workspace.size());
-                workspace.shrink(borrowed);
-                reservation.shrink(size - borrowed);
-                Ok(batch)
-            });
+            let batches = sorted_batches.into_iter().zip(release_sizes).map(
+                move |(batch, size)| {
+                    let borrowed = size.min(workspace.size());
+                    workspace.shrink(borrowed);
+                    reservation.shrink(size - borrowed);
+                    Ok(batch)
+                },
+            );
             Result::<_, DataFusionError>::Ok(Box::pin(RecordBatchStreamAdapter::new(
                 Arc::clone(&schema),
                 futures::stream::iter(batches),
@@ -1260,6 +1272,21 @@ impl ExternalSorter {
 
         stream
     }
+}
+
+/// Release shared output buffers with the last sorted chunk retaining them.
+/// Sorted output batches stay alive while the reverse counter computes the
+/// schedule, so allocation identity cannot be reused during counting. As in upstream's
+/// sort reservations, this counts buffer capacity, excluding array metadata.
+fn release_sizes_in_order(batches: &[RecordBatch]) -> Vec<usize> {
+    let mut counter = RecordBatchMemoryCounter::new();
+    let mut sizes: Vec<_> = batches
+        .iter()
+        .rev()
+        .map(|batch| counter.count_batch(batch))
+        .collect();
+    sizes.reverse();
+    sizes
 }
 
 /// Estimate how much memory is needed to sort a `RecordBatch`.

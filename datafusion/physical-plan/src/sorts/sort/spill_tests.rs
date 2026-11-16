@@ -26,6 +26,7 @@ use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
 use futures::TryStreamExt;
 use std::fmt::{Display, Formatter};
+use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -473,8 +474,8 @@ async fn check_chunked_string_view_workspace(during_spill: bool) -> Result<()> {
         .sum::<usize>();
     assert!(input_bytes > options.sort_in_place_threshold_bytes);
 
-    // Every chunk retains the long-string buffers. The ordinary sort
-    // reservation must grow even though all input was already reserved.
+    // Per-chunk estimates repeat the long-string backing buffers. Unique
+    // output capacity fits the input charge even when the pool is full.
     let sorted_bytes = sort_batch_chunked(&batches[0], &ordering, batch_size)?
         .iter()
         .map(get_record_batch_memory_size)
@@ -530,9 +531,11 @@ async fn test_chunked_string_view_spill_can_use_workspace() -> Result<()> {
     check_chunked_string_view_workspace(true).await
 }
 
-/// Prepared runs retain their workspace loans until merging starts. Looking
-/// ahead during the merge returns enough workspace for its batch and cursors.
-async fn check_sort_preparation_workspace(consume_output: bool) -> Result<()> {
+/// Unit fixture for sort_run with an explicit shared-input charge. Production
+/// view schemas use separate input reservations instead of shared_input.
+async fn check_sort_run_explicit_shared_input_workspace(
+    consume_output: bool,
+) -> Result<()> {
     let batch_size = 1024;
     let values: ArrayRef = Arc::new(StringViewArray::from_iter_values(
         (0..4096)
@@ -546,16 +549,12 @@ async fn check_sort_preparation_workspace(consume_output: bool) -> Result<()> {
     .into();
     let input_bytes = get_reserved_bytes_for_record_batch(&batch)?;
     let sorted_batches = sort_batch_chunked(&batch, &ordering, batch_size)?;
-    // Each StringView output chunk retains the shared string buffers.
-    // Summing the per-batch estimates counts those buffers once per chunk.
-    let sorted_bytes = sorted_batches
-        .iter()
-        .map(get_record_batch_memory_size)
-        .sum::<usize>();
-    let loan_per_run = sorted_bytes - input_bytes;
+    let releases = super::release_sizes_in_order(&sorted_batches);
+    let loan_per_run: usize = releases.iter().sum();
     let first_bytes = get_record_batch_memory_size(&sorted_batches[0]);
-    assert!(loan_per_run > first_bytes);
-    // Both full loans fit before merging; only one extra batch fits beside them.
+    // Charge input separately through shared_input. Output then needs a real
+    // workspace loan of its unique capacity, not a repeated backing-buffer
+    // estimate. Both complete loans fit plus one cursor batch of headroom.
     let workspace = 2 * loan_per_run + first_bytes;
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(Arc::new(GreedyMemoryPool::new(2 * input_bytes + workspace)))
@@ -574,23 +573,34 @@ async fn check_sort_preparation_workspace(consume_output: bool) -> Result<()> {
     sorter.insert_batch(batch.clone()).await?;
     sorter.insert_batch(batch.clone()).await?;
     sorter.merge_reservation.free();
-    let stream = sorter.in_mem_sort_stream(false, false).await?;
-    // Verify every sort task exits before merging. Tokio can update its task
-    // count shortly after the join completes.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while tokio::runtime::Handle::current()
-            .metrics()
-            .num_alive_tasks()
-            != 0
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("sort jobs must finish before merging");
-    // Temporarily borrow the unused workspace: both runs hold their full loans,
-    // leaving only the extra batch. Dropping the temporary returns it immediately.
+    let input = Arc::new(sorter.reservation.take());
+    let runs = std::mem::take(&mut sorter.in_mem_batches);
+    let permits = Arc::new(tokio::sync::Semaphore::new(2));
+    let mut streams = Vec::new();
+    for run in runs {
+        let sort = sorter.sort_run(
+            run,
+            sorter.reservation.new_empty(),
+            Some(Arc::clone(&input)),
+        )?;
+        streams.push(
+            ExternalSorter::prepare_sort_run(sort, Arc::clone(&permits), None).await?,
+        );
+    }
+    drop(input);
+    assert_eq!(permits.available_permits(), 2);
     assert_eq!(sorter.merge_pool.borrow(usize::MAX).size(), first_bytes);
+    let stream = crate::sorts::streaming_merge::StreamingMergeBuilder::new()
+        .with_streams(streams)
+        .with_schema(batch.schema())
+        .with_expressions(&ordering)
+        .with_metrics(crate::metrics::BaselineMetrics::new(
+            &ExecutionPlanMetricsSet::new(),
+            0,
+        ))
+        .with_batch_size(batch_size)
+        .with_reservation(sorter.merge_reservation.new_empty())
+        .build()?;
     if consume_output {
         let output: Vec<RecordBatch> = stream.try_collect().await?;
         let expected = sort_batch(
@@ -608,13 +618,15 @@ async fn check_sort_preparation_workspace(consume_output: bool) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_sort_preparation_retains_workspace_until_drop() -> Result<()> {
-    check_sort_preparation_workspace(false).await
+async fn test_sort_run_explicit_shared_input_retains_workspace_until_drop() -> Result<()>
+{
+    check_sort_run_explicit_shared_input_workspace(false).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_sort_merge_lookahead_returns_cursor_workspace() -> Result<()> {
-    check_sort_preparation_workspace(true).await
+async fn test_sort_run_explicit_shared_input_lookahead_returns_cursor_workspace()
+-> Result<()> {
+    check_sort_run_explicit_shared_input_workspace(true).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1114,7 +1126,8 @@ async fn test_final_spilled_merge_retains_workspace_between_passes() -> Result<(
 }
 
 #[tokio::test]
-async fn test_single_batch_spill_returns_live_workspace_loan_on_drop() -> Result<()> {
+async fn test_sort_run_explicit_shared_input_returns_live_workspace_loan_on_drop()
+-> Result<()> {
     let options = ExecutionOptions::default();
     let rows = 4096;
     let batch_size = 1024;
@@ -1135,13 +1148,12 @@ async fn test_single_batch_spill_returns_live_workspace_loan_on_drop() -> Result
     .into();
     let input_bytes = get_reserved_bytes_for_record_batch(&batch)?;
     let expected = sort_batch_chunked(&batch, &ordering, batch_size)?;
-    let sorted_bytes = expected
-        .iter()
-        .map(get_record_batch_memory_size)
-        .sum::<usize>();
-    let first_bytes = get_record_batch_memory_size(&expected[0]);
-    assert!(sorted_bytes > input_bytes);
-    let initial_loan = sorted_bytes - input_bytes;
+    let releases = super::release_sizes_in_order(&expected);
+    let sorted_bytes: usize = releases.iter().sum();
+    let first_bytes = releases[0];
+    // Input ownership is charged separately below. All unique output capacity
+    // is a workspace loan; only this chunk's unshared views retire on poll.
+    let initial_loan = sorted_bytes;
     assert!(initial_loan <= options.sort_spill_reservation_bytes);
     assert!(
         initial_loan > first_bytes,
@@ -1165,16 +1177,18 @@ async fn test_single_batch_spill_returns_live_workspace_loan_on_drop() -> Result
         &ExecutionPlanMetricsSet::new(),
         Arc::clone(&runtime),
     )?;
-    sorter.insert_batch(batch).await?;
+    sorter.insert_batch(batch.clone()).await?;
     assert_eq!(pool.reserved(), capacity);
 
-    // Follow spill preparation through the one-input branch, retaining the
-    // workspace but assigning it no merge cursors.
+    // Exercise sort_run through its lazy stream with an explicit shared-input
+    // charge; the production one-batch path instead passes shared_input=None.
     sorter.merge_reservation.free();
     let merge_pool = Arc::clone(&sorter.merge_pool);
     assert_eq!(sorter.in_mem_batches.len(), 1);
-    let mut stream = sorter.in_mem_sort_stream(false, false).await?;
-    assert!(sorter.in_mem_batches.is_empty());
+    let input = Arc::new(sorter.reservation.take());
+    sorter.in_mem_batches.clear();
+    let mut stream =
+        sorter.sort_batch_stream(batch, sorter.reservation.new_empty(), Some(input))?;
     drop(sorter);
 
     let first_batch = stream
@@ -1183,7 +1197,7 @@ async fn test_single_batch_spill_returns_live_workspace_loan_on_drop() -> Result
         .expect("the sorted stream must produce a batch");
     assert_eq!(first_batch, expected[0]);
     assert_eq!(first_batch.num_rows(), batch_size);
-    assert_eq!(pool.reserved(), capacity);
+    assert_eq!(pool.reserved(), options.sort_spill_reservation_bytes);
 
     // Check actual loan accounting rather than inferring a loan from the input
     // type. Only the workspace not held by the remaining output is available.
@@ -1194,7 +1208,7 @@ async fn test_single_batch_spill_returns_live_workspace_loan_on_drop() -> Result
     );
     drop(unused_workspace);
     drop(merge_pool);
-    assert_eq!(pool.reserved(), capacity);
+    assert_eq!(pool.reserved(), options.sort_spill_reservation_bytes);
 
     // The stream is the remaining owner of the positive loan. Drop it without
     // consuming the remaining batches and require both reservations to retire.
@@ -1321,5 +1335,268 @@ async fn test_immediate_sort_spill_respects_aggregate_cap_and_disabled_disk() ->
         assert_eq!(pool.reserved(), 0);
         assert_eq!(runtime.disk_manager.used_disk_space(), 0);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_accounting_sort_output_charges_shared_view_buffer_once() -> Result<()> {
+    use crate::ExecutionPlan;
+    use crate::common::collect;
+    use crate::sorts::sort::SortExec;
+    use crate::test::TestMemoryExec;
+    use datafusion_execution::TaskContext;
+    use datafusion_execution::config::SessionConfig;
+    use datafusion_execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion_physical_expr::expressions::col;
+    use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+
+    // 256 rows of 4 KiB strings in one 1 MiB data buffer.
+    let rows: Vec<String> = (0..256)
+        .rev()
+        .map(|i| format!("{i:04}{}", "x".repeat(4092)))
+        .collect();
+    let values = StringViewArray::from_iter_values(rows.iter());
+    let batch = RecordBatch::try_from_iter([("s", Arc::new(values) as ArrayRef)])?;
+    let retained = get_record_batch_memory_size(&batch);
+    let schema = batch.schema();
+    let input = TestMemoryExec::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+    let ordering: LexOrdering =
+        [PhysicalSortExpr::new_default(col("s", &schema)?)].into();
+    let sort = SortExec::new(ordering, input);
+
+    // 16 output chunks of 16 rows each, every one retaining the data buffer.
+    // The input is reserved twice (batch and sliced size) until it is sorted.
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(4 * retained));
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        )
+        .build_arc()?;
+    let context = Arc::new(
+        TaskContext::default()
+            .with_session_config(SessionConfig::new().with_batch_size(16))
+            .with_runtime(runtime),
+    );
+    let output = collect(sort.execute(0, context)?).await?;
+    assert_eq!(output.len(), 16);
+    assert_eq!(output.iter().map(|b| b.num_rows()).sum::<usize>(), 256);
+    assert!(
+        output
+            .iter()
+            .map(get_record_batch_memory_size)
+            .sum::<usize>()
+            > 8 * retained
+    );
+    drop(output);
+    assert_eq!(pool.reserved(), 0);
+    Ok(())
+}
+
+#[test]
+fn test_sort_release_schedule_covers_every_retained_suffix() -> Result<()> {
+    let values = Arc::new(StringViewArray::from_iter_values(
+        (0..32).map(|i| format!("{i:04}{}", "x".repeat(1024))),
+    ));
+    let dictionary = Arc::new(DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from_iter_values(0..32),
+        values,
+    )?);
+    let batch = RecordBatch::try_from_iter([("dictionary", dictionary as ArrayRef)])?;
+    let mut chunks = vec![batch.slice(0, 8), batch.slice(8, 8), batch.slice(16, 16)];
+    chunks.push(RecordBatch::try_from_iter([(
+        "distinct",
+        Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+    )])?);
+    let sizes = super::release_sizes_in_order(&chunks);
+    for first in 0..chunks.len() {
+        let mut counter =
+            datafusion_common::utils::memory::RecordBatchMemoryCounter::new();
+        let retained: usize = chunks[first..]
+            .iter()
+            .map(|batch| counter.count_batch(batch))
+            .sum();
+        assert_eq!(
+            sizes[first..].iter().sum::<usize>(),
+            retained,
+            "every live suffix must remain fully reserved"
+        );
+    }
+    assert_eq!(sizes[0], 0);
+    assert_eq!(sizes[1], 0);
+    assert!(super::release_sizes_in_order(&[]).is_empty());
+    Ok(())
+}
+
+async fn assert_sort_tasks_finished() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("sort jobs must finish before merging");
+}
+
+/// Actual multi-run path: view schemas disable the shared-input counter, so
+/// prepare_sort_runs splits a complete input reservation for each run.
+async fn check_sort_preparation_real_reservations(consume_output: bool) -> Result<()> {
+    let batch_size = 1024;
+    let batch = RecordBatch::try_from_iter([(
+        "key",
+        Arc::new(StringViewArray::from_iter_values(
+            (0..4096)
+                .rev()
+                .map(|i| format!("row-{i:08}-{}", "x".repeat(87))),
+        )) as ArrayRef,
+    )])?;
+    let ordering: LexOrdering = [PhysicalSortExpr::new_default(Arc::new(Column::new(
+        "key", 0,
+    )))]
+    .into();
+    let input_bytes = get_reserved_bytes_for_record_batch(&batch)?;
+    let sorted = sort_batch_chunked(&batch, &ordering, batch_size)?;
+    // Sorted chunks keep the original string buffers and rebuild exactly the
+    // same number of 16-byte views. Derive the expected bytes independently
+    // of the release schedule under test.
+    let unique_bytes = get_record_batch_memory_size(&batch);
+    assert!(unique_bytes < input_bytes);
+    // Match the explicit-input unit fixture's workspace: two unique runs
+    // plus a cursor batch. The real preparation path borrows none of it.
+    let workspace = 2 * unique_bytes + get_record_batch_memory_size(&sorted[0]);
+    let pool: Arc<dyn MemoryPool> =
+        Arc::new(GreedyMemoryPool::new(2 * input_bytes + workspace));
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .build_arc()?;
+    let mut sorter = ExternalSorter::new(
+        0,
+        batch.schema(),
+        ordering.clone(),
+        batch_size,
+        workspace,
+        0,
+        SpillCompression::Uncompressed,
+        &ExecutionPlanMetricsSet::new(),
+        runtime,
+    )?;
+    assert!(sorter.in_mem_batches_counter.is_none());
+    sorter.insert_batch(batch.clone()).await?;
+    sorter.insert_batch(batch.clone()).await?;
+    assert_eq!(pool.reserved(), 2 * input_bytes + workspace);
+    sorter.merge_reservation.free();
+    let stream = sorter.in_mem_sort_stream(false, false).await?;
+    assert!(
+        sorter.sort_concurrency.get().is_some(),
+        "must use prepare_sort_runs"
+    );
+    assert!(sorter.in_mem_batches.is_empty());
+    assert_eq!(sorter.reservation.size(), 0);
+    assert_sort_tasks_finished().await;
+    assert_eq!(pool.reserved(), 2 * unique_bytes + workspace);
+    let unused = sorter.merge_pool.borrow(usize::MAX);
+    assert_eq!(
+        unused.size(),
+        workspace,
+        "real view runs borrow zero workspace"
+    );
+    drop(unused);
+    if consume_output {
+        let output: Vec<RecordBatch> = stream.try_collect().await?;
+        assert_eq!(
+            concat_batches(&batch.schema(), &output)?,
+            sort_batch(
+                &concat_batches(&batch.schema(), &[batch.clone(), batch.clone()])?,
+                &ordering,
+                None
+            )?
+        );
+    } else {
+        drop(stream);
+    }
+    assert_eq!(pool.reserved(), workspace);
+    drop(sorter);
+    assert_eq!(pool.reserved(), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sort_preparation_real_reservations_release_output_on_drop() -> Result<()> {
+    check_sort_preparation_real_reservations(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sort_preparation_real_reservations_merge_without_loans() -> Result<()> {
+    check_sort_preparation_real_reservations(true).await
+}
+
+#[tokio::test]
+async fn test_single_batch_spill_real_reservation_has_no_loan_on_drop() -> Result<()> {
+    let batch_size = 1024;
+    let batch = RecordBatch::try_from_iter([(
+        "key",
+        Arc::new(StringViewArray::from_iter_values(
+            (0..4096)
+                .rev()
+                .map(|i| format!("row-{i:08}-{}", "x".repeat(87))),
+        )) as ArrayRef,
+    )])?;
+    let ordering: LexOrdering = [PhysicalSortExpr::new_default(Arc::new(Column::new(
+        "key", 0,
+    )))]
+    .into();
+    let input_bytes = get_reserved_bytes_for_record_batch(&batch)?;
+    let expected = sort_batch_chunked(&batch, &ordering, batch_size)?;
+    let unique_bytes = get_record_batch_memory_size(&batch);
+    // Only the first chunk's newly allocated view words retire on its pull.
+    // Its string backing buffers remain held by later chunks.
+    let first_release = batch_size * size_of::<u128>();
+    assert!(unique_bytes < input_bytes);
+    let pool: Arc<dyn MemoryPool> =
+        Arc::new(GreedyMemoryPool::new(input_bytes + MERGE_BYTES));
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .build_arc()?;
+    let mut sorter = ExternalSorter::new(
+        0,
+        batch.schema(),
+        ordering,
+        batch_size,
+        MERGE_BYTES,
+        0,
+        SpillCompression::Uncompressed,
+        &ExecutionPlanMetricsSet::new(),
+        runtime,
+    )?;
+    assert!(sorter.in_mem_batches_counter.is_none());
+    sorter.insert_batch(batch).await?;
+    sorter.merge_reservation.free();
+    let merge_pool = Arc::clone(&sorter.merge_pool);
+    let mut stream = sorter.in_mem_sort_stream(false, false).await?;
+    assert_eq!(
+        pool.reserved(),
+        input_bytes + MERGE_BYTES,
+        "one-batch sorting is lazy"
+    );
+    assert_sort_tasks_finished().await;
+    drop(sorter);
+    let first = stream.try_next().await?.unwrap();
+    assert_eq!(first, expected[0]);
+    assert_eq!(pool.reserved(), MERGE_BYTES + unique_bytes - first_release);
+    let unused = merge_pool.borrow(usize::MAX);
+    assert_eq!(
+        unused.size(),
+        MERGE_BYTES,
+        "one-batch path borrows zero workspace"
+    );
+    drop(unused);
+    drop(merge_pool);
+    drop(stream);
+    assert_eq!(pool.reserved(), 0);
     Ok(())
 }
