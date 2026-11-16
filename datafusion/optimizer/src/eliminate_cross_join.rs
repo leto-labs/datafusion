@@ -101,6 +101,14 @@ impl OptimizerRule for EliminateCrossJoin {
                 return rewrite_children(self, LogicalPlan::Filter(filter), config);
             }
 
+            // WHERE equality is strict. It cannot become a NULL-safe key or
+            // disappear as a duplicate of an existing NULL-safe key.
+            if matches!(filter.input.as_ref(), LogicalPlan::Join(join)
+                if join.null_equality == NullEquality::NullEqualsNull)
+            {
+                return rewrite_children(self, LogicalPlan::Filter(filter), config);
+            }
+
             let Filter {
                 input, predicate, ..
             } = filter;
@@ -112,6 +120,7 @@ impl OptimizerRule for EliminateCrossJoin {
 
             flatten_join_inputs(
                 Arc::unwrap_or_clone(input),
+                null_equality,
                 &mut possible_join_keys,
                 &mut all_inputs,
                 &mut all_filters,
@@ -128,6 +137,7 @@ impl OptimizerRule for EliminateCrossJoin {
                 }) => {
                     flatten_join_inputs(
                         plan,
+                        original_null_equality,
                         &mut possible_join_keys,
                         &mut all_inputs,
                         &mut all_filters,
@@ -258,24 +268,30 @@ fn rewrite_children(
 /// flattening them.
 fn flatten_join_inputs(
     plan: LogicalPlan,
+    null_equality: NullEquality,
     possible_join_keys: &mut JoinKeySet,
     all_inputs: &mut Vec<LogicalPlan>,
     all_filters: &mut Vec<Expr>,
 ) {
     match plan {
-        LogicalPlan::Join(join) if join.join_type == JoinType::Inner => {
+        LogicalPlan::Join(join)
+            if join.join_type == JoinType::Inner
+                && join.null_equality == null_equality =>
+        {
             if let Some(filter) = join.filter {
                 all_filters.push(filter);
             }
             possible_join_keys.insert_all_owned(join.on);
             flatten_join_inputs(
                 Arc::unwrap_or_clone(join.left),
+                null_equality,
                 possible_join_keys,
                 all_inputs,
                 all_filters,
             );
             flatten_join_inputs(
                 Arc::unwrap_or_clone(join.right),
+                null_equality,
                 possible_join_keys,
                 all_inputs,
                 all_filters,
@@ -1583,6 +1599,135 @@ mod tests {
             starting_display,
             optimized_plan.display_indent_schema().to_string()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_null_equality_cluster_is_not_flattened() -> Result<()> {
+        for nulls in [
+            NullEquality::NullEqualsNothing,
+            NullEquality::NullEqualsNull,
+        ] {
+            for right_child in [false, true] {
+                for filtered in [false, true] {
+                    let a = test_table_scan_with_name("t1")?;
+                    let b = test_table_scan_with_name("t2")?;
+                    let c = test_table_scan_with_name("t3")?;
+                    let mut child = LogicalPlanBuilder::from(a)
+                        .join(b, JoinType::Inner, (vec!["t1.a"], vec!["t2.a"]), None)?
+                        .build()?;
+                    if let LogicalPlan::Join(j) = &mut child {
+                        j.null_equality = nulls;
+                    }
+                    let mut plan = if right_child {
+                        LogicalPlanBuilder::from(c)
+                            .join(
+                                child,
+                                JoinType::Inner,
+                                (vec!["t3.a"], vec!["t2.a"]),
+                                None,
+                            )?
+                            .build()?
+                    } else {
+                        LogicalPlanBuilder::from(child)
+                            .join(c, JoinType::Inner, (vec!["t2.a"], vec!["t3.a"]), None)?
+                            .build()?
+                    };
+                    if let LogicalPlan::Join(j) = &mut plan {
+                        j.null_equality = if nulls == NullEquality::NullEqualsNull {
+                            NullEquality::NullEqualsNothing
+                        } else {
+                            NullEquality::NullEqualsNull
+                        };
+                    }
+                    if filtered {
+                        plan = LogicalPlanBuilder::from(plan)
+                            .filter(col("t1.b").eq(lit(1u32)))?
+                            .build()?;
+                    }
+                    let before = plan.clone();
+                    let result = EliminateCrossJoin::new()
+                        .rewrite(plan, &OptimizerContext::new())?;
+                    // The 56 rule rebuilds each homogeneous cluster once,
+                    // retaining the mixed-policy join as an atomic input.
+                    assert_eq!(result.data, before);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn volatile_filter_over_null_safe_join_still_optimizes_nested_cross_join()
+    -> Result<()> {
+        use crate::test::udfs::PlacementTestUDF;
+        use datafusion_expr::{ScalarUDF, Volatility};
+        let key = col("t1.a").eq(col("t2.a"));
+        let low = col("t1.b").gt(lit(0u32));
+        let high = col("t2.b").lt(lit(100u32));
+        let nested = LogicalPlanBuilder::from(test_table_scan_with_name("t1")?)
+            .cross_join(test_table_scan_with_name("t2")?)?
+            .filter(key.clone().and(low.clone()).or(key.and(high.clone())))?
+            .build()?;
+        let predicate = ScalarUDF::from(
+            PlacementTestUDF::new().with_volatility(Volatility::Volatile),
+        )
+        .call(vec![lit(1u32)])
+        .gt(lit(0u32));
+        assert!(predicate.is_volatile());
+        let plan = LogicalPlanBuilder::from(nested)
+            .join_detailed(
+                test_table_scan_with_name("t3")?,
+                JoinType::Inner,
+                (vec!["t2.c"], vec!["t3.c"]),
+                None,
+                NullEquality::NullEqualsNull,
+            )?
+            .filter(predicate.clone())?
+            .build()?;
+        let nested_expected = LogicalPlanBuilder::from(test_table_scan_with_name("t1")?)
+            .join(
+                test_table_scan_with_name("t2")?,
+                JoinType::Inner,
+                (vec!["t1.a"], vec!["t2.a"]),
+                None,
+            )?
+            .filter(low.or(high))?
+            .build()?;
+        let expected = LogicalPlanBuilder::from(nested_expected)
+            .join_detailed(
+                test_table_scan_with_name("t3")?,
+                JoinType::Inner,
+                (vec!["t2.c"], vec!["t3.c"]),
+                None,
+                NullEquality::NullEqualsNull,
+            )?
+            .filter(predicate)?
+            .build()?;
+        let actual = EliminateCrossJoin::new().rewrite(plan, &OptimizerContext::new())?;
+        assert!(actual.transformed);
+        assert_eq!(actual.data, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn strict_filter_keys_do_not_acquire_null_safe_semantics() -> Result<()> {
+        let a = test_table_scan_with_name("t1")?;
+        let b = test_table_scan_with_name("t2")?;
+        let mut join = LogicalPlanBuilder::from(a)
+            .join(b, JoinType::Inner, (vec!["t1.a"], vec!["t2.a"]), None)?
+            .build()?;
+        if let LogicalPlan::Join(j) = &mut join {
+            j.null_equality = NullEquality::NullEqualsNull;
+        }
+        for predicate in [col("t1.a").eq(col("t2.a")), col("t1.b").eq(col("t2.b"))] {
+            let plan = LogicalPlanBuilder::from(join.clone())
+                .filter(predicate)?
+                .build()?;
+            let result = EliminateCrossJoin::new()
+                .rewrite(plan.clone(), &OptimizerContext::new())?;
+            assert_eq!(result.data, plan);
+        }
         Ok(())
     }
 }

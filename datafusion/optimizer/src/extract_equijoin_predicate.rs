@@ -49,6 +49,13 @@ impl OptimizerRule for ExtractEquijoinPredicate {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
+        // Strict residual equalities must not acquire the existing keys' NULL
+        // policy. Retain them as filters on a NULL-safe join.
+        if matches!(&plan, LogicalPlan::Join(join)
+            if join.null_equality == NullEquality::NullEqualsNull)
+        {
+            return Ok(Transformed::no(plan));
+        }
         match plan {
             LogicalPlan::Join(Join {
                 left,
@@ -516,5 +523,27 @@ mod tests {
           TableScan: t2 [a:UInt32, b:UInt32, c:UInt32]
         "
         )
+    }
+
+    #[test]
+    fn strict_residual_on_null_safe_join_remains_a_filter() -> Result<()> {
+        let a = test_table_scan_with_name("t1")?;
+        let b = test_table_scan_with_name("t2")?;
+        let mut plan = LogicalPlanBuilder::from(a)
+            .join(
+                b,
+                JoinType::Inner,
+                (vec!["t1.a"], vec!["t2.a"]),
+                Some(col("t1.a").eq(col("t2.a"))),
+            )?
+            .build()?;
+        if let LogicalPlan::Join(join) = &mut plan {
+            join.null_equality = NullEquality::NullEqualsNull;
+        }
+        let result = ExtractEquijoinPredicate::new()
+            .rewrite(plan.clone(), &crate::optimizer::OptimizerContext::new())?;
+        assert!(!result.transformed);
+        assert_eq!(result.data, plan);
+        Ok(())
     }
 }
