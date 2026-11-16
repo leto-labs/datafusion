@@ -16,6 +16,7 @@ mod batch_codes;
 #[cfg(test)]
 mod batch_codes_spill;
 mod inline_cache;
+pub mod packed;
 mod row;
 pub use row::GroupValuesRows;
 mod single_group_by;
@@ -204,8 +205,25 @@ pub fn new_group_values(
         }
     }
 
-    if matches!(group_clustering, GroupClustering::None)
-        && schema.fields().len() == 2
+    if !matches!(group_clustering, GroupClustering::None) {
+        return if multi_group_by::supported_schema(schema.as_ref()) {
+            Ok(Box::new(GroupValuesColumn::<true>::try_new(schema)?))
+        } else {
+            Ok(Box::new(GroupValuesRows::try_new(schema)?))
+        };
+    }
+    if schema.fields().len() >= 2 && packed::supported(&schema) {
+        return Ok(Box::new(packed::GroupValuesPacked::try_new(
+            schema,
+            unordered_multi_column,
+        )?));
+    }
+    unordered_multi_column(schema)
+}
+
+/// The general interner of unordered keys with several columns.
+fn unordered_multi_column(schema: SchemaRef) -> Result<Box<dyn GroupValues>> {
+    if schema.fields().len() == 2
         && schema
             .fields()
             .iter()
@@ -215,13 +233,8 @@ pub fn new_group_values(
             GroupValuesColumn::<false>::try_new(schema)?,
         ))));
     }
-
     if multi_group_by::supported_schema(schema.as_ref()) {
-        if matches!(group_clustering, GroupClustering::None) {
-            Ok(Box::new(GroupValuesColumn::<false>::try_new(schema)?))
-        } else {
-            Ok(Box::new(GroupValuesColumn::<true>::try_new(schema)?))
-        }
+        Ok(Box::new(GroupValuesColumn::<false>::try_new(schema)?))
     } else {
         Ok(Box::new(GroupValuesRows::try_new(schema)?))
     }
@@ -392,3 +405,6 @@ mod tests {
 
 #[cfg(test)]
 mod compact_mixed_tests;
+
+#[cfg(test)]
+mod preserving_tests;
