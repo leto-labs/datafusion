@@ -618,6 +618,20 @@ impl TopK {
 
         let mut prev_sort_expr: Option<Arc<dyn PhysicalExpr>> = None;
         for (sort_expr, value) in sort_exprs.iter().zip(thresholds.iter()) {
+            // Parquet statistics omit NaN, while row sorting includes it.
+            // Keep every tie on the safe prefix; the heap decides this suffix.
+            let mut unencoded = value;
+            while let ScalarValue::Dictionary(_, inner)
+            | ScalarValue::RunEndEncoded(_, _, inner) = unencoded
+            {
+                unencoded = inner;
+            }
+            if unencoded.data_type().is_floating() {
+                if let Some(prefix) = prev_sort_expr.take() {
+                    filters.push(prefix);
+                }
+                break;
+            }
             // Comparisons on nested types (List, Struct, ...) order NULL elements
             // with fixed default options rather than the sort's `nulls_first`, so
             // `col < threshold` could drop rows that belong in the TopK. Stop at
@@ -3770,6 +3784,7 @@ mod tests {
         a_options: SortOptions,
         threshold_source_rows: &'static [AbRow],
         lagging_partition_rows: &'static [AbRow],
+        expected_heap_rows: usize,
         expected_finished: bool,
     }
 
@@ -3807,9 +3822,11 @@ mod tests {
         lagging_partition
             .insert_batch(make_ab_rows_batch(schema, case.lagging_partition_rows)?)?;
 
-        assert!(
-            lagging_partition.heap.inner.is_empty(),
-            "{}: lagging partition's local heap should remain empty",
+        // Float suffixes cannot prune prefix ties using Parquet statistics.
+        assert_eq!(
+            lagging_partition.heap.inner.len(),
+            case.expected_heap_rows,
+            "{}: rows admitted by the shared prefix filter",
             case.name
         );
         assert_eq!(
@@ -3829,6 +3846,7 @@ mod tests {
             a_options: SortOptions::default(),
             threshold_source_rows: &[(Some(1), 20.0), (Some(1), 15.0), (Some(2), 30.0)],
             lagging_partition_rows: &[(Some(3), 10.0), (Some(3), 20.0)],
+            expected_heap_rows: 0,
             expected_finished: true,
         })
     }
@@ -3846,6 +3864,7 @@ mod tests {
                     (Some(2), 30.0),
                 ],
                 lagging_partition_rows: &[(Some(2), 40.0), (Some(2), 50.0)],
+                expected_heap_rows: 2,
                 expected_finished: false,
             },
             SharedPrefixCase {
@@ -3861,6 +3880,7 @@ mod tests {
                     (Some(9), 3.0),
                 ],
                 lagging_partition_rows: &[(Some(8), 1.0), (Some(8), 2.0)],
+                expected_heap_rows: 0,
                 expected_finished: true,
             },
             SharedPrefixCase {
@@ -3876,6 +3896,7 @@ mod tests {
                     (Some(2), 30.0),
                 ],
                 lagging_partition_rows: &[(None, 10.0), (None, 20.0)],
+                expected_heap_rows: 0,
                 expected_finished: true,
             },
         ] {
@@ -8161,3 +8182,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod correctness_tests;
