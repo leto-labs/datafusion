@@ -441,7 +441,9 @@ fn test_filter_collapse_outer_fetch_preserved() {
 
 #[test]
 fn test_filter_collapse_inner_fetch_preserved() {
-    // When the inner filter has fetch and outer does not, the merged filter should preserve fetch
+    // Longbow family FR: a parent predicate is not merged below a fetch. The
+    // outer filter keeps rows among the inner filter's first 5; a merged
+    // `b AND a, fetch=5` would return up to 5 rows from later input as well.
     let scan = TestScanBuilder::new(schema()).with_support(false).build();
     let predicate1 = col_lit_predicate("a", "foo", &schema());
     let filter1 = Arc::new(
@@ -463,16 +465,17 @@ fn test_filter_collapse_inner_fetch_preserved() {
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
-          - FilterExec: b@1 = bar AND a@0 = foo, fetch=5
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
+          - FilterExec: b@1 = bar
+          -   FilterExec: a@0 = foo, fetch=5
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
     "
     );
 }
 
 #[test]
 fn test_filter_collapse_both_fetch_uses_minimum() {
-    // When both filters have fetch, the merged filter should use the smaller (tighter) fetch.
-    // Inner fetch=5 is tighter than outer fetch=10, so the result should be fetch=5.
+    // Longbow family FR: the inner fetch bounds the input of the outer filter,
+    // so neither filter merges into the other (see the test above).
     let scan = TestScanBuilder::new(schema()).with_support(false).build();
     let predicate1 = col_lit_predicate("a", "foo", &schema());
     let filter1 = Arc::new(
@@ -499,8 +502,9 @@ fn test_filter_collapse_both_fetch_uses_minimum() {
         -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
       output:
         Ok:
-          - FilterExec: b@1 = bar AND a@0 = foo, fetch=5
-          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
+          - FilterExec: b@1 = bar, fetch=10
+          -   FilterExec: a@0 = foo, fetch=5
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
     "
     );
 }

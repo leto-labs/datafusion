@@ -409,7 +409,7 @@ impl PhysicalOptimizerRule for FilterPushdown {
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(
-            push_down_filters(&Arc::clone(&plan), vec![], config, self.phase)?
+            push_down_filters(&Arc::clone(&plan), &[], config, self.phase)?
                 .updated_node
                 .unwrap_or(plan),
         )
@@ -426,7 +426,7 @@ impl PhysicalOptimizerRule for FilterPushdown {
 
 fn push_down_filters(
     node: &Arc<dyn ExecutionPlan>,
-    parent_predicates: Vec<Arc<dyn PhysicalExpr>>,
+    parent_predicates: &[Arc<dyn PhysicalExpr>],
     config: &ConfigOptions,
     phase: FilterPushdownPhase,
 ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
@@ -437,8 +437,13 @@ fn push_down_filters(
     let mut self_filters_pushdown_supports = Vec::with_capacity(children.len());
     let mut new_children = Vec::with_capacity(children.len());
 
-    // Filter out expressions that are not allowed for pushdown
-    let parent_filtered = FilteredVec::new(&parent_predicates, allow_pushdown_for_expr);
+    // Filter out expressions that are not allowed for pushdown. Longbow
+    // family FR: a node with a fetch accepts no parent predicate, since one
+    // applied below the fetch would change which rows it keeps; its own
+    // filters still go down.
+    let parent_filtered = FilteredVec::new(parent_predicates, |expr| {
+        node.fetch().is_none() && allow_pushdown_for_expr(expr)
+    });
 
     let filter_description = node.gather_filters_for_pushdown(
         phase,
@@ -502,7 +507,7 @@ fn push_down_filters(
 
         // Any filters that could not be pushed down to a child are marked as not-supported to our parents
         let result =
-            push_down_filters(&Arc::clone(child), all_predicates, config, phase)?;
+            push_down_filters(&Arc::clone(child), &all_predicates, config, phase)?;
 
         if let Some(new_child) = result.updated_node {
             // If we have a filter pushdown result, we need to update our children
@@ -568,14 +573,21 @@ fn push_down_filters(
     let mut res = updated_node.handle_child_pushdown_result(
         phase,
         ChildPushdownResult {
-            parent_filters: parent_predicates
-                .into_iter()
+            // Longbow family FR: the handler sees only the eligible parent
+            // predicates, so a node that absorbs predicates its children
+            // rejected (`FilterExec`) cannot absorb a volatile or fetch-bound
+            // one.
+            parent_filters: parent_filtered
+                .items()
+                .iter()
+                .cloned()
                 .enumerate()
                 .map(
                     |(parent_filter_idx, parent_filter)| ChildFilterPushdownResult {
                         filter: parent_filter,
-                        child_results: parent_filter_pushdown_supports[parent_filter_idx]
-                            .clone(),
+                        child_results: parent_filter_pushdown_supports
+                            [parent_filtered.trace_to_original_index(parent_filter_idx)]
+                        .clone(),
                     },
                 )
                 .collect(),
@@ -583,6 +595,14 @@ fn push_down_filters(
         },
         config,
     )?;
+    assert_eq_or_internal_err!(
+        res.filters.len(),
+        parent_filtered.len(),
+        "Filter pushdown expected one handler result per eligible parent filter for {}",
+        node.name()
+    );
+    // Rejected predicates stay at their owner.
+    res.filters = parent_filtered.map_results_to_original(res.filters, PushedDown::No);
     // Compare pointers for new_node and node, if they are different we must replace
     // ourselves because of changes in our children.
     if res.updated_node.is_none() && !Arc::ptr_eq(&updated_node, node) {
@@ -698,6 +718,129 @@ fn allow_pushdown_for_expr(expr: &Arc<dyn PhysicalExpr>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod rejected_parent_filters {
+        //! Longbow family FR: a parent predicate that a node may not push down
+        //! never reaches its handler, so an absorbing node (`FilterExec`)
+        //! cannot evaluate it below its owner.
+        use super::*;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion_expr::{Operator, ScalarUDF};
+        use datafusion_functions::math::random::RandomFunc;
+        use datafusion_physical_expr::ScalarFunctionExpr;
+        use datafusion_physical_expr::expressions::{BinaryExpr, Column, lit};
+        use datafusion_physical_plan::empty::EmptyExec;
+        use datafusion_physical_plan::filter::{FilterExec, FilterExecBuilder};
+
+        fn compare(
+            left: Arc<dyn PhysicalExpr>,
+            op: Operator,
+            right: i32,
+        ) -> Arc<dyn PhysicalExpr> {
+            Arc::new(BinaryExpr::new(left, op, lit(right)))
+        }
+
+        fn filter(fetch: Option<usize>) -> Result<Arc<dyn ExecutionPlan>> {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+            let input = Arc::new(EmptyExec::new(schema));
+            let predicate = compare(Arc::new(Column::new("a", 0)), Operator::Gt, 1);
+            Ok(Arc::new(
+                FilterExecBuilder::new(predicate, input)
+                    .with_fetch(fetch)
+                    .build()?,
+            ))
+        }
+
+        /// The pushdown result and the predicate of the (updated) filter.
+        fn push(
+            node: &Arc<dyn ExecutionPlan>,
+            parent: Arc<dyn PhysicalExpr>,
+        ) -> Result<(Vec<PushedDown>, String)> {
+            let result = push_down_filters(
+                node,
+                &[parent],
+                &ConfigOptions::default(),
+                FilterPushdownPhase::Pre,
+            )?;
+            let plan = result.updated_node.unwrap_or_else(|| Arc::clone(node));
+            let filter = plan.downcast_ref::<FilterExec>().expect("filter remains");
+            Ok((result.filters, format!("{}", filter.predicate())))
+        }
+
+        #[test]
+        fn volatile_parent_predicates_are_not_absorbed() -> Result<()> {
+            let random = Arc::new(ScalarFunctionExpr::new(
+                "random",
+                Arc::new(ScalarUDF::new_from_impl(RandomFunc::new())),
+                vec![],
+                Arc::new(Field::new("r", DataType::Float64, false)),
+                Arc::new(ConfigOptions::default()),
+            )) as Arc<dyn PhysicalExpr>;
+            let volatile = Arc::new(BinaryExpr::new(random, Operator::Lt, lit(0.5)));
+            let (pushed, predicate) = push(&filter(None)?, volatile)?;
+            assert!(matches!(pushed.as_slice(), [PushedDown::No]));
+            assert!(!predicate.contains("random"), "{predicate}");
+            Ok(())
+        }
+
+        /// Executes `FilterExec(b = 'bar')` over `FilterExec(a = 'foo',
+        /// fetch = 2)`: the first two `foo` rows have `b = 'x'`, so the
+        /// answer is empty. Merging the outer predicate below the fetch would
+        /// return the third `foo` row.
+        #[tokio::test]
+        async fn a_filter_above_a_fetch_keeps_its_answer() -> Result<()> {
+            use arrow::array::{RecordBatch, StringArray};
+            use datafusion_execution::TaskContext;
+            use datafusion_physical_plan::test::TestMemoryExec;
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Utf8, false),
+                Field::new("b", DataType::Utf8, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["foo", "foo", "foo"])),
+                    Arc::new(StringArray::from(vec!["x", "x", "bar"])),
+                ],
+            )?;
+            let input = TestMemoryExec::try_new_exec(&[vec![batch]], schema, None)?;
+            let equals = |index: usize, name: &str, value: &str| {
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new(name, index)),
+                    Operator::Eq,
+                    lit(value),
+                )) as Arc<dyn PhysicalExpr>
+            };
+            let inner = FilterExecBuilder::new(equals(0, "a", "foo"), input)
+                .with_fetch(Some(2))
+                .build()?;
+            let plan: Arc<dyn ExecutionPlan> =
+                Arc::new(FilterExec::try_new(equals(1, "b", "bar"), Arc::new(inner))?);
+            let optimized = FilterPushdown::new()
+                .optimize(Arc::clone(&plan), &ConfigOptions::default())?;
+            let context = Arc::new(TaskContext::default());
+            for plan in [plan, optimized] {
+                let batches =
+                    datafusion_physical_plan::collect(plan, Arc::clone(&context)).await?;
+                assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn fetch_nodes_reject_parent_predicates_and_keep_their_own() -> Result<()> {
+            let parent = compare(Arc::new(Column::new("a", 0)), Operator::Lt, 10);
+            let (pushed, predicate) = push(&filter(Some(1))?, Arc::clone(&parent))?;
+            assert!(matches!(pushed.as_slice(), [PushedDown::No]));
+            assert_eq!(predicate, "a@0 > 1");
+            // Without a fetch the filter absorbs the parent predicate.
+            let (pushed, predicate) = push(&filter(None)?, parent)?;
+            assert!(matches!(pushed.as_slice(), [PushedDown::Yes]));
+            assert!(predicate.contains("a@0 < 10"), "{predicate}");
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_filtered_vec_single_pass() {

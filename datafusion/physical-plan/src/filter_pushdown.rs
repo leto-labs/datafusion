@@ -615,3 +615,76 @@ impl FilterDescription {
             .collect()
     }
 }
+
+/// Longbow family FR regressions on the upstream positional remapper
+/// (#25259): filters address columns by position, so same-named columns
+/// stay distinct and explicit mappings carry offsets, aliases and reorders.
+#[cfg(test)]
+mod positional_tests {
+    use super::*;
+    use arrow::array::{Array, BooleanArray, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr::expressions::{BinaryExpr, lit};
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+        ]))
+    }
+
+    fn admits(expr: Arc<dyn PhysicalExpr>) -> bool {
+        let input = RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(Int64Array::from(vec![Some(2)])),
+            ],
+        )
+        .unwrap();
+        let result = expr.evaluate(&input).unwrap().into_array(1).unwrap();
+        let result = result.as_any().downcast_ref::<BooleanArray>().unwrap();
+        result.is_valid(0) && result.value(0)
+    }
+
+    fn equals(index: usize, value: i64) -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("x", index)),
+            Operator::Eq,
+            lit(value),
+        ))
+    }
+
+    #[test]
+    fn identity_keeps_the_second_same_named_column() {
+        let mapped = FilterRemapper::new(schema())
+            .try_remap(&equals(1, 2))
+            .unwrap()
+            .unwrap();
+        assert!(admits(mapped), "the first x is NULL, the second x is 2");
+    }
+
+    #[test]
+    fn child_mapping_keeps_offsets_and_rejects_other_sides() {
+        let mapper =
+            FilterRemapper::with_column_mapping(schema(), HashMap::from([(3, 1)]));
+        assert!(admits(mapper.try_remap(&equals(3, 2)).unwrap().unwrap()));
+        assert!(mapper.try_remap(&equals(0, 2)).unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_positions_support_aliases_and_reordering() {
+        let mapper = FilterRemapper::with_column_mapping(
+            schema(),
+            HashMap::from([(0, 1), (1, 0)]),
+        );
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("group_alias", 0)),
+            Operator::Eq,
+            lit(2i64),
+        ));
+        assert!(admits(mapper.try_remap(&predicate).unwrap().unwrap()));
+    }
+}
