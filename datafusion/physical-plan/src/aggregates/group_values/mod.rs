@@ -369,3 +369,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod compact_mixed_tests;

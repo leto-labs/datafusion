@@ -205,7 +205,7 @@ impl GroupValues for GroupValuesRows {
         let mut group_values = self
             .group_values
             .take()
-            .expect("Can not emit from empty rows");
+            .unwrap_or_else(|| self.row_converter.empty_rows(0, 0));
 
         let mut output = match emit_to {
             EmitTo::All => {
