@@ -2109,6 +2109,10 @@ pub struct FileScanExecConf {
     /// legacy behavior of deriving this from output_ordering.
     #[prost(bool, optional, tag = "17")]
     pub preserve_order: ::core::option::Option<bool>,
+    /// Longbow family RP (reserved fork range >= 900, see LONGBOW.md): virtual
+    /// fields form the suffix of schema, after file and partition fields.
+    #[prost(uint32, tag = "902")]
+    pub virtual_column_count: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParquetScanExecNode {

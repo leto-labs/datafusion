@@ -7736,6 +7736,9 @@ impl serde::Serialize for FileScanExecConf {
         if self.preserve_order.is_some() {
             len += 1;
         }
+        if self.virtual_column_count != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.FileScanExecConf", len)?;
         if !self.file_groups.is_empty() {
             struct_ser.serialize_field("fileGroups", &self.file_groups)?;
@@ -7783,6 +7786,9 @@ impl serde::Serialize for FileScanExecConf {
         if let Some(v) = self.preserve_order.as_ref() {
             struct_ser.serialize_field("preserveOrder", v)?;
         }
+        if self.virtual_column_count != 0 {
+            struct_ser.serialize_field("virtualColumnCount", &self.virtual_column_count)?;
+        }
         struct_ser.end()
     }
 }
@@ -7816,6 +7822,8 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             "fileCompressionType",
             "preserve_order",
             "preserveOrder",
+            "virtual_column_count",
+            "virtualColumnCount",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -7834,6 +7842,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             OutputPartitioning,
             FileCompressionType,
             PreserveOrder,
+            VirtualColumnCount,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -7869,6 +7878,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                             "outputPartitioning" | "output_partitioning" => Ok(GeneratedField::OutputPartitioning),
                             "fileCompressionType" | "file_compression_type" => Ok(GeneratedField::FileCompressionType),
                             "preserveOrder" | "preserve_order" => Ok(GeneratedField::PreserveOrder),
+                            "virtualColumnCount" | "virtual_column_count" => Ok(GeneratedField::VirtualColumnCount),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -7902,6 +7912,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                 let mut output_partitioning__ = None;
                 let mut file_compression_type__ = None;
                 let mut preserve_order__ = None;
+                let mut virtual_column_count__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::FileGroups => {
@@ -7993,6 +8004,14 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                             }
                             preserve_order__ = map_.next_value()?;
                         }
+                        GeneratedField::VirtualColumnCount => {
+                            if virtual_column_count__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("virtualColumnCount"));
+                            }
+                            virtual_column_count__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(FileScanExecConf {
@@ -8010,6 +8029,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                     output_partitioning: output_partitioning__,
                     file_compression_type: file_compression_type__,
                     preserve_order: preserve_order__,
+                    virtual_column_count: virtual_column_count__.unwrap_or_default(),
                 })
             }
         }

@@ -22,8 +22,8 @@ use crate::push_decoder::{
 use crate::row_group_filter::{RowGroupAccessPlanFilter, row_group_in_range};
 use crate::{
     BloomFilterStatistics, Int96Coercer, ParquetAccessPlan, ParquetFileMetrics,
-    ParquetFileReaderFactory, ParquetRowSelection, ParquetVirtualColumn, RowGroupAccess,
-    coerce_decimals_to_table_width,
+    ParquetFileReaderFactory, ParquetRowPositions, ParquetRowSelection,
+    ParquetVirtualColumn, RowGroupAccess, coerce_decimals_to_table_width,
     schema_coercion::apply_file_schema_type_coercions_with_rle,
 };
 use arrow::array::RecordBatch;
@@ -2059,6 +2059,17 @@ fn create_initial_plan(
     rg_metadata: &[RowGroupMetaData],
 ) -> Result<ParquetAccessPlan> {
     let row_group_count = rg_metadata.len();
+    if let Some(positions) = extensions.get::<ParquetRowPositions>() {
+        if extensions.get::<ParquetAccessPlan>().is_some()
+            || extensions.get::<ParquetRowSelection>().is_some()
+        {
+            return exec_err!(
+                "Conflicting Parquet row-position access extension for {file_name}"
+            );
+        }
+        // Positions become upstream's file-level selection after validation.
+        return positions.access_plan(rg_metadata);
+    }
     match (
         extensions.get::<ParquetAccessPlan>(),
         extensions.get::<ParquetRowSelection>(),
@@ -2242,6 +2253,29 @@ mod test {
         row_group_range_assignment: RowGroupRangeAssignment,
         reverse_row_groups: bool,
         preserve_order: bool,
+    }
+
+    #[test]
+    fn create_initial_plan_from_row_positions_and_reject_conflicts() {
+        let metadata = row_group_metadata(&[10, 20, 30]);
+        let mut extensions = datafusion_datasource::FileExtensions::new();
+        extensions.insert(ParquetRowPositions::new(vec![0, 59]));
+        let plan = create_initial_plan("test.parquet", &extensions, &metadata).unwrap();
+        assert_eq!(plan.row_group_indexes(), vec![0, 2]);
+        assert_eq!(
+            plan,
+            ParquetRowPositions::new(vec![0, 59])
+                .access_plan(&metadata)
+                .unwrap()
+        );
+        extensions.insert(ParquetAccessPlan::new_all(3));
+        assert!(create_initial_plan("test.parquet", &extensions, &metadata).is_err());
+        let mut extensions = datafusion_datasource::FileExtensions::new();
+        extensions.insert(ParquetRowPositions::new(vec![0]));
+        extensions.insert(ParquetRowSelection::new(
+            vec![RowSelector::select(60)].into(),
+        ));
+        assert!(create_initial_plan("test.parquet", &extensions, &metadata).is_err());
     }
 
     #[test]

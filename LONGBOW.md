@@ -94,3 +94,29 @@ panic or fail otherwise). The opener applies it after upstream's
 `apply_file_schema_type_coercions_with_rle`. A narrow decimal literal probes a
 Bloom filter as the `Decimal128` of its value. `ParquetSource::with_retyped_columns`
 lets a physical rule declare the narrow types for an existing scan.
+
+## Family RP: positional Parquet retrieval and virtual scan fields
+
+Purpose: retrieve exact file rows by position after the opener has the
+footer, and keep virtual scan fields through the native codec. Dependent
+Longbow feature: TOPN-POSITIONAL. Audit classification: UPSTREAMABLE.
+
+`ParquetRowPositions` is a thin extension on upstream's file-level
+`ParquetRowSelection` and `create_initial_plan`. It rejects unsorted or
+duplicate positions, positions at or past the file's last row and row groups
+whose footer ordinals do not strictly increase, then builds upstream's
+selection. Combining it with another access extension is an error.
+`ParquetSource::with_new_metrics` gives an independently executed scan branch
+fresh counters.
+
+The file-scan codec appends virtual fields after file and partition fields
+and counts them in `FileScanExecConf.virtual_column_count` (tag 902; the 55.2
+fork used tag 16, which upstream now uses for `file_compression_type`). A
+virtual role is never inferred from Arrow extension metadata on a physical
+column. A count wider than the schema, or a field that is both virtual and
+partitioned, is rejected.
+
+Compatibility: a stock upstream decoder ignores the unknown tag 902, so it
+would decode the virtual suffix as file columns. Plans that carry virtual
+columns must be decoded by this fork (Longbow's codec identity changes with
+the fork pins).

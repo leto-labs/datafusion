@@ -1212,3 +1212,43 @@ fn roundtrip_parquet_exec_range_output_partitioning_utf8view_split_points() -> R
 
     Ok(())
 }
+
+/// Family RP: virtual scan fields cross the native codec as an explicitly
+/// counted schema suffix after file and partition fields.
+#[test]
+fn explicit_virtual_suffix_roundtrips_parquet_row_number_scan() -> Result<()> {
+    use datafusion::parquet::arrow::RowNumber;
+    let file_schema =
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let row = Arc::new(
+        Field::new("row", DataType::Int64, false).with_extension_type(RowNumber),
+    );
+    let partition = Arc::new(Field::new("part", DataType::Utf8, false));
+    let table_schema = TableSchemaBuilder::new(Arc::clone(&file_schema))
+        .with_table_partition_cols(vec![Arc::clone(&partition)])
+        .with_virtual_columns(vec![Arc::clone(&row)])
+        .build();
+    let source = ParquetSource::new(table_schema);
+    let config =
+        FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), Arc::new(source))
+            .with_file_groups(vec![FileGroup::new(vec![PartitionedFile::new(
+                "/path/to/file.parquet".to_string(),
+                1024,
+            )])])
+            .build();
+    let decoded = roundtrip_test_and_return(
+        DataSourceExec::from_data_source(config),
+        &SessionContext::new(),
+        &DefaultPhysicalExtensionCodec {},
+        &DefaultPhysicalProtoConverter {},
+    )?;
+    let scan = decoded
+        .downcast_ref::<DataSourceExec>()
+        .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+        .expect("file scan");
+    let decoded_schema = scan.file_source().table_schema();
+    assert_eq!(decoded_schema.file_schema(), &file_schema);
+    assert_eq!(decoded_schema.table_partition_cols().as_ref(), &[partition]);
+    assert_eq!(decoded_schema.virtual_columns().as_ref(), &[row]);
+    Ok(())
+}

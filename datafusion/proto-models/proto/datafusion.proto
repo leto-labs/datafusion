@@ -1379,6 +1379,9 @@ message FileScanExecConf {
   // Whether file processing order must be preserved. Absent payloads retain the
   // legacy behavior of deriving this from output_ordering.
   optional bool preserve_order = 17;
+  // Longbow family RP (reserved fork range >= 900, see LONGBOW.md): virtual
+  // fields form the suffix of schema, after file and partition fields.
+  uint32 virtual_column_count = 902;
 }
 
 message ParquetScanExecNode {

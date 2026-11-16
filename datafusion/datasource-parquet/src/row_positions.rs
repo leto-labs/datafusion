@@ -1,0 +1,187 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+// SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+//! File positions resolved after metadata is available, without a second footer read.
+use datafusion_common::{Result, exec_err};
+use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+use parquet::file::metadata::RowGroupMetaData;
+
+use crate::{ParquetAccessPlan, ParquetRowSelection};
+
+/// Sorted, unique zero-based file row positions to retrieve.
+///
+/// Attach to a `PartitionedFile` as an extension. The opener validates positions
+/// against its metadata and intersects their selections with normal file-range
+/// ownership. Other parquet access extensions cannot be combined with this one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParquetRowPositions {
+    positions: Vec<usize>,
+}
+
+impl ParquetRowPositions {
+    /// Positions are validated when file metadata is available to the opener.
+    pub fn new(positions: Vec<usize>) -> Self {
+        Self { positions }
+    }
+
+    /// Validate the positions against the file's row groups and express them
+    /// as upstream's file-level [`ParquetRowSelection`].
+    ///
+    /// Fails for unsorted or duplicate positions, a position at or after the
+    /// file's last row, and row groups whose footer ordinals are not strictly
+    /// increasing (an ambiguous ordinal could redirect a position to another
+    /// row group's payload).
+    pub fn row_selection(
+        &self,
+        groups: &[RowGroupMetaData],
+    ) -> Result<ParquetRowSelection> {
+        if self.positions.windows(2).any(|rows| rows[0] >= rows[1]) {
+            return exec_err!("Parquet row positions must be sorted and unique");
+        }
+        let mut total = 0usize;
+        let mut previous_ordinal = None;
+        for group in groups {
+            // RowNumber resolves ordinals to file offsets; selections below
+            // resolve metadata list positions. Ambiguous ordinals must never
+            // redirect a winner to another group's payload.
+            if let Some(ordinal) = group.ordinal() {
+                if previous_ordinal.is_some_and(|previous| previous >= ordinal) {
+                    return exec_err!(
+                        "Parquet positional access requires increasing unique row-group ordinals"
+                    );
+                }
+                previous_ordinal = Some(ordinal);
+            }
+            let Ok(rows) = usize::try_from(group.num_rows()) else {
+                return exec_err!("invalid Parquet row-group count");
+            };
+            let Some(sum) = total.checked_add(rows) else {
+                return exec_err!("Parquet file row count overflow");
+            };
+            total = sum;
+        }
+        if self.positions.last().is_some_and(|row| *row >= total) {
+            return exec_err!("Parquet row position exceeds the file's {total} rows");
+        }
+        let mut selectors =
+            Vec::with_capacity(self.positions.len().saturating_mul(2).saturating_add(1));
+        let mut previous = 0;
+        for &position in &self.positions {
+            if position > previous {
+                selectors.push(RowSelector::skip(position - previous));
+            }
+            selectors.push(RowSelector::select(1));
+            previous = position + 1;
+        }
+        if previous < total {
+            selectors.push(RowSelector::skip(total - previous));
+        }
+        Ok(ParquetRowSelection::new(RowSelection::from(selectors)))
+    }
+
+    /// The access plan of [`Self::row_selection`], built by upstream's
+    /// file-level selection path.
+    pub(crate) fn access_plan(
+        &self,
+        groups: &[RowGroupMetaData],
+    ) -> Result<ParquetAccessPlan> {
+        ParquetAccessPlan::try_new_from_overall_row_selection(
+            self.row_selection(groups)?.into_inner(),
+            groups,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RowGroupAccess;
+    use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
+    use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
+    use std::sync::Arc;
+
+    fn groups() -> Vec<RowGroupMetaData> {
+        let schema = Arc::new(SchemaDescriptor::new(Arc::new(
+            parse_message_type("message test { REQUIRED INT64 id; }").unwrap(),
+        )));
+        [10, 20, 30]
+            .into_iter()
+            .map(|rows| {
+                let column = ColumnChunkMetaData::builder(schema.column(0))
+                    .set_num_values(rows)
+                    .build()
+                    .unwrap();
+                RowGroupMetaData::builder(Arc::clone(&schema))
+                    .set_num_rows(rows)
+                    .set_column_metadata(vec![column])
+                    .build()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn row_positions_cross_group_boundaries_and_skip_other_groups() {
+        let actual = ParquetRowPositions::new(vec![0, 9, 30, 59])
+            .access_plan(&groups())
+            .unwrap();
+        let expected = ParquetAccessPlan::new(vec![
+            RowGroupAccess::Selection(
+                vec![
+                    RowSelector::select(1),
+                    RowSelector::skip(8),
+                    RowSelector::select(1),
+                ]
+                .into(),
+            ),
+            RowGroupAccess::Skip,
+            RowGroupAccess::Selection(
+                vec![
+                    RowSelector::select(1),
+                    RowSelector::skip(28),
+                    RowSelector::select(1),
+                ]
+                .into(),
+            ),
+        ]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn row_positions_empty_and_invalid_inputs() {
+        assert_eq!(
+            ParquetRowPositions::new(vec![])
+                .access_plan(&groups())
+                .unwrap(),
+            ParquetAccessPlan::new_none(3)
+        );
+        for rows in [vec![60], vec![1, 1], vec![2, 1], vec![usize::MAX]] {
+            assert!(
+                ParquetRowPositions::new(rows)
+                    .access_plan(&groups())
+                    .is_err()
+            );
+        }
+        assert!(ParquetRowPositions::new(vec![0]).access_plan(&[]).is_err());
+        assert_eq!(
+            ParquetRowPositions::new(vec![]).access_plan(&[]).unwrap(),
+            ParquetAccessPlan::new_none(0)
+        );
+    }
+
+    #[test]
+    fn row_positions_reject_ambiguous_footer_ordinals() {
+        let positions = ParquetRowPositions::new(vec![0, 30]);
+        for ordinals in [[0, 0, 2], [0, 2, 1]] {
+            let metadata: Vec<_> = groups()
+                .into_iter()
+                .zip(ordinals)
+                .map(|(group, ordinal)| {
+                    group.into_builder().set_ordinal(ordinal).build().unwrap()
+                })
+                .collect();
+            assert!(positions.access_plan(&metadata).is_err(), "{ordinals:?}");
+        }
+    }
+}

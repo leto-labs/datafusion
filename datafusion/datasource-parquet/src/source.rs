@@ -339,6 +339,13 @@ impl ParquetSource {
         }
     }
 
+    /// Give an independently executed scan fresh counters. Ordinary plan
+    /// transformations retain their existing counters instead.
+    pub fn with_new_metrics(mut self) -> Self {
+        self.metrics = ExecutionPlanMetricsSet::new();
+        self
+    }
+
     /// Set the `TableParquetOptions` for this ParquetSource.
     pub fn with_table_parquet_options(
         mut self,
