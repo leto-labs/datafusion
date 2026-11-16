@@ -104,6 +104,9 @@ pub(crate) fn configured_rows(config: &ConfigOptions) -> usize {
 pub(super) enum BuildPath {
     /// The native build, unchanged.
     Native,
+    /// The native build, then [`compact_build`]: the parallel-build option is
+    /// set, but this build stayed on the native path.
+    Compacted,
     /// [`ParallelBuild::build_consolidated`] built this map; the batches are
     /// already consolidated.
     Prebuilt(Box<dyn JoinHashMapType>),
@@ -624,6 +627,10 @@ struct HashedGroup {
     views: Vec<Option<ArrayRef>>,
 }
 
+/// A view column of a batch with more data buffers than this is compacted
+/// before it becomes (part of) a build.
+const MAX_VIEW_BUFFERS: usize = 64;
+
 /// Bytes of one string or binary view.
 const VIEW_BYTES: usize = 16;
 
@@ -819,6 +826,84 @@ fn deduplicated<T: ByteViewType + ?Sized>(
         )
     };
     Ok(array)
+}
+
+/// Compacts the consolidated native build `batch` ([`compact_views`]) under
+/// the 56 build accounting: `reservation` holds exactly what `batch` retains
+/// (`concat_build_batches` trimmed it), and `batches` holds `batch`. The copy
+/// is charged before it is made; once the wide batch and its key arrays are
+/// dropped, `reservation` holds what the compacted batch retains, and
+/// `batches` holds it. Returns the batch and its key arrays.
+pub(super) fn compact_build(
+    batch: RecordBatch,
+    left_values: Vec<ArrayRef>,
+    batches: &mut Vec<RecordBatch>,
+    on_left: &[PhysicalExprRef],
+    reservation: &MemoryReservation,
+    metrics: &BuildProbeJoinMetrics,
+) -> Result<(RecordBatch, Vec<ArrayRef>)> {
+    let held = get_record_batch_memory_size(&batch);
+    let copies = reservation.new_empty();
+    match compact_views(batch, &copies)? {
+        (batch, true) => {
+            // Release every reference to the wide arrays first.
+            drop(left_values);
+            batches.clear();
+            batches.push(batch.clone());
+            let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+            let retained = get_record_batch_memory_size(&batch);
+            adopt_copies(reservation, &copies, held, retained, metrics)?;
+            Ok((batch, left_values))
+        }
+        (batch, false) => Ok((batch, left_values)),
+    }
+}
+
+/// `batch` with every view column that references more than
+/// [`MAX_VIEW_BUFFERS`] data buffers compacted, and whether any was. The
+/// copies are charged to `copies` before they are allocated.
+pub(super) fn compact_views(
+    batch: RecordBatch,
+    copies: &MemoryReservation,
+) -> Result<(RecordBatch, bool)> {
+    let wide = |array: &ArrayRef| match array.data_type() {
+        DataType::Utf8View => {
+            array.as_string_view().data_buffers().len() > MAX_VIEW_BUFFERS
+        }
+        DataType::BinaryView => {
+            array.as_binary_view().data_buffers().len() > MAX_VIEW_BUFFERS
+        }
+        _ => false,
+    };
+    if !batch.columns().iter().any(wide) {
+        return Ok((batch, false));
+    }
+    // The batch holds the whole build, so each decision is build-wide.
+    let decide = |array: &ArrayRef| Compaction::of(&[array.as_ref()]);
+    let bytes: usize = batch
+        .columns()
+        .iter()
+        .filter(|array| wide(array))
+        .map(|array| compaction_bytes(&[array.as_ref()], decide(array)))
+        .sum();
+    copies.try_grow(bytes)?;
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|array| {
+            if wide(array) {
+                compacted(&[array.as_ref()], decide(array))
+            } else {
+                Ok(Arc::clone(array))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let batch = RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )?;
+    Ok((batch, true))
 }
 
 #[inline]

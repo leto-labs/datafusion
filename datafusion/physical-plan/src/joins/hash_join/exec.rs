@@ -3173,7 +3173,7 @@ async fn collect_left_input(
                 &metrics,
             )
             .await?
-            .map_or(BuildPath::Native, BuildPath::Prebuilt),
+            .map_or(BuildPath::Compacted, BuildPath::Prebuilt),
         _ => BuildPath::Native,
     };
 
@@ -3233,6 +3233,7 @@ fn build_in_memory(
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
 
+    let compact = matches!(path, BuildPath::Compacted);
     let (join_hash_map, batch, left_values) = if let BuildPath::Prebuilt(hashmap) = path {
         // Longbow family H: `batches` holds the consolidated batch of the
         // parallel build, whose rows the sharded map indexes.
@@ -3311,6 +3312,22 @@ fn build_in_memory(
         let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
         (Map::HashMap(hashmap), batch, left_values)
+    };
+
+    // Longbow family H+M: under the parallel-build option, a single-future
+    // build also compacts string-view columns that concatenation left with
+    // too many data buffers; the parallel build compacts per batch group.
+    let (batch, left_values) = if compact {
+        shared_build::compact_build(
+            batch,
+            left_values,
+            batches,
+            on_left,
+            &reservation,
+            metrics,
+        )?
+    } else {
+        (batch, left_values)
     };
 
     // Rewrite float `-0.0` to `+0.0` once here, so the per probe batch key

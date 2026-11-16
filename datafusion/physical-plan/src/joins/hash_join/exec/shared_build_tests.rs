@@ -765,6 +765,47 @@ async fn refused_parallel_build_steps_release_every_reservation() -> Result<()> 
     Ok(())
 }
 
+#[test]
+fn native_builds_compact_only_wide_string_views() -> Result<()> {
+    let (schema, batches) = view_batches(100);
+    let wide = concat_batches(&schema, &batches)?;
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(usize::MAX));
+    let copies = MemoryConsumer::new("test").register(&pool);
+    let (compacted, changed) = shared_build::compact_views(wide.clone(), &copies)?;
+    // The copy was charged before it was made: views plus value bytes.
+    assert!(copies.size() >= compacted.column(1).as_string_view().views().len() * 16);
+    assert!(changed);
+    assert_eq!(buffers(&compacted), 1);
+    assert_eq!(compacted, wide);
+    let narrow = concat_batches(&schema, &batches[..10])?;
+    let charged = copies.size();
+    let (kept, changed) = shared_build::compact_views(narrow.clone(), &copies)?;
+    assert!(!changed);
+    assert_eq!(copies.size(), charged);
+    assert_eq!(buffers(&kept), 10 * buffers(&batches[0]));
+    assert_eq!(kept, narrow);
+    Ok(())
+}
+
+/// A pool too small for the compaction copy refuses it before allocating:
+/// the pool's error class, nothing charged, the input untouched.
+#[test]
+fn refused_compaction_charges_nothing() -> Result<()> {
+    let (schema, batches) = view_batches(100);
+    let wide = concat_batches(&schema, &batches)?;
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+    let copies = MemoryConsumer::new("HashJoinInput").register(&pool);
+    let error = shared_build::compact_views(wide.clone(), &copies).expect_err("refused");
+    assert!(
+        matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+        "{error}"
+    );
+    assert_eq!(copies.size(), 0);
+    assert_eq!(pool.reserved(), 0);
+    assert_eq!(buffers(&wide), 100 * buffers(&batches[0]));
+    Ok(())
+}
+
 /// Longbow's plan-time admission (`shared_hash_joins::admission`) bounds a
 /// parallel build by 3 x its input bytes + 64 bytes per row. With the input
 /// batches charged first, as `collect_left_input` does, a pool of exactly
@@ -798,6 +839,46 @@ async fn admission_working_set_covers_the_parallel_build_peak() -> Result<()> {
             .expect("parallel build");
         assert_eq!(built.1, concat_batches(&schema, &batches)?);
     }
+    Ok(())
+}
+
+/// Views that share one dictionary-like buffer would expand row by row
+/// under `gc`; compaction then deduplicates the buffers instead, copying no
+/// value bytes, with the same values.
+#[test]
+fn shared_view_buffers_are_deduplicated_not_expanded() -> Result<()> {
+    let dictionary: StringViewArray = (0..100)
+        .map(|i| Some(format!("a dictionary value longer than twelve {i}")))
+        .collect();
+    let dictionary_bytes: usize = dictionary.data_buffers().iter().map(|b| b.len()).sum();
+    let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, true)]));
+    let batches = (0..200)
+        .map(|b| {
+            let indices = arrow::array::UInt32Array::from_iter_values(
+                (0..1024).map(|i| (b * 7 + i) % 100),
+            );
+            let column = arrow::compute::take(&dictionary, &indices, None).unwrap();
+            RecordBatch::try_new(Arc::clone(&schema), vec![column]).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let wide = concat_batches(&schema, &batches)?;
+    assert_eq!(
+        wide.column(0).as_string_view().data_buffers().len(),
+        200 * dictionary.data_buffers().len()
+    );
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(usize::MAX));
+    let copies = MemoryConsumer::new("test").register(&pool);
+    let (compacted, changed) = shared_build::compact_views(wide.clone(), &copies)?;
+    assert!(changed);
+    let views = compacted.column(0).as_string_view();
+    assert_eq!(views.data_buffers().len(), dictionary.data_buffers().len());
+    assert_eq!(
+        views.data_buffers().iter().map(|b| b.len()).sum::<usize>(),
+        dictionary_bytes
+    );
+    // Only the remapped views and validity were charged (no value bytes).
+    assert_eq!(copies.size(), wide.num_rows() * 17);
+    assert_eq!(compacted, wide);
     Ok(())
 }
 
@@ -1232,6 +1313,54 @@ async fn dynamic_hash_lookup_and_null_aware_builds_match_native() -> Result<()> 
         assert!(!outputs[0].is_empty() || join_type == JoinType::LeftAnti);
         assert!(outputs[0] == outputs[1], "{join_type}");
     }
+    Ok(())
+}
+
+/// Family H+M: with the parallel-build option set but a build below its
+/// threshold, the single-future build compacts wide string views. 56 already
+/// charges the consolidated batch (`concat_build_batches`); the compaction
+/// moves its copy into that charge and trims it to the compacted batch, so
+/// the build holds exactly what the native build holds apart from the batch,
+/// and the pool holds exactly the build's reservation (no double charge).
+#[tokio::test]
+async fn native_build_compaction_replaces_the_batch_charge() -> Result<()> {
+    let (schema, batches) = view_batches(100);
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(usize::MAX));
+    let native = collect_build(&schema, batches.clone(), 0, None, false, &pool).await?;
+    let native_reserved = pool.reserved();
+    let parallel = ParallelBuild::for_test(usize::MAX, 8);
+    let compacted =
+        collect_build(&schema, batches.clone(), 0, Some(parallel), false, &pool).await?;
+    assert_eq!(
+        pool.reserved(),
+        native_reserved + compacted.build.reservation.size()
+    );
+    assert_eq!(buffers(native.batch()), 100 * buffers(&batches[0]));
+    assert_eq!(buffers(compacted.batch()), 1);
+    assert_eq!(compacted.batch(), native.batch());
+    let rest = |data: &JoinLeftData| {
+        data.build.reservation.size() - get_record_batch_memory_size(data.batch())
+    };
+    assert_eq!(rest(&compacted), rest(&native));
+    assert!(compacted.build.reservation.size() < native.build.reservation.size());
+    drop(native);
+    drop(compacted);
+    assert_eq!(pool.reserved(), 0);
+    // A pool that admits the native build but not the copy refuses the build
+    // with its own error and keeps nothing.
+    let pool: Arc<dyn MemoryPool> =
+        Arc::new(GreedyMemoryPool::new(native_reserved + 1024));
+    let parallel = ParallelBuild::for_test(usize::MAX, 8);
+    let Err(error) =
+        collect_build(&schema, batches, 0, Some(parallel), false, &pool).await
+    else {
+        panic!("the compaction copy must be refused")
+    };
+    assert!(
+        matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+        "{error}"
+    );
+    assert_eq!(pool.reserved(), 0);
     Ok(())
 }
 
