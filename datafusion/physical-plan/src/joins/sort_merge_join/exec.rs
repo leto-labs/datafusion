@@ -14,6 +14,10 @@ use super::materializing_stream::MaterializingSortMergeJoinStream;
 use super::metrics::SortMergeJoinMetrics;
 use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::expressions::PhysicalSortExpr;
+use crate::filter_pushdown::{
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+    FilterPushdownPropagation,
+};
 use crate::joins::utils::{
     JoinFilter, JoinOn, JoinOnRef, build_join_schema, check_join_is_valid,
     estimate_join_statistics, reorder_output_after_swap, swap_join_projection,
@@ -36,6 +40,7 @@ use crate::{
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::project_schema;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
@@ -648,6 +653,33 @@ impl ExecutionPlan for SortMergeJoinExec {
             Some(projection) => stats.project(Some(projection)),
             None => stats,
         }))
+    }
+
+    /// Routes live parent dynamic predicates of an inner join to the input
+    /// whose columns they reference, through the embedded projection.
+    /// See `parent_filter::describe`.
+    fn gather_filters_for_pushdown(
+        &self,
+        phase: FilterPushdownPhase,
+        parent_filters: Vec<PhysicalExprRef>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        super::parent_filter::describe(self, phase, &parent_filters)
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        phase: FilterPushdownPhase,
+        result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        // An inner row retains each input's columns. A one-sided parent
+        // predicate applied on that input fully evaluates it for joined rows.
+        Ok(if super::parent_filter::routes(self.join_type, phase) {
+            FilterPushdownPropagation::if_any(result)
+        } else {
+            FilterPushdownPropagation::if_all(result)
+        })
     }
 
     /// Tries to push `projection` down through this join. If possible, returns a
