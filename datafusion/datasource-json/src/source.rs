@@ -22,6 +22,7 @@ use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};
 use datafusion_datasource::{ListingTableUrl, PartitionedFile, as_file_source};
+use datafusion_physical_plan::attempt_tasks::AttemptTasks;
 use datafusion_physical_plan::projection::ProjectionExprs;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
@@ -92,6 +93,8 @@ pub struct JsonOpener {
     /// When `true` (default), expects newline-delimited JSON (NDJSON).
     /// When `false`, expects JSON array format `[{...}, {...}]`.
     newline_delimited: bool,
+    /// The attempt that owns the tasks of the JSON array format reader.
+    attempt_tasks: Option<Arc<AttemptTasks>>,
 }
 
 impl JsonOpener {
@@ -109,7 +112,14 @@ impl JsonOpener {
             file_compression_type,
             object_store,
             newline_delimited,
+            attempt_tasks: None,
         }
+    }
+
+    /// Register the JSON array format reader's tasks with `scope`.
+    pub fn with_attempt_tasks(mut self, scope: Option<Arc<AttemptTasks>>) -> Self {
+        self.attempt_tasks = scope;
+        self
     }
 }
 
@@ -123,6 +133,9 @@ pub struct JsonSource {
     /// When `true` (default), expects newline-delimited JSON (NDJSON).
     /// When `false`, expects JSON array format `[{...}, {...}]`.
     newline_delimited: bool,
+    /// Attempt scope of the task that opens this source, see
+    /// [`FileSource::with_task_context`].
+    attempt_tasks: Option<Arc<AttemptTasks>>,
 }
 
 impl JsonSource {
@@ -135,6 +148,7 @@ impl JsonSource {
             batch_size: None,
             metrics: ExecutionPlanMetricsSet::new(),
             newline_delimited: true,
+            attempt_tasks: None,
         }
     }
 
@@ -179,6 +193,7 @@ impl FileSource for JsonSource {
             file_compression_type: base_config.file_compression_type,
             object_store,
             newline_delimited: self.newline_delimited,
+            attempt_tasks: self.attempt_tasks.clone(),
         }) as Arc<dyn FileOpener>;
 
         // Wrap with ProjectionOpener
@@ -193,6 +208,14 @@ impl FileSource for JsonSource {
 
     fn table_schema(&self) -> &datafusion_datasource::TableSchema {
         &self.table_schema
+    }
+
+    fn with_task_context(&self, context: &TaskContext) -> Option<Arc<dyn FileSource>> {
+        // Only the JSON array format spawns; unscoped tasks keep `self`.
+        let scope = AttemptTasks::from_task(context)?;
+        let mut conf = self.clone();
+        conf.attempt_tasks = Some(scope);
+        Some(Arc::new(conf))
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
@@ -256,6 +279,8 @@ impl FileSource for JsonSource {
             metrics: _,
             // Serialized in `base` and reapplied on decode.
             projection: _,
+            // Set from the opening task's context, never part of the plan.
+            attempt_tasks: _,
             newline_delimited,
         } = self;
 
@@ -336,6 +361,7 @@ impl FileOpener for JsonOpener {
         let batch_size = self.batch_size;
         let file_compression_type = self.file_compression_type.to_owned();
         let newline_delimited = self.newline_delimited;
+        let attempt_tasks = self.attempt_tasks.clone();
 
         // JSON array format requires reading the complete file
         if !newline_delimited && partitioned_file.range.is_some() {
@@ -468,7 +494,7 @@ impl FileOpener for JsonOpener {
 
                         // Async task: read from object store stream and send bytes to channel
                         // Store the SpawnedTask to keep it alive until stream is dropped
-                        let read_task = SpawnedTask::spawn(async move {
+                        let read = async move {
                             tokio::pin!(decompressed_stream);
                             while let Some(chunk) = decompressed_stream.next().await {
                                 match chunk {
@@ -490,11 +516,25 @@ impl FileOpener for JsonOpener {
                                 }
                             }
                             // byte_tx dropped here, signals EOF to ChannelReader
-                        });
+                        };
+                        // A registered producer: stopping the attempt aborts
+                        // the read, which closes the byte channel.
+                        let read_task = match &attempt_tasks {
+                            Some(scope) => {
+                                let read = scope
+                                    .track_producer(read)
+                                    .map_err(|e| exec_datafusion_err!("{e}"))?;
+                                SpawnedTask::spawn(async move {
+                                    // Producer stop is teardown, not an outcome.
+                                    let _ = read.await;
+                                })
+                            }
+                            None => SpawnedTask::spawn(read),
+                        };
 
                         // Blocking task: receive bytes from channel and parse JSON
                         // Store the SpawnedTask to keep it alive until stream is dropped
-                        let parse_task = SpawnedTask::spawn_blocking(move || {
+                        let parse = move || {
                             let channel_reader = ChannelReader::new(byte_rx);
                             let mut ndjson_reader =
                                 JsonArrayToNdjsonReader::with_capacity(
@@ -526,7 +566,21 @@ impl FileOpener for JsonOpener {
                                 ));
                             }
                             // result_tx dropped here, closes the stream
-                        });
+                        };
+                        // Blocking work cannot be aborted: a registered
+                        // cooperative writer, which ends when the byte
+                        // channel closes or the result receiver is dropped.
+                        let parse_task = match &attempt_tasks {
+                            Some(scope) => {
+                                let parse = scope
+                                    .track_cooperative(async move { parse() })
+                                    .map_err(|e| exec_datafusion_err!("{e}"))?;
+                                SpawnedTask::spawn_blocking(move || {
+                                    futures::executor::block_on(parse)
+                                })
+                            }
+                            None => SpawnedTask::spawn_blocking(parse),
+                        };
 
                         // Wrap in JsonArrayStream to keep tasks alive until stream is consumed
                         let stream = JsonArrayStream {
@@ -681,6 +735,67 @@ mod tests {
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
 
+        Ok(())
+    }
+
+    // The JSON array format (`format.newline_delimited false`) reads on a
+    // spawned task and parses on a blocking task. Both run plan work for the
+    // attempt that opened the file, so the attempt's drain must wait for them.
+    #[tokio::test]
+    async fn test_json_array_tasks_register_with_the_attempt() -> Result<()> {
+        use datafusion_execution::config::SessionConfig;
+        use futures::FutureExt;
+
+        let scope = AttemptTasks::new();
+        let scoped = TaskContext::default()
+            .with_session_config(SessionConfig::new().with_extension(Arc::clone(&scope)));
+        // The source takes the scope from the task that opens it; tasks
+        // without one keep the unscoped source.
+        let source = JsonSource::new(test_schema()).with_newline_delimited(false);
+        assert!(source.with_task_context(&scoped).is_some());
+        assert!(source.with_task_context(&TaskContext::default()).is_none());
+
+        // Many rows in batches of one, so the parse task waits on its result
+        // channel (capacity 2) while the first batch is read.
+        let mut json = String::from("[");
+        for id in 0..10_000 {
+            if id > 0 {
+                json.push(',');
+            }
+            write!(json, r#"{{"id": {id}, "name": "n{id}"}}"#).unwrap();
+        }
+        json.push(']');
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("test_attempt.json");
+        store
+            .put(&path, PutPayload::from(json.into_bytes()))
+            .await?;
+        let opener = JsonOpener::new(
+            1,
+            test_schema(),
+            FileCompressionType::UNCOMPRESSED,
+            store.clone(),
+            false,
+        )
+        .with_attempt_tasks(Some(Arc::clone(&scope)));
+        let meta = store.head(&path).await?;
+        let mut stream = opener
+            .open(PartitionedFile::new(path.to_string(), meta.size))?
+            .await?;
+        assert_eq!(stream.next().await.unwrap()?.num_rows(), 1);
+
+        scope.root_joined();
+        assert!(
+            scope.drain().now_or_never().is_none(),
+            "tasks not registered"
+        );
+        // Stop aborts the read; dropping the stream ends the parse.
+        scope.stop();
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(10), scope.drain())
+            .await
+            .expect("drain must finish")
+            .unwrap();
         Ok(())
     }
 

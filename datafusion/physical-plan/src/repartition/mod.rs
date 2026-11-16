@@ -18,6 +18,7 @@ use super::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use super::{
     DisplayAs, ExecutionPlanProperties, RecordBatchStream, SendableRecordBatchStream,
 };
+use crate::attempt_tasks::{AttemptTasks, discard};
 use crate::coalesce::LimitedBatchCoalescer;
 use crate::execution_plan::{CardinalityEffect, EvaluationType, SchedulingType};
 use crate::hash_utils::create_hashes;
@@ -604,7 +605,8 @@ impl RepartitionExecState {
                 .map(|(partition, channel)| (*partition, channel.sender.clone()))
                 .collect();
 
-            let input_task = SpawnedTask::spawn(RepartitionExec::pull_from_input(
+            let scope = AttemptTasks::from_task(context);
+            let pull = RepartitionExec::pull_from_input(
                 stream,
                 txs,
                 partitioning.clone(),
@@ -613,12 +615,30 @@ impl RepartitionExecState {
                 // preserve_order depends on partition index to start from 0
                 if preserve_order { 0 } else { i },
                 num_input_partitions,
-            ));
+            );
+            let input_task = if let Some(scope) = &scope {
+                let tracked = scope
+                    .track_producer(pull)
+                    .map_err(|error| internal_datafusion_err!("{error}"))?;
+                SpawnedTask::spawn(async move { tracked.await.unwrap_or(Ok(())) })
+            } else {
+                SpawnedTask::spawn(pull)
+            };
 
             // In a separate task, wait for each input to be done
             // (and pass along any errors, including panic!s)
-            let wait_for_task =
-                SpawnedTask::spawn(RepartitionExec::wait_for_task(input_task, senders));
+            let forward =
+                RepartitionExec::wait_for_task(input_task, senders, scope.clone());
+            let wait_for_task = if let Some(scope) = &scope {
+                let tracked = scope
+                    .track_producer(forward)
+                    .map_err(|error| internal_datafusion_err!("{error}"))?;
+                SpawnedTask::spawn(async move {
+                    let _ = tracked.await;
+                })
+            } else {
+                SpawnedTask::spawn(forward)
+            };
             spawned_tasks.push(wait_for_task);
         }
         *self = Self::ConsumingInputStreams(ConsumingInputStreamsState {
@@ -1767,6 +1787,7 @@ impl ExecutionPlan for RepartitionExec {
             spill_metrics,
             input.schema(),
         )
+        .with_attempt_tasks(AttemptTasks::from_task(&context))
         .with_compression_type(context.session_config().spill_compression());
 
         // Get existing ordering to use for merging
@@ -2391,6 +2412,7 @@ impl RepartitionExec {
     async fn wait_for_task(
         input_task: SpawnedTask<Result<()>>,
         txs: HashMap<usize, DistributionSender<MaybeBatch>>,
+        scope: Option<Arc<AttemptTasks>>,
     ) {
         // wait for completion, and propagate error
         // note we ignore errors on send (.ok) as that means the receiver has already shutdown.
@@ -2405,8 +2427,9 @@ impl RepartitionExec {
                         "Join Error".to_string(),
                         Box::new(DataFusionError::External(Box::new(Arc::clone(&e)))),
                     ));
-                    tx.send(Some(err)).await.ok();
+                    discard(scope.as_ref(), tx.send(Some(err)).await);
                 }
+                discard(scope.as_ref(), e);
             }
             // Error from running input task
             Ok(Err(e)) => {
@@ -2416,14 +2439,15 @@ impl RepartitionExec {
                 for (_, tx) in txs {
                     // wrap it because need to send error to all output partitions
                     let err = Err(DataFusionError::from(&e));
-                    tx.send(Some(err)).await.ok();
+                    discard(scope.as_ref(), tx.send(Some(err)).await);
                 }
+                discard(scope.as_ref(), e);
             }
             // Input task completed successfully
             Ok(Ok(())) => {
                 // notify each output partition that this input partition has no more data
                 for (_partition, tx) in txs {
-                    tx.send(None).await.ok();
+                    discard(scope.as_ref(), tx.send(None).await);
                 }
             }
         }

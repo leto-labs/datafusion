@@ -94,6 +94,17 @@ pub trait FileSource: Any + Send + Sync {
     /// Initialize new type with batch size configuration
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource>;
 
+    /// Bind this source to the task that opens it, for a source whose
+    /// openers spawn work that the task must own (for example the attempt
+    /// scope in the task's session config). Returns `None` to keep `self`,
+    /// which is the default.
+    fn with_task_context(
+        &self,
+        _context: &datafusion_execution::TaskContext,
+    ) -> Option<Arc<dyn FileSource>> {
+        None
+    }
+
     /// Returns the filter expression that will be applied *during* the file scan.
     ///
     /// These expressions are in terms of the unprojected [`Self::table_schema`].

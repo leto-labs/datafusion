@@ -193,6 +193,7 @@ impl AggregateSpill {
             spill_metrics,
             Arc::clone(spill_schema),
         )
+        .with_attempt_tasks(crate::attempt_tasks::AttemptTasks::from_task(context))
         .with_compression_type(context.session_config().spill_compression());
 
         Ok(Self {
@@ -262,12 +263,8 @@ impl AggregateSpill {
         schema: SchemaRef,
         batches: impl Iterator<Item = Result<RecordBatch>>,
     ) -> Result<SendableRecordBatchStream> {
-        let spill_manager = SpillManager::new(
-            self.context.runtime_env(),
-            self.spill_manager.metrics.clone(),
-            schema,
-        )
-        .with_compression_type(self.spill_manager.compression);
+        // Same runtime, metrics, compression and attempt scope as the run spills.
+        let spill_manager = self.spill_manager.with_schema(schema);
         let spill_file = spill_manager
             .spill_record_batch_iter_and_return_max_batch_memory(batches, self.label)?;
         let Some((file, max_record_batch_memory)) = spill_file else {

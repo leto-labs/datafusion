@@ -41,7 +41,6 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, Statistics, internal_err};
-use datafusion_common_runtime::JoinSet;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{SendableRecordBatchStream, SpillFile, TaskContext};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
@@ -49,6 +48,7 @@ use futures::stream::BoxStream;
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 
+use crate::attempt_tasks::{AttemptTasks, ScopedJoinSet, stopped_error};
 use crate::coop::cooperative;
 use crate::execution_plan::{
     Boundedness, CardinalityEffect, EmissionType, ExecutionPlan, ExecutionPlanProperties,
@@ -330,10 +330,11 @@ async fn buffer_body(
         SpillMetrics::new(&metrics, 0),
         body.schema(),
     )
+    .with_attempt_tasks(AttemptTasks::from_task(&context))
     .with_compression_type(context.session_config().spill_compression());
     let buffered_rows = MetricBuilder::new(&metrics).global_counter("buffered_rows");
 
-    let mut join_set = JoinSet::new();
+    let mut join_set = ScopedJoinSet::new(AttemptTasks::from_task(&context));
     for partition in 0..body.output_partitioning().partition_count() {
         let stream = body.execute(partition, Arc::clone(&context))?;
         let reservation =
@@ -342,12 +343,15 @@ async fn buffer_body(
                 .register(context.memory_pool());
         let spill_manager = spill_manager.clone();
         let buffered_rows = buffered_rows.clone();
-        join_set.spawn(async move {
-            let result =
-                buffer_partition(stream, reservation, &spill_manager, &buffered_rows)
-                    .await;
-            (partition, result)
-        });
+        join_set.spawn_producer(
+            async move {
+                let result =
+                    buffer_partition(stream, reservation, &spill_manager, &buffered_rows)
+                        .await;
+                (partition, result)
+            },
+            move |stopped| (partition, stopped_error(stopped)),
+        )?;
     }
 
     let mut partitions = Vec::with_capacity(join_set.len());

@@ -5,6 +5,7 @@
 //! [`BufferExec`] decouples production and consumption on messages by buffering the input in the
 //! background up to a certain capacity.
 
+use crate::attempt_tasks::{AttemptTasks, CaughtPollPanic, ScopedValue, discard};
 use crate::execution_plan::LimitBehavior;
 use crate::execution_plan::{
     CardinalityEffect, EvaluationType, SchedulingType, replace_children_if_necessary,
@@ -23,7 +24,9 @@ use crate::{
 use arrow::array::RecordBatch;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::{Result, Statistics, internal_err};
+use datafusion_common::{
+    DataFusionError, Result, Statistics, internal_datafusion_err, internal_err,
+};
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -202,6 +205,7 @@ impl ExecutionPlan for BufferExec {
     ) -> Result<SendableRecordBatchStream> {
         let mem_reservation = MemoryConsumer::new(format!("BufferExec[{partition}]"))
             .register(context.memory_pool());
+        let scope = AttemptTasks::from_task(&context);
         let in_stream = self.input.execute(partition, context)?;
 
         // Set up the metrics for the stream.
@@ -234,8 +238,12 @@ impl ExecutionPlan for BufferExec {
             }
         });
         // Buffer the input.
-        let out_stream =
-            MemoryBufferedStream::new(in_stream, self.capacity, mem_reservation);
+        let out_stream = MemoryBufferedStream::new_with_scope(
+            in_stream,
+            self.capacity,
+            mem_reservation,
+            scope,
+        )?;
         // Update in the metrics that when an element gets out, some memory gets freed.
         let out_stream = out_stream.inspect_ok(move |v| {
             curr_mem_out.fetch_sub(v.get_array_memory_size(), Ordering::Relaxed);
@@ -404,7 +412,7 @@ pin_project! {
 /// the queue is full or not.
 pub struct MemoryBufferedStream<T: SizedMessage> {
     task: SpawnedTask<()>,
-    batch_rx: UnboundedReceiver<Result<(T, OwnedSemaphorePermit)>>,
+    batch_rx: ScopedValue<UnboundedReceiver<Result<(T, OwnedSemaphorePermit)>>>,
     memory_reservation: Arc<MemoryReservation>,
 }}
 
@@ -413,16 +421,28 @@ impl<T: Send + SizedMessage + 'static> MemoryBufferedStream<T> {
     ///
     /// This immediately spawns a Tokio task that will start consumption of the input stream.
     pub fn new(
-        mut input: impl Stream<Item = Result<T>> + Unpin + Send + 'static,
+        input: impl Stream<Item = Result<T>> + Unpin + Send + 'static,
         capacity: usize,
         memory_reservation: MemoryReservation,
     ) -> Self {
+        Self::new_with_scope(input, capacity, memory_reservation, None)
+            .expect("unscoped memory buffer cannot fail registration")
+    }
+
+    /// Scoped sibling of [`Self::new`], registering the producer before spawning.
+    pub fn new_with_scope(
+        mut input: impl Stream<Item = Result<T>> + Unpin + Send + 'static,
+        capacity: usize,
+        memory_reservation: MemoryReservation,
+        scope: Option<Arc<AttemptTasks>>,
+    ) -> Result<Self> {
         let semaphore = Arc::new(Semaphore::new(capacity));
         let (batch_tx, batch_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let memory_reservation = Arc::new(memory_reservation);
         let memory_reservation_clone = Arc::clone(&memory_reservation);
-        let task = SpawnedTask::spawn(async move {
+        let panic_scope = scope.clone();
+        let produce = async move {
             loop {
                 // Select on both the input stream and the channel being closed.
                 // By down this, we abort polling the input as soon as the consumer channel is
@@ -438,14 +458,26 @@ impl<T: Send + SizedMessage + 'static> MemoryBufferedStream<T> {
                             Ok(Some(item_or_err)) => item_or_err,
                             Ok(None) => break, // stream finished
                             Err(panic) => {
+                                if let Some(scope) = &panic_scope {
+                                    scope.record_poll_panic();
+                                }
                                 let msg = panic
                                     .downcast_ref::<&str>()
                                     .map(|s| s.to_string())
                                     .or_else(|| panic.downcast_ref::<String>().cloned())
                                     .unwrap_or_else(|| "unknown panic".to_string());
-                                let _ = batch_tx.send(internal_err!(
+                                let original = internal_datafusion_err!(
                                     "BufferExec input stream panicked: {msg}"
-                                ));
+                                );
+                                let error = if panic_scope.is_some() {
+                                    DataFusionError::External(Box::new(CaughtPollPanic {
+                                        original,
+                                    }))
+                                } else {
+                                    original
+                                };
+                                discard(panic_scope.as_ref(), batch_tx.send(Err(error)));
+                                discard(panic_scope.as_ref(), panic);
                                 break;
                             }
                         }
@@ -455,14 +487,15 @@ impl<T: Send + SizedMessage + 'static> MemoryBufferedStream<T> {
                 let item = match item_or_err {
                     Ok(batch) => batch,
                     Err(err) => {
-                        let _ = batch_tx.send(Err(err)); // If there's an error it means the channel was closed, which is fine.
+                        discard(panic_scope.as_ref(), batch_tx.send(Err(err)));
                         break;
                     }
                 };
 
                 let size = item.size();
                 if let Err(err) = memory_reservation.try_grow(size) {
-                    let _ = batch_tx.send(Err(err)); // If there's an error it means the channel was closed, which is fine.
+                    discard(panic_scope.as_ref(), batch_tx.send(Err(err)));
+                    discard(panic_scope.as_ref(), item);
                     break;
                 }
 
@@ -473,21 +506,37 @@ impl<T: Send + SizedMessage + 'static> MemoryBufferedStream<T> {
 
                 let semaphore = Arc::clone(&semaphore);
                 let Ok(permit) = semaphore.acquire_many_owned(capped_size).await else {
-                    let _ = batch_tx.send(internal_err!("Closed semaphore in MemoryBufferedStream. This is a bug in DataFusion, please report it!"));
+                    discard(panic_scope.as_ref(), batch_tx.send(internal_err!("Closed semaphore in MemoryBufferedStream. This is a bug in DataFusion, please report it!")));
+                    discard(panic_scope.as_ref(), item);
                     break;
                 };
 
-                if batch_tx.send(Ok((item, permit))).is_err() {
+                if let Err(error) = batch_tx.send(Ok((item, permit))) {
+                    discard(panic_scope.as_ref(), error);
                     break; // stream was closed
                 }
             }
-        });
+            if panic_scope.is_some() {
+                discard(panic_scope.as_ref(), input);
+            }
+        };
+        let task = if let Some(scope) = &scope {
+            let tracked = scope
+                .track_producer(produce)
+                .map_err(|error| internal_datafusion_err!("{error}"))?;
+            SpawnedTask::spawn(async move {
+                // Producer stop is internal teardown, not an execution outcome.
+                let _ = tracked.await;
+            })
+        } else {
+            SpawnedTask::spawn(produce)
+        };
 
-        Self {
+        Ok(Self {
             task,
-            batch_rx,
+            batch_rx: ScopedValue::new(batch_rx, scope),
             memory_reservation: memory_reservation_clone,
-        }
+        })
     }
 
     /// Returns the number of queued messages.

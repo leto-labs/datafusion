@@ -13,11 +13,12 @@ use std::task::Poll;
 use super::metrics::ExecutionPlanMetricsSet;
 use super::metrics::{BaselineMetrics, SplitMetrics};
 use super::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
+use crate::attempt_tasks::{AttemptTasks, ScopedJoinSet, ScopedValue, discard};
 use crate::displayable;
 use crate::spill::get_record_batch_memory_size;
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
-use datafusion_common::{Result, exec_err};
+use datafusion_common::{Result, exec_err, internal_datafusion_err};
 use datafusion_common_runtime::JoinSet;
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryReservation;
@@ -45,6 +46,7 @@ pub(crate) struct ReceiverStreamBuilder<O> {
     tx: Sender<Result<O>>,
     rx: Receiver<Result<O>>,
     join_set: JoinSet<Result<()>>,
+    scope: Option<Arc<AttemptTasks>>,
 }
 
 impl<O: Send + 'static> ReceiverStreamBuilder<O> {
@@ -56,6 +58,7 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
             tx,
             rx,
             join_set: JoinSet::new(),
+            scope: None,
         }
     }
 
@@ -110,15 +113,18 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         let Self {
             tx,
             rx,
-            mut join_set,
+            join_set,
+            scope,
         } = self;
+        let mut tasks = ScopedJoinSet::from_set(join_set, scope.clone());
+        let rx = ScopedValue::new(rx, scope);
 
         // Doesn't need tx
         drop(tx);
 
         // future that checks the result of the join set, and propagates panic if seen
         let check = async move {
-            while let Some(result) = join_set.join_next().await {
+            while let Some(result) = tasks.join_next().await {
                 match result {
                     // Nothing to report
                     Ok(Ok(())) => {}
@@ -225,6 +231,11 @@ pub struct RecordBatchReceiverStreamBuilder {
 }
 
 impl RecordBatchReceiverStreamBuilder {
+    pub(crate) fn with_scope(mut self, scope: Option<Arc<AttemptTasks>>) -> Self {
+        self.inner.scope = scope;
+        self
+    }
+
     /// Create new channels with the specified buffer size
     pub fn new(schema: SchemaRef, capacity: usize) -> Self {
         Self {
@@ -311,7 +322,10 @@ impl RecordBatchReceiverStreamBuilder {
         input: Arc<dyn ExecutionPlan>,
         partition: usize,
         context: Arc<TaskContext>,
-    ) {
+    ) -> Result<()> {
+        let scope = AttemptTasks::from_task(&context);
+        self.inner.scope.clone_from(&scope);
+        let output_scope = scope.clone();
         let output = self.tx();
         let input_display = if log::log_enabled!(log::Level::Debug) {
             displayable(input.as_ref()).one_line().to_string()
@@ -319,15 +333,13 @@ impl RecordBatchReceiverStreamBuilder {
             String::new()
         };
 
-        self.inner.spawn(async move {
+        let producer = async move {
             let mut stream = match input.execute(partition, context) {
                 Err(e) => {
                     // If send fails, the plan being torn down, there
                     // is no place to send the error and no reason to continue.
-                    output.send(Err(e)).await.ok();
-                    debug!(
-                        "Stopping execution: error executing input: {input_display}",
-                    );
+                    discard(output_scope.as_ref(), output.send(Err(e)).await);
+                    debug!("Stopping execution: error executing input: {input_display}");
                     return Ok(());
                 }
                 Ok(stream) => stream,
@@ -336,7 +348,7 @@ impl RecordBatchReceiverStreamBuilder {
             // Drop the input early, as soon as we're done with it.
             // Holding on to it can cause delays in cancelling the child plan when the query is
             // cancelled.
-            drop(input);
+            discard(output_scope.as_ref(), input);
 
             // Transfer batches from inner stream to the output tx
             // immediately.
@@ -345,10 +357,12 @@ impl RecordBatchReceiverStreamBuilder {
 
                 // If send fails, plan being torn down, there is no
                 // place to send the error and no reason to continue.
-                if output.send(item).await.is_err() {
+                if let Err(error) = output.send(item).await {
+                    discard(output_scope.as_ref(), error);
                     debug!(
                         "Stopping execution: output is gone, plan cancelling: {input_display}",
                     );
+                    discard(output_scope.as_ref(), stream);
                     return Ok(());
                 }
 
@@ -356,12 +370,25 @@ impl RecordBatchReceiverStreamBuilder {
                 // drive all streams to completion)
                 if is_err {
                     debug!("Stopping execution: plan returned error: {input_display}");
+                    discard(output_scope.as_ref(), stream);
                     return Ok(());
                 }
             }
 
+            discard(output_scope.as_ref(), stream);
             Ok(())
-        });
+        };
+        if let Some(scope) = scope {
+            let tracked = scope
+                .track_producer(producer)
+                .map_err(|error| internal_datafusion_err!("{error}"))?;
+            // Stopped producers are teardown, never a task-success decision.
+            self.inner
+                .spawn(async move { tracked.await.unwrap_or(Ok(())) });
+        } else {
+            self.inner.spawn(producer);
+        }
+        Ok(())
     }
 
     /// Create a stream of all [`RecordBatch`] written to `tx`
@@ -851,7 +878,9 @@ mod test {
 
         // Configure a RecordBatchReceiverStream to consume the input
         let mut builder = RecordBatchReceiverStream::builder(schema, 2);
-        builder.run_input(Arc::new(input), 0, Arc::clone(&task_ctx));
+        builder
+            .run_input(Arc::new(input), 0, Arc::clone(&task_ctx))
+            .unwrap();
         let stream = builder.build();
 
         // Input should still be present
@@ -878,7 +907,9 @@ mod test {
         .with_use_task(false);
 
         let mut builder = RecordBatchReceiverStream::builder(schema, 2);
-        builder.run_input(Arc::new(error_stream), 0, Arc::clone(&task_ctx));
+        builder
+            .run_input(Arc::new(error_stream), 0, Arc::clone(&task_ctx))
+            .unwrap();
         let mut stream = builder.build();
 
         // Get the first result, which should be an error
@@ -942,11 +973,13 @@ mod test {
         let mut builder =
             RecordBatchReceiverStream::builder(input.schema(), num_partitions);
         for partition in 0..num_partitions {
-            builder.run_input(
-                Arc::clone(&input) as Arc<dyn ExecutionPlan>,
-                partition,
-                Arc::clone(&task_ctx),
-            );
+            builder
+                .run_input(
+                    Arc::clone(&input) as Arc<dyn ExecutionPlan>,
+                    partition,
+                    Arc::clone(&task_ctx),
+                )
+                .unwrap();
         }
         let mut stream = builder.build();
 

@@ -738,6 +738,9 @@ impl ExecutionPlan for NestedLoopJoinExec {
                     metrics.spill_metrics.clone(),
                     stream.schema(),
                 )
+                .with_attempt_tasks(crate::attempt_tasks::AttemptTasks::from_task(
+                    &context,
+                ))
                 .with_compression_type(context.session_config().spill_compression())
             });
 
@@ -2593,6 +2596,7 @@ impl NestedLoopJoinStream {
             self.metrics.spill_metrics.clone(),
             Arc::clone(&right_schema),
         )
+        .with_attempt_tasks(crate::attempt_tasks::AttemptTasks::from_task(&context))
         .with_compression_type(context.session_config().spill_compression());
 
         self.spill_state = SpillState::Active(Box::new(SpillStateActive {

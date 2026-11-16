@@ -760,6 +760,7 @@ impl DataSource for FileScanConfig {
             .unwrap_or_else(|| context.session_config().batch_size());
 
         let source = self.file_source.with_batch_size(batch_size);
+        let source = source.with_task_context(&context).unwrap_or(source);
 
         let morselizer = source.create_morselizer(object_store, self, partition)?;
 

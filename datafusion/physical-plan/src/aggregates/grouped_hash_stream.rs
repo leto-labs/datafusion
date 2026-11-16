@@ -560,6 +560,7 @@ impl GroupedHashAggregateStream {
             metrics::SpillMetrics::new(&agg.metrics, partition),
             Arc::clone(&spill_schema),
         )
+        .with_attempt_tasks(crate::attempt_tasks::AttemptTasks::from_task(context))
         .with_compression_type(context.session_config().spill_compression());
 
         let spill_state = SpillState {

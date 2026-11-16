@@ -6,7 +6,8 @@
 
 use std::sync::Arc;
 
-use crate::common::spawn_buffered;
+use crate::attempt_tasks::AttemptTasks;
+use crate::common::spawn_buffered_with_scope;
 use crate::execution_plan::LimitBehavior;
 use crate::limit::LimitStream;
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
@@ -357,11 +358,12 @@ impl ExecutionPlan for SortPreservingMergeExec {
                 }
             },
             _ => {
+                let scope = AttemptTasks::from_task(&context);
                 let receivers = (0..input_partitions)
                     .map(|partition| {
                         let stream =
                             self.input.execute(partition, Arc::clone(&context))?;
-                        Ok(spawn_buffered(stream, 1))
+                        spawn_buffered_with_scope(stream, 1, scope.clone())
                     })
                     .collect::<Result<_>>()?;
 

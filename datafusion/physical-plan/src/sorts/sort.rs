@@ -13,6 +13,7 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 
+use crate::attempt_tasks::{AttemptTasks, spawn_producer, stopped_error};
 use crate::execution_plan::{
     Boundedness, CardinalityEffect, EmissionType, has_same_children_properties,
     replace_children_if_necessary,
@@ -57,7 +58,6 @@ use datafusion_common::{
     DataFusionError, Result, assert_eq_or_internal_err, assert_or_internal_err,
     internal_datafusion_err, unwrap_or_internal_err,
 };
-use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{
     MemoryConsumer, MemoryPool, MemoryReservation, MergeMemoryPool,
@@ -298,6 +298,7 @@ struct ExternalSorter {
     /// Reservation for in_mem_batches
     reservation: MemoryReservation,
     spill_manager: SpillManager,
+    attempt_tasks: Option<Arc<AttemptTasks>>,
 
     /// Reservation for the merging of in-memory batches. If the sort
     /// might spill, `sort_spill_reservation_bytes` will be
@@ -366,6 +367,7 @@ impl ExternalSorter {
             metrics,
             reservation,
             spill_manager,
+            attempt_tasks: None,
             merge_reservation,
             merge_pool,
             runtime,
@@ -374,6 +376,13 @@ impl ExternalSorter {
             sort_in_place_threshold_bytes,
             sort_concurrency: Arc::new(OnceLock::new()),
         })
+    }
+
+    /// Retain the same attempt scope for in-memory buffers and recursive spill reads.
+    pub fn with_attempt_tasks(mut self, scope: Option<Arc<AttemptTasks>>) -> Self {
+        self.spill_manager = self.spill_manager.with_attempt_tasks(scope.clone());
+        self.attempt_tasks = scope;
+        self
     }
 
     /// Appends an unsorted [`RecordBatch`] to `in_mem_batches`
@@ -781,6 +790,7 @@ impl ExternalSorter {
         let (sizes, shared_input_size) = self.sort_run_sizes(&runs)?;
         let shared_input =
             shared_input_size.map(|size| Arc::new(self.reservation.split(size)));
+        let scope = self.attempt_tasks.clone();
         let jobs =
             runs.into_iter()
                 .zip(sizes)
@@ -789,8 +799,9 @@ impl ExternalSorter {
                     let reservation = self.reservation.split(size);
                     let sort = self.sort_run(batch, reservation, shared_input.clone())?;
                     let permits = Arc::clone(&concurrency.permits);
+                    let scope = scope.clone();
                     Ok::<_, DataFusionError>(async move {
-                        let stream = Self::prepare_sort_run(sort, permits).await?;
+                        let stream = Self::prepare_sort_run(sort, permits, scope).await?;
                         Ok((index, stream))
                     })
                 });
@@ -823,20 +834,24 @@ impl ExternalSorter {
     async fn prepare_sort_run(
         sort: impl Future<Output = Result<SendableRecordBatchStream>> + Send + 'static,
         permits: Arc<Semaphore>,
+        scope: Option<Arc<AttemptTasks>>,
     ) -> Result<SendableRecordBatchStream> {
         // Acquire before spawning so queued runs do not become Tokio tasks.
         let permit = permits
             .acquire_owned()
             .await
             .map_err(|e| internal_datafusion_err!("Sort concurrency closed: {e}"))?;
-        let stream = SpawnedTask::spawn(async move {
+        // The job owns attempt batches and reservations; register it so the
+        // attempt drain waits for its destruction.
+        let job = async move {
             // Keep the permit until this job exits, even if its caller is cancelled.
             let _permit = permit;
             sort.await
-        })
-        .join_unwind()
-        .await
-        .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
+        };
+        let stream = spawn_producer(scope.as_ref(), job, stopped_error)?
+            .join_unwind()
+            .await
+            .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
         Ok(Self::with_lookahead(stream))
     }
 
@@ -1836,7 +1851,8 @@ impl ExecutionPlan for SortExec {
                     context.session_config().spill_compression(),
                     &self.metrics_set,
                     context.runtime_env(),
-                )?;
+                )?
+                .with_attempt_tasks(AttemptTasks::from_task(&context));
                 sorter.sort_concurrency = Arc::clone(&self.sort_concurrency);
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     self.schema(),
@@ -2612,7 +2628,7 @@ mod tests {
             assert_eq!(elapsed_compute.value(), before);
 
             let stream = if spawned {
-                ExternalSorter::prepare_sort_run(sort, Arc::new(Semaphore::new(1)))
+                ExternalSorter::prepare_sort_run(sort, Arc::new(Semaphore::new(1)), None)
                     .await?
             } else {
                 sort.await?
@@ -2636,7 +2652,7 @@ mod tests {
             }
         };
         let mut preparation =
-            ExternalSorter::prepare_sort_run(sort, Arc::clone(&permits)).boxed();
+            ExternalSorter::prepare_sort_run(sort, Arc::clone(&permits), None).boxed();
         assert_is_pending(&mut preparation);
         assert_eq!(Handle::current().metrics().num_alive_tasks(), 0);
         drop(held);
@@ -2655,7 +2671,7 @@ mod tests {
     async fn sort_preparation_propagates_errors_and_releases_permit() {
         let permits = Arc::new(Semaphore::new(1));
         let sort = async { Err(internal_datafusion_err!("sort failed")) };
-        let error = ExternalSorter::prepare_sort_run(sort, Arc::clone(&permits))
+        let error = ExternalSorter::prepare_sort_run(sort, Arc::clone(&permits), None)
             .await
             .err()
             .expect("preparation must propagate the sort error");

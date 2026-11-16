@@ -955,6 +955,7 @@ pub(crate) fn sort_merge_join_stream(
         SpillMetrics::new(metrics, partition),
         buffered.schema(),
     )
+    .with_attempt_tasks(crate::attempt_tasks::AttemptTasks::from_task(context))
     .with_compression_type(context.session_config().spill_compression());
 
     if matches!(

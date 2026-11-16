@@ -10,7 +10,6 @@ use arrow::{
 use arrow_schema::{SchemaRef, SortOptions};
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{JoinSide, Result, internal_datafusion_err, internal_err};
-use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::{
     SendableRecordBatchStream,
     memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
@@ -726,6 +725,7 @@ impl ExecutionPlan for PiecewiseMergeJoinExec {
                     reservation,
                     Arc::clone(context.memory_pool()),
                     descending,
+                    crate::attempt_tasks::AttemptTasks::from_task(&context),
                 ))
             })?;
 
@@ -1143,6 +1143,7 @@ async fn partition_extreme(
 /// A min/max combines across partitions, so this side needs no single-partition funnel --
 /// `input_distribution_requirements` asks for `UnspecifiedDistribution` here and the partitions
 /// are folded independently, each in its own spawned task.
+#[expect(clippy::too_many_arguments)]
 async fn build_buffered_extreme(
     buffered_streams: Vec<SendableRecordBatchStream>,
     buffered_schema: SchemaRef,
@@ -1151,6 +1152,7 @@ async fn build_buffered_extreme(
     reservation: MemoryReservation,
     memory_pool: Arc<dyn MemoryPool>,
     descending: bool,
+    scope: Option<Arc<crate::attempt_tasks::AttemptTasks>>,
 ) -> Result<BufferedExtreme> {
     let tasks: Vec<_> = buffered_streams
         .into_iter()
@@ -1164,15 +1166,13 @@ async fn build_buffered_extreme(
                 "PiecewiseMergeJoinBufferedFold[{partition}]"
             ))
             .register(&memory_pool);
-            SpawnedTask::spawn(partition_extreme(
-                stream,
-                on_buffered,
-                metrics,
-                reservation,
-                descending,
-            ))
+            crate::attempt_tasks::spawn_producer(
+                scope.as_ref(),
+                partition_extreme(stream, on_buffered, metrics, reservation, descending),
+                crate::attempt_tasks::stopped_error,
+            )
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     // The tasks run concurrently; this only collects them. Awaiting in order is fine, and a
     // failure propagates after the rest have been joined, since `SpawnedTask` aborts on drop.
