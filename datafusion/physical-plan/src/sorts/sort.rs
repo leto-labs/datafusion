@@ -315,6 +315,11 @@ struct ExternalSorter {
     sort_concurrency: Arc<OnceLock<SortConcurrency>>,
 }
 
+enum SortBatchReservation {
+    InMemory,
+    Spill(MemoryReservation),
+}
+
 impl ExternalSorter {
     // TODO: make a builder or some other nicer API to avoid the
     // clippy warning
@@ -394,10 +399,15 @@ impl ExternalSorter {
         }
 
         self.reserve_memory_for_merge()?;
-        self.reserve_memory_for_batch_and_maybe_spill(&input)
-            .await?;
-
-        self.in_mem_batches.push(input);
+        match self
+            .reserve_memory_for_batch_and_maybe_spill(&input)
+            .await?
+        {
+            SortBatchReservation::InMemory => self.in_mem_batches.push(input),
+            SortBatchReservation::Spill(reservation) => {
+                self.sort_and_spill_batch(input, reservation).await?;
+            }
+        }
         Ok(())
     }
 
@@ -1118,17 +1128,17 @@ impl ExternalSorter {
     async fn reserve_memory_for_batch_and_maybe_spill(
         &mut self,
         input: &RecordBatch,
-    ) -> Result<()> {
+    ) -> Result<SortBatchReservation> {
         let size = get_reserved_bytes_for_next_record_batch(
             input,
             self.in_mem_batches_counter.as_mut(),
         )?;
 
         match self.reservation.try_grow(size) {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(SortBatchReservation::InMemory),
             Err(e) => {
                 if self.in_mem_batches.is_empty() {
-                    return Err(Self::err_with_oom_context(e));
+                    return self.reserve_for_immediate_spill(size, e);
                 }
 
                 // Spill and try again. Nothing is buffered after the spill, so
@@ -1138,11 +1148,87 @@ impl ExternalSorter {
                     input,
                     self.in_mem_batches_counter.as_mut(),
                 )?;
-                self.reservation
-                    .try_grow(size)
-                    .map_err(Self::err_with_oom_context)
+                match self.reservation.try_grow(size) {
+                    Ok(_) => Ok(SortBatchReservation::InMemory),
+                    Err(error) => self.reserve_for_immediate_spill(size, error),
+                }
             }
         }
+    }
+
+    /// An empty sorter cannot free another consumer's spillable loan. Charge
+    /// only this batch's sorting footprint as transient unspillable work, then
+    /// spill it immediately. The ordinary merge reservation stays charged, and
+    /// the pool's fallible admission still enforces the aggregate byte cap.
+    fn reserve_for_immediate_spill(
+        &mut self,
+        size: usize,
+        error: DataFusionError,
+    ) -> Result<SortBatchReservation> {
+        // A failed admission counted the input, but immediate spill retains no
+        // buffered batch. The next insertion must start a fresh buffer count.
+        self.in_mem_batches_counter = self.new_buffered_batches_counter();
+        if !self.runtime.disk_manager.tmp_files_enabled()
+            || !matches!(error.find_root(), DataFusionError::ResourcesExhausted(_))
+        {
+            return Err(Self::err_with_oom_context(error));
+        }
+        let reservation =
+            MemoryConsumer::new(format!("{}Spill", self.reservation.consumer().name()))
+                .register(&self.runtime.memory_pool);
+        reservation
+            .try_grow(size)
+            .map_err(Self::err_with_oom_context)?;
+        Ok(SortBatchReservation::Spill(reservation))
+    }
+
+    /// Persist a transient batch through the same async spill/merge path.
+    async fn sort_and_spill_batch(
+        &mut self,
+        input: RecordBatch,
+        reservation: MemoryReservation,
+    ) -> Result<()> {
+        let mut sorted = self.sort_batch_stream(input, reservation, None)?;
+        let mut file = self.spill_manager.create_in_progress_file("Sorting")?;
+        let mut max_record_batch_memory = 0;
+        let result: Result<_> = async {
+            while let Some(batch) = sorted.try_next().await? {
+                // Pulling a chunk transfers its reservation to the consumer.
+                // Match the buffered spill loop: keep that materialized chunk
+                // charged across async I/O, borrowing idle merge credit first.
+                let size = get_record_batch_memory_size(&batch);
+                let chunk = self.reservation.new_empty();
+                let workspace = match chunk.try_grow(size) {
+                    Ok(()) => None,
+                    Err(_) => {
+                        let workspace = self.merge_pool.borrow(size);
+                        // The allocation already exists, so account for it even
+                        // if the pool cannot grant a fresh fallible admission.
+                        chunk.grow(size - workspace.size());
+                        Some(workspace)
+                    }
+                };
+                let written = file.append_batch_async(&batch).await;
+                drop(batch);
+                drop(chunk);
+                drop(workspace);
+                max_record_batch_memory = max_record_batch_memory.max(written?);
+            }
+            file.finish_async().await
+        }
+        .await;
+        if result.is_err()
+            && let Err(error) = file.abort_async().await
+        {
+            debug!("Failed to abort immediate sort spill: {error}");
+        }
+        if let Some(file) = result? {
+            self.finished_spill_files.push(SortedSpillFile {
+                file,
+                max_record_batch_memory,
+            });
+        }
+        Ok(())
     }
 
     /// Wraps the error with a context message suggesting settings to tweak.
@@ -4516,6 +4602,7 @@ mod tests {
     #[tokio::test]
     async fn test_spill_reservation_held_during_async_write(
         #[case] workspace_bytes: usize,
+        #[values(false, true)] immediate: bool,
     ) -> Result<()> {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(0));
         let write_started = Arc::new(Notify::new());
@@ -4556,11 +4643,23 @@ mod tests {
         sorter.merge_reservation.grow(workspace_bytes);
         sorter.merge_pool.retain(workspace_bytes);
         let merge_pool = Arc::clone(&sorter.merge_pool);
-        sorter.in_mem_batches.push(batch);
+        let input_reservation = if immediate {
+            Some(sorter.reservation.take())
+        } else {
+            None
+        };
+        if !immediate {
+            sorter.in_mem_batches.push(batch.clone());
+        }
 
         #[expect(clippy::disallowed_methods)] // spawn allowed only in tests
-        let task =
-            tokio::spawn(async move { sorter.sort_and_spill_in_mem_batches().await });
+        let task = tokio::spawn(async move {
+            if let Some(reservation) = input_reservation {
+                sorter.sort_and_spill_batch(batch, reservation).await
+            } else {
+                sorter.sort_and_spill_in_mem_batches().await
+            }
+        });
 
         if tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -4578,7 +4677,7 @@ mod tests {
         assert_eq!(merge_pool.reserved(), workspace_bytes);
         assert_eq!(
             pool.reserved(),
-            reserved_bytes,
+            reserved_bytes + if immediate { workspace_bytes } else { 0 },
             "resident batches must remain accounted for while an async spill is pending"
         );
 

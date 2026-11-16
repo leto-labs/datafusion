@@ -1202,3 +1202,124 @@ async fn test_single_batch_spill_returns_live_workspace_loan_on_drop() -> Result
     assert_released(&pool, &runtime).await;
     Ok(())
 }
+
+#[tokio::test]
+async fn test_empty_sorter_immediately_spills_under_fair_share_pressure() -> Result<()> {
+    use datafusion_execution::memory_pool::FairSpillPool;
+    let batch = RecordBatch::try_from_iter([(
+        "key",
+        Arc::new(Int64Array::from_iter_values((0..4096).rev())) as ArrayRef,
+    )])?;
+    let bytes = get_reserved_bytes_for_record_batch(&batch)?;
+    let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(MERGE_BYTES + 3 * bytes));
+    let other = MemoryConsumer::new("other")
+        .with_can_spill(true)
+        .register(&pool);
+    other.try_grow(bytes)?;
+    let idle: Vec<_> = (0..3)
+        .map(|i| {
+            MemoryConsumer::new(format!("idle{i}"))
+                .with_can_spill(true)
+                .register(&pool)
+        })
+        .collect();
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .build_arc()?;
+    let ordering: LexOrdering = [PhysicalSortExpr::new_default(Arc::new(Column::new(
+        "key", 0,
+    )))]
+    .into();
+    let mut sorter = ExternalSorter::new(
+        0,
+        batch.schema(),
+        ordering.clone(),
+        1024,
+        MERGE_BYTES,
+        0,
+        SpillCompression::Uncompressed,
+        &ExecutionPlanMetricsSet::new(),
+        Arc::clone(&runtime),
+    )?;
+    for _ in 0..2 {
+        sorter.insert_batch(batch.clone()).await?;
+        assert!(sorter.in_mem_batches.is_empty());
+        assert_eq!(sorter.reservation.size(), 0);
+    }
+    assert_eq!(sorter.finished_spill_files.len(), 2);
+    drop(idle);
+    drop(other);
+    let output: Vec<RecordBatch> = sorter.sort().await?.try_collect().await?;
+    assert_eq!(
+        concat_batches(&batch.schema(), &output)?,
+        sort_batch(
+            &concat_batches(&batch.schema(), &[batch.clone(), batch])?,
+            &ordering,
+            None
+        )?
+    );
+    drop(sorter);
+    assert_eq!(pool.reserved(), 0);
+    assert_eq!(runtime.disk_manager.used_disk_space(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_immediate_sort_spill_respects_aggregate_cap_and_disabled_disk() -> Result<()>
+{
+    use datafusion_execution::memory_pool::FairSpillPool;
+    let batch = RecordBatch::try_from_iter([(
+        "key",
+        Arc::new(Int64Array::from_iter_values((0..4096).rev())) as ArrayRef,
+    )])?;
+    let bytes = get_reserved_bytes_for_record_batch(&batch)?;
+    for enabled in [true, false] {
+        let capacity = if enabled {
+            MERGE_BYTES + bytes - 1
+        } else {
+            3 * bytes
+        };
+        let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(capacity));
+        let idle: Vec<_> = (0..3)
+            .map(|i| {
+                MemoryConsumer::new(format!("idle{i}"))
+                    .with_can_spill(true)
+                    .register(&pool)
+            })
+            .collect();
+        let mut runtime = RuntimeEnvBuilder::new().with_memory_pool(Arc::clone(&pool));
+        if !enabled {
+            runtime = runtime.with_disk_manager_builder(
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+            );
+        }
+        let runtime = runtime.build_arc()?;
+        let ordering: LexOrdering = [PhysicalSortExpr::new_default(Arc::new(
+            Column::new("key", 0),
+        ))]
+        .into();
+        let mut sorter = ExternalSorter::new(
+            0,
+            batch.schema(),
+            ordering,
+            1024,
+            MERGE_BYTES,
+            0,
+            SpillCompression::Uncompressed,
+            &ExecutionPlanMetricsSet::new(),
+            Arc::clone(&runtime),
+        )?;
+        let error = sorter.insert_batch(batch.clone()).await.unwrap_err();
+        assert!(matches!(
+            error.find_root(),
+            DataFusionError::ResourcesExhausted(_)
+        ));
+        assert_eq!(pool.reserved(), if enabled { MERGE_BYTES } else { 0 });
+        assert!(sorter.finished_spill_files.is_empty());
+        drop(sorter);
+        drop(idle);
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(runtime.disk_manager.used_disk_space(), 0);
+    }
+    Ok(())
+}
