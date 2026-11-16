@@ -96,6 +96,10 @@ use super::partitioned_hash_eval::SeededRandomState;
 
 mod prepared;
 pub use prepared::PreparedHashJoinBuild;
+mod shared_build;
+#[cfg(test)]
+mod shared_build_tests;
+use shared_build::{BuildPath, ParallelBuild};
 
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
 pub(crate) const HASH_JOIN_SEED: SeededRandomState =
@@ -1731,6 +1735,7 @@ impl ExecutionPlan for HashJoinExec {
                     not_in,
                     array_map_created_count,
                     BuildMode::Ordinary,
+                    ParallelBuild::from_task(&context, &self.metrics, partition),
                 ))
             })?,
             (None, PartitionMode::Partitioned) => {
@@ -1753,6 +1758,7 @@ impl ExecutionPlan for HashJoinExec {
                     not_in,
                     array_map_created_count,
                     BuildMode::Ordinary,
+                    None,
                 ))
             }
             (None, PartitionMode::Auto) => {
@@ -3075,6 +3081,7 @@ async fn collect_left_input(
     not_in: Option<NotIn>,
     array_map_created_count: Count,
     mode: BuildMode,
+    parallel: Option<ParallelBuild>,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
     let prepared = mode == BuildMode::Prepared;
@@ -3118,7 +3125,7 @@ async fn collect_left_input(
 
     // Bind the reservation first so error paths release allocations before their charge.
     let BuildSideState {
-        reservation,
+        mut reservation,
         mut batches,
         num_rows,
         metrics,
@@ -3148,6 +3155,28 @@ async fn collect_left_input(
         _ => None,
     };
 
+    // Longbow family H: a CollectLeft build of at least
+    // `longbow.execution.parallel_hash_build_rows` rows builds one sharded
+    // table in parallel and consolidates `batches` itself (see
+    // `shared_build.rs`); the rest of the build below is shared.
+    let path = match &parallel {
+        Some(parallel) if !prepared => parallel
+            .build_consolidated(
+                &mut batches,
+                num_rows,
+                input_bytes,
+                &schema,
+                &on_left,
+                &random_state,
+                null_equality,
+                &mut reservation,
+                &metrics,
+            )
+            .await?
+            .map_or(BuildPath::Native, BuildPath::Prebuilt),
+        _ => BuildPath::Native,
+    };
+
     build_in_memory(
         &random_state,
         &schema,
@@ -3168,6 +3197,7 @@ async fn collect_left_input(
         not_in,
         &array_map_created_count,
         prepared,
+        path,
     )
 }
 
@@ -3199,20 +3229,26 @@ fn build_in_memory(
     not_in: Option<NotIn>,
     array_map_created_count: &Count,
     prepared: bool,
+    path: BuildPath,
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
 
-    let (join_hash_map, batch, left_values) = if let Some((min_val, max_val)) =
-        array_map_key_range(
-            bounds.as_ref(),
-            schema,
-            batches,
-            on_left,
-            &mut reservation,
-            config.execution.perfect_hash_join_small_build_threshold,
-            config.execution.perfect_hash_join_min_key_density,
-            null_equality,
-        )? {
+    let (join_hash_map, batch, left_values) = if let BuildPath::Prebuilt(hashmap) = path {
+        // Longbow family H: `batches` holds the consolidated batch of the
+        // parallel build, whose rows the sharded map indexes.
+        let batch = batches[0].clone();
+        let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+        (Map::HashMap(hashmap), batch, left_values)
+    } else if let Some((min_val, max_val)) = array_map_key_range(
+        bounds.as_ref(),
+        schema,
+        batches,
+        on_left,
+        &mut reservation,
+        config.execution.perfect_hash_join_small_build_threshold,
+        config.execution.perfect_hash_join_min_key_density,
+        null_equality,
+    )? {
         let batch = if prepared {
             concat_batches(schema, batches.iter())?
         } else {
@@ -4292,6 +4328,7 @@ mod tests {
             None,
             Count::new(),
             BuildMode::Ordinary,
+            None,
         )
         .await?;
         Ok((left_data, metrics))
