@@ -50,6 +50,29 @@ use sqlparser::dialect::{
 };
 use sqlparser::parser::Parser;
 
+#[test]
+fn null_safe_conjunction_precedence_matches_grouped_plan() {
+    for comparison in ["IS DISTINCT FROM", "IS NOT DISTINCT FROM"] {
+        for boolean in ["AND", "OR"] {
+            let ungrouped = format!(
+                "SELECT * FROM (VALUES (1, 2), (NULL, NULL)) AS t(a, b) \
+                 WHERE a {comparison} b {boolean} a {comparison} 1"
+            );
+            let grouped = format!(
+                "SELECT * FROM (VALUES (1, 2), (NULL, NULL)) AS t(a, b) \
+                 WHERE (a {comparison} b) {boolean} (a {comparison} 1)"
+            );
+            let actual = logical_plan(&ungrouped).unwrap();
+            let expected = logical_plan(&grouped).unwrap();
+            assert_eq!(
+                actual.display_indent_schema().to_string(),
+                expected.display_indent_schema().to_string(),
+                "{ungrouped}",
+            );
+        }
+    }
+}
+
 mod cases;
 mod common;
 

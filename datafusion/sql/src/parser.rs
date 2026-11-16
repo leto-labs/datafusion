@@ -2503,6 +2503,37 @@ mod tests {
     }
 
     #[test]
+    fn null_safe_conjunction_precedence() {
+        use sqlparser::ast::{BinaryOperator, Expr};
+
+        for comparison in ["IS DISTINCT FROM", "IS NOT DISTINCT FROM"] {
+            for (boolean, expected) in
+                [("AND", BinaryOperator::And), ("OR", BinaryOperator::Or)]
+            {
+                let sql = format!("a {comparison} b {boolean} c {comparison} d");
+                let expr = DFParser::parse_sql_into_expr(&sql).unwrap().expr;
+                let Expr::BinaryOp { left, op, right } = expr else {
+                    panic!("boolean operator must be the root: {sql}: {expr:?}");
+                };
+                assert_eq!(op, expected);
+                assert!(matches!(
+                    *left,
+                    Expr::IsDistinctFrom(_, _) | Expr::IsNotDistinctFrom(_, _)
+                ));
+                assert!(matches!(
+                    *right,
+                    Expr::IsDistinctFrom(_, _) | Expr::IsNotDistinctFrom(_, _)
+                ));
+            }
+        }
+        // Explicit parentheses still allow a boolean-valued right operand.
+        let expr = DFParser::parse_sql_into_expr("a IS NOT DISTINCT FROM (b AND c)")
+            .unwrap()
+            .expr;
+        assert!(matches!(expr, Expr::IsNotDistinctFrom(_, _)));
+    }
+
+    #[test]
     fn literal() {
         expect_parse_expr_ok(
             "1234",
