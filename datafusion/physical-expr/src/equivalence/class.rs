@@ -813,9 +813,6 @@ impl EquivalenceGroup {
         {
             return cls.constant.clone();
         }
-        // TODO: This function should be able to return values of non-literal
-        //       complex constants as well; e.g. it should return `8` for the
-        //       expression `3 + 5`, not an unknown `heterogenous` value.
         // A volatile expression can change from row to row, even when all of
         // its inputs are constant
         if expr.is_volatile_node() {
@@ -832,10 +829,15 @@ impl EquivalenceGroup {
                 .is_ok_and(|props| props.sort_properties == SortProperties::Singleton);
             return singleton.then_some(AcrossPartitions::Uniform(None));
         }
+        // A deterministic expression of uniform constants is itself uniform,
+        // even when its value is not known until evaluation.
+        let mut scope = AcrossPartitions::Uniform(None);
         for child in children {
-            self.is_expr_constant(child)?;
+            if self.is_expr_constant(child)? == AcrossPartitions::Heterogeneous {
+                scope = AcrossPartitions::Heterogeneous;
+            }
         }
-        Some(AcrossPartitions::Heterogeneous)
+        Some(scope)
     }
 
     /// Returns the equivalence class containing `expr`. If no equivalence class
@@ -1020,6 +1022,143 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
     use datafusion_expr::Operator;
+
+    #[test]
+    fn deterministic_constant_scope_survives_projection() -> Result<()> {
+        use crate::expressions::CastExpr;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, true)]));
+        let k = col("k", &schema)?;
+        let cast = Arc::new(CastExpr::new_with_target_field(
+            Arc::clone(&k),
+            Arc::new(Field::new("k", DataType::Int64, true)),
+            None,
+        )) as Arc<dyn PhysicalExpr>;
+        for scope in [
+            AcrossPartitions::Uniform(Some(ScalarValue::Int32(Some(3)))),
+            AcrossPartitions::Uniform(None),
+            AcrossPartitions::Heterogeneous,
+        ] {
+            let mut group = EquivalenceGroup::default();
+            group.add_constant(ConstExpr::new(Arc::clone(&k), scope.clone()));
+            let expected = match scope {
+                AcrossPartitions::Uniform(_) => AcrossPartitions::Uniform(None),
+                AcrossPartitions::Heterogeneous => AcrossPartitions::Heterogeneous,
+            };
+            assert_eq!(group.is_expr_constant(&cast), Some(expected));
+        }
+        assert_eq!(EquivalenceGroup::default().is_expr_constant(&cast), None);
+        Ok(())
+    }
+
+    #[test]
+    fn derived_constant_scope_checks_every_input() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let a = col("a", &schema)?;
+        let b = col("b", &schema)?;
+        let sum = binary(Arc::clone(&a), Operator::Plus, Arc::clone(&b), &schema)?;
+        let scopes = [
+            None,
+            Some(AcrossPartitions::Uniform(None)),
+            Some(AcrossPartitions::Heterogeneous),
+        ];
+        for left in &scopes {
+            for right in &scopes {
+                let mut group = EquivalenceGroup::default();
+                for (expr, scope) in [(&a, left), (&b, right)] {
+                    if let Some(scope) = scope {
+                        group.add_constant(ConstExpr::new(
+                            Arc::clone(expr),
+                            scope.clone(),
+                        ));
+                    }
+                }
+                let expected = match (left, right) {
+                    (
+                        Some(AcrossPartitions::Uniform(_)),
+                        Some(AcrossPartitions::Uniform(_)),
+                    ) => Some(AcrossPartitions::Uniform(None)),
+                    (Some(_), Some(_)) => Some(AcrossPartitions::Heterogeneous),
+                    _ => None,
+                };
+                assert_eq!(group.is_expr_constant(&sum), expected);
+                let mapping = ProjectionMapping::from_iter([(
+                    Arc::clone(&sum),
+                    vec![(Arc::new(Column::new("sum", 0)) as Arc<dyn PhysicalExpr>, 0)]
+                        .into(),
+                )]);
+                assert_eq!(
+                    group.project(&mapping).is_expr_constant(
+                        &(Arc::new(Column::new("sum", 0)) as Arc<dyn PhysicalExpr>)
+                    ),
+                    expected
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn volatile_constant_inputs_do_not_make_a_uniform_constant() -> Result<()> {
+        use crate::ScalarFunctionExpr;
+        use datafusion_common::config::ConfigOptions;
+        use datafusion_expr::{ColumnarValue, Volatility, create_udf};
+        let schema = Schema::empty();
+        for volatility in [
+            Volatility::Immutable,
+            Volatility::Stable,
+            Volatility::Volatile,
+        ] {
+            let udf = Arc::new(create_udf(
+                "identity",
+                vec![DataType::Int32],
+                DataType::Int32,
+                volatility,
+                Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+            ));
+            let expr = Arc::new(ScalarFunctionExpr::try_new(
+                udf,
+                vec![lit(3i32)],
+                &schema,
+                Arc::new(ConfigOptions::new()),
+            )?) as Arc<dyn PhysicalExpr>;
+            let expected = (volatility != Volatility::Volatile)
+                .then_some(AcrossPartitions::Uniform(None));
+            assert_eq!(
+                EquivalenceGroup::default().is_expr_constant(&expr),
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_uniform_constants_do_not_imply_equal_partition_keys() -> Result<()> {
+        use crate::{Distribution, Partitioning};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, false),
+            Field::new("y", DataType::Utf8, false),
+        ]));
+        let x = col("x", &schema)?;
+        let y = col("y", &schema)?;
+        let mut props = crate::EquivalenceProperties::new(schema);
+        props.add_constants([
+            ConstExpr::new(Arc::clone(&x), AcrossPartitions::Uniform(None)),
+            ConstExpr::new(Arc::clone(&y), AcrossPartitions::Uniform(None)),
+        ])?;
+        assert_ne!(
+            props.eq_group().normalize_expr(Arc::clone(&x)).as_ref(),
+            props.eq_group().normalize_expr(Arc::clone(&y)).as_ref()
+        );
+        assert!(
+            !Partitioning::Hash(vec![x], 8)
+                .satisfaction(&Distribution::KeyPartitioned(vec![y]), &props, false,)
+                .is_satisfied()
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_bridge_groups() -> Result<()> {
@@ -1628,7 +1767,7 @@ mod tests {
         let stable = call(Volatility::Stable, subquery)?;
         assert_eq!(
             group.is_expr_constant(&stable),
-            Some(AcrossPartitions::Heterogeneous)
+            Some(AcrossPartitions::Uniform(None))
         );
 
         Ok(())

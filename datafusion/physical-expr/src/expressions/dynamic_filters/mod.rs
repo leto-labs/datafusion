@@ -13,7 +13,7 @@ use arrow::datatypes::{DataType, Schema};
 use datafusion_common::internal_datafusion_err;
 use datafusion_common::{
     Result, internal_err,
-    tree_node::{Transformed, TransformedResult, TreeNode},
+    tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
 };
 
 use crate::expressions::lit;
@@ -68,7 +68,7 @@ pub struct DynamicFilterPhysicalExpr {
     /// when the inner generation hasn't changed (common — updates fire once
     /// per HashJoin build or once per TopK threshold refresh, but `evaluate`
     /// is called per batch), the cache serves the remapped expression
-    /// without re-running the `transform_up` tree walk in
+    /// without re-running the `transform_down` tree walk in
     /// [`Self::remap_children`]. Invalidated by the generation bump in
     /// `update()` or `update_from()`, and populated with `None` on
     /// `with_new_children` (each derived filter owns its own cache).
@@ -234,7 +234,9 @@ impl DynamicFilterPhysicalExpr {
         if let Some(remapped_children) = remapped_children {
             // Remap the children to the new children
             // of the expression.
-            expr.transform_up(|child| {
+            // Match complete keys before descendants. Replacements already use
+            // the destination schema, so do not traverse them again.
+            expr.transform_down(|child| {
                 // Check if this is any of our original children
                 if let Some(pos) =
                     children.iter().position(|c| c.as_ref() == child.as_ref())
@@ -242,7 +244,7 @@ impl DynamicFilterPhysicalExpr {
                     // If so, remap it to the current children
                     // of the expression.
                     let new_child = Arc::clone(&remapped_children[pos]);
-                    Ok(Transformed::yes(new_child))
+                    Ok(Transformed::new(new_child, true, TreeNodeRecursion::Jump))
                 } else {
                     // Otherwise, just return the expression
                     Ok(Transformed::no(child))
@@ -313,6 +315,11 @@ impl DynamicFilterPhysicalExpr {
     /// This should be called e.g.:
     /// - When we've computed the probe side's hash table in a HashJoinExec
     /// - After every batch is processed if we update the TopK heap in a SortExec using a TopK approach.
+    ///
+    /// Prefer publishing through the original producer. On a derived handle,
+    /// this method remaps before publication and `current()` remaps again, so
+    /// that mapping must be idempotent. Non-idempotent mappings must publish
+    /// through the original producer instead.
     pub fn update(&self, new_expr: Arc<dyn PhysicalExpr>) -> Result<()> {
         // Remap the children of the new expression to match the original children
         // We still do this again in `current()` but doing it preventively here
@@ -886,6 +893,45 @@ mod test {
     use datafusion_expr::Operator;
 
     use super::*;
+
+    #[test]
+    fn remap_overlapping_keys_atomically() -> Result<()> {
+        use datafusion_expr::Operator;
+        let a =
+            Arc::new(crate::expressions::Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let b =
+            Arc::new(crate::expressions::Column::new("b", 1)) as Arc<dyn PhysicalExpr>;
+        let sum = Arc::new(BinaryExpr::new(
+            Arc::clone(&a),
+            Operator::Plus,
+            Arc::clone(&b),
+        )) as Arc<dyn PhysicalExpr>;
+        let new_a =
+            Arc::new(crate::expressions::Column::new("a", 2)) as Arc<dyn PhysicalExpr>;
+        let new_b =
+            Arc::new(crate::expressions::Column::new("b", 3)) as Arc<dyn PhysicalExpr>;
+        let new_sum = Arc::new(BinaryExpr::new(new_a, Operator::Plus, Arc::clone(&new_b)))
+            as Arc<dyn PhysicalExpr>;
+        let predicate = Arc::new(BinaryExpr::new(Arc::clone(&sum), Operator::Lt, lit(10)))
+            as Arc<dyn PhysicalExpr>;
+        let actual = DynamicFilterPhysicalExpr::remap_children(
+            &[sum, b],
+            Some(&vec![Arc::clone(&new_sum), new_b]),
+            predicate,
+        )?;
+        let expected = Arc::new(BinaryExpr::new(new_sum, Operator::Lt, lit(10)))
+            as Arc<dyn PhysicalExpr>;
+        assert_eq!(actual.as_ref(), expected.as_ref());
+
+        // A replacement can itself equal another original key. Never rewrite it twice.
+        let actual = DynamicFilterPhysicalExpr::remap_children(
+            &[Arc::clone(&a), Arc::clone(&expected)],
+            Some(&vec![Arc::clone(&expected), lit(99)]),
+            Arc::clone(&a),
+        )?;
+        assert_eq!(actual.as_ref(), expected.as_ref());
+        Ok(())
+    }
 
     #[test]
     fn test_remap_children() {
