@@ -23,6 +23,26 @@ consumer's vendor tree. Longbow runs native regressions through a generated
 standalone harness with its pinned graph and Arrow patches. A standalone
 upstream-workspace build does not provide those Arrow extensions.
 
+## Family PWK: partial window Top-K before the partition-key exchange
+
+Purpose: let `PartitionedTopKExec` run on every input partition before the
+exchange on the window partition keys, so that few window partitions do not
+leave most cores without work. Dependent Longbow feature: WINDOW-TOPK.
+Audit classification: UPSTREAMABLE.
+
+`PartitionedTopKMode::Partial` requires no input distribution and declares no
+output order; `Final` is the operator as it was. A row with rank at most K in
+its window partition has rank at most K in any subset of it, so the partial
+heap removes only rows that the final heap, the window and its filter would
+remove. A partial partition that retains more than one row in four after
+65,536 input rows (many window partitions, or many boundary peers) emits its
+heaps and passes the rest of its input through; the check repeats at each
+doubling. The display names the mode only when it is partial. Native tests
+compare partial-then-final with final alone for RANK and ROW_NUMBER, with
+NULL keys, boundary peers and pass-through, and check the properties, metrics
+and released memory. The Longbow consumer places the partial operator and
+carries the mode in its stage codec.
+
 ## Family PSN: retain positional key partitions during sort pushdown
 
 Purpose: keep the key input of Longbow's `PositionalFetchExec` local while

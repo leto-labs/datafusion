@@ -250,6 +250,11 @@ impl RowNumberTopK {
         Ok(())
     }
 
+    /// Rows that `emit` would return now.
+    pub(crate) fn retained_rows(&self) -> usize {
+        self.rows
+    }
+
     pub(crate) fn emit(mut self) -> Result<SendableRecordBatchStream> {
         self.batch_size = self.batch_size.min(self.rows.max(1));
         let extra = add(

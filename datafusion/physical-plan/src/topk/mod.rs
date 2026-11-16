@@ -1699,6 +1699,21 @@ impl PartitionedTopKRank {
         rank_emit::emit(self)
     }
 
+    /// Rows that `emit` would return now: every heap row and boundary peer.
+    pub(crate) fn retained_rows(&self) -> usize {
+        self.states
+            .values()
+            .map(|state| {
+                state.heap.inner.len()
+                    + state
+                        .ties
+                        .iter()
+                        .map(|tie| tie.row_indices.len())
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
     /// Total memory currently held, including the unique allocation union.
     fn size(&self) -> usize {
         self.metadata_size() + self.array_bytes
