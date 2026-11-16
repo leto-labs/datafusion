@@ -27,6 +27,7 @@ use arrow::row::SortField;
 use datafusion_common::Result;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::MemoryLimit;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::equivalence::EquivalenceProperties;
@@ -36,7 +37,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 
 use crate::execution_plan::{Boundedness, EmissionType};
-use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use crate::topk::{
     PartitionedTopK, PartitionedTopKDenseRank, PartitionedTopKRank, build_sort_fields,
     partitioned_topk_output_schema,
@@ -68,6 +69,50 @@ pub enum WindowFnKind {
     /// distinct-smallest ob values seen in the partition.
     DenseRank,
 }
+
+/// Where a [`PartitionedTopKExec`] runs relative to the exchange that brings
+/// the rows of one window partition together.
+///
+/// A row with global rank at most K also has rank at most K among any subset
+/// of its window partition, so the same heap is a safe filter on every input
+/// partition before the exchange. The consumer keeps the final operator, the
+/// window and its filter above the exchange; the partial operator only removes
+/// rows that can never pass them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PartitionedTopKMode {
+    /// Every row of a window partition is in one input partition. The output
+    /// is ordered by `(partition_keys, order_keys)`.
+    #[default]
+    Final,
+    /// Any input distribution. The output is a superset of the rows that the
+    /// final operator keeps, in no declared order. When the input does not
+    /// reduce (see [`PARTIAL_MIN_REDUCTION`]), or the heaps would take too much
+    /// of a bounded pool (see [`PARTIAL_POOL_SHARE`] and
+    /// [`PARTIAL_POOL_HEADROOM`]), the operator emits what it holds and passes
+    /// the remaining input through unchanged.
+    Partial,
+}
+
+/// Input rows of one partial operator partition between two reduction checks,
+/// and before the first one.
+pub const PARTIAL_PROBE_ROWS: usize = 1 << 16;
+
+/// A partial operator keeps reducing only while it retains at most one row in
+/// this many input rows.
+pub const PARTIAL_MIN_REDUCTION: usize = 4;
+
+/// The partial partitions of one operator together reserve at most one part in
+/// this many of a bounded memory pool. The final operator holds its heaps at
+/// the same time and neither spills, so the partial heaps must stay a small
+/// part of what the plan may use. Checked after every input batch.
+pub const PARTIAL_POOL_SHARE: usize = 4;
+
+/// A partial partition stops reducing when less than one part in this many of
+/// a bounded memory pool is free: the heaps are an optimization, and must not
+/// take the memory that another operator of the plan needs. Checked before
+/// every input batch, so that a refused reservation cannot fail the query in
+/// the middle of a batch.
+pub const PARTIAL_POOL_HEADROOM: usize = 8;
 
 /// Per-partition Top-K operator for window function queries.
 ///
@@ -196,6 +241,8 @@ pub struct PartitionedTopKExec {
     /// Which window function this operator is optimizing. Selects the
     /// per-partition retention policy (see [`WindowFnKind`]).
     fn_kind: WindowFnKind,
+    /// Whether this operator runs before or after the partition-key exchange.
+    mode: PartitionedTopKMode,
     /// When set, the operator appends this column to its output, holding each
     /// retained row's value for [`Self::fn_kind`]'s ranking function.
     ///
@@ -248,18 +295,65 @@ impl PartitionedTopKExec {
         fetch: usize,
         fn_kind: WindowFnKind,
     ) -> Result<Self> {
-        let cache =
-            Self::compute_properties(&input, expr.clone(), partition_prefix_len, None)?;
+        Self::try_new_with_mode(
+            input,
+            expr,
+            partition_prefix_len,
+            fetch,
+            fn_kind,
+            PartitionedTopKMode::Final,
+        )
+    }
+
+    /// Create an operator before or after the partition-key exchange.
+    pub fn try_new_with_mode(
+        input: Arc<dyn ExecutionPlan>,
+        expr: LexOrdering,
+        partition_prefix_len: usize,
+        fetch: usize,
+        fn_kind: WindowFnKind,
+        mode: PartitionedTopKMode,
+    ) -> Result<Self> {
+        if fetch == 0 || partition_prefix_len >= expr.len() {
+            return datafusion_common::plan_err!(
+                "Top-K requires positive K and a valid ordering suffix"
+            );
+        }
+        let cache = Self::compute_properties(
+            &input,
+            expr.clone(),
+            partition_prefix_len,
+            None,
+            mode,
+        )?;
         Ok(Self {
             input,
             expr,
             partition_prefix_len,
             fetch,
             fn_kind,
+            mode,
             ranking_field: None,
             metrics_set: ExecutionPlanMetricsSet::new(),
             cache: Arc::new(cache),
         })
+    }
+
+    /// Build the corresponding partial filter over `input`, without a ranking column.
+    pub fn partial(&self, input: Arc<dyn ExecutionPlan>) -> Result<Self> {
+        Self::try_new_with_mode(
+            input,
+            self.expr.clone(),
+            self.partition_prefix_len,
+            self.fetch,
+            self.fn_kind,
+            PartitionedTopKMode::Partial,
+        )
+    }
+
+    /// Whether this operator runs before or after the partition-key exchange.
+    pub fn mode(&self) -> PartitionedTopKMode {
+        self.mode
     }
 
     /// Append `field` to the output, holding each retained row's value for
@@ -269,11 +363,17 @@ impl PartitionedTopKExec {
     /// The output schema widens by that one column, so the plan properties
     /// are recomputed under it.
     pub fn with_ranking_field(self, field: FieldRef) -> Result<Self> {
+        if self.mode == PartitionedTopKMode::Partial {
+            return datafusion_common::plan_err!(
+                "Partial Top-K cannot emit a ranking column"
+            );
+        }
         let cache = Self::compute_properties(
             &self.input,
             self.expr.clone(),
             self.partition_prefix_len,
             Some(&field),
+            self.mode,
         )?;
         Ok(Self {
             ranking_field: Some(field),
@@ -332,6 +432,7 @@ impl PartitionedTopKExec {
         sort_exprs: LexOrdering,
         partition_prefix_len: usize,
         ranking_field: Option<&FieldRef>,
+        mode: PartitionedTopKMode,
     ) -> Result<PlanProperties> {
         // With a ranking column appended the output schema is wider than
         // the input's, so the input's properties have to be re-hung under the
@@ -346,6 +447,15 @@ impl PartitionedTopKExec {
                     .extend(input.equivalence_properties().clone())?
             }
         };
+        if mode == PartitionedTopKMode::Partial {
+            eq_properties.clear_orderings();
+            return Ok(PlanProperties::new(
+                eq_properties,
+                input.output_partitioning().clone(),
+                EmissionType::Both,
+                Boundedness::Bounded,
+            ));
+        }
         let partition_exprs = sort_exprs[..partition_prefix_len].to_vec();
         eq_properties.reorder(sort_exprs)?;
 
@@ -403,6 +513,9 @@ impl DisplayAs for PartitionedTopKExec {
                     partition_exprs.join(", "),
                     order_exprs.join(", "),
                 )?;
+                if self.mode == PartitionedTopKMode::Partial {
+                    write!(f, ", mode=Partial")?;
+                }
                 if let Some(field) = &self.ranking_field {
                     write!(f, ", emit=[{}]", field.name())?;
                 }
@@ -412,6 +525,9 @@ impl DisplayAs for PartitionedTopKExec {
                 writeln!(f, "fetch={}", self.fetch)?;
                 writeln!(f, "partition=[{}]", partition_exprs.join(", "))?;
                 writeln!(f, "order=[{}]", order_exprs.join(", "))?;
+                if self.mode == PartitionedTopKMode::Partial {
+                    writeln!(f, "mode=Partial")?;
+                }
                 if let Some(field) = &self.ranking_field {
                     writeln!(f, "emit=[{}]", field.name())?;
                 }
@@ -435,14 +551,21 @@ impl ExecutionPlan for PartitionedTopKExec {
     }
 
     fn input_distribution_requirements(&self) -> crate::InputDistributionRequirements {
+        if self.mode == PartitionedTopKMode::Partial {
+            return crate::InputDistributionRequirements::new(vec![
+                Distribution::UnspecifiedDistribution,
+            ]);
+        }
         let partition_exprs: Vec<Arc<dyn PhysicalExpr>> = self.expr
             [..self.partition_prefix_len]
             .iter()
             .map(|e| Arc::clone(&e.expr))
             .collect();
-        crate::InputDistributionRequirements::new(vec![Distribution::KeyPartitioned(
-            partition_exprs,
-        )])
+        crate::InputDistributionRequirements::new(vec![if partition_exprs.is_empty() {
+            Distribution::SinglePartition
+        } else {
+            Distribution::KeyPartitioned(partition_exprs)
+        }])
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -459,12 +582,13 @@ impl ExecutionPlan for PartitionedTopKExec {
         _: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         assert_eq!(children.len(), 1);
-        let mut exec = PartitionedTopKExec::try_new(
+        let mut exec = PartitionedTopKExec::try_new_with_mode(
             Arc::clone(&children[0]),
             self.expr.clone(),
             self.partition_prefix_len,
             self.fetch,
             self.fn_kind,
+            self.mode,
         )?;
         // Not a `try_new` argument, so it has to be carried over by hand:
         // dropping it would narrow the schema the nodes above were planned
@@ -516,6 +640,8 @@ impl ExecutionPlan for PartitionedTopKExec {
                 .expect("PartitionedTopKExec requires at least one order-by expression");
         let fetch = self.fetch;
         let fn_kind = self.fn_kind;
+        let mode = self.mode;
+        let partitions = self.cache.output_partitioning().partition_count();
         let batch_size = context.session_config().batch_size();
         let runtime = Arc::clone(&context.runtime_env());
         let metrics_set = self.metrics_set.clone();
@@ -535,6 +661,8 @@ impl ExecutionPlan for PartitionedTopKExec {
                 order_expr,
                 fetch,
                 fn_kind,
+                mode,
+                partitions,
                 batch_size,
                 runtime,
                 metrics_set,
@@ -555,34 +683,103 @@ impl ExecutionPlan for PartitionedTopKExec {
     }
 }
 
-/// Read all input, feed each batch into a per-partition top-K state
-/// ([`PartitionedTopK`] for `ROW_NUMBER`, [`PartitionedTopKRank`] for
-/// `RANK`, or [`PartitionedTopKDenseRank`] for `DENSE_RANK`), then emit
-/// results ordered by `(partition_keys, order_keys)`.
-///
-/// # Phases
-///
-/// 1. **Accumulation** — forward each input `RecordBatch` to the
-///    per-partition state's `insert_batch`. The `RowConverter` for
-///    ORDER BY columns, the operator's `MemoryReservation`, and the
-///    `TopKMetrics` are shared across all distinct partition keys for
-///    this operator instance.
-///
-/// 2. **Emission** — `emit` drains all per-partition state in sorted
-///    partition-key order. `ROW_NUMBER` and `RANK` interleave the retained
-///    rows out of their shared store in `batch_size` chunks, so their output
-///    needs no coalescing; `DENSE_RANK` still coalesces. For `RANK`,
-///    boundary-tied rows are emitted after each partition's heap rows. For
-///    `DENSE_RANK`, rows are emitted from a K-bounded map of distinct ob
-///    keys, sorted ascending.
-///
-/// # Cost
-///
-/// - Time: O(N log K) where N = total rows, K = fetch
-/// - Memory: O(K × P × row_size) where P = number of distinct partitions
-///   plus, for RANK, the boundary ties' rows. `ROW_NUMBER` and `RANK` hold
-///   their rows by reference into gathered batches, so their constant is the
-///   store's compaction ratio, and one in-flight gather is pinned on top.
+/// Retention state over the upstream shared store for each ranking policy.
+enum TopKState {
+    RowNumber(PartitionedTopK),
+    Rank(PartitionedTopKRank),
+    DenseRank(PartitionedTopKDenseRank),
+}
+
+impl TopKState {
+    fn insert_batch(&mut self, batch: &arrow::record_batch::RecordBatch) -> Result<()> {
+        match self {
+            Self::RowNumber(s) => s.insert_batch(batch),
+            Self::Rank(s) => s.insert_batch(batch),
+            Self::DenseRank(s) => s.insert_batch(batch),
+        }
+    }
+    fn retained_rows(&self) -> usize {
+        match self {
+            Self::RowNumber(s) => s.retained_rows(),
+            Self::Rank(s) => s.retained_rows(),
+            Self::DenseRank(s) => s.retained_rows(),
+        }
+    }
+    fn reserved_bytes(&self) -> usize {
+        match self {
+            Self::RowNumber(s) => s.reserved_bytes(),
+            Self::Rank(s) => s.reserved_bytes(),
+            Self::DenseRank(s) => s.reserved_bytes(),
+        }
+    }
+    fn output_rows(&self) -> crate::metrics::Count {
+        match self {
+            Self::RowNumber(s) => s.output_rows(),
+            Self::Rank(s) => s.output_rows(),
+            Self::DenseRank(s) => s.output_rows(),
+        }
+    }
+    fn emit(self) -> Result<SendableRecordBatchStream> {
+        match self {
+            Self::RowNumber(s) => s.emit(),
+            Self::Rank(s) => s.emit(),
+            Self::DenseRank(s) => s.emit(),
+        }
+    }
+}
+
+/// The memory bounds of one partial partition in a bounded pool.
+struct PartialBounds {
+    /// The pool's limit.
+    pool: usize,
+    /// The most bytes that this partition's heaps may reserve.
+    partition: usize,
+}
+
+impl PartialBounds {
+    /// The bounds of one of `partitions` partial partitions in `runtime`'s
+    /// pool; `None` for a pool without a known limit, which cannot refuse.
+    fn of(runtime: &RuntimeEnv, partitions: usize) -> Option<Self> {
+        match runtime.memory_pool.memory_limit() {
+            MemoryLimit::Finite(pool) => Some(Self {
+                pool,
+                partition: pool / PARTIAL_POOL_SHARE / partitions.max(1),
+            }),
+            MemoryLimit::Infinite | MemoryLimit::Unknown => None,
+        }
+    }
+
+    /// Whether the pool has less than its headroom free.
+    fn pool_is_tight(&self, runtime: &RuntimeEnv) -> bool {
+        runtime.memory_pool.reserved() > self.pool - self.pool / PARTIAL_POOL_HEADROOM
+    }
+}
+
+/// Ends the reduction of a partial partition: the stream of what `state`
+/// holds, then `pending` (a batch that was not inserted), then the rest of
+/// `input`, unchanged. Passed rows count in the partition's `output_rows`.
+fn pass_through(
+    state: TopKState,
+    pending: Option<arrow::record_batch::RecordBatch>,
+    input: SendableRecordBatchStream,
+    schema: SchemaRef,
+    partition_id: usize,
+    metrics_set: &ExecutionPlanMetricsSet,
+) -> Result<SendableRecordBatchStream> {
+    MetricBuilder::new(metrics_set)
+        .counter("partial_passthrough", partition_id)
+        .add(1);
+    let passed = state.output_rows();
+    let rest = futures::stream::iter(pending.map(Ok))
+        .chain(input)
+        .inspect_ok(move |batch| passed.add(batch.num_rows()));
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        state.emit()?.chain(rest),
+    )))
+}
+
+/// Reduce a prefix, then release it before forwarding the remaining input.
 #[expect(clippy::too_many_arguments)]
 async fn do_partitioned_topk(
     partition_id: usize,
@@ -593,52 +790,40 @@ async fn do_partitioned_topk(
     order_expr: LexOrdering,
     fetch: usize,
     fn_kind: WindowFnKind,
+    mode: PartitionedTopKMode,
+    partitions: usize,
     batch_size: usize,
     runtime: Arc<RuntimeEnv>,
     metrics_set: ExecutionPlanMetricsSet,
     ranked_schema: Option<SchemaRef>,
 ) -> Result<SendableRecordBatchStream> {
-    match fn_kind {
-        WindowFnKind::RowNumber => {
-            let mut state = PartitionedTopK::try_new(
-                partition_id,
-                &schema,
-                partition_exprs,
-                partition_sort_fields,
-                order_expr,
-                fetch,
-                batch_size,
-                &runtime,
-                &metrics_set,
-                ranked_schema,
-            )?;
-            while let Some(batch) = input.next().await {
-                state.insert_batch(&batch?)?;
-            }
-            drop(input);
-            state.emit()
-        }
-        WindowFnKind::Rank => {
-            let mut state = PartitionedTopKRank::try_new(
-                partition_id,
-                &schema,
-                partition_exprs,
-                partition_sort_fields,
-                order_expr,
-                fetch,
-                batch_size,
-                &runtime,
-                &metrics_set,
-                ranked_schema,
-            )?;
-            while let Some(batch) = input.next().await {
-                state.insert_batch(&batch?)?;
-            }
-            drop(input);
-            state.emit()
-        }
+    let mut state = match fn_kind {
+        WindowFnKind::RowNumber => TopKState::RowNumber(PartitionedTopK::try_new(
+            partition_id,
+            &schema,
+            partition_exprs,
+            partition_sort_fields,
+            order_expr,
+            fetch,
+            batch_size,
+            &runtime,
+            &metrics_set,
+            ranked_schema,
+        )?),
+        WindowFnKind::Rank => TopKState::Rank(PartitionedTopKRank::try_new(
+            partition_id,
+            &schema,
+            partition_exprs,
+            partition_sort_fields,
+            order_expr,
+            fetch,
+            batch_size,
+            &runtime,
+            &metrics_set,
+            ranked_schema,
+        )?),
         WindowFnKind::DenseRank => {
-            let mut state = PartitionedTopKDenseRank::try_new(
+            TopKState::DenseRank(PartitionedTopKDenseRank::try_new(
                 partition_id,
                 &schema,
                 partition_exprs,
@@ -649,14 +834,59 @@ async fn do_partitioned_topk(
                 &runtime,
                 &metrics_set,
                 ranked_schema,
-            )?;
-            while let Some(batch) = input.next().await {
-                state.insert_batch(&batch?)?;
-            }
-            drop(input);
-            state.emit()
+            )?)
         }
+    };
+    if mode == PartitionedTopKMode::Final {
+        while let Some(batch) = input.next().await {
+            state.insert_batch(&batch?)?;
+            tokio::task::yield_now().await;
+        }
+        drop(input);
+        return state.emit();
     }
+    let bounds = PartialBounds::of(&runtime, partitions);
+    let peak = MetricBuilder::new(&metrics_set)
+        .peak_memory_usage("partial_peak_bytes", partition_id);
+    let mut seen: usize = 0;
+    let mut next_check = PARTIAL_PROBE_ROWS;
+    while let Some(batch) = input.next().await {
+        let batch = batch?;
+        if bounds
+            .as_ref()
+            .is_some_and(|bounds| bounds.pool_is_tight(&runtime))
+        {
+            // Nothing of this batch is in the heaps yet: forward it whole.
+            return pass_through(
+                state,
+                Some(batch),
+                input,
+                schema,
+                partition_id,
+                &metrics_set,
+            );
+        }
+        seen = seen.saturating_add(batch.num_rows());
+        state.insert_batch(&batch)?;
+        drop(batch);
+        let reserved = state.reserved_bytes();
+        peak.set_max(reserved);
+        let over_share = bounds
+            .as_ref()
+            .is_some_and(|bounds| reserved > bounds.partition);
+        let mut not_reducing = false;
+        if seen >= next_check {
+            not_reducing =
+                state.retained_rows().saturating_mul(PARTIAL_MIN_REDUCTION) > seen;
+            next_check = seen.saturating_add(PARTIAL_PROBE_ROWS);
+        }
+        if over_share || not_reducing {
+            return pass_through(state, None, input, schema, partition_id, &metrics_set);
+        }
+        tokio::task::yield_now().await;
+    }
+    drop(input);
+    state.emit()
 }
 
 #[cfg(test)]
@@ -804,3 +1034,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "partitioned_topk_partial_tests.rs"]
+mod partial_tests;

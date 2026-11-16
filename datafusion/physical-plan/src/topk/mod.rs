@@ -2030,6 +2030,16 @@ pub(crate) struct PartitionedTopK {
 }
 
 impl PartitionedTopK {
+    pub(crate) fn retained_rows(&self) -> usize {
+        self.core.live_slots
+    }
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.core.reservation.size()
+    }
+    pub(crate) fn output_rows(&self) -> Count {
+        self.core.metrics.baseline.output_rows().clone()
+    }
+
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         partition_id: usize,
@@ -2423,6 +2433,16 @@ pub(crate) struct PartitionedTopKRank {
 }
 
 impl PartitionedTopKRank {
+    pub(crate) fn retained_rows(&self) -> usize {
+        self.core.live_slots
+    }
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.core.reservation.size()
+    }
+    pub(crate) fn output_rows(&self) -> Count {
+        self.core.metrics.baseline.output_rows().clone()
+    }
+
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         partition_id: usize,
@@ -2813,6 +2833,21 @@ pub(crate) struct PartitionedTopKDenseRank {
 }
 
 impl PartitionedTopKDenseRank {
+    pub(crate) fn retained_rows(&self) -> usize {
+        self.states
+            .values()
+            .flat_map(|s| s.groups.values())
+            .flatten()
+            .map(|e| e.row_indices.len())
+            .sum()
+    }
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.reservation.size()
+    }
+    pub(crate) fn output_rows(&self) -> Count {
+        self.metrics.baseline.output_rows().clone()
+    }
+
     /// `ranked_schema` is as for [`PartitionedTopKCore::try_new`].
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn try_new(
