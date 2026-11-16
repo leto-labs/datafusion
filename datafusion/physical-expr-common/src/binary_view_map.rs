@@ -340,6 +340,12 @@ where
                             return header.view == view_u128;
                         }
 
+                        // A colliding inline view is not an external buffer
+                        // reference. Check length before parsing that layout.
+                        if header.view as u32 != len {
+                            return false;
+                        }
+
                         // For larger strings: first compare the 4-byte prefix
                         let stored_prefix = (header.view >> 32) as u32;
                         let input_prefix = (view_u128 >> 32) as u32;
@@ -635,6 +641,31 @@ mod tests {
         let strings = strings.as_string_view();
         let state = strings.into_iter().collect::<Vec<_>>();
         assert_eq!(state, expected);
+    }
+
+    #[test]
+    fn string_view_prefix_collision_keeps_inline_and_external_values_distinct() {
+        let input = StringViewArray::from(vec![
+            Some("same"),
+            Some("same-prefix-value-longer-than-twelve"),
+            None,
+            Some("same"),
+            Some("same-prefix-value-longer-than-twelve"),
+            Some("same-prefix-other-long-value"),
+        ]);
+        let mut set = ArrowBytesViewSet::new(OutputType::Utf8View);
+        let input: ArrayRef = Arc::new(input);
+        set.insert(&input);
+        let result = set.into_state();
+        assert_eq!(
+            result.as_string_view().iter().collect::<Vec<_>>(),
+            vec![
+                Some("same"),
+                Some("same-prefix-value-longer-than-twelve"),
+                None,
+                Some("same-prefix-other-long-value"),
+            ]
+        );
     }
 
     #[test]
