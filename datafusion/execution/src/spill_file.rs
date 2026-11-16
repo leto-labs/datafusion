@@ -79,6 +79,15 @@ pub trait AsyncSpillWriter: Send {
     /// caller will invoke [`Self::abort`] before dropping the writer.
     async fn finish(&mut self) -> Result<()>;
 
+    /// Whether dropping an unfinished writer requires asynchronous abort work.
+    ///
+    /// Return false only when abort is a no-op and synchronous destruction
+    /// releases all backend resources. Such writers do not need a cleanup task
+    /// or one of DataFusion's limited asynchronous abort slots.
+    fn requires_abort(&self) -> bool {
+        true
+    }
+
     /// Aborts an uncommitted spill write and cleans up backend resources.
     ///
     /// Multipart backends should override this method to explicitly abort an
@@ -99,6 +108,10 @@ struct BlockingSpillWriterAdapter {
 
 #[async_trait]
 impl AsyncSpillWriter for BlockingSpillWriterAdapter {
+    fn requires_abort(&self) -> bool {
+        false
+    }
+
     async fn write_all(&mut self, data: Bytes) -> Result<()> {
         self.inner.write_all(&data)?;
         Ok(())

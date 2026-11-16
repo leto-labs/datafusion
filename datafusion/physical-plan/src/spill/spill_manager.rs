@@ -29,7 +29,7 @@ pub struct SpillManager {
     env: Arc<RuntimeEnv>,
     pub(crate) metrics: SpillMetrics,
     schema: SchemaRef,
-    attempt_tasks: Option<Arc<AttemptTasks>>,
+    pub(super) attempt_tasks: Option<Arc<AttemptTasks>>,
     /// Number of batches to buffer in memory during disk reads
     batch_read_buffer_capacity: usize,
     /// general-purpose compression options

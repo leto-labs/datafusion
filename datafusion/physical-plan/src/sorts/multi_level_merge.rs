@@ -1892,4 +1892,54 @@ mod tests {
 
         Ok(())
     }
+    #[test]
+    fn spill_merge_configured_bounds_growing_run_counts() -> Result<()> {
+        for run_count in [16, 128] {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+            let runtime = RuntimeEnvBuilder::new()
+                .with_max_spill_merge_fan_in(8)
+                .build_arc()?;
+            let spill_manager = SpillManager::new(
+                Arc::clone(&runtime),
+                SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+                Arc::clone(&schema),
+            );
+            let files = (0..run_count)
+                .map(|_| {
+                    Ok(SortedSpillFile {
+                        file: runtime.disk_manager.create_tmp_file("bounded default")?,
+                        max_record_batch_memory: 1,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let expr =
+                LexOrdering::new([PhysicalSortExpr::new_default(col("a", &schema)?)])
+                    .unwrap();
+            let reservation =
+                MemoryConsumer::new("bounded default").register(&runtime.memory_pool);
+            let mut builder = MultiLevelMergeBuilder::new(
+                spill_manager,
+                schema,
+                files,
+                vec![],
+                expr,
+                BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+                1024,
+                reservation,
+                None,
+                false,
+            );
+            let mut reservation = MemoryConsumer::new("bounded default phase")
+                .register(&runtime.memory_pool);
+            let phase =
+                builder.get_sorted_spill_files_to_merge(1, 2, &mut reservation, false)?;
+            let SpillFilesToMerge::Ready(files, _) = phase else {
+                panic!("unexpected skew split");
+            };
+            assert_eq!(files.len(), 8, "{run_count} runs must use a bounded phase");
+            assert_eq!(builder.sorted_spill_files.len(), run_count - 8);
+        }
+        Ok(())
+    }
 }

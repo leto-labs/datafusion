@@ -119,10 +119,10 @@ impl InProgressSpillFile {
                 )?;
                 let spill_writer = in_progress_file.open_async_writer().await?;
 
-                self.writer = Some(InProgressWriter::Async(AsyncIPCStreamWriter::new(
-                    spill_writer,
-                    encoder,
-                )));
+                self.writer = Some(InProgressWriter::Async(
+                    AsyncIPCStreamWriter::new(spill_writer, encoder)
+                        .with_attempt_tasks(self.spill_manager.attempt_tasks.as_ref())?,
+                ));
 
                 self.spill_manager.metrics.spill_file_count.add(1);
             }

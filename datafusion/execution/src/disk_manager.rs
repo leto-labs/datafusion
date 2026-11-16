@@ -17,7 +17,7 @@ use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tempfile::{Builder, NamedTempFile, TempDir};
+use tempfile::{Builder, TempDir, TempPath};
 pub const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 pub const DEFAULT_MAX_SPILL_MERGE_FAN_IN: usize = 0;
 
@@ -366,88 +366,63 @@ impl DiskManager {
         }
 
         let dir_index = rng().random_range(0..local_dirs.len());
+        // Keep deletion ownership without keeping the creation descriptor open.
+        // The number of retained runs can grow independently of active I/O.
+        let tempfile = Builder::new()
+            .prefix(&escape_for_temp_file_name_prefix(request_description))
+            .tempfile_in(local_dirs[dir_index].as_ref())
+            .map_err(DataFusionError::IoError)?
+            .into_temp_path();
         self.active_files_count.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new(RefCountedTempFile {
-            parent_temp_dir: Arc::clone(&local_dirs[dir_index]),
-            tempfile: Arc::new(
-                Builder::new()
-                    .prefix(&escape_for_temp_file_name_prefix(request_description))
-                    .tempfile_in(local_dirs[dir_index].as_ref())
-                    .map_err(DataFusionError::IoError)?,
-            ),
-            current_file_disk_usage: Arc::new(AtomicU64::new(0)),
-            disk_manager: Arc::clone(self),
+            owner: Arc::new(TempFileOwner {
+                tempfile,
+                _parent_temp_dir: Arc::clone(&local_dirs[dir_index]),
+                current_file_disk_usage: AtomicU64::new(0),
+                disk_manager: Arc::clone(self),
+            }),
         }))
     }
 }
 
-/// A wrapper around a [`NamedTempFile`] that also contains
-/// a reference to its parent temporary directory.
-///
-/// This type is Clone-able, allowing multiple references to the same underlying file.
-/// The file is deleted only when the last reference is dropped.
-///
-/// The parent temporary directory is also kept alive as long as any reference to
-/// this file exists, preventing premature cleanup of the directory.
-///
-/// Once all references to this file are dropped, the file is deleted, and the
-/// disk usage is subtracted from the disk manager's total.
-#[derive(Debug)]
+/// Shared deletion and quota ownership of a local spill path, without an idle
+/// descriptor. Active readers and writers retain the same owner. The last owner
+/// deletes the path and releases its quota, then releases the parent directory.
+#[derive(Debug, Clone)]
 pub struct RefCountedTempFile {
-    /// The reference to the directory in which temporary files are created to ensure
-    /// it is not cleaned up prior to the NamedTempFile
-    parent_temp_dir: Arc<TempDir>,
-    /// The underlying temporary file, wrapped in Arc to allow cloning
-    tempfile: Arc<NamedTempFile>,
-    /// Tracks the current disk usage of this temporary file.
-    ///
-    /// This is wrapped in `Arc<AtomicU64>` so that all clones share the same
-    /// disk usage tracking, preventing incorrect accounting when clones are dropped.
-    current_file_disk_usage: Arc<AtomicU64>,
-    /// The disk manager that created and manages this temporary file
-    disk_manager: Arc<DiskManager>,
+    owner: Arc<TempFileOwner>,
 }
 
-impl Clone for RefCountedTempFile {
-    fn clone(&self) -> Self {
-        Self {
-            parent_temp_dir: Arc::clone(&self.parent_temp_dir),
-            tempfile: Arc::clone(&self.tempfile),
-            current_file_disk_usage: Arc::clone(&self.current_file_disk_usage),
-            disk_manager: Arc::clone(&self.disk_manager),
-        }
-    }
+#[derive(Debug)]
+struct TempFileOwner {
+    // Drop the path before its parent directory. Readers and writers retain
+    // this owner too, including an unpolled asynchronous open.
+    tempfile: TempPath,
+    _parent_temp_dir: Arc<TempDir>,
+    current_file_disk_usage: AtomicU64,
+    disk_manager: Arc<DiskManager>,
 }
 
 impl RefCountedTempFile {
     pub fn path(&self) -> &Path {
-        self.tempfile.path()
-    }
-
-    pub fn inner(&self) -> &NamedTempFile {
-        self.tempfile.as_ref()
+        self.owner.tempfile.as_ref()
     }
 
     fn current_disk_usage(&self) -> u64 {
-        self.current_file_disk_usage.load(Ordering::Relaxed)
+        self.owner.current_file_disk_usage.load(Ordering::Relaxed)
     }
 }
 
 /// When the temporary file is dropped, subtract its disk usage from the disk manager's total
-impl Drop for RefCountedTempFile {
+impl Drop for TempFileOwner {
     fn drop(&mut self) {
-        // Only subtract disk usage when this is the last reference to the file
-        // Check if we're the last one by seeing if there's only one strong reference
-        // left to the underlying tempfile (the one we're holding)
-        if Arc::strong_count(&self.tempfile) == 1 {
-            let current_usage = self.current_file_disk_usage.load(Ordering::Relaxed);
-            self.disk_manager
-                .used_disk_space
-                .fetch_sub(current_usage, Ordering::Relaxed);
-            self.disk_manager
-                .active_files_count
-                .fetch_sub(1, Ordering::Relaxed);
-        }
+        let current_usage = self.current_file_disk_usage.load(Ordering::Relaxed);
+        self.disk_manager
+            .used_disk_space
+            .fetch_sub(current_usage, Ordering::Relaxed);
+        self.disk_manager
+            .active_files_count
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -470,8 +445,7 @@ fn create_local_dirs(local_dirs: &[PathBuf]) -> Result<Vec<Arc<TempDir>>> {
 
 pub struct FileSpillWriter {
     file: std::fs::File,
-    disk_manager: Arc<DiskManager>,
-    current_file_disk_usage: Arc<AtomicU64>,
+    owner: Arc<TempFileOwner>,
 }
 
 impl std::io::Write for FileSpillWriter {
@@ -482,15 +456,17 @@ impl std::io::Write for FileSpillWriter {
         }
 
         let new_global = self
+            .owner
             .disk_manager
             .used_disk_space
             .fetch_add(len, Ordering::Relaxed)
             + len;
 
-        let limit = self.disk_manager.max_temp_directory_size();
+        let limit = self.owner.disk_manager.max_temp_directory_size();
 
         if new_global > limit {
-            self.disk_manager
+            self.owner
+                .disk_manager
                 .used_disk_space
                 .fetch_sub(len, Ordering::Relaxed);
 
@@ -503,7 +479,8 @@ impl std::io::Write for FileSpillWriter {
 
         self.file.write_all(buf).map_err(DataFusionError::IoError)?;
 
-        self.current_file_disk_usage
+        self.owner
+            .current_file_disk_usage
             .fetch_add(len, Ordering::Relaxed);
 
         Ok(buf.len())
@@ -523,7 +500,7 @@ impl SpillWriter for FileSpillWriter {
 
 impl SpillFile for RefCountedTempFile {
     fn path(&self) -> Option<&Path> {
-        Some(self.tempfile.path())
+        Some(self.path())
     }
 
     fn size(&self) -> Option<u64> {
@@ -534,24 +511,28 @@ impl SpillFile for RefCountedTempFile {
         &self,
     ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes>> + Send>>>
     {
-        let path = self.path().to_owned();
+        let owner = Arc::clone(&self.owner);
 
         let stream =
             futures::stream::once(async move {
-                tokio::fs::File::open(&path)
+                tokio::fs::File::open(&owner.tempfile)
                     .await
                     .map_err(DataFusionError::IoError)
+                    .map(|file| (file, owner))
             })
             .flat_map(
                 |open_result| -> std::pin::Pin<
                     Box<dyn futures::Stream<Item = Result<Bytes>> + Send>,
                 > {
                     match open_result {
-                        Ok(file) => Box::pin(
+                        Ok((file, owner)) => Box::pin(
                             // Use a 128KB read buffer. The default 8KB causes excessive async
                             // poll overhead when reading multi-MB spill files back into memory.
                             tokio_util::io::ReaderStream::with_capacity(file, 128 * 1024)
-                                .map(|r| r.map_err(DataFusionError::IoError)),
+                                .map(move |r| {
+                                    let _keep_alive = &owner;
+                                    r.map_err(DataFusionError::IoError)
+                                }),
                         ),
                         Err(e) => Box::pin(futures::stream::once(async move { Err(e) })),
                     }
@@ -572,15 +553,13 @@ impl SpillFile for RefCountedTempFile {
     }
 
     fn open_writer(&self) -> Result<Box<dyn SpillWriter>> {
-        let file = self
-            .tempfile
-            .as_file()
-            .try_clone()
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(self.path())
             .map_err(DataFusionError::IoError)?;
         Ok(Box::new(FileSpillWriter {
             file,
-            disk_manager: Arc::clone(&self.disk_manager),
-            current_file_disk_usage: Arc::clone(&self.current_file_disk_usage),
+            owner: Arc::clone(&self.owner),
         }))
     }
 }
@@ -831,6 +810,9 @@ mod tests {
         // Drop the file
         drop(temp_file);
 
+        // An active writer still owns the path and its quota.
+        assert_eq!(dm.used_disk_space(), new_usage);
+        drop(writer);
         // Disk usage should return to 0
         assert_eq!(dm.used_disk_space(), 0);
 
@@ -933,6 +915,8 @@ mod tests {
         // Drop the last clone
         drop(clone3);
 
+        assert_eq!(dm.used_disk_space(), usage);
+        drop(writer);
         // Now disk usage should be 0
         assert_eq!(dm.used_disk_space(), 0);
 
@@ -966,12 +950,16 @@ mod tests {
         // Drop first file
         drop(file1);
 
+        assert_eq!(dm.used_disk_space(), usage1 + usage2);
+        drop(writer1);
         // Usage should only reflect second file
         assert_eq!(dm.used_disk_space(), usage2);
 
         // Drop second file
         drop(file2);
 
+        assert_eq!(dm.used_disk_space(), usage2);
+        drop(writer2);
         // Usage should be 0
         assert_eq!(dm.used_disk_space(), 0);
 
@@ -1257,5 +1245,67 @@ mod tests {
             escape_for_temp_file_name_prefix(&"a".repeat(200)),
             format!(".tmp.{}.", "a".repeat(118))
         );
+    }
+    #[tokio::test]
+    async fn test_spill_reader_owns_unpolled_path_and_quota() -> Result<()> {
+        use futures::TryStreamExt;
+        let dm = Arc::new(DiskManagerBuilder::default().build()?);
+        let file = dm.create_tmp_file("reader lifetime")?;
+        let path = file.path().unwrap().to_owned();
+        let mut writer = file.open_writer()?;
+        writer.write_all(b"retained reader bytes")?;
+        drop(writer);
+        let reader = file.read_stream()?;
+        drop(file);
+        assert!(
+            path.exists(),
+            "an unpolled reader must retain deletion ownership"
+        );
+        assert_eq!(dm.spilling_progress().active_files_count, 1);
+        assert_eq!(dm.used_disk_space(), 21);
+        let chunks: Vec<_> = reader.try_collect().await?;
+        assert_eq!(chunks.concat(), b"retained reader bytes");
+        assert!(!path.exists());
+        assert_eq!(dm.spilling_progress().active_files_count, 0);
+        assert_eq!(dm.used_disk_space(), 0);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_retained_spill_paths_have_no_idle_descriptors() -> Result<()> {
+        let dm = Arc::new(DiskManagerBuilder::default().build()?);
+        let files = (0..128)
+            .map(|_| dm.create_tmp_file("idle descriptor"))
+            .collect::<Result<Vec<_>>>()?;
+        let paths: std::collections::HashSet<_> = files
+            .iter()
+            .map(|file| file.path().unwrap().to_owned())
+            .collect();
+        let count = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                .filter(|path| paths.contains(path))
+                .count()
+        };
+        assert_eq!(
+            count(),
+            0,
+            "retained spill paths must not hold creation descriptors"
+        );
+        let mut writer = files[0].open_writer()?;
+        writer.write_all(b"one active writer")?;
+        assert_eq!(count(), 1);
+        let path = files[0].path().unwrap().to_owned();
+        drop(files);
+        assert!(path.exists());
+        assert_eq!(dm.spilling_progress().active_files_count, 1);
+        assert_eq!(dm.used_disk_space(), 17);
+        drop(writer);
+        assert!(!path.exists());
+        assert_eq!(dm.spilling_progress().active_files_count, 0);
+        assert_eq!(dm.used_disk_space(), 0);
+        Ok(())
     }
 }

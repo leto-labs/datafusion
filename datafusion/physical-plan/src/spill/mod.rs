@@ -506,11 +506,15 @@ struct AsyncIPCStreamWriter {
     writer: Option<Box<dyn AsyncSpillWriter>>,
     encoder: IPCStreamEncoder,
     abort_handle: Option<tokio::runtime::Handle>,
+    abort_permits: Arc<tokio::sync::Semaphore>,
+    // Registered while the writer is active and moved into dropped-writer
+    // cleanup. Attempt drain must include path/quota and backend cleanup.
+    cleanup: Option<crate::attempt_tasks::TrackedCooperative<std::future::Pending<()>>>,
 }
 
-/// Bounds the number of detached cleanup tasks after query cancellation. If all
-/// permits are occupied, the writer is dropped and the backend lifecycle policy
-/// is the remaining cleanup mechanism.
+/// Bounds concurrent abort I/O after query cancellation. Scoped writers wait
+/// for a permit while retaining their attempt obligation. Unscoped writers drop
+/// at saturation and rely on the backend's abandoned-upload lifecycle policy.
 const MAX_CONCURRENT_SPILL_ABORTS: usize = 8;
 static SPILL_ABORT_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SPILL_ABORTS)));
@@ -520,11 +524,40 @@ impl AsyncIPCStreamWriter {
         spill_writer: Box<dyn AsyncSpillWriter>,
         encoder: IPCStreamEncoder,
     ) -> Self {
+        Self::new_with_abort_permits(
+            spill_writer,
+            encoder,
+            Arc::clone(&SPILL_ABORT_PERMITS),
+        )
+    }
+
+    fn new_with_abort_permits(
+        spill_writer: Box<dyn AsyncSpillWriter>,
+        encoder: IPCStreamEncoder,
+        abort_permits: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
         Self {
             writer: Some(spill_writer),
             encoder,
             abort_handle: tokio::runtime::Handle::try_current().ok(),
+            abort_permits,
+            cleanup: None,
         }
+    }
+
+    fn with_attempt_tasks(
+        mut self,
+        scope: Option<&Arc<crate::attempt_tasks::AttemptTasks>>,
+    ) -> Result<Self> {
+        self.cleanup = scope
+            .map(|scope| scope.track_cooperative(std::future::pending()))
+            .transpose()
+            .or_else(|_| {
+                crate::attempt_tasks::stopped_error(
+                    crate::attempt_tasks::DescendantStopped,
+                )
+            })?;
+        Ok(self)
     }
 
     pub async fn write(&mut self, batch: &RecordBatch) -> Result<(usize, usize)> {
@@ -595,6 +628,7 @@ impl AsyncIPCStreamWriter {
             return Err(error);
         }
         self.writer.take();
+        self.cleanup.take();
         Ok(bytes)
     }
 
@@ -604,6 +638,7 @@ impl AsyncIPCStreamWriter {
         };
         writer.abort().await?;
         self.writer = None;
+        self.cleanup.take();
         Ok(())
     }
 
@@ -620,6 +655,14 @@ impl Drop for AsyncIPCStreamWriter {
             return;
         };
 
+        // Local blocking adapters have no asynchronous abort operation. Drop
+        // their path/quota owner synchronously, without using an abort slot.
+        if !writer.requires_abort() {
+            drop(writer);
+            self.cleanup.take();
+            return;
+        }
+
         let Some(handle) = tokio::runtime::Handle::try_current()
             .ok()
             .or_else(|| self.abort_handle.take())
@@ -628,21 +671,38 @@ impl Drop for AsyncIPCStreamWriter {
             return;
         };
 
-        let Ok(permit) = Arc::clone(&SPILL_ABORT_PERMITS).try_acquire_owned() else {
-            debug!(
-                "Skipping spill writer abort because the cleanup concurrency limit was reached"
-            );
-            return;
+        let cleanup = self.cleanup.take();
+        // Scoped cleanup must wait for a slot instead of abandoning a writer
+        // when the global concurrency cap is occupied. Unscoped callers keep
+        // upstream's best-effort policy.
+        let abort_permits = Arc::clone(&self.abort_permits);
+        let permit = if cleanup.is_none() {
+            let Ok(permit) = Arc::clone(&abort_permits).try_acquire_owned() else {
+                debug!(
+                    "Skipping spill writer abort because the cleanup concurrency limit was reached"
+                );
+                return;
+            };
+            Some(permit)
+        } else {
+            None
         };
-
         let _abort_task = handle.spawn(async move {
-            // Backends bound their own abort latency; the runtime may not have
-            // a time driver. See the AsyncSpillWriter::abort contract.
+            let permit = match permit {
+                Some(permit) => permit,
+                None => abort_permits
+                    .acquire_owned()
+                    .await
+                    .expect("spill abort semaphore is never closed"),
+            };
+            // Backends bound their own abort latency. Keep the registration
+            // until the writer and its deletion/quota owner are destroyed.
             if let Err(error) = writer.abort().await {
                 debug!("Failed to abort dropped spill writer: {error}");
             }
-            // Keep the permit until cleanup finishes.
+            drop(writer);
             drop(permit);
+            drop(cleanup);
         });
     }
 }
@@ -1166,6 +1226,154 @@ mod tests {
             self.cleanup_done.notify_one();
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn test_spill_abort_is_included_in_attempt_drain() -> Result<()> {
+        use crate::attempt_tasks::AttemptTasks;
+        struct GatedAbort {
+            started: tokio::sync::mpsc::UnboundedSender<()>,
+            release: Arc<tokio::sync::Semaphore>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Drop for GatedAbort {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        #[async_trait::async_trait]
+        impl AsyncSpillWriter for GatedAbort {
+            async fn write_all(&mut self, _: bytes::Bytes) -> Result<()> {
+                Ok(())
+            }
+            async fn finish(&mut self) -> Result<()> {
+                Ok(())
+            }
+            async fn abort(&mut self) -> Result<()> {
+                self.started.send(()).unwrap();
+                self.release.acquire().await.unwrap().forget();
+                Ok(())
+            }
+        }
+        let scope = AttemptTasks::new();
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SPILL_ABORTS));
+        let count = MAX_CONCURRENT_SPILL_ABORTS + 1;
+        let writers = (0..count)
+            .map(|_| {
+                let encoder = IPCStreamEncoder::new(
+                    &Schema::empty(),
+                    SpillCompression::Uncompressed,
+                )?;
+                AsyncIPCStreamWriter::new_with_abort_permits(
+                    Box::new(GatedAbort {
+                        started: started.clone(),
+                        release: Arc::clone(&release),
+                        dropped: Arc::clone(&dropped),
+                    }),
+                    encoder,
+                    Arc::clone(&permits),
+                )
+                .with_attempt_tasks(Some(&scope))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        scope.stop();
+        drop(writers);
+        scope.root_joined();
+        for _ in 0..MAX_CONCURRENT_SPILL_ABORTS {
+            tokio::time::timeout(Duration::from_secs(5), starts.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            starts.try_recv().is_err(),
+            "abort I/O must respect the concurrency bound"
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        assert!(futures::poll!(Box::pin(scope.drain())).is_pending());
+        release.add_permits(MAX_CONCURRENT_SPILL_ABORTS);
+        tokio::time::timeout(Duration::from_secs(5), starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            futures::poll!(Box::pin(scope.drain())).is_pending(),
+            "the queued abort must remain registered"
+        );
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), scope.drain())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), count);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_local_spill_drop_needs_no_abort_permit() -> Result<()> {
+        use crate::attempt_tasks::AttemptTasks;
+        use datafusion_execution::disk_manager::DiskManagerBuilder;
+        let manager = Arc::new(DiskManagerBuilder::default().build()?);
+        let file = manager.create_tmp_file("local abort")?;
+        let path = file.path().unwrap().to_owned();
+        let backend = file.open_async_writer().await?;
+        assert!(!backend.requires_abort());
+        let batch =
+            build_table_i32(("a", &vec![1, 2]), ("b", &vec![3, 4]), ("c", &vec![5, 6]));
+        let encoder = IPCStreamEncoder::new(
+            batch.schema().as_ref(),
+            SpillCompression::Uncompressed,
+        )?;
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let scope = AttemptTasks::new();
+        let mut writer = AsyncIPCStreamWriter::new_with_abort_permits(
+            backend,
+            encoder,
+            Arc::clone(&permits),
+        )
+        .with_attempt_tasks(Some(&scope))?;
+        writer.write(&batch).await?;
+        assert!(manager.used_disk_space() > 0);
+        drop(file);
+        scope.stop();
+        drop(writer);
+        assert!(!path.exists(), "local writer cleanup must be synchronous");
+        assert_eq!(manager.used_disk_space(), 0);
+        assert_eq!(permits.available_permits(), 0);
+        scope.root_joined();
+        assert!(matches!(
+            futures::poll!(Box::pin(scope.drain())),
+            Poll::Ready(Ok(()))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_closed_spill_scope_returns_stopped_error() -> Result<()> {
+        use crate::attempt_tasks::{AttemptTasks, DescendantStopped};
+        use datafusion_execution::disk_manager::DiskManagerBuilder;
+        let manager = Arc::new(DiskManagerBuilder::default().build()?);
+        let file = manager.create_tmp_file("closed scope")?;
+        let backend = file.open_async_writer().await?;
+        let encoder =
+            IPCStreamEncoder::new(&Schema::empty(), SpillCompression::Uncompressed)?;
+        let scope = AttemptTasks::new();
+        scope.stop();
+        scope.root_joined();
+        let error = AsyncIPCStreamWriter::new(backend, encoder)
+            .with_attempt_tasks(Some(&scope))
+            .err()
+            .expect("registration must be closed");
+        assert!(
+            matches!(error, datafusion_common::DataFusionError::External(ref source)
+            if source.is::<DescendantStopped>())
+        );
+        drop(file);
+        assert_eq!(manager.used_disk_space(), 0);
+        Ok(())
     }
 
     #[tokio::test]
