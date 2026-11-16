@@ -1115,6 +1115,9 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                 // a real Result rather than panicking.
                 let fresh = Self::build_group_columns(&self.schema)?;
                 let group_values = mem::replace(&mut self.group_values, fresh);
+                self.map.clear();
+                self.group_index_lists.clear();
+                self.vectorized_operation_buffers.clear();
 
                 group_values
                     .into_iter()
@@ -2786,3 +2789,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod probe_cache_tests;
