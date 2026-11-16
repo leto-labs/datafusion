@@ -273,3 +273,20 @@ DF5's `TaskContext::requires_independent_partitions`. The scan regressions in
 declared order under a filtered limit, scan sharing kept below a blocking
 sort, mixed sharing settings across partitions of one scan, and grouping sets
 over constants. The join regressions of the same file belong to lane DF6.
+
+## Family V: scan-plan advice for read-ahead readers
+
+Purpose: let a reader that prefetches ahead of demand follow the native
+stream's post-pruning read plan. Dependent Longbow feature: PF-READ-AHEAD.
+Audit classification: NEEDS-DECISION, decided 2026-11-16: keep a small hook,
+UPSTREAMABLE. The 55.2 Arrow read-ahead patch is dropped; Longbow plans
+read-ahead from upstream's `ParquetPushDecoder::scan_plan`, but the native
+stream's decoder is private to the opener, so this hook hands its plan out.
+
+`ParquetFileReaderFactory::create_reader_with_scan_plan_advice` (defaulted:
+no advice) returns the reader and an optional `ScanPlanAdvice`. The stream
+calls `ScanPlanAdvice::advise(decoder.scan_plan())` after it builds its
+decoder and after every rebuild (filter toggle, donation). It gives no advice
+while the predicate has a dynamic filter that can still change. The fork
+contains no read-ahead logic. Prepared scans (family PQ) own their decoders
+and call `scan_plan` themselves.

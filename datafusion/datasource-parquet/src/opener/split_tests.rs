@@ -809,3 +809,187 @@ async fn donated_units_reuse_the_donor_footer() {
     assert!(count(&metrics, "row_group_units_published") > 0);
     assert_eq!(footers.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+/// Family V: every advised plan, as (row group, byte range) in plan order.
+type AdvisedPlans = Arc<std::sync::Mutex<Vec<Vec<(usize, std::ops::Range<u64>)>>>>;
+
+/// Family V: a factory whose advice records every plan and whose reader
+/// records every data read.
+#[derive(Debug)]
+struct AdviceFactory {
+    inner: crate::reader::DefaultParquetFileReaderFactory,
+    plans: AdvisedPlans,
+    reads: Arc<std::sync::Mutex<Vec<std::ops::Range<u64>>>>,
+}
+struct RecordPlans(AdvisedPlans);
+impl crate::ScanPlanAdvice for RecordPlans {
+    fn advise(&mut self, plan: parquet::arrow::push_decoder::ScanPlan) {
+        let ranges = plan.map(|range| (range.row_group, range.range)).collect();
+        self.0.lock().unwrap().push(ranges);
+    }
+}
+impl ParquetFileReaderFactory for AdviceFactory {
+    fn create_reader(
+        &self,
+        partition: usize,
+        file: PartitionedFile,
+        hint: Option<usize>,
+        metrics: &datafusion_physical_plan::metrics::ExecutionPlanMetricsSet,
+    ) -> datafusion_common::Result<
+        Box<dyn parquet::arrow::async_reader::AsyncFileReader + Send>,
+    > {
+        Ok(Box::new(ReadCountingReader {
+            inner: self.inner.create_reader(partition, file, hint, metrics)?,
+            reads: Arc::clone(&self.reads),
+        }))
+    }
+    fn create_reader_with_scan_plan_advice(
+        &self,
+        partition: usize,
+        file: PartitionedFile,
+        hint: Option<usize>,
+        metrics: &datafusion_physical_plan::metrics::ExecutionPlanMetricsSet,
+    ) -> datafusion_common::Result<crate::ReaderWithScanPlanAdvice> {
+        Ok((
+            self.create_reader(partition, file, hint, metrics)?,
+            Some(Box::new(RecordPlans(Arc::clone(&self.plans)))),
+        ))
+    }
+}
+
+/// Scan `k.parquet` with `streams` streams and work sharing through an
+/// [`AdviceFactory`]. Return the keys, the advised plans, the data reads and
+/// the number of published units.
+async fn advised_scan(
+    store: &Arc<dyn ObjectStore>,
+    size: u64,
+    predicate: Option<Arc<dyn PhysicalExpr>>,
+    streams: usize,
+) -> (
+    Vec<i32>,
+    Vec<Vec<(usize, std::ops::Range<u64>)>>,
+    Vec<std::ops::Range<u64>>,
+    usize,
+) {
+    let plans: AdvisedPlans = Arc::new(std::sync::Mutex::new(vec![]));
+    let reads = Arc::new(std::sync::Mutex::new(vec![]));
+    let factory = Arc::new(AdviceFactory {
+        inner: crate::reader::DefaultParquetFileReaderFactory::new(Arc::clone(store)),
+        plans: Arc::clone(&plans),
+        reads: Arc::clone(&reads),
+    });
+    let mut source =
+        ParquetSource::new(schema()).with_parquet_file_reader_factory(factory);
+    if let Some(predicate) = predicate {
+        source = source.with_predicate(predicate);
+    }
+    let groups = vec![vec![PartitionedFile::new("k.parquet", size)]];
+    let (keys, metrics) = run(Arc::clone(store), source, groups, streams, true).await;
+    let plans = plans.lock().unwrap().clone();
+    let reads = reads.lock().unwrap().clone();
+    (
+        keys,
+        plans,
+        reads,
+        count(&metrics, "row_group_units_published"),
+    )
+}
+
+/// Family V: the advice receives upstream's `scan_plan` of the post-pruning
+/// decoder, and the decoder then fetches exactly the advised ranges.
+#[tokio::test]
+async fn scan_plan_advice_matches_the_ranges_the_decoder_fetches() {
+    let (store, size) = store().await;
+    let bytes = store
+        .get(&Path::from("k.parquet"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+        .parse_and_finish(&bytes)
+        .unwrap();
+    let data: Vec<std::ops::Range<u64>> = metadata
+        .row_groups()
+        .iter()
+        .flat_map(|group| group.columns().iter())
+        .map(|column| {
+            let (start, len) = column.byte_range();
+            start..start + len
+        })
+        .collect();
+    // Sorted, merged byte intervals.
+    let covered = |ranges: Box<dyn Iterator<Item = std::ops::Range<u64>> + '_>| {
+        let mut ranges: Vec<_> = ranges.collect();
+        ranges.sort_by_key(|range| range.start);
+        let mut merged: Vec<std::ops::Range<u64>> = vec![];
+        for range in ranges {
+            match merged.last_mut() {
+                Some(last) if range.start <= last.end => {
+                    last.end = last.end.max(range.end)
+                }
+                _ => merged.push(range),
+            }
+        }
+        merged
+    };
+    for predicate in [None, Some(key_between(150, 1250))] {
+        let pruned = predicate.is_some();
+        let (_, plans, reads, published) = advised_scan(&store, size, predicate, 1).await;
+        assert_eq!(published, 0);
+        assert_eq!(plans.len(), 1, "one decoder build, no rebuild: {plans:?}");
+        let groups: std::collections::BTreeSet<usize> =
+            plans[0].iter().map(|(group, _)| *group).collect();
+        let expected: std::collections::BTreeSet<usize> = if pruned {
+            (1..=12).collect()
+        } else {
+            (0..ROW_GROUPS as usize).collect()
+        };
+        assert_eq!(groups, expected);
+        // The plan lists pages in decode order; the decoder coalesces them per
+        // column chunk. Compare the bytes covered, within the row groups'
+        // column chunks (metadata, Bloom filter and index reads are outside).
+        let planned = covered(Box::new(plans[0].iter().map(|(_, range)| range.clone())));
+        let fetched = covered(Box::new(reads.into_iter().filter(|read| {
+            data.iter()
+                .any(|chunk| chunk.start <= read.start && read.end <= chunk.end)
+        })));
+        assert!(!planned.is_empty());
+        assert_eq!(fetched, planned, "pruned={pruned}");
+    }
+}
+
+#[tokio::test]
+async fn scan_plan_advice_follows_the_post_pruning_plan() {
+    let (store, size) = store().await;
+    let advised = |predicate: Arc<dyn PhysicalExpr>, streams: usize| {
+        let store = Arc::clone(&store);
+        async move {
+            let (keys, plans, _, published) =
+                advised_scan(&store, size, Some(predicate), streams).await;
+            let plans: Vec<std::collections::BTreeSet<usize>> = plans
+                .into_iter()
+                .map(|plan| plan.into_iter().map(|(group, _)| group).collect())
+                .collect();
+            (keys, plans, published)
+        }
+    };
+    // Statistics keep row groups 1..=12; the first plan is exactly those.
+    let (keys, plans, published) = advised(key_between(150, 1250), 1).await;
+    assert_eq!(keys, (100..1300).collect::<Vec<_>>());
+    assert_eq!(published, 0);
+    assert_eq!(plans, vec![(1..=12).collect()]);
+
+    // A donor is advised again with only the row groups it kept.
+    let (_, plans, published) = advised(key_between(150, 1250), 8).await;
+    assert!(published > 0);
+    let all: std::collections::BTreeSet<usize> = (1..=12).collect();
+    assert!(plans.iter().all(|plan| plan.is_subset(&all)), "{plans:?}");
+    assert!(plans.iter().any(|plan| plan.len() < all.len()), "{plans:?}");
+
+    // A live dynamic filter keeps the scan demand-driven: no advice.
+    let (_, plans, _) =
+        advised(and(key_between(150, 1250), dynamic_filter(false)), 1).await;
+    assert!(plans.is_empty(), "{plans:?}");
+}

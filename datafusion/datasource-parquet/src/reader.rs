@@ -19,6 +19,7 @@ use futures::future::BoxFuture;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::AsyncFileReader;
+use parquet::arrow::push_decoder::ScanPlan;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
@@ -63,6 +64,33 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
         0
     }
 
+    /// Like [`Self::create_reader`], and also return advice that receives the
+    /// byte ranges the native scan stream may still read (Longbow family V).
+    ///
+    /// The stream calls [`ScanPlanAdvice::advise`] with upstream's
+    /// [`ParquetPushDecoder::scan_plan`] after it builds its decoder and after
+    /// every rebuild (filter toggle, runtime pruning, row-group donation), so
+    /// a reader that prefetches can follow the post-pruning plan. Advice is
+    /// never given while the predicate has a dynamic filter that can still
+    /// change: such a scan stays demand-driven. The default returns no advice.
+    ///
+    /// [`ParquetPushDecoder::scan_plan`]: parquet::arrow::push_decoder::ParquetPushDecoder::scan_plan
+    fn create_reader_with_scan_plan_advice(
+        &self,
+        partition_index: usize,
+        partitioned_file: PartitionedFile,
+        metadata_size_hint: Option<usize>,
+        metrics: &ExecutionPlanMetricsSet,
+    ) -> datafusion_common::Result<ReaderWithScanPlanAdvice> {
+        let reader = self.create_reader(
+            partition_index,
+            partitioned_file,
+            metadata_size_hint,
+            metrics,
+        )?;
+        Ok((reader, None))
+    }
+
     /// Provides an `AsyncFileReader` for reading data from a parquet file specified
     ///
     /// # Notes
@@ -84,6 +112,21 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
         metadata_size_hint: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>>;
+}
+
+/// A reader and its optional [`ScanPlanAdvice`] (Longbow family V).
+pub type ReaderWithScanPlanAdvice = (
+    Box<dyn AsyncFileReader + Send>,
+    Option<Box<dyn ScanPlanAdvice>>,
+);
+
+/// Receives the remaining read plan of one native Parquet scan stream
+/// (Longbow family V). See
+/// [`ParquetFileReaderFactory::create_reader_with_scan_plan_advice`].
+pub trait ScanPlanAdvice: Send {
+    /// The byte ranges the stream's decoder may still read, in decode order.
+    /// A later call replaces the earlier plan.
+    fn advise(&mut self, plan: ScanPlan);
 }
 
 /// Default implementation of [`ParquetFileReaderFactory`]

@@ -520,6 +520,8 @@ struct PreparedParquetOpen {
     /// Longbow family WS: eligible readers can offer their unread tail to
     /// idle siblings. Published units remain eligible for later donation.
     shared_work_source: Option<SharedWorkSource>,
+    /// Longbow family V: advice about the stream's remaining read plan.
+    scan_plan_advice: Option<Box<dyn crate::ScanPlanAdvice>>,
     #[cfg(feature = "parquet_encryption")]
     file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
 }
@@ -874,13 +876,15 @@ impl ParquetMorselizer {
             .metadata_size_hint
             .or(self.metadata_size_hint);
 
-        let async_file_reader: Box<dyn AsyncFileReader> =
-            self.parquet_file_reader_factory.create_reader(
+        let (async_file_reader, scan_plan_advice) = self
+            .parquet_file_reader_factory
+            .create_reader_with_scan_plan_advice(
                 self.partition_index,
                 partitioned_file.clone(),
                 metadata_size_hint,
                 &self.metrics,
             )?;
+        let async_file_reader: Box<dyn AsyncFileReader> = async_file_reader;
 
         // Calculate the output schema from the original projection (before literal replacement)
         // so we get correct field names from column references
@@ -1056,6 +1060,7 @@ impl ParquetMorselizer {
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             preserve_order: self.preserve_order,
             shared_work_source,
+            scan_plan_advice,
             #[cfg(feature = "parquet_encryption")]
             file_decryption_properties: None,
         })
@@ -2033,7 +2038,7 @@ impl RowGroupsPrunedParquetOpen {
             .file_metrics
             .row_groups_pruned_dynamic_filter
             .clone();
-        let stream = PushDecoderStreamState {
+        let mut stream = PushDecoderStreamState {
             decoder: Some(decoder),
             active_reader: None,
             rg_plan,
@@ -2050,8 +2055,12 @@ impl RowGroupsPrunedParquetOpen {
             row_filter_skipped_fully_matched,
             byte_progress,
             row_group_sharing,
-        }
-        .into_stream();
+            // A predicate whose dynamic filter can still change keeps the
+            // scan demand-driven: future row groups may be pruned first.
+            scan_plan_advice: prepared.scan_plan_advice.filter(|_| !predicate_watching),
+        };
+        stream.advise_scan_plan();
+        let stream = stream.into_stream();
 
         // Wrap the stream so a dynamic filter can stop the file scan early, but
         // only when the pruner is still watching a filter that can change

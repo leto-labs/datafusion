@@ -350,6 +350,10 @@ pub(crate) struct PushDecoderStreamState {
     /// unread tail after a sibling becomes idle, also after the first row
     /// group was read. `None` when the stream is not eligible.
     pub(crate) row_group_sharing: Option<Box<RowGroupSharing>>,
+    /// Longbow family V: receives the decoder's remaining read plan after
+    /// every decoder build. `None` without advice or while a dynamic filter
+    /// can still prune row groups.
+    pub(crate) scan_plan_advice: Option<Box<dyn crate::ScanPlanAdvice>>,
 }
 
 /// A reusable, `Arc`-shared list of prebuilt row-filter candidates.
@@ -757,7 +761,17 @@ impl PushDecoderStreamState {
             }
         }
         self.decoder = Some(builder.build().map_err(DataFusionError::from)?);
+        self.advise_scan_plan();
         Ok(false)
+    }
+
+    /// Give the reader's advice the decoder's remaining read plan.
+    pub(crate) fn advise_scan_plan(&mut self) {
+        if let (Some(advice), Some(decoder)) =
+            (self.scan_plan_advice.as_mut(), self.decoder.as_ref())
+        {
+            advice.advise(decoder.scan_plan());
+        }
     }
 
     /// Publish whole unread row groups beyond the retained window to idle
@@ -771,6 +785,9 @@ impl PushDecoderStreamState {
         let sharing = self.row_group_sharing.as_ref().expect("sharing present");
         let (decoder, donated_bytes) = sharing.offer(decoder, &mut self.rg_plan)?;
         self.decoder = Some(decoder);
+        if donated_bytes > 0 {
+            self.advise_scan_plan();
+        }
         // The donor's range no longer includes these bytes; the reader of
         // the donated unit credits none (see `DonatedRowGroups`).
         self.byte_progress.credit(donated_bytes);
