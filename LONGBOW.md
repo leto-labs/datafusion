@@ -48,3 +48,30 @@ same-size in-place overwrite fails the read instead of decoding new bytes
 with the planned footer's offsets. Without a validator the reads are
 upstream's plain range reads. A custom `ParquetFileReaderFactory` owns its
 own checks.
+
+## Family I: bounded static expression preparation cache
+
+Purpose: reuse the simplified form of an unchanged, fully static scan
+predicate across the files and row groups that one executor thread prepares,
+instead of simplifying the same tree again per file. Dependent Longbow
+feature: EF-PREPARATION-CACHE. Audit classification: NEEDS-DECISION (owner
+decision 2026-11-16: port; upstream has no cache, #24323 adds a benchmark
+only).
+
+`PhysicalExprSimplifier::simplify` looks up a thread-local cache of at most
+256 entries keyed by the input tree's address, the schema (fingerprint and
+full equality, metadata included) and the evaluation context. Entries hold
+weak references only, so the cache never keeps a plan's trees or literal
+payloads alive. A tree that contains any dynamic filter, complete or not, is
+never cached (`DynamicFilterTracking::contains_dynamic_filter`), and a result
+that changed during preparation is retried once and not cached. Only roots
+that simplification leaves unchanged are cached, because rewritten roots are
+owned by the call site and could never hit.
+
+The setting `longbow.execution.expr_prep_cache` (default on; parsed as a
+boolean, case-insensitively, anything else keeps the default) is resolved
+once per scan stream. `FileScanConfig::open_with_args` wraps the stream so
+that each poll runs inside `with_preparation_cache`, which restores the
+previous thread-local value on return or panic. A setting therefore never
+leaks across interleaved sessions or tasks that move between threads.
+`LONGBOW_EXPR_PREP_COUNTERS=<path>` appends diagnostic counters.

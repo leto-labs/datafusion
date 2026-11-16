@@ -14,6 +14,8 @@ pub(crate) mod sort_pushdown;
 #[cfg(feature = "proto")]
 mod proto;
 
+mod preparation;
+
 use crate::file_groups::FileGroup;
 use crate::{
     PartitionedFile, display::FileGroupsDisplay, file::FileSource,
@@ -778,7 +780,10 @@ impl DataSource for FileScanConfig {
             .with_morselizer(morselizer)
             .with_metrics(source.metrics())
             .build()?;
-        Ok(Box::pin(cooperative(stream)))
+        Ok(preparation::session_stream(
+            Box::pin(cooperative(stream)),
+            context.session_config().options(),
+        ))
     }
 
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> FmtResult {
