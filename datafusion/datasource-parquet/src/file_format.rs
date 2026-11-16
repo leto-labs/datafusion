@@ -59,7 +59,7 @@ use datafusion_datasource::source::DataSourceExec;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use object_store::path::Path;
-use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+use object_store::{ObjectMeta, ObjectStore};
 use parquet::arrow::async_reader::MetadataFetch;
 use parquet::errors::ParquetError;
 
@@ -775,8 +775,8 @@ impl<'a> ObjectStoreFetch<'a> {
 impl MetadataFetch for ObjectStoreFetch<'_> {
     fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes, ParquetError>> {
         async {
-            self.store
-                .get_range(&self.meta.location, range)
+            // Longbow family D: read the generation the plan names.
+            crate::identity_io::get_range(self.store, self.meta, range)
                 .await
                 .map_err(ParquetError::from)
         }

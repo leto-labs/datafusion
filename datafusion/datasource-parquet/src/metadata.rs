@@ -364,14 +364,13 @@ impl<'a> DFParquetMetadata<'a> {
         if let Some(hint) = self.metadata_size_hint {
             let prefetch_start = file_size.saturating_sub(hint as u64);
             let prefetch_range = prefetch_start..file_size;
-            let data = self
-                .store
-                .get_ranges(
-                    &self.object_meta.location,
-                    std::slice::from_ref(&prefetch_range),
-                )
-                .await
-                .map_err(DataFusionError::from)?;
+            let data = crate::identity_io::get_ranges(
+                self.store,
+                self.object_meta,
+                std::slice::from_ref(&prefetch_range),
+            )
+            .await
+            .map_err(DataFusionError::from)?;
             decoder
                 .push_ranges(vec![prefetch_range], data)
                 .map_err(DataFusionError::from)?;
@@ -381,11 +380,13 @@ impl<'a> DFParquetMetadata<'a> {
             match decoder.try_decode().map_err(DataFusionError::from)? {
                 DecodeResult::Data(metadata) => break metadata,
                 DecodeResult::NeedsData(ranges) => {
-                    let buffers = self
-                        .store
-                        .get_ranges(&self.object_meta.location, &ranges)
-                        .await
-                        .map_err(DataFusionError::from)?;
+                    let buffers = crate::identity_io::get_ranges(
+                        self.store,
+                        self.object_meta,
+                        &ranges,
+                    )
+                    .await
+                    .map_err(DataFusionError::from)?;
                     decoder
                         .push_ranges(ranges, buffers)
                         .map_err(DataFusionError::from)?;

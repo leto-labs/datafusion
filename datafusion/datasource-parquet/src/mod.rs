@@ -15,6 +15,7 @@ pub mod access_plan;
 mod bloom_filter;
 mod decoder_projection;
 pub mod file_format;
+mod identity_io;
 mod leaf_resolver;
 pub mod metadata;
 mod metrics;

@@ -15,9 +15,8 @@ use datafusion_execution::cache::cache_manager::FileMetadata;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::FutureExt;
-use futures::TryFutureExt;
 use futures::future::BoxFuture;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::errors::ParquetError;
@@ -251,10 +250,17 @@ impl AsyncFileReader for ParquetFileReader {
     ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
         let bytes_scanned = range.end - range.start;
         self.file_metrics.bytes_scanned.add(bytes_scanned as usize);
-        self.store
-            .get_range(&self.partitioned_file.object_meta.location, range)
+        // Longbow family D: read the generation the plan names.
+        async move {
+            crate::identity_io::get_range(
+                self.store.as_ref(),
+                &self.partitioned_file.object_meta,
+                range,
+            )
+            .await
             .map_err(|e| ParquetError::External(Box::new(e)))
-            .boxed()
+        }
+        .boxed()
     }
 
     fn get_byte_ranges(
@@ -267,10 +273,13 @@ impl AsyncFileReader for ParquetFileReader {
         let total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
         self.file_metrics.bytes_scanned.add(total as usize);
         async move {
-            self.store
-                .get_ranges(&self.partitioned_file.object_meta.location, &ranges)
-                .await
-                .map_err(|e| ParquetError::External(Box::new(e)))
+            crate::identity_io::get_ranges(
+                self.store.as_ref(),
+                &self.partitioned_file.object_meta,
+                &ranges,
+            )
+            .await
+            .map_err(|e| ParquetError::External(Box::new(e)))
         }
         .boxed()
     }

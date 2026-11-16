@@ -1748,6 +1748,10 @@ message PartitionedFile {
   FileRange range = 5;
   datafusion_common.Statistics statistics = 6;
   datafusion_common.Schema arrow_schema = 7;
+  // Longbow family D (reserved fork range >= 900, see LONGBOW.md): object
+  // validators. Presence is significant: absent and empty are distinct.
+  optional string e_tag = 900;
+  optional string version = 901;
 }
 
 message FileRange {

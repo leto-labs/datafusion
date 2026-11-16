@@ -2620,6 +2620,12 @@ pub struct PartitionedFile {
     pub statistics: ::core::option::Option<super::datafusion_common::Statistics>,
     #[prost(message, optional, tag = "7")]
     pub arrow_schema: ::core::option::Option<super::datafusion_common::Schema>,
+    /// Longbow family D (reserved fork range >= 900, see LONGBOW.md): object
+    /// validators. Presence is significant: absent and empty are distinct.
+    #[prost(string, optional, tag = "900")]
+    pub e_tag: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "901")]
+    pub version: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileRange {
