@@ -75,3 +75,22 @@ that each poll runs inside `with_preparation_cache`, which restores the
 previous thread-local value on return or panic. A setting therefore never
 leaks across interleaved sessions or tasks that move between threads.
 `LONGBOW_EXPR_PREP_COUNTERS=<path>` appends diagnostic counters.
+
+## Family ND: decode narrow decimals at the table's width
+
+Purpose: read a `Decimal128` file column at the `Decimal32` or `Decimal64`
+width that the table declares, instead of decoding 128-bit values and
+casting each batch. Dependent Longbow feature: NARROW-DECIMALS. Audit
+classification: UPSTREAMABLE.
+
+`coerce_decimals_to_table_width` narrows a top-level decimal column only when
+precision and scale are equal, so every value is unchanged, and only when the
+reader decodes its physical type to that width: `Decimal32` from `INT32` or a
+`FIXED_LEN_BYTE_ARRAY` of at most 4 bytes, `Decimal64` from `INT32`, `INT64`
+or a `FIXED_LEN_BYTE_ARRAY` of at most 8 bytes. Other columns, for example an
+`INT64` `DECIMAL(9,2)` as written by DuckDB and Trino read as `Decimal32`,
+keep their file type and the schema adapter casts them (the reader would
+panic or fail otherwise). The opener applies it after upstream's
+`apply_file_schema_type_coercions_with_rle`. A narrow decimal literal probes a
+Bloom filter as the `Decimal128` of its value. `ParquetSource::with_retyped_columns`
+lets a physical rule declare the narrow types for an existing scan.

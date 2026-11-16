@@ -148,6 +148,20 @@ impl BloomFilterStatistics {
                 }
                 _ => true,
             },
+            // A narrow decimal literal probes as the `Decimal128` of its value:
+            // the filter hashes the stored value, not the Arrow type.
+            ScalarValue::Decimal64(Some(v), p, s) => BloomFilterStatistics::check_scalar(
+                sbbf,
+                &ScalarValue::Decimal128(Some(i128::from(*v)), *p, *s),
+                parquet_type,
+                type_length,
+            ),
+            ScalarValue::Decimal32(Some(v), p, s) => BloomFilterStatistics::check_scalar(
+                sbbf,
+                &ScalarValue::Decimal128(Some(i128::from(*v)), *p, *s),
+                parquet_type,
+                type_length,
+            ),
             ScalarValue::Dictionary(_, inner) => BloomFilterStatistics::check_scalar(
                 sbbf,
                 inner,

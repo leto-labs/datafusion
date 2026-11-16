@@ -371,6 +371,27 @@ impl ParquetSource {
         conf
     }
 
+    /// Returns this source over `table_schema`, a copy of its table schema
+    /// whose columns have other data types, with `projection` and `predicate`
+    /// in place of its own.
+    ///
+    /// The caller rewrites the projection and the predicate for the new column
+    /// types. Every other setting is kept. A caller uses this to declare
+    /// `Decimal64` for a `Decimal128` column, which the opener then decodes at
+    /// that width (`coerce_decimals_to_table_width`).
+    pub fn with_retyped_columns(
+        &self,
+        table_schema: TableSchema,
+        projection: ProjectionExprs,
+        predicate: Option<Arc<dyn PhysicalExpr>>,
+    ) -> Self {
+        let mut conf = self.clone();
+        conf.table_schema = table_schema;
+        conf.projection = projection;
+        conf.predicate = predicate;
+        conf
+    }
+
     /// Set the encryption factory to use to generate file decryption properties
     #[cfg(feature = "parquet_encryption")]
     pub fn with_encryption_factory(

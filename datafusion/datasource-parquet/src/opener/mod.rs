@@ -23,6 +23,7 @@ use crate::row_group_filter::{RowGroupAccessPlanFilter, row_group_in_range};
 use crate::{
     BloomFilterStatistics, Int96Coercer, ParquetAccessPlan, ParquetFileMetrics,
     ParquetFileReaderFactory, ParquetRowSelection, ParquetVirtualColumn, RowGroupAccess,
+    coerce_decimals_to_table_width,
     schema_coercion::apply_file_schema_type_coercions_with_rle,
 };
 use arrow::array::RecordBatch;
@@ -1132,6 +1133,18 @@ impl MetadataLoadedParquetOpen {
             &prepared.logical_file_schema,
             &physical_file_schema,
             prepared.enable_rle_to_dictionary,
+        ) {
+            physical_file_schema = Arc::new(merged);
+            options = options.with_schema(Arc::clone(&physical_file_schema));
+            metadata_dirty = true;
+        }
+
+        // A table that declares a narrow decimal for a `Decimal128` file column
+        // reads the column at the table's width instead of casting each batch.
+        if let Some(merged) = coerce_decimals_to_table_width(
+            reader_metadata.parquet_schema(),
+            &prepared.logical_file_schema,
+            &physical_file_schema,
         ) {
             physical_file_schema = Arc::new(merged);
             options = options.with_schema(Arc::clone(&physical_file_schema));
@@ -6076,6 +6089,206 @@ mod test {
             batches.push(batch.unwrap());
         }
         batches
+    }
+
+    /// The schema the decoder reads a file with, after every opener coercion:
+    /// drive the open state machine to `BuildStream` and read its metadata.
+    async fn decoder_physical_schema(
+        morselizer: &ParquetMorselizer,
+        file: PartitionedFile,
+    ) -> Option<SchemaRef> {
+        let mut state = ParquetMorselPlanner::try_new(morselizer, file)
+            .unwrap()
+            .state;
+        loop {
+            state = match state {
+                #[cfg(feature = "parquet_encryption")]
+                ParquetOpenState::LoadEncryption(f) => {
+                    ParquetOpenState::PruneFile(f.await.unwrap())
+                }
+                ParquetOpenState::LoadMetadata(f) => {
+                    ParquetOpenState::PrepareFilters(Box::new(f.await.unwrap()))
+                }
+                ParquetOpenState::LoadPageIndex(f) => ParquetOpenState::LoadBloomFilters(
+                    f.await.unwrap().load_bloom_filters().boxed(),
+                ),
+                ParquetOpenState::LoadBloomFilters(f) => {
+                    ParquetOpenState::PruneWithBloomFilters(Box::new(f.await.unwrap()))
+                }
+                ParquetOpenState::BuildStream(state) => {
+                    return Some(Arc::clone(
+                        state.prepared.loaded.reader_metadata.schema(),
+                    ));
+                }
+                ParquetOpenState::Done => return None,
+                other => other.transition().unwrap(),
+            };
+        }
+    }
+
+    /// Write one `price` column of `physical` Parquet type and decimal logical
+    /// type `DECIMAL(precision, scale)` with the given unscaled values.
+    async fn write_decimal_column(
+        store: &Arc<dyn ObjectStore>,
+        name: &str,
+        physical: &str,
+        precision: u8,
+        values: &[i64],
+    ) -> u64 {
+        let message = format!(
+            "message schema {{ required {physical} price (DECIMAL({precision},2)); }}"
+        );
+        let schema = Arc::new(parse_message_type(&message).unwrap());
+        let mut bytes = Vec::new();
+        let mut writer = SerializedFileWriter::new(
+            &mut bytes,
+            schema,
+            Arc::new(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        let mut row_group = writer.next_row_group().unwrap();
+        let mut column = row_group.next_column().unwrap().unwrap();
+        match physical {
+            "int32" => {
+                let values: Vec<i32> = values.iter().map(|&v| v as i32).collect();
+                column
+                    .typed::<ParquetInt32Type>()
+                    .write_batch(&values, None, None)
+                    .unwrap();
+            }
+            "int64" => {
+                column
+                    .typed::<parquet::data_type::Int64Type>()
+                    .write_batch(values, None, None)
+                    .unwrap();
+            }
+            other => panic!("unsupported physical type {other}"),
+        }
+        column.close().unwrap();
+        row_group.close().unwrap();
+        writer.close().unwrap();
+        let size = bytes.len() as u64;
+        store.put(&Path::from(name), bytes.into()).await.unwrap();
+        size
+    }
+
+    /// Family ND: a table that declares a narrow decimal for a file `Decimal128`
+    /// column of equal precision and scale reads it at the table's width when
+    /// the column's physical type decodes to that width, and otherwise keeps
+    /// the file type and casts. Values are unchanged either way, also with a
+    /// pushed-down predicate on the narrow type.
+    #[tokio::test]
+    async fn coerce_decimals_to_table_width_reads_narrow_decimals_end_to_end() {
+        use arrow::array::{Decimal32Array, Decimal64Array};
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let values = [10_i64, 25, 30, 45];
+        // (physical type, precision, table type, type the decoder reads)
+        let cases = [
+            (
+                "int64",
+                15,
+                DataType::Decimal64(15, 2),
+                DataType::Decimal64(15, 2),
+            ),
+            (
+                "int32",
+                9,
+                DataType::Decimal32(9, 2),
+                DataType::Decimal32(9, 2),
+            ),
+            (
+                "int32",
+                9,
+                DataType::Decimal64(9, 2),
+                DataType::Decimal64(9, 2),
+            ),
+            // INT64 into Decimal32 would panic in the reader: keep the cast.
+            (
+                "int64",
+                9,
+                DataType::Decimal32(9, 2),
+                DataType::Decimal128(9, 2),
+            ),
+        ];
+        for (index, (physical, precision, table_type, decoded_type)) in
+            cases.into_iter().enumerate()
+        {
+            let name = format!("narrow{index}.parquet");
+            let size =
+                write_decimal_column(&store, &name, physical, precision, &values).await;
+            let table_schema = Arc::new(Schema::new(vec![Field::new(
+                "price",
+                table_type.clone(),
+                false,
+            )]));
+            let literal = match table_type {
+                DataType::Decimal32(p, s) => ScalarValue::Decimal32(Some(25), p, s),
+                DataType::Decimal64(p, s) => ScalarValue::Decimal64(Some(25), p, s),
+                _ => unreachable!(),
+            };
+            for pushdown in [false, true] {
+                let predicate = pushdown.then(|| {
+                    Arc::new(datafusion_physical_expr::expressions::BinaryExpr::new(
+                        Arc::new(Column::new("price", 0)),
+                        datafusion_expr::Operator::Gt,
+                        Arc::new(Literal::new(literal.clone())),
+                    )) as Arc<dyn PhysicalExpr>
+                });
+                let mut builder = ParquetMorselizerBuilder::new()
+                    .with_store(Arc::clone(&store))
+                    .with_schema(Arc::clone(&table_schema))
+                    .with_projection_indices(&[0])
+                    .with_pushdown_filters(pushdown);
+                if let Some(predicate) = predicate {
+                    builder = builder.with_predicate(predicate);
+                }
+                let morselizer = builder.build();
+                let file = PartitionedFile::new(name.clone(), size);
+                let physical_schema = decoder_physical_schema(&morselizer, file.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    physical_schema.field(0).data_type(),
+                    &decoded_type,
+                    "{physical} DECIMAL({precision},2) as {table_type}"
+                );
+                let batches = collect_batches(&morselizer, file).await;
+                let mut read = Vec::new();
+                for batch in &batches {
+                    assert_eq!(batch.column(0).data_type(), &table_type);
+                    let column = batch.column(0);
+                    match table_type {
+                        DataType::Decimal32(..) => read.extend(
+                            column
+                                .as_any()
+                                .downcast_ref::<Decimal32Array>()
+                                .unwrap()
+                                .values()
+                                .iter()
+                                .map(|&v| i64::from(v)),
+                        ),
+                        _ => read.extend(
+                            column
+                                .as_any()
+                                .downcast_ref::<Decimal64Array>()
+                                .unwrap()
+                                .values()
+                                .iter()
+                                .copied(),
+                        ),
+                    }
+                }
+                let expected: Vec<i64> = if pushdown {
+                    values.iter().copied().filter(|&v| v > 25).collect()
+                } else {
+                    values.to_vec()
+                };
+                assert_eq!(
+                    read, expected,
+                    "{physical} as {table_type}, pushdown {pushdown}"
+                );
+            }
+        }
     }
 
     // Proves the opener passes a promoted binary Dictionary schema to arrow-rs.
