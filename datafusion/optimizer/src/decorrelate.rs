@@ -400,7 +400,11 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
             LogicalPlan::Filter(plan_filter) => {
                 let subquery_filter_exprs = split_conjunction(&plan_filter.predicate);
                 for &expr in subquery_filter_exprs.iter().filter(|e| e.contains_outer()) {
-                    self.can_pull_over_aggregation &= can_pullup_over_aggregation(expr);
+                    self.can_pull_over_aggregation &= can_pullup_over_aggregation(
+                        expr,
+                        plan_filter.input.schema(),
+                        self.need_handle_count_bug,
+                    );
                     self.can_extend_partition_by &=
                         is_partitionable_equality(expr, plan_filter.input.schema());
                 }
@@ -1100,13 +1104,30 @@ fn collides_with_existing(exprs: &[Expr], candidate: &Expr) -> bool {
         .any(|expr| expr.schema_name().to_string() == candidate_name)
 }
 
-fn can_pullup_over_aggregation(expr: &Expr) -> bool {
-    split_column_equality(expr).is_some()
+fn can_pullup_over_aggregation(
+    expr: &Expr,
+    schema: &DFSchema,
+    handle_count_bug: bool,
+) -> bool {
+    if matches!(
+        expr,
+        Expr::BinaryExpr(BinaryExpr {
+            op: Operator::IsNotDistinctFrom,
+            ..
+        })
+    ) {
+        // A real NULL-key group cannot stand in for the independent presence
+        // marker used to compensate an empty scalar aggregate. Reuse the
+        // partitionability check to reject lossy casts and floating keys.
+        handle_count_bug && is_partitionable_equality(expr, schema)
+    } else {
+        split_column_equality(expr).is_some()
+    }
 }
 
 /// Whether partitioning by the columns of `expr` keeps the rows `expr` matches
-/// for one outer row in one partition. That holds for `col = <expr>` or
-/// `<expr> = col`, where:
+/// for one outer row in one partition. That holds for strict or NULL-safe
+/// equality between `col` and `<expr>`, where:
 /// - `<expr>` reads no subquery column and is not volatile.
 /// - `col` has no float leaf, because `-0.0 = 0.0` holds but a partition
 ///   keeps the two apart.
@@ -1128,12 +1149,12 @@ fn is_partitionable_equality(expr: &Expr, schema: &DFSchema) -> bool {
         && cast_to.is_none_or(|to| is_injective_cast(&col_type, to))
 }
 
-/// Splits `col = <expr>` or `<expr> = col` into the subquery column side, a
+/// Splits strict or NULL-safe equality into the subquery column side, a
 /// column or a cast of one, and the other side, which reads no subquery column.
 fn split_column_equality(expr: &Expr) -> Option<(&Expr, &Expr)> {
     let Expr::BinaryExpr(BinaryExpr {
         left,
-        op: Operator::Eq,
+        op: Operator::Eq | Operator::IsNotDistinctFrom,
         right,
     }) = expr
     else {
@@ -1435,6 +1456,44 @@ mod tests {
             build_join_filter(filters, [&column, &column], "sq")?,
             Some(col("sq.a").eq(col("t.a")).and(col("t.a").gt(lit(1))))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn null_safe_correlation_reuses_partitionable_cast_checks() -> Result<()> {
+        use arrow::datatypes::{Field, Schema};
+        use datafusion_expr::{binary_expr, cast};
+        let schema = DFSchema::try_from(Schema::new(vec![
+            Field::new("key", DataType::Int32, true),
+            Field::new("float_key", DataType::Float64, true),
+        ]))?;
+        for (inner, outer_type, supported) in [
+            (col("key"), DataType::Int32, true),
+            (cast(col("key"), DataType::Int64), DataType::Int64, true),
+            (cast(col("key"), DataType::Int16), DataType::Int16, false),
+            (col("float_key"), DataType::Float64, false),
+        ] {
+            for reverse in [false, true] {
+                let outer = out_ref_col(outer_type.clone(), "outer.key");
+                let (left, right) = if reverse {
+                    (outer, inner.clone())
+                } else {
+                    (inner.clone(), outer)
+                };
+                let predicate = binary_expr(left, Operator::IsNotDistinctFrom, right);
+                assert_eq!(
+                    is_partitionable_equality(&predicate, &schema),
+                    supported,
+                    "{predicate}"
+                );
+                assert_eq!(
+                    can_pullup_over_aggregation(&predicate, &schema, true),
+                    supported,
+                    "{predicate}"
+                );
+                assert!(!can_pullup_over_aggregation(&predicate, &schema, false));
+            }
+        }
         Ok(())
     }
 }

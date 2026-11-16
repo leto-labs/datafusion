@@ -1,0 +1,75 @@
+# Duplicate outer keys, real NULL groups, absent groups, and NULL-only values.
+statement ok
+CREATE TABLE b1_parent AS SELECT * FROM (VALUES (NULL, 10), (NULL, 11), (1, 20), (2, 30), (3, 40)) p(k, tag)
+
+statement ok
+CREATE TABLE b1_child AS SELECT * FROM (VALUES (NULL, 7), (1, NULL), (1, 8), (2, NULL)) c(k, v)
+
+query IIII rowsort
+SELECT p.tag, (SELECT count(*) FROM b1_child c WHERE c.k IS NOT DISTINCT FROM p.k), (SELECT count(c.v) FROM b1_child c WHERE p.k IS NOT DISTINCT FROM c.k), (SELECT count(*) + 2 FROM b1_child c WHERE c.k IS NOT DISTINCT FROM p.k) FROM b1_parent p
+----
+10 1 1 3
+11 1 1 3
+20 2 1 4
+30 1 0 3
+40 0 0 2
+
+query I rowsort
+SELECT p.tag FROM b1_parent p WHERE 0 = (SELECT count(*) FROM b1_child c WHERE c.k IS NOT DISTINCT FROM p.k)
+----
+40
+
+query II rowsort
+SELECT p.tag, (SELECT count(*) FROM b1_child c WHERE c.k = p.k) FROM b1_parent p
+----
+10 0
+11 0
+20 2
+30 1
+40 0
+
+# An empty inner relation must also produce zero for NULL outer keys.
+query II rowsort
+SELECT p.tag, (SELECT count(*) FROM b1_child c WHERE (c.k IS NOT DISTINCT FROM p.k) AND c.v > 100) FROM b1_parent p
+----
+10 0
+11 0
+20 0
+30 0
+40 0
+
+# Mixed ordinary and null-safe predicates must retain their own NULL behavior.
+query II rowsort
+SELECT p.tag, (SELECT count(*) FROM b1_child c WHERE (c.k IS NOT DISTINCT FROM p.k) AND c.v = p.tag - 3) FROM b1_parent p
+----
+10 1
+11 0
+20 0
+30 0
+40 0
+
+# Original GROUP BY must not acquire empty-input COUNT compensation.
+query II rowsort
+SELECT p.tag, (SELECT count(*) FROM b1_child c WHERE c.k IS NOT DISTINCT FROM p.k GROUP BY c.k) FROM b1_parent p
+----
+10 1
+11 1
+20 2
+30 1
+40 NULL
+
+# HAVING can remove the scalar aggregate's otherwise present empty row.
+query II rowsort
+SELECT p.tag, (SELECT count(*) FROM b1_child c WHERE c.k IS NOT DISTINCT FROM p.k HAVING count(*) > 0) FROM b1_parent p
+----
+10 1
+11 1
+20 2
+30 1
+40 NULL
+
+statement ok
+DROP TABLE b1_parent
+
+statement ok
+DROP TABLE b1_child
