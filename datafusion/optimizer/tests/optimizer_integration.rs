@@ -123,7 +123,7 @@ fn subquery_filter_with_cast() -> Result<()> {
     @r#"
     Filter: CAST(test.col_int32 AS Float64) > (<subquery>)
       Subquery:
-        Aggregate: groupBy=[[]], aggr=[[avg(CAST(test.col_int32 AS Float64))]]
+        Aggregate: groupBy=[[]], aggr=[[avg(test.col_int32)]]
           Projection: test.col_int32
             Filter: CAST(test.col_utf8 AS Date32) >= Date32("2002-05-08") AND CAST(test.col_utf8 AS Date32) <= Date32("2002-05-13")
               TableScan: test projection=[col_int32, col_utf8]

@@ -4,6 +4,7 @@
 
 //! Defines `SUM` and `SUM DISTINCT` aggregate accumulators
 
+use crate::sum_widening::{WideningSumAccumulator, WideningSumGroupsAccumulator};
 use arrow::array::{Array, ArrayRef, ArrowNativeTypeOp, ArrowNumericType, AsArray};
 use arrow::datatypes::Field;
 use arrow::datatypes::{
@@ -150,11 +151,56 @@ macro_rules! downcast_sum {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Sum {
     signature: Signature,
+    /// See [`Self::with_logical_input`].
+    logical_input: Option<DataType>,
 }
 
 impl Sum {
+    /// A `sum` whose argument is the narrow storage of `logical` values:
+    /// `Decimal32` or `Decimal64` arrays that hold the unscaled values of a
+    /// `Decimal128` column of type `logical`, at the scale of `logical`.
+    ///
+    /// The state, the result type and the result value are those of `sum` over
+    /// the same values stored as `logical`. Each value is widened as it is
+    /// added, so a sum that leaves the narrow type does not wrap. Only the
+    /// accumulators of an aggregation are implemented; a sliding window frame
+    /// or `DISTINCT` is an error.
+    pub fn with_logical_input(logical: DataType) -> Self {
+        Self {
+            logical_input: Some(logical),
+            ..Self::new()
+        }
+    }
+
+    /// The type set by [`Self::with_logical_input`].
+    pub fn logical_input(&self) -> Option<&DataType> {
+        self.logical_input.as_ref()
+    }
+
+    /// The accumulator of [`Self::with_logical_input`] for the narrow input
+    /// type of `args`.
+    fn widening<A>(
+        &self,
+        args: &AccumulatorArgs,
+        build: impl Fn(&DataType, DataType) -> Result<A>,
+    ) -> Result<A> {
+        let input = args.expr_fields[0].data_type();
+        let sum = args.return_field.data_type();
+        match (self.logical_input.as_ref(), input, sum) {
+            (
+                Some(DataType::Decimal128(_, logical_scale)),
+                DataType::Decimal32(_, scale) | DataType::Decimal64(_, scale),
+                DataType::Decimal128(..),
+            ) if scale == logical_scale && !args.is_distinct => build(input, sum.clone()),
+            (logical, input, sum) => internal_err!(
+                "sum of {input} cannot accumulate {logical:?} values as {sum}"
+            ),
+        }
+    }
+
     pub fn new() -> Self {
         Self {
+            logical_input: None,
             // Refer to https://www.postgresql.org/docs/8.2/functions-aggregate.html doc
             // smallint, int, bigint, real, double precision, decimal, or interval.
             signature: Signature::one_of(
@@ -217,7 +263,7 @@ impl AggregateUDFImpl for Sum {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        match &arg_types[0] {
+        match self.logical_input.as_ref().unwrap_or(&arg_types[0]) {
             DataType::Int64 => Ok(DataType::Int64),
             DataType::UInt64 => Ok(DataType::UInt64),
             DataType::Float64 => Ok(DataType::Float64),
@@ -248,6 +294,17 @@ impl AggregateUDFImpl for Sum {
     }
 
     fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        if self.logical_input.is_some() {
+            return self.widening(&args, |input, sum| {
+                Ok(match input {
+                    DataType::Decimal32(..) => {
+                        Box::new(WideningSumAccumulator::<Decimal32Type>::new(sum))
+                            as Box<dyn Accumulator>
+                    }
+                    _ => Box::new(WideningSumAccumulator::<Decimal64Type>::new(sum)),
+                })
+            });
+        }
         let is_distinct = args.is_distinct;
         macro_rules! helper {
             ($t:ty, $dt:expr) => {
@@ -293,6 +350,19 @@ impl AggregateUDFImpl for Sum {
         &self,
         args: AccumulatorArgs,
     ) -> Result<Box<dyn GroupsAccumulator>> {
+        if self.logical_input.is_some() {
+            return self.widening(&args, |input, sum| {
+                Ok(match input {
+                    DataType::Decimal32(..) => {
+                        Box::new(WideningSumGroupsAccumulator::<Decimal32Type>::new(sum))
+                            as Box<dyn GroupsAccumulator>
+                    }
+                    _ => {
+                        Box::new(WideningSumGroupsAccumulator::<Decimal64Type>::new(sum))
+                    }
+                })
+            });
+        }
         macro_rules! helper {
             ($t:ty, $dt:expr) => {
                 Ok(Box::new(PrimitiveGroupsAccumulator::<$t, _>::new(
@@ -308,6 +378,11 @@ impl AggregateUDFImpl for Sum {
         &self,
         args: AccumulatorArgs,
     ) -> Result<Box<dyn Accumulator>> {
+        if self.logical_input.is_some() {
+            return not_impl_err!(
+                "sum over narrow decimal storage in a sliding window frame"
+            );
+        }
         if args.is_distinct {
             // distinct path: [`SlidingDistinctSumAccumulator`] only implements
             // Int64, so gate the supported type here rather than dispatching
@@ -404,7 +479,8 @@ impl AggregateUDFImpl for Sum {
     }
 
     fn value_from_stats(&self, statistics_args: &StatisticsArgs) -> Option<ScalarValue> {
-        if statistics_args.is_distinct {
+        // The statistics of narrow storage are not in the type of the sum.
+        if statistics_args.is_distinct || self.logical_input.is_some() {
             return None;
         }
 
@@ -860,6 +936,96 @@ mod tests {
         assert_eq!(
             Sum::new().value_from_stats(&statistics_args),
             Some(ScalarValue::Decimal128(Some(12345), 15, 2))
+        );
+    }
+    fn narrow_args<R>(
+        input: &DataType,
+        return_type: &DataType,
+        is_distinct: bool,
+        f: impl FnOnce(AccumulatorArgs) -> R,
+    ) -> R {
+        let schema = arrow::datatypes::Schema::empty();
+        let expr_field = Arc::new(Field::new("a", input.clone(), true));
+        f(AccumulatorArgs {
+            return_field: Arc::new(Field::new("sum", return_type.clone(), true)),
+            schema: &schema,
+            expr_fields: &[expr_field],
+            ignore_nulls: false,
+            order_bys: &[],
+            is_distinct,
+            name: "sum",
+            is_reversed: false,
+            exprs: &[],
+        })
+    }
+
+    /// `sum` over narrow storage has the type of `sum` over the logical type,
+    /// and accumulates beyond the narrow type.
+    #[test]
+    fn narrow_storage_has_the_sum_of_the_logical_type() -> Result<()> {
+        let logical = DataType::Decimal128(15, 2);
+        let narrow = DataType::Decimal64(15, 2);
+        let function = Sum::with_logical_input(logical.clone());
+        assert_eq!(function.logical_input(), Some(&logical));
+        assert_ne!(function, Sum::new());
+        let return_type = function.return_type(std::slice::from_ref(&narrow))?;
+        assert_eq!(return_type, Sum::new().return_type(&[logical])?);
+        assert_eq!(return_type, DataType::Decimal128(25, 2));
+
+        let values: ArrayRef = Arc::new(
+            arrow::array::Decimal64Array::from(vec![
+                Some(i64::MAX),
+                None,
+                Some(i64::MAX),
+            ])
+            .with_precision_and_scale(15, 2)?,
+        );
+        let mut all = narrow_args(&narrow, &return_type, false, |args| {
+            function.accumulator(args)
+        })?;
+        all.update_batch(std::slice::from_ref(&values))?;
+        assert_eq!(
+            all.evaluate()?,
+            ScalarValue::Decimal128(Some(2 * i128::from(i64::MAX)), 25, 2)
+        );
+        let mut groups = narrow_args(&narrow, &return_type, false, |args| {
+            function.create_groups_accumulator(args)
+        })?;
+        groups.update_batch(&[values], &[0, 1, 0], None, 2)?;
+        let sums = groups.evaluate(datafusion_expr::EmitTo::All)?;
+        assert_eq!(sums.data_type(), &return_type);
+        let sums = sums.as_primitive::<Decimal128Type>();
+        assert_eq!(sums.value(0), 2 * i128::from(i64::MAX));
+        assert!(sums.is_null(1));
+        Ok(())
+    }
+
+    #[test]
+    fn narrow_storage_rejects_other_uses() {
+        let function = Sum::with_logical_input(DataType::Decimal128(15, 2));
+        let return_type = DataType::Decimal128(25, 2);
+        let narrow = DataType::Decimal64(15, 2);
+        // Another scale, the logical type itself, and DISTINCT are errors.
+        for (input, distinct) in [
+            (DataType::Decimal64(15, 3), false),
+            (DataType::Decimal128(15, 2), false),
+            (narrow.clone(), true),
+        ] {
+            assert!(
+                narrow_args(&input, &return_type, distinct, |args| function
+                    .accumulator(args))
+                .is_err()
+            );
+            assert!(
+                narrow_args(&input, &return_type, distinct, |args| function
+                    .create_groups_accumulator(args))
+                .is_err()
+            );
+        }
+        assert!(
+            narrow_args(&narrow, &return_type, false, |args| function
+                .create_sliding_accumulator(args))
+            .is_err()
         );
     }
 }

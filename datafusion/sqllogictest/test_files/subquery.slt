@@ -2648,7 +2648,7 @@ logical_plan
 03)----Projection: generate_series().value AS i
 04)------Filter: CAST(generate_series().value AS Float64) > (<subquery>)
 05)--------Subquery:
-06)----------Aggregate: groupBy=[[]], aggr=[[avg(CAST(u.j AS Float64))]]
+06)----------Aggregate: groupBy=[[]], aggr=[[avg(u.j)]]
 07)------------SubqueryAlias: u
 08)--------------Projection: generate_series().value AS j
 09)----------------TableScan: generate_series() projection=[value]

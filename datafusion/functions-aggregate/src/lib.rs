@@ -75,6 +75,7 @@ pub mod regr;
 pub mod stddev;
 pub mod string_agg;
 pub mod sum;
+mod sum_widening;
 pub mod variance;
 
 pub mod planner;

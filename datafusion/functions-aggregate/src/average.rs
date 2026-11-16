@@ -4,6 +4,16 @@
 
 //! Defines `Avg` & `Mean` aggregate & accumulators
 
+mod integer;
+mod narrow;
+
+use integer::{
+    IntegerAvgAccumulator, IntegerAvgGroupsAccumulator, IntegerDistinctAvgAccumulator,
+};
+use narrow::{
+    NarrowAvgAccumulator, NarrowAvgGroupsAccumulator, NarrowDistinctAvgAccumulator,
+};
+
 use arrow::array::{
     Array, ArrayRef, ArrowNativeTypeOp, ArrowNumericType, ArrowPrimitiveType, AsArray,
     BooleanArray, PrimitiveArray, PrimitiveBuilder, UInt64Array,
@@ -16,7 +26,8 @@ use arrow::datatypes::{
     DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE, DataType,
     Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type, DecimalType,
     DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType,
-    DurationSecondType, Field, FieldRef, Float64Type, TimeUnit, UInt64Type,
+    DurationSecondType, Field, FieldRef, Float64Type, Int8Type, Int16Type, Int32Type,
+    Int64Type, TimeUnit, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use datafusion_common::types::{NativeType, logical_float64};
 use datafusion_common::{
@@ -81,11 +92,50 @@ pub fn avg_distinct(expr: Expr) -> Expr {
 pub struct Avg {
     signature: Signature,
     aliases: Vec<String>,
+    /// See [`Self::with_logical_input`].
+    logical_input: Option<DataType>,
 }
 
 impl Avg {
+    /// An `avg` whose argument is the narrow storage of `logical` values:
+    /// `Decimal32` or `Decimal64` arrays that hold the unscaled values of a
+    /// `Decimal128` column of type `logical`, at the scale of `logical`.
+    ///
+    /// The state, the result type and the result value are those of `avg` over
+    /// the same values stored as `logical`: the sum accumulates in the sum type
+    /// of `logical`, and each value is widened as it is added. `DISTINCT` is an
+    /// error.
+    pub fn with_logical_input(logical: DataType) -> Self {
+        Self {
+            logical_input: Some(logical),
+            ..Self::new()
+        }
+    }
+
+    /// The type set by [`Self::with_logical_input`].
+    pub fn logical_input(&self) -> Option<&DataType> {
+        self.logical_input.as_ref()
+    }
+
+    /// The sum type of [`Self::with_logical_input`] when `input` is narrow
+    /// storage of the logical type and `result` is its `avg` type. The widening
+    /// accumulators keep a `Decimal128` sum, so a logical type whose sum needs
+    /// `Decimal256` has none.
+    fn widened_sum_type(&self, input: &DataType, result: &DataType) -> Option<DataType> {
+        match (self.logical_input.as_ref()?, input, result) {
+            (
+                logical @ DataType::Decimal128(_, logical_scale),
+                DataType::Decimal32(_, scale) | DataType::Decimal64(_, scale),
+                DataType::Decimal128(..),
+            ) if scale == logical_scale => Some(avg_sum_data_type(logical))
+                .filter(|sum| matches!(sum, DataType::Decimal128(..))),
+            _ => None,
+        }
+    }
+
     pub fn new() -> Self {
         Self {
+            logical_input: None,
             // Supported types smallint, int, bigint, real, double precision, decimal, or interval
             // Refer to https://www.postgresql.org/docs/8.2/functions-aggregate.html doc
             signature: Signature::one_of(
@@ -96,9 +146,12 @@ impl Avg {
                     TypeSignature::Coercible(vec![Coercion::new_exact(
                         TypeSignatureClass::Duration,
                     )]),
+                    TypeSignature::Coercible(vec![Coercion::new_exact(
+                        TypeSignatureClass::Integer,
+                    )]),
                     TypeSignature::Coercible(vec![Coercion::new_implicit(
                         TypeSignatureClass::Native(logical_float64()),
-                        vec![TypeSignatureClass::Integer, TypeSignatureClass::Float],
+                        vec![TypeSignatureClass::Float],
                         NativeType::Float64,
                     )]),
                 ],
@@ -266,7 +319,7 @@ impl AggregateUDFImpl for Avg {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        match &arg_types[0] {
+        match self.logical_input.as_ref().unwrap_or(&arg_types[0]) {
             data_type @ (DataType::Decimal32(..)
             | DataType::Decimal64(..)
             | DataType::Decimal128(..)
@@ -280,10 +333,90 @@ impl AggregateUDFImpl for Avg {
         let data_type = acc_args.expr_fields[0].data_type();
         use DataType::*;
 
+        if self.logical_input.is_some() {
+            let Some(sum_data_type) = self
+                .widened_sum_type(data_type, acc_args.return_type())
+                .filter(|_| !acc_args.is_distinct)
+            else {
+                return internal_err!(
+                    "avg of {data_type} cannot accumulate {:?} values as {}",
+                    self.logical_input,
+                    acc_args.return_type()
+                );
+            };
+            return match data_type {
+                Decimal32(..) => decimal_avg_accumulator::<
+                    Decimal32Type,
+                    Decimal128Type,
+                    Decimal128Type,
+                >(&sum_data_type, acc_args.return_type()),
+                _ => decimal_avg_accumulator::<
+                    Decimal64Type,
+                    Decimal128Type,
+                    Decimal128Type,
+                >(&sum_data_type, acc_args.return_type()),
+            };
+        }
+
+        if data_type.is_integer() {
+            macro_rules! make_integer {
+                ($t:ty, $avg:ident, $distinct:ident) => {
+                    if acc_args.is_distinct {
+                        Ok(Box::new($distinct::<$t>::new()) as Box<dyn Accumulator>)
+                    } else {
+                        Ok(Box::new($avg::<$t>::new()) as Box<dyn Accumulator>)
+                    }
+                };
+            }
+            return match data_type {
+                Int8 => make_integer!(
+                    Int8Type,
+                    NarrowAvgAccumulator,
+                    NarrowDistinctAvgAccumulator
+                ),
+                Int16 => make_integer!(
+                    Int16Type,
+                    NarrowAvgAccumulator,
+                    NarrowDistinctAvgAccumulator
+                ),
+                Int32 => make_integer!(
+                    Int32Type,
+                    NarrowAvgAccumulator,
+                    NarrowDistinctAvgAccumulator
+                ),
+                UInt8 => make_integer!(
+                    UInt8Type,
+                    NarrowAvgAccumulator,
+                    NarrowDistinctAvgAccumulator
+                ),
+                UInt16 => make_integer!(
+                    UInt16Type,
+                    NarrowAvgAccumulator,
+                    NarrowDistinctAvgAccumulator
+                ),
+                UInt32 => make_integer!(
+                    UInt32Type,
+                    NarrowAvgAccumulator,
+                    NarrowDistinctAvgAccumulator
+                ),
+                Int64 => make_integer!(
+                    Int64Type,
+                    IntegerAvgAccumulator,
+                    IntegerDistinctAvgAccumulator
+                ),
+                UInt64 => make_integer!(
+                    UInt64Type,
+                    IntegerAvgAccumulator,
+                    IntegerDistinctAvgAccumulator
+                ),
+                _ => unreachable!("integer type checked"),
+            };
+        }
+
         // instantiate specialized accumulator based for the type
         if acc_args.is_distinct {
             match (data_type, acc_args.return_type()) {
-                // Numeric types are converted to Float64 via `coerce_avg_type` during logical plan creation
+                // Floating inputs are coerced to Float64 during logical planning.
                 (Float64, _) => Ok(Box::new(Float64DistinctAvgAccumulator::default())),
 
                 (
@@ -354,6 +487,7 @@ impl AggregateUDFImpl for Avg {
                 DataType::Decimal256(_, scale) => {
                     DataType::Decimal256(DECIMAL256_MAX_PRECISION, *scale)
                 }
+                dt if dt.is_integer() => dt.clone(),
                 _ => args.return_type().clone(),
             };
             // Similar to datafusion_functions_aggregate::sum::Sum::state_fields
@@ -367,7 +501,43 @@ impl AggregateUDFImpl for Avg {
                 .into(),
             ])
         } else {
-            let sum_data_type = avg_sum_data_type(args.input_fields[0].data_type());
+            // Narrow decimal storage has the state of its logical type.
+            let input_type = self
+                .logical_input
+                .as_ref()
+                .unwrap_or_else(|| args.input_fields[0].data_type());
+            if matches!(
+                input_type,
+                DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+            ) {
+                return Ok(vec![
+                    Arc::new(Field::new(
+                        format_state_name(args.name, "count"),
+                        DataType::Int64,
+                        false,
+                    )),
+                    Arc::new(Field::new(
+                        format_state_name(args.name, "sum"),
+                        DataType::Int64,
+                        false,
+                    )),
+                    Arc::new(Field::new(
+                        format_state_name(args.name, "sum_high"),
+                        DataType::Int32,
+                        true,
+                    )),
+                ]);
+            }
+            let sum_data_type = if input_type.is_integer() {
+                DataType::FixedSizeBinary(16)
+            } else {
+                avg_sum_data_type(input_type)
+            };
             Ok(vec![
                 Field::new(
                     format_state_name(args.name, "count"),
@@ -401,6 +571,52 @@ impl AggregateUDFImpl for Avg {
         use DataType::*;
 
         let data_type = args.expr_fields[0].data_type();
+
+        if self.logical_input.is_some() {
+            let Some(sum_data_type) = self
+                .widened_sum_type(data_type, args.return_field.data_type())
+                .filter(|_| !args.is_distinct)
+            else {
+                return internal_err!(
+                    "avg of {data_type} cannot accumulate {:?} values as {}",
+                    self.logical_input,
+                    args.return_field.data_type()
+                );
+            };
+            return match data_type {
+                Decimal32(..) => {
+                    decimal_avg_groups_accumulator::<
+                        Decimal32Type,
+                        Decimal128Type,
+                        Decimal128Type,
+                    >(&sum_data_type, args.return_field.data_type())
+                }
+                _ => decimal_avg_groups_accumulator::<
+                    Decimal64Type,
+                    Decimal128Type,
+                    Decimal128Type,
+                >(&sum_data_type, args.return_field.data_type()),
+            };
+        }
+
+        if data_type.is_integer() {
+            macro_rules! make_integer_groups {
+                ($t:ty, $avg:ident) => {
+                    Ok(Box::new($avg::<$t>::new()) as Box<dyn GroupsAccumulator>)
+                };
+            }
+            return match data_type {
+                Int8 => make_integer_groups!(Int8Type, NarrowAvgGroupsAccumulator),
+                Int16 => make_integer_groups!(Int16Type, NarrowAvgGroupsAccumulator),
+                Int32 => make_integer_groups!(Int32Type, NarrowAvgGroupsAccumulator),
+                UInt8 => make_integer_groups!(UInt8Type, NarrowAvgGroupsAccumulator),
+                UInt16 => make_integer_groups!(UInt16Type, NarrowAvgGroupsAccumulator),
+                UInt32 => make_integer_groups!(UInt32Type, NarrowAvgGroupsAccumulator),
+                Int64 => make_integer_groups!(Int64Type, IntegerAvgGroupsAccumulator),
+                UInt64 => make_integer_groups!(UInt64Type, IntegerAvgGroupsAccumulator),
+                _ => unreachable!("integer type checked"),
+            };
+        }
 
         // instantiate specialized accumulator based for the type
         match (data_type, args.return_field.data_type()) {
@@ -1270,6 +1486,9 @@ mod tests {
     };
     use arrow::datatypes::{Schema, i256};
 
+    mod integer;
+    mod narrow;
+
     struct AvgCase {
         name: &'static str,
         values: ArrayRef,
@@ -1746,5 +1965,145 @@ mod tests {
             &expected
         );
         Ok(())
+    }
+    /// `avg` over narrow storage has the state and the result of `avg` over
+    /// the same values stored as their `Decimal128` logical type, grouped and
+    /// ungrouped, updated from rows and merged from states.
+    #[test]
+    fn narrow_storage_matches_the_logical_type() -> Result<()> {
+        let logical = DataType::Decimal128(15, 2);
+        let narrow = DataType::Decimal64(15, 2);
+        let function = Avg::with_logical_input(logical.clone());
+        let return_type = function.return_type(std::slice::from_ref(&narrow))?;
+        assert_eq!(
+            return_type,
+            Avg::new().return_type(std::slice::from_ref(&logical))?
+        );
+        assert_eq!(return_type, DataType::Decimal128(19, 6));
+
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            seed.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let groups = 5_usize;
+        let mut narrow_groups = with_avg_args(&narrow, &return_type, |args| {
+            function.create_groups_accumulator(args)
+        })?;
+        let mut wide_groups = avg_groups_accumulator(&logical, &return_type)?;
+        let mut narrow_all =
+            with_avg_args(&narrow, &return_type, |args| function.accumulator(args))?;
+        let mut wide_all = avg_accumulator(&logical, &return_type)?;
+        for _ in 0..50 {
+            let rows = (next() % 200) as usize;
+            let values: Vec<Option<i64>> = (0..rows)
+                .map(|_| match next() % 4 {
+                    0 => None,
+                    1 => Some(999_999_999_999_999),
+                    2 => Some(-999_999_999_999_999),
+                    _ => Some((next() % 1_000_000) as i64),
+                })
+                .collect();
+            // Group 4 receives no valid value and stays null.
+            let indices: Vec<usize> = values
+                .iter()
+                .map(|value| match value {
+                    Some(_) => (next() % 4) as usize,
+                    None => 4,
+                })
+                .collect();
+            let narrow_values: ArrayRef = Arc::new(
+                Decimal64Array::from(values.clone()).with_precision_and_scale(15, 2)?,
+            );
+            let wide_values: ArrayRef = Arc::new(
+                Decimal128Array::from(
+                    values
+                        .iter()
+                        .map(|value| value.map(i128::from))
+                        .collect::<Vec<_>>(),
+                )
+                .with_precision_and_scale(15, 2)?,
+            );
+            narrow_groups.update_batch(
+                std::slice::from_ref(&narrow_values),
+                &indices,
+                None,
+                groups,
+            )?;
+            wide_groups.update_batch(
+                std::slice::from_ref(&wide_values),
+                &indices,
+                None,
+                groups,
+            )?;
+            narrow_all.update_batch(&[narrow_values])?;
+            wide_all.update_batch(&[wide_values])?;
+        }
+
+        // The states are equal, so a final aggregation over the logical type
+        // merges either.
+        assert_eq!(
+            with_avg_args(&narrow, &return_type, |args| function
+                .create_groups_accumulator(args))?
+            .convert_to_state(
+                &[Arc::new(
+                    Decimal64Array::from(vec![Some(7), None])
+                        .with_precision_and_scale(15, 2)?
+                )],
+                None
+            )?,
+            avg_groups_accumulator(&logical, &return_type)?.convert_to_state(
+                &[Arc::new(
+                    Decimal128Array::from(vec![Some(7), None])
+                        .with_precision_and_scale(15, 2)?
+                )],
+                None
+            )?
+        );
+        assert_eq!(narrow_all.state()?, wide_all.state()?);
+        assert_eq!(narrow_all.evaluate()?, wide_all.evaluate()?);
+        let narrow_result = narrow_groups.evaluate(EmitTo::First(groups))?;
+        let wide_result = wide_groups.evaluate(EmitTo::First(groups))?;
+        assert_eq!(narrow_result.data_type(), &return_type);
+        assert_eq!(&narrow_result, &wide_result);
+        assert_eq!(narrow_result.null_count(), 1);
+
+        // A merged state gives the same averages.
+        let mut merged = with_avg_args(&narrow, &return_type, |args| {
+            function.create_groups_accumulator(args)
+        })?;
+        let mut source = avg_groups_accumulator(&logical, &return_type)?;
+        let wide_values: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(100), Some(301), None])
+                .with_precision_and_scale(15, 2)?,
+        );
+        source.update_batch(&[wide_values], &[0, 0, 1], None, 2)?;
+        let state = source.state(EmitTo::All)?;
+        merged.merge_batch(&state, &[0, 1], 2)?;
+        let averages = merged.evaluate(EmitTo::All)?;
+        let averages = averages.as_primitive::<Decimal128Type>();
+        assert_eq!(averages.value(0), 2_005_000);
+        assert!(averages.is_null(1));
+        Ok(())
+    }
+
+    #[test]
+    fn narrow_storage_rejects_other_types() {
+        let function = Avg::with_logical_input(DataType::Decimal128(15, 2));
+        let return_type = DataType::Decimal128(19, 6);
+        // The scale of the storage must be the scale of the logical type.
+        for input in [DataType::Decimal64(15, 3), DataType::Decimal128(15, 2)] {
+            assert!(
+                with_avg_args(&input, &return_type, |args| function
+                    .create_groups_accumulator(args))
+                .is_err()
+            );
+            assert!(
+                with_avg_args(&input, &return_type, |args| function.accumulator(args))
+                    .is_err()
+            );
+        }
     }
 }
