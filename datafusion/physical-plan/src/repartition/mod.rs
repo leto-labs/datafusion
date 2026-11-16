@@ -435,7 +435,6 @@ impl RepartitionExecState {
         &mut self,
         input: &Arc<dyn ExecutionPlan>,
         metrics: &ExecutionPlanMetricsSet,
-        output_partitions: usize,
         ctx: &Arc<TaskContext>,
     ) -> Result<()> {
         if !matches!(self, RepartitionExecState::NotInitialized) {
@@ -446,7 +445,7 @@ impl RepartitionExecState {
         let mut streams_and_metrics = Vec::with_capacity(num_input_partitions);
 
         for i in 0..num_input_partitions {
-            let metrics = RepartitionMetrics::new(i, output_partitions, metrics);
+            let metrics = RepartitionMetrics::new(i, metrics);
 
             let timer = metrics.fetch_time.timer();
             let stream = input.execute(i, Arc::clone(ctx))?;
@@ -472,12 +471,7 @@ impl RepartitionExecState {
     ) -> Result<&mut ConsumingInputStreamsState> {
         let streams_and_metrics = match self {
             RepartitionExecState::NotInitialized => {
-                self.ensure_input_streams_initialized(
-                    input,
-                    metrics,
-                    partitioning.partition_count(),
-                    context,
-                )?;
+                self.ensure_input_streams_initialized(input, metrics, context)?;
                 let RepartitionExecState::InputStreamsInitialized(value) = self else {
                     // This cannot happen, as ensure_input_streams_initialized() was just called,
                     // but the compiler does not know.
@@ -1651,16 +1645,13 @@ struct RepartitionMetrics {
     repartition_time: metrics::Time,
     /// Time in nanos for sending resulting batches to channels.
     ///
-    /// One metric per output partition.
-    send_time: Vec<metrics::Time>,
+    /// Sending is measured once per input partition. Per-output labels made
+    /// this setup quadratic at high fanout without adding a scheduling signal.
+    send_time: metrics::Time,
 }
 
 impl RepartitionMetrics {
-    pub fn new(
-        input_partition: usize,
-        num_output_partitions: usize,
-        metrics: &ExecutionPlanMetricsSet,
-    ) -> Self {
+    pub fn new(input_partition: usize, metrics: &ExecutionPlanMetricsSet) -> Self {
         // Time in nanos to execute child operator and fetch batches
         let fetch_time =
             MetricBuilder::new(metrics).subset_time("fetch_time", input_partition);
@@ -1670,15 +1661,8 @@ impl RepartitionMetrics {
             MetricBuilder::new(metrics).subset_time("repartition_time", input_partition);
 
         // Time in nanos for sending resulting batches to channels
-        let send_time = (0..num_output_partitions)
-            .map(|output_partition| {
-                let label =
-                    metrics::Label::new("outputPartition", output_partition.to_string());
-                MetricBuilder::new(metrics)
-                    .with_label(label)
-                    .subset_time("send_time", input_partition)
-            })
-            .collect();
+        let send_time =
+            MetricBuilder::new(metrics).subset_time("send_time", input_partition);
 
         Self {
             fetch_time,
@@ -1876,12 +1860,7 @@ impl ExecutionPlan for RepartitionExec {
 
         let state = Arc::clone(&self.state);
         if let Some(mut state) = state.try_lock() {
-            state.ensure_input_streams_initialized(
-                &input,
-                &metrics,
-                partitioning.partition_count(),
-                &context,
-            )?;
+            state.ensure_input_streams_initialized(&input, &metrics, &context)?;
         }
 
         let num_input_partitions = input.output_partitioning().partition_count();
@@ -2425,7 +2404,7 @@ impl RepartitionExec {
                 ranges.len() == 1 && ranges[0].1 == 0 && ranges[0].2 == batch.num_rows();
             let mut batch = Some(batch);
             for (partition, start, len) in ranges {
-                let timer = metrics.send_time[partition].timer();
+                let timer = metrics.send_time.timer();
                 // if there is still a receiver, send to it
                 if let Some(output_channel) = output_channels.get_mut(&partition) {
                     if whole {
@@ -2779,6 +2758,20 @@ mod tests {
         LexOrdering, PhysicalSortExpr, RangePartitioning, SplitPoint,
     };
     use insta::assert_snapshot;
+
+    #[test]
+    fn repartition_send_metrics_are_linear_in_input_partitions() {
+        let metrics = ExecutionPlanMetricsSet::new();
+        let created = RepartitionMetrics::new(7, &metrics);
+        assert_eq!(created.send_time.value(), 0);
+        let all_metrics = metrics.clone_inner();
+        let send_metrics: Vec<_> = all_metrics
+            .iter()
+            .filter(|metric| metric.value().name() == "send_time")
+            .collect();
+        assert_eq!(send_metrics.len(), 1);
+        assert!(send_metrics[0].labels().is_empty());
+    }
 
     #[derive(Debug)]
     struct UnboundedTestPartition {
