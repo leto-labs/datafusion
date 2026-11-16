@@ -11918,4 +11918,62 @@ mod tests {
         }
         Ok(())
     }
+
+    /// Family FZ regression (the FZ patch is dropped: 56 covers it). The join
+    /// matches `-0.0` with `0.0`; 56 compares floats in the pushed bounds and
+    /// IN list by SQL float semantics, so the dynamic filter it publishes for
+    /// float keys keeps every matching probe row, in both directions.
+    #[tokio::test]
+    async fn float_keys_produce_no_dynamic_filter_row_loss() -> Result<()> {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("k", DataType::Float64, true)]));
+        let batch = |values: Vec<f64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Float64Array::from(values)) as ArrayRef],
+            )
+        };
+        let mut config = SessionConfig::default();
+        config
+            .options_mut()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown = true;
+        let context =
+            Arc::new(TaskContext::default().with_session_config(config.clone()));
+        // Each build/probe pair has two matches by the join's equality.
+        for (build, probe) in [
+            (vec![0.0, 1.5], vec![-0.0, 0.0, 2.0]),
+            (vec![-0.0, 1.5], vec![0.0, -0.0, 2.0]),
+            (vec![-0.0], vec![0.0, 0.0, 1.0]),
+            (vec![f64::NAN, 1.0], vec![f64::NAN, 1.0, 2.0]),
+        ] {
+            let left = TestMemoryExec::try_new_exec(
+                &[vec![batch(build.clone())?]],
+                Arc::clone(&schema),
+                None,
+            )?;
+            let right = TestMemoryExec::try_new_exec(
+                &[vec![batch(probe)?]],
+                Arc::clone(&schema),
+                None,
+            )?;
+            let on: JoinOn = vec![(
+                Arc::new(Column::new_with_schema("k", &schema)?) as _,
+                Arc::new(Column::new_with_schema("k", &schema)?) as _,
+            )];
+            let (join, dynamic_filter) =
+                hash_join_with_dynamic_filter(left, right, on, JoinType::Inner)?;
+            assert!(join.allow_join_dynamic_filter_pushdown(config.options()));
+            let batches = common::collect(join.execute(0, Arc::clone(&context))?).await?;
+            let rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
+            assert_eq!(rows, 2, "build {build:?}");
+            let filter = dynamic_filter.current()?;
+            assert!(format!("{filter}").contains(">="), "{filter}");
+            let zeros = batch(vec![-0.0, 0.0])?;
+            let mask = filter.evaluate(&zeros)?.into_array(2)?;
+            let keeps_zeros = mask.as_boolean().iter().all(|keep| keep == Some(true));
+            assert_eq!(keeps_zeros, build.contains(&0.0), "{filter}");
+        }
+        Ok(())
+    }
 }
