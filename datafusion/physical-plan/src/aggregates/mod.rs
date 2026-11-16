@@ -115,8 +115,8 @@
 //!
 //! ## 5. Partial-reduce hash aggregation
 //!
-//! This implementation will not be planned by DataFusion SQL interface, it must be
-//! manually constructed at [`ExecutionPlan`] level.
+//! Chained grouping sets construct this mode internally. Other uses can
+//! construct it at [`ExecutionPlan`] level.
 //!
 //! This mode is useful in a distributed setting.
 //!
@@ -201,6 +201,11 @@ mod aggregate_argument;
 mod aggregate_hash_table;
 mod aggregate_stream;
 mod bounded_partial;
+mod chained_grouping_sets;
+#[cfg(test)]
+mod chained_grouping_sets_review_tests;
+#[cfg(test)]
+mod chained_grouping_sets_tests;
 mod clustered_final_stream;
 mod clustered_partial_stream;
 mod clustered_single_stream;
@@ -2300,6 +2305,11 @@ impl ExecutionPlan for AggregateExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        if let Some(stream) =
+            chained_grouping_sets::execute(self, partition, Arc::clone(&context))?
+        {
+            return Ok(stream);
+        }
         self.execute_typed(partition, &context)
             .map(|stream| stream.into())
     }
@@ -4064,8 +4074,11 @@ mod tests {
             Arc::clone(&input_schema),
         )?);
 
-        let result =
-            collect(partial_aggregate.execute(0, Arc::clone(&task_ctx))?).await?;
+        // This snapshot covers native partial-state pressure emission. Keep
+        // that mechanism explicit; CG has different intermediate rows/metrics.
+        // The final-result check below still executes the default CG dispatcher.
+        let partial_stream = partial_aggregate.execute_typed(0, &task_ctx)?.into();
+        let result = collect(partial_stream).await?;
 
         if spill {
             let early_emit_count = partial_aggregate
