@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 impl serde::Serialize for AggLimit {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
