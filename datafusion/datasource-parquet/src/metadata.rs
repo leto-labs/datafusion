@@ -106,6 +106,96 @@ pub(crate) fn has_untrusted_byte_array_stats<'a>(
     })
 }
 
+/// Longbow family SCN: whether Parquet leaf `index` stores floating-point
+/// values, whose min/max statistics leave out NaN and may not order the two
+/// zeros: the spec asks writers to write a zero min as -0.0 and a zero max as
+/// +0.0, but a non-conforming writer can record min = max = +0.0 for
+/// `[-0.0, 0.0]` (see [`widen_float_zero_bounds`]). FLOAT, DOUBLE and
+/// FIXED_LEN_BYTE_ARRAY with the FLOAT16 logical type.
+pub(crate) fn is_float_leaf(parquet_schema: &SchemaDescriptor, index: usize) -> bool {
+    let column = parquet_schema.column(index);
+    match column.physical_type() {
+        parquet::basic::Type::FLOAT | parquet::basic::Type::DOUBLE => true,
+        parquet::basic::Type::FIXED_LEN_BYTE_ARRAY => matches!(
+            column.logical_type_ref(),
+            Some(parquet::basic::LogicalType::Float16)
+        ),
+        _ => false,
+    }
+}
+
+/// Longbow family SCN: read float bounds as the Parquet spec requires: a min
+/// of +0.0 as -0.0 and a max of -0.0 as +0.0. A zero bound then covers both
+/// zeros, whatever sign the writer recorded. Other types are unchanged.
+pub(crate) fn widen_float_zero_bounds(values: ArrayRef, is_min: bool) -> ArrayRef {
+    use arrow::array::AsArray;
+    use arrow::datatypes::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type};
+    match values.data_type() {
+        DataType::Float64 => {
+            let zero = if is_min { -0.0 } else { 0.0 };
+            Arc::new(
+                values
+                    .as_primitive::<Float64Type>()
+                    .unary::<_, Float64Type>(|v| if v == 0.0 { zero } else { v }),
+            )
+        }
+        DataType::Float32 => {
+            let zero = if is_min { -0.0 } else { 0.0 };
+            Arc::new(
+                values
+                    .as_primitive::<Float32Type>()
+                    .unary::<_, Float32Type>(|v| if v == 0.0 { zero } else { v }),
+            )
+        }
+        DataType::Float16 => {
+            type F16 = <Float16Type as ArrowPrimitiveType>::Native;
+            let zero = F16::from_bits(if is_min { 0x8000 } else { 0 });
+            // IEEE equality: true for both zeros.
+            let positive_zero = F16::from_bits(0);
+            Arc::new(
+                values
+                    .as_primitive::<Float16Type>()
+                    .unary::<_, Float16Type>(
+                        |v| if v == positive_zero { zero } else { v },
+                    ),
+            )
+        }
+        _ => values,
+    }
+}
+
+/// Longbow family SCN: whether a row group's min/max of leaf `index` may omit
+/// NaN values. Float statistics are trusted only when they record
+/// `nan_count == 0` (Arrow 60 writers record it); without a NaN count a
+/// column `[NaN, 1.0]` has min = max = 1.0.
+pub(crate) fn row_group_stats_may_omit_nan(
+    parquet_schema: &SchemaDescriptor,
+    index: usize,
+    group: &RowGroupMetaData,
+) -> bool {
+    is_float_leaf(parquet_schema, index)
+        && group
+            .column(index)
+            .statistics()
+            .and_then(|stats| stats.nan_count_opt())
+            != Some(0)
+}
+
+/// Longbow family SCN: whether any row group's min/max of leaf `index` may
+/// omit NaN values, so file-level bounds cannot be established.
+pub(crate) fn has_nan_unsafe_float_stats<'a>(
+    parquet_schema: &SchemaDescriptor,
+    parquet_column_index: Option<usize>,
+    row_groups: impl IntoIterator<Item = &'a RowGroupMetaData>,
+) -> bool {
+    parquet_column_index.is_some_and(|index| {
+        is_float_leaf(parquet_schema, index)
+            && row_groups
+                .into_iter()
+                .any(|group| row_group_stats_may_omit_nan(parquet_schema, index, group))
+    })
+}
+
 /// Handles fetching Parquet file schema, metadata and statistics
 /// from object store.
 ///
@@ -637,6 +727,10 @@ impl<'a> DFParquetMetadata<'a> {
                                 file_metadata.schema_descr(),
                                 parquet_index,
                                 row_groups_metadata,
+                            ) || has_nan_unsafe_float_stats(
+                                file_metadata.schema_descr(),
+                                parquet_index,
+                                row_groups_metadata,
                             ) {
                                 // The remaining row groups cannot establish bounds
                                 // for the whole file. Keep unrelated statistics.
@@ -810,25 +904,41 @@ fn summarize_column_statistics(
     let parquet_index = stats_converter.parquet_column_index();
 
     if accumulators.max_accs[logical_schema_index].is_some() {
+        // A widened zero bound (Longbow family SCN) may not be a value of
+        // the file: it stays a bound but is no longer exact.
+        let raw = stats_converter.row_group_maxes(row_groups_metadata)?;
+        let widened = widen_float_zero_bounds(Arc::clone(&raw), false);
+        let was_widened = widened.as_ref() != raw.as_ref();
         accumulators.is_max_value_exact[logical_schema_index] = summarize_bound(
             &mut accumulators.max_accs[logical_schema_index],
-            &stats_converter.row_group_maxes(row_groups_metadata)?,
+            &widened,
             parquet_index,
             row_groups_metadata,
             ParquetStatistics::max_is_exact,
             || Ok(stats_converter.row_group_is_max_value_exact(row_groups_metadata)?),
         )?;
+        if was_widened {
+            accumulators.is_max_value_exact[logical_schema_index] = Some(false);
+        }
     }
 
     if accumulators.min_accs[logical_schema_index].is_some() {
+        // A widened zero bound (Longbow family SCN) may not be a value of
+        // the file: it stays a bound but is no longer exact.
+        let raw = stats_converter.row_group_mins(row_groups_metadata)?;
+        let widened = widen_float_zero_bounds(Arc::clone(&raw), true);
+        let was_widened = widened.as_ref() != raw.as_ref();
         accumulators.is_min_value_exact[logical_schema_index] = summarize_bound(
             &mut accumulators.min_accs[logical_schema_index],
-            &stats_converter.row_group_mins(row_groups_metadata)?,
+            &widened,
             parquet_index,
             row_groups_metadata,
             ParquetStatistics::min_is_exact,
             || Ok(stats_converter.row_group_is_min_value_exact(row_groups_metadata)?),
         )?;
+        if was_widened {
+            accumulators.is_min_value_exact[logical_schema_index] = Some(false);
+        }
     }
 
     accumulators.null_counts_array[logical_schema_index] =
@@ -1459,6 +1569,157 @@ mod tests {
             );
 
             ParquetMetaData::new(file_meta, row_groups)
+        }
+
+        /// Longbow family SCN: zero bounds widen for every float width and leave
+        /// other values and nulls alone.
+        #[test]
+        fn widen_float_zero_bounds_covers_float16_float32_float64() {
+            use arrow::array::{Float16Array, Float32Array, Float64Array, Int32Array};
+            use arrow::datatypes::{ArrowPrimitiveType, Float16Type};
+            type F16 = <Float16Type as ArrowPrimitiveType>::Native;
+            let sign = |values: &ArrayRef, i: usize| -> Option<bool> {
+                if values.is_null(i) {
+                    return None;
+                }
+                Some(match values.data_type() {
+                    DataType::Float16 => {
+                        values
+                            .as_any()
+                            .downcast_ref::<Float16Array>()
+                            .unwrap()
+                            .value(i)
+                            .to_bits()
+                            & 0x8000
+                            != 0
+                    }
+                    DataType::Float32 => values
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .unwrap()
+                        .value(i)
+                        .is_sign_negative(),
+                    _ => values
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .unwrap()
+                        .value(i)
+                        .is_sign_negative(),
+                })
+            };
+            let arrays: Vec<ArrayRef> = vec![
+                Arc::new(Float16Array::from(vec![
+                    Some(F16::from_bits(0)),
+                    Some(F16::from_bits(0x8000)),
+                    None,
+                    Some(F16::from_bits(0x3c00)),
+                ])),
+                Arc::new(Float32Array::from(vec![
+                    Some(0.0),
+                    Some(-0.0),
+                    None,
+                    Some(1.0),
+                ])),
+                Arc::new(Float64Array::from(vec![
+                    Some(0.0),
+                    Some(-0.0),
+                    None,
+                    Some(1.0),
+                ])),
+            ];
+            for values in arrays {
+                let mins = widen_float_zero_bounds(Arc::clone(&values), true);
+                let maxes = widen_float_zero_bounds(Arc::clone(&values), false);
+                let kind = values.data_type().clone();
+                assert_eq!(
+                    (0..4).map(|i| sign(&mins, i)).collect::<Vec<_>>(),
+                    vec![Some(true), Some(true), None, Some(false)],
+                    "{kind}"
+                );
+                assert_eq!(
+                    (0..4).map(|i| sign(&maxes, i)).collect::<Vec<_>>(),
+                    vec![Some(false), Some(false), None, Some(false)],
+                    "{kind}"
+                );
+            }
+            let ints: ArrayRef = Arc::new(Int32Array::from(vec![0]));
+            assert_eq!(
+                widen_float_zero_bounds(Arc::clone(&ints), true).as_ref(),
+                ints.as_ref()
+            );
+        }
+
+        /// Longbow family SCN: float file statistics. A NaN count of zero is
+        /// required for bounds, and per the Parquet spec a zero min is read as
+        /// -0.0 and a zero max as +0.0; a widened bound is not exact. A
+        /// non-conforming writer that recorded min = max = +0.0 for
+        /// `[-0.0, 0.0]` must not yield an exact `[+0.0, +0.0]`.
+        #[test]
+        fn float_file_statistics_require_nan_counts_and_widen_zero_bounds() {
+            use parquet::file::statistics::ValueStatistics;
+            use parquet::schema::types::Type as SchemaType;
+            let field = SchemaType::primitive_type_builder("k", PhysicalType::DOUBLE)
+                .with_repetition(parquet::basic::Repetition::REQUIRED)
+                .build()
+                .unwrap();
+            let schema = SchemaType::group_type_builder("schema")
+                .with_fields(vec![Arc::new(field)])
+                .build()
+                .unwrap();
+            let schema_descr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
+            let arrow_schema =
+                Arc::new(Schema::new(vec![Field::new("k", DataType::Float64, false)]));
+            let stats = |min: f64, max: f64, nan_count: Option<u64>| {
+                ParquetStatistics::Double(
+                    ValueStatistics::new(Some(min), Some(max), None, Some(0), false)
+                        .with_nan_count(nan_count),
+                )
+            };
+            let file = |stats: ParquetStatistics| {
+                let row_group =
+                    create_row_group_with_stats(&schema_descr, vec![Some(stats)], 2);
+                let metadata =
+                    create_parquet_metadata(Arc::clone(&schema_descr), vec![row_group]);
+                let statistics = DFParquetMetadata::statistics_from_parquet_metadata(
+                    &metadata,
+                    &arrow_schema,
+                )
+                .unwrap();
+                let column = &statistics.column_statistics[0];
+                (column.min_value.clone(), column.max_value.clone())
+            };
+            // No NaN count, or NaNs present: no bounds at all.
+            for nan_count in [None, Some(1)] {
+                assert_eq!(
+                    file(stats(1.0, 1.0, nan_count)),
+                    (Precision::Absent, Precision::Absent),
+                    "{nan_count:?}"
+                );
+            }
+            // NaN-free: the bounds stay exact.
+            assert_eq!(
+                file(stats(1.0, 3.0, Some(0))),
+                (
+                    Precision::Exact(ScalarValue::Float64(Some(1.0))),
+                    Precision::Exact(ScalarValue::Float64(Some(3.0)))
+                )
+            );
+            // min = max = +0.0 widens to [-0.0, +0.0], inexact.
+            let (min, max) = file(stats(0.0, 0.0, Some(0)));
+            let Precision::Inexact(ScalarValue::Float64(Some(min))) = min else {
+                panic!("widened min must be inexact: {min:?}")
+            };
+            assert!(min == 0.0 && min.is_sign_negative());
+            assert_eq!(max, Precision::Exact(ScalarValue::Float64(Some(0.0))));
+            // min = max = -0.0 widens the max.
+            let (min, max) = file(stats(-0.0, -0.0, Some(0)));
+            let Precision::Inexact(ScalarValue::Float64(Some(max))) = max else {
+                panic!("widened max must be inexact: {max:?}")
+            };
+            assert!(max == 0.0 && max.is_sign_positive());
+            assert!(
+                matches!(min, Precision::Exact(ScalarValue::Float64(Some(v))) if v.is_sign_negative())
+            );
         }
 
         #[test]

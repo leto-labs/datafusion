@@ -2149,11 +2149,18 @@ fn constant_value_from_stats(
     num_rows: Option<usize>,
     data_type: &DataType,
 ) -> Option<ScalarValue> {
+    // Longbow family SCN: Parquet float statistics leave out NaN, and a
+    // signed zero can compare equal to the other zero, so `min == max` does
+    // not prove that every value of a float column is that value. Column
+    // statistics carry no NaN count, so float columns never become
+    // statistics constants (an all-NULL column below is still exact).
     if let (Precision::Exact(min), Precision::Exact(max)) =
         (&column_stats.min_value, &column_stats.max_value)
         && min == max
         && !min.is_null()
         && matches!(column_stats.null_count, Precision::Exact(0))
+        && !may_hide_float_values(data_type)
+        && !may_hide_float_values(&min.data_type())
     {
         // Cast to the expected data type if needed (e.g., Utf8 -> Dictionary)
         if min.data_type() != *data_type {
@@ -2170,6 +2177,17 @@ fn constant_value_from_stats(
     }
 
     None
+}
+
+/// Whether min/max statistics of `data_type` can omit values: floating point
+/// statistics exclude NaN and need not distinguish `-0.0` from `0.0`.
+fn may_hide_float_values(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => true,
+        DataType::Dictionary(_, values) => may_hide_float_values(values),
+        DataType::RunEndEncoded(_, values) => may_hide_float_values(values.data_type()),
+        _ => false,
+    }
 }
 
 /// Return the initial [`ParquetAccessPlan`]
@@ -3421,6 +3439,152 @@ mod test {
 
             assert_eq!(rows, 2);
             assert_eq!(bytes_processed(&metrics), data_len);
+        }
+    }
+
+    /// Family SCN: Parquet float statistics leave out NaN, and `-0.0`/`0.0`
+    /// can compare equal as statistics. A float column whose statistics show
+    /// `min == max` and no nulls must still be read from the file, never
+    /// replaced by the statistics value, with and without a predicate on it.
+    #[tokio::test]
+    async fn stats_constants_never_replace_nan_capable_float_columns() {
+        use arrow::array::{ArrayRef, Float32Array, Float64Array};
+        use arrow::compute::filter_record_batch;
+        let cases: Vec<(&str, Vec<f64>)> = vec![
+            ("nan_one", vec![f64::NAN, 1.0]),
+            ("nan_nan", vec![f64::NAN, f64::NAN]),
+            ("signed_zero", vec![-0.0, 0.0]),
+            ("one_one", vec![1.0, 1.0]),
+        ];
+        for (name, values) in cases {
+            for float32 in [false, true] {
+                let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+                let (data_type, column): (DataType, ArrayRef) = if float32 {
+                    let values = values.iter().map(|v| *v as f32);
+                    (
+                        DataType::Float32,
+                        Arc::new(Float32Array::from_iter_values(values)),
+                    )
+                } else {
+                    (
+                        DataType::Float64,
+                        Arc::new(Float64Array::from(values.clone())),
+                    )
+                };
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "k",
+                    data_type.clone(),
+                    false,
+                )]));
+                let batch =
+                    RecordBatch::try_new(Arc::clone(&schema), vec![column]).unwrap();
+                let filename = format!("{name}.parquet");
+                let (data_size, statistics) = write_parquet_with_collected_statistics(
+                    Arc::clone(&store),
+                    &filename,
+                    batch.clone(),
+                    &schema,
+                )
+                .await;
+                let literal = |v: f64| {
+                    if float32 {
+                        ScalarValue::Float32(Some(v as f32))
+                    } else {
+                        ScalarValue::Float64(Some(v))
+                    }
+                };
+                let predicates: Vec<Option<Arc<dyn PhysicalExpr>>> = vec![
+                    None,
+                    Some(Arc::new(
+                        datafusion_physical_expr::expressions::BinaryExpr::new(
+                            Arc::new(Column::new("k", 0)),
+                            datafusion_expr::Operator::Eq,
+                            Arc::new(Literal::new(literal(1.0))),
+                        ),
+                    )),
+                    Some(Arc::new(
+                        datafusion_physical_expr::expressions::BinaryExpr::new(
+                            Arc::new(Column::new("k", 0)),
+                            datafusion_expr::Operator::Eq,
+                            Arc::new(Literal::new(literal(0.0))),
+                        ),
+                    )),
+                ];
+                for predicate in predicates {
+                    for pushdown in [false, true] {
+                        // Expected rows: the predicate evaluated on the
+                        // in-memory batch, compared bit for bit.
+                        let expected = match &predicate {
+                            Some(predicate) => {
+                                let mask = predicate
+                                    .evaluate(&batch)
+                                    .unwrap()
+                                    .into_array(batch.num_rows())
+                                    .unwrap();
+                                filter_record_batch(&batch, mask.as_boolean()).unwrap()
+                            }
+                            _ => batch.clone(),
+                        };
+                        let mut file = PartitionedFile::new(
+                            filename.clone(),
+                            u64::try_from(data_size).unwrap(),
+                        );
+                        file.statistics = Some(Arc::new(statistics.clone()));
+                        let mut builder = ParquetMorselizerBuilder::new()
+                            .with_store(Arc::clone(&store))
+                            .with_schema(Arc::clone(&schema))
+                            .with_projection_indices(&[0])
+                            .with_pushdown_filters(pushdown);
+                        if let Some(predicate) = &predicate {
+                            builder = builder.with_predicate(Arc::clone(predicate));
+                        }
+                        let morselizer = builder.build();
+                        let batches = collect_batches(&morselizer, file).await;
+                        let bits = |batches: &[RecordBatch]| -> Vec<u64> {
+                            batches
+                                .iter()
+                                .flat_map(|batch| {
+                                    let column = batch.column(0);
+                                    (0..column.len())
+                                        .map(|i| {
+                                            if float32 {
+                                                column
+                                                    .as_primitive::<arrow::datatypes::Float32Type>()
+                                                    .value(i)
+                                                    .to_bits()
+                                                    as u64
+                                            } else {
+                                                column
+                                                    .as_primitive::<arrow::datatypes::Float64Type>()
+                                                    .value(i)
+                                                    .to_bits()
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .collect()
+                        };
+                        // Without pushdown the scan may return rows that the
+                        // predicate rejects (the filter runs above it): it must
+                        // return every matching row and only file values.
+                        let read = bits(&batches);
+                        let wanted = bits(&[expected]);
+                        if pushdown || predicate.is_none() {
+                            assert_eq!(
+                                read, wanted,
+                                "{name} float32={float32} pushdown={pushdown} predicate={predicate:?}"
+                            );
+                        } else {
+                            let file_values = bits(std::slice::from_ref(&batch));
+                            assert!(
+                                read.iter().all(|v| file_values.contains(v)),
+                                "{name} float32={float32} predicate={predicate:?}: {read:?}"
+                            );
+                            assert!(wanted.iter().all(|v| read.contains(v)));
+                        }
+                    }
+                }
+            }
         }
     }
 

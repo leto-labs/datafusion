@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use super::{ParquetAccessPlan, ParquetFileMetrics, RowGroupAccess};
 use crate::bloom_filter::BloomFilterStatistics;
-use crate::metadata::{has_untrusted_byte_array_stats, has_untrusted_min_max_order};
+use crate::metadata::{
+    has_nan_unsafe_float_stats, has_untrusted_byte_array_stats,
+    has_untrusted_min_max_order, row_group_stats_may_omit_nan, widen_float_zero_bounds,
+};
 use crate::pruning::build_inverted_predicate;
 use arrow::array::{ArrayRef, BooleanArray, UInt64Array};
 use arrow::compute::nullif;
@@ -563,19 +566,51 @@ impl<'a> RowGroupPruningStatistics<'a> {
         }));
         nullif(values.as_ref(), &mask).ok()
     }
+
+    /// Longbow family SCN: drop float bounds of row groups whose statistics
+    /// do not record `nan_count == 0`; min/max leave NaN out, so such bounds
+    /// would prune or fully match a group that holds NaN rows.
+    fn mask_nan_unsafe_float_stats(
+        &self,
+        parquet_index: Option<usize>,
+        values: ArrayRef,
+    ) -> Option<ArrayRef> {
+        if !has_nan_unsafe_float_stats(
+            self.parquet_schema,
+            parquet_index,
+            self.metadata_iter(),
+        ) {
+            return Some(values);
+        }
+        let index = parquet_index.expect("checked above");
+        let mask = BooleanArray::from_iter(self.metadata_iter().map(|group| {
+            Some(row_group_stats_may_omit_nan(
+                self.parquet_schema,
+                index,
+                group,
+            ))
+        }));
+        nullif(values.as_ref(), &mask).ok()
+    }
 }
 
 impl PruningStatistics for RowGroupPruningStatistics<'_> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         let converter = self.min_max_statistics_converter(column)?;
         let values = converter.row_group_mins(self.metadata_iter()).ok()?;
-        self.mask_untrusted_byte_array_stats(converter.parquet_column_index(), values)
+        let values = self
+            .mask_untrusted_byte_array_stats(converter.parquet_column_index(), values)?;
+        self.mask_nan_unsafe_float_stats(converter.parquet_column_index(), values)
+            .map(|values| widen_float_zero_bounds(values, true))
     }
 
     fn max_values(&self, column: &Column) -> Option<ArrayRef> {
         let converter = self.min_max_statistics_converter(column)?;
         let values = converter.row_group_maxes(self.metadata_iter()).ok()?;
-        self.mask_untrusted_byte_array_stats(converter.parquet_column_index(), values)
+        let values = self
+            .mask_untrusted_byte_array_stats(converter.parquet_column_index(), values)?;
+        self.mask_nan_unsafe_float_stats(converter.parquet_column_index(), values)
+            .map(|values| widen_float_zero_bounds(values, false))
     }
 
     fn num_containers(&self) -> usize {
@@ -859,6 +894,128 @@ mod tests {
             &metrics,
         );
         assert_pruned(row_groups, ExpectedPruning::Some(vec![1]))
+    }
+
+    /// Longbow family SCN: float min/max leave NaN out. A row group whose
+    /// statistics do not record `nan_count == 0` (older writers record no NaN
+    /// count) is neither pruned nor fully matched by its bounds.
+    #[test]
+    fn row_group_float_bounds_require_a_zero_nan_count() {
+        use datafusion_expr::{col, lit};
+        use parquet::file::statistics::ValueStatistics;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c1",
+            DataType::Float64,
+            false,
+        )]));
+        let schema_descr = get_test_schema_descr(vec![PrimitiveTypeField::new(
+            "c1",
+            PhysicalType::DOUBLE,
+        )]);
+        let group = |nan_count: Option<u64>| {
+            get_row_group_meta_data(
+                &schema_descr,
+                vec![ParquetStatistics::Double(
+                    ValueStatistics::new(Some(1.0), Some(1.0), None, Some(0), false)
+                        .with_nan_count(nan_count),
+                )],
+            )
+        };
+        let groups = [group(None), group(Some(1)), group(Some(0))];
+        for (expr, expected, fully_matched) in [
+            // min = max = 1.0: only the group without NaN can be pruned.
+            (col("c1").gt(lit(1.5)), vec![0, 1], vec![false, false]),
+            // Every non-NaN row matches: only the group without NaN is fully
+            // matched, so the row filter still runs for the others.
+            (
+                col("c1").lt(lit(2.0)),
+                vec![0, 1, 2],
+                vec![false, false, true],
+            ),
+        ] {
+            let expr = logical2physical(&expr, &schema);
+            let pruning_predicate =
+                build_test_pruning_predicate(expr, Arc::clone(&schema));
+            let mut row_groups =
+                RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(3));
+            row_groups.prune_by_statistics(
+                &schema,
+                &schema_descr,
+                &groups,
+                &pruning_predicate,
+                &parquet_file_metrics(),
+            );
+            assert_eq!(row_groups.access_plan.row_group_indexes(), expected);
+            let matched: Vec<bool> = expected
+                .iter()
+                .map(|&index| row_groups.is_fully_matched()[index])
+                .collect();
+            assert_eq!(matched, fully_matched);
+        }
+    }
+
+    /// Longbow family SCN: per the Parquet spec a float min of +0.0 is read
+    /// as -0.0 and a max of -0.0 as +0.0, so a zero bound covers both zeros
+    /// whatever sign a (non-conforming) writer recorded. Equality on either
+    /// zero keeps the group. (DataFusion's comparisons treat the two zeros as
+    /// equal, so comparison pruning was not affected before; the widened
+    /// bounds matter to consumers that order the zeros, such as exact
+    /// statistics-answered MIN/MAX, see the metadata tests.)
+    #[test]
+    fn row_group_float_zero_bounds_cover_both_zeros() {
+        use arrow::array::AsArray;
+        use datafusion_expr::{col, lit};
+        use parquet::file::statistics::ValueStatistics;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c1",
+            DataType::Float64,
+            false,
+        )]));
+        let schema_descr = get_test_schema_descr(vec![PrimitiveTypeField::new(
+            "c1",
+            PhysicalType::DOUBLE,
+        )]);
+        let group = |zero: f64| {
+            get_row_group_meta_data(
+                &schema_descr,
+                vec![ParquetStatistics::Double(
+                    ValueStatistics::new(Some(zero), Some(zero), None, Some(0), false)
+                        .with_nan_count(Some(0)),
+                )],
+            )
+        };
+        for zero in [0.0, -0.0] {
+            let group = group(zero);
+            let stats = RowGroupPruningStatistics {
+                parquet_schema: &schema_descr,
+                column_orders: None,
+                row_group_metadatas: vec![&group],
+                arrow_schema: &schema,
+            };
+            let column = Column::from_name("c1");
+            let min = stats.min_values(&column).unwrap();
+            let max = stats.max_values(&column).unwrap();
+            let min = min.as_primitive::<arrow::datatypes::Float64Type>().value(0);
+            let max = max.as_primitive::<arrow::datatypes::Float64Type>().value(0);
+            assert!(
+                min == 0.0 && min.is_sign_negative(),
+                "{zero:?}: min {min:?}"
+            );
+            assert!(
+                max == 0.0 && max.is_sign_positive(),
+                "{zero:?}: max {max:?}"
+            );
+            for value in [0.0_f64, -0.0] {
+                let expr = logical2physical(&col("c1").eq(lit(value)), &schema);
+                let pruning_predicate =
+                    build_test_pruning_predicate(expr, Arc::clone(&schema));
+                assert_eq!(
+                    pruning_predicate.prune(&stats).unwrap(),
+                    vec![true],
+                    "bound {zero:?}, c1 = {value:?}"
+                );
+            }
+        }
     }
 
     #[test]

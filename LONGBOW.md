@@ -221,3 +221,41 @@ of the column's required ranges through the file's page-cache generation
 handle (Arrow family DPC); the leases and their memory charge stay with the
 caller until decode ends. Partial hits fetch the whole column, including
 predicate-cache batch boundaries. `byte_ranges` keeps its fetch-all behaviour.
+
+## Family SCN: statistics constants exclude NaN-capable columns
+
+Purpose: fix a wrong result in upstream 56. The opener replaces a column with
+a literal when the file statistics show `min == max` and no nulls. Parquet
+float statistics leave out NaN (and `-0.0` and `0.0` can compare equal), so a
+column `[NaN, 1.0]` read back as `[1.0, 1.0]`. Dependent Longbow feature:
+CORE-RESULTS. Audit classification: UPSTREAMABLE (keep and upstream later).
+
+The fix is at the source. When the scan converts Parquet statistics of a
+float leaf (FLOAT, DOUBLE, FLOAT16), it keeps min/max only where the
+statistics record `nan_count == 0` (Arrow 60 writers record it):
+
+- file statistics (`statistics_from_parquet_metadata`): min/max are Absent if
+  any row group lacks that proof, so aggregates answered from statistics,
+  `FilterExec` constants and file pruning cannot use them;
+- row-group pruning statistics: such row groups have no bounds, so they are
+  neither pruned nor fully matched (the row filter still runs);
+- page-index statistics: such pages (column index `nan_counts`) have no
+  bounds.
+
+In addition, `constant_value_from_stats` derives no `min == max` constant for
+a float column at all (also inside dictionaries and run-end encoding), and
+the statistics-unsatisfiable proof uses the same constants. The all-NULL
+constant is unchanged. Files written without NaN counts lose float pruning
+(correct but slower).
+
+All three sources also read float bounds as the Parquet spec requires: a min
+of +0.0 as -0.0 and a max of -0.0 as +0.0, so a zero bound covers both zeros
+even for a non-conforming writer that recorded min = max = +0.0 for
+`[-0.0, 0.0]`. A widened file-level bound is Inexact. (DataFusion's
+comparisons treat the two zeros as equal, so comparison pruning did not lose
+rows before; the widening keeps statistics-answered MIN/MAX and other
+order-sensitive consumers exact.)
+
+Statistics that reach a scan from outside (`PartitionedFile::statistics`, for
+example from a catalog or a consumer's statistics codec) do not pass through
+these rules; the supplier must apply them.

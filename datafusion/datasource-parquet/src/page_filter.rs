@@ -8,7 +8,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::metrics::ParquetFileMetrics;
-use crate::metadata::has_untrusted_min_max_order;
+use crate::metadata::{
+    has_untrusted_min_max_order, is_float_leaf, widen_float_zero_bounds,
+};
 use crate::pruning::build_inverted_predicate;
 use crate::{ParquetAccessPlan, RowGroupAccess};
 
@@ -706,6 +708,10 @@ struct PagesPruningStatistics<'a> {
     page_index: &'a dyn PageIndexProvider,
     page_offsets: &'a Vec<PageLocation>,
     trusted_min_max: bool,
+    /// Longbow family SCN: pages of a float column whose column index does
+    /// not record `nan_count == 0`. Their bounds leave NaN out and are
+    /// dropped. `None` for other columns.
+    nan_unsafe_pages: Option<BooleanArray>,
 }
 
 impl<'a> PagesPruningStatistics<'a> {
@@ -750,6 +756,21 @@ impl<'a> PagesPruningStatistics<'a> {
             parquet_column_index,
         );
 
+        let nan_unsafe_pages =
+            is_float_leaf(file_metadata.schema_descr(), parquet_column_index)
+                .then(|| {
+                    let nan_counts = page_index
+                        .column_index(row_group_index, parquet_column_index)
+                        .and_then(|index| index.nan_counts());
+                    BooleanArray::from_iter((0..page_offsets.len()).map(|page| {
+                        Some(
+                            nan_counts.and_then(|counts| counts.get(page).copied())
+                                != Some(0),
+                        )
+                    }))
+                })
+                .filter(|mask| mask.true_count() > 0);
+
         Some(Self {
             row_group_index,
             row_group_metadatas,
@@ -757,7 +778,16 @@ impl<'a> PagesPruningStatistics<'a> {
             page_index,
             page_offsets,
             trusted_min_max,
+            nan_unsafe_pages,
         })
+    }
+
+    /// Longbow family SCN: null the bounds of pages that may hold NaN.
+    fn mask_nan_unsafe_pages(&self, values: ArrayRef) -> Option<ArrayRef> {
+        match &self.nan_unsafe_pages {
+            None => Some(values),
+            Some(mask) => arrow::compute::nullif(values.as_ref(), mask).ok(),
+        }
     }
 
     /// return the row counts in each data page, if possible.
@@ -790,7 +820,9 @@ impl PruningStatistics for PagesPruningStatistics<'_> {
             .converter
             .data_page_mins(self.page_index, [&self.row_group_index])
         {
-            Ok(min_values) => Some(min_values),
+            Ok(min_values) => self
+                .mask_nan_unsafe_pages(min_values)
+                .map(|values| widen_float_zero_bounds(values, true)),
             Err(e) => {
                 debug!("Error evaluating data page min values {e}");
                 None
@@ -806,7 +838,9 @@ impl PruningStatistics for PagesPruningStatistics<'_> {
             .converter
             .data_page_maxes(self.page_index, [&self.row_group_index])
         {
-            Ok(min_values) => Some(min_values),
+            Ok(max_values) => self
+                .mask_nan_unsafe_pages(max_values)
+                .map(|values| widen_float_zero_bounds(values, false)),
             Err(e) => {
                 debug!("Error evaluating data page max values {e}");
                 None
