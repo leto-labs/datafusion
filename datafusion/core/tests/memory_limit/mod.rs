@@ -238,6 +238,20 @@ async fn nested_key_spill_keeps_groups_unique() {
     /// gets even while all 12 consumers (partials, repartitions and finals) are
     /// registered.
     ///
+    /// The legacy partial stages skip aggregation from the first batch, so each
+    /// partial state row carries one value. Otherwise a partial holds up to its
+    /// share of `count(distinct)` values and emits them as a few rows, and one
+    /// merged batch can grow a final stream's state well past its last
+    /// successful reservation. The legacy final stream reserves headroom equal
+    /// to its accounted state for the sort of a spill, which covers twice the
+    /// emitted state only while the accounted state per value is at least the
+    /// emitted 8 bytes and the growth per batch is small. With large partial
+    /// states, whether the final spill could reserve its sort depended on
+    /// which streams were still registered, and a more compact distinct set
+    /// spilled only a few times, too rarely to reproduce the bug. Single value
+    /// partial states grow the final state in small steps, so it spills many
+    /// times and each spill fits its share.
+    ///
     /// The migrated final stream replays the merged spill through an ordered
     /// table that accounts for every group of a merged batch before emitting
     /// the completed ones, and one group's `count(distinct)` state here is
@@ -254,7 +268,16 @@ async fn nested_key_spill_keeps_groups_unique() {
         if legacy {
             // small batches: the merged spill stream arrives in many batches and
             // groups span batch boundaries
-            config.with_batch_size(64)
+            config
+                .with_batch_size(64)
+                .set_usize(
+                    "datafusion.execution.skip_partial_aggregation_probe_rows_threshold",
+                    0,
+                )
+                .set_str(
+                    "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold",
+                    "0.0",
+                )
         } else {
             config
                 .with_batch_size(8)
