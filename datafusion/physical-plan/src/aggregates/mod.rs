@@ -6003,6 +6003,70 @@ mod tests {
         Ok(())
     }
 
+    /// A constant grouping prefix cannot complete any group before EOF.
+    /// Do not use ordered emission merely because equality makes a key constant.
+    #[tokio::test]
+    async fn constant_prefix_uses_hash_aggregation() -> Result<()> {
+        use crate::filter::FilterExec;
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::{BinaryExpr, lit};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("year", DataType::Int32, false),
+            Field::new("key", DataType::Int32, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![2000, 2000, 2000, 2001])),
+                Arc::new(Int32Array::from(vec![2, 1, 2, 3])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+            ],
+        )?;
+        let source = Arc::new(TestMemoryExec::try_new(
+            &[vec![batch]],
+            Arc::clone(&schema),
+            None,
+        )?);
+        let predicate = Arc::new(BinaryExpr::new(
+            col("year", &schema)?,
+            Operator::Eq,
+            lit(2000_i32),
+        ));
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, source)?);
+        let group_by = PhysicalGroupBy::new_single(vec![
+            (col("year", &schema)?, "year".to_string()),
+            (col("key", &schema)?, "key".to_string()),
+        ]);
+        let aggr_expr = vec![Arc::new(
+            AggregateExprBuilder::new(count_udaf(), vec![col("value", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("n")
+                .build()?,
+        )];
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Partial,
+            group_by,
+            aggr_expr,
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+        assert_eq!(aggregate.group_clustering_mode(), &GroupClusteringMode::None);
+        let output = collect(aggregate.execute(0, new_migrated_hash_ctx(2))?).await?;
+        assert_snapshot!(batches_to_sort_string(&output), @r"
++------+-----+----------+
+| year | key | n[count] |
++------+-----+----------+
+| 2000 | 1   | 1        |
+| 2000 | 2   | 2        |
++------+-----+----------+
+");
+        Ok(())
+    }
+
     /// Ensures for ordered input, `ClusteredPartialAggregateStream` is used.
     #[tokio::test]
     async fn ordered_partial_aggregate_planning() -> Result<()> {
