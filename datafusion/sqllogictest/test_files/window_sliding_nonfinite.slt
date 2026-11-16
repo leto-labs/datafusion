@@ -1,0 +1,380 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+# Expected answers follow IEEE addition of the current non-NULL frame:
+# NaN dominates; +inf and -inf together give NaN; empty frames give NULL.
+statement ok
+CREATE TABLE sliding_nonfinite AS
+SELECT * FROM (VALUES (1, 'NaN'::DOUBLE), (2, 'NaN'::DOUBLE), (3, 2.0),
+(4, 'inf'::DOUBLE), (5, '-inf'::DOUBLE), (6, 6.0), (7, NULL),
+(8, 2.0), (9, NULL), (10, NULL)) AS t(id, x);
+
+# Float16 inputs are coerced to Float64 for SUM and AVG.
+query IRR
+SELECT id,
+SUM(arrow_cast(x, 'Float16')) OVER w,
+AVG(arrow_cast(x, 'Float16')) OVER w
+FROM sliding_nonfinite
+WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+ORDER BY id;
+----
+1 NaN NaN
+2 NaN NaN
+3 NaN NaN
+4 Infinity Infinity
+5 NaN NaN
+6 -Infinity -Infinity
+7 6 6
+8 2 2
+9 2 2
+10 NULL NULL
+
+# Float32 inputs are coerced to Float64 for SUM and AVG.
+query IRR
+SELECT id,
+SUM(arrow_cast(x, 'Float32')) OVER w,
+AVG(arrow_cast(x, 'Float32')) OVER w
+FROM sliding_nonfinite
+WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+ORDER BY id;
+----
+1 NaN NaN
+2 NaN NaN
+3 NaN NaN
+4 Infinity Infinity
+5 NaN NaN
+6 -Infinity -Infinity
+7 6 6
+8 2 2
+9 2 2
+10 NULL NULL
+
+# Float64 inputs are coerced to Float64 for SUM and AVG.
+query IRR
+SELECT id,
+SUM(arrow_cast(x, 'Float64')) OVER w,
+AVG(arrow_cast(x, 'Float64')) OVER w
+FROM sliding_nonfinite
+WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+ORDER BY id;
+----
+1 NaN NaN
+2 NaN NaN
+3 NaN NaN
+4 Infinity Infinity
+5 NaN NaN
+6 -Infinity -Infinity
+7 6 6
+8 2 2
+9 2 2
+10 NULL NULL
+
+# DuckDB reference: MKR4-20261116/T05-first-frame.csv. mid is Float32;
+# compare rounded finite averages to six decimal places, retaining NaNs.
+query IR
+SELECT id, round(AVG(x::REAL) OVER (
+ORDER BY id ROWS BETWEEN 4 PRECEDING AND CURRENT ROW), 6)
+FROM (VALUES (1, 'NaN'::DOUBLE), (2, 'NaN'::DOUBLE), (3, 'NaN'::DOUBLE),
+(4, 31.99059), (5, 29.5), (6, 30.75), (7, 31.226667), (8, 31.42),
+(9, 30.613333), (10, 37.0), (11, 35.0), (12, 32.25),
+(13, 31.25), (14, 31.25), (15, 31.25)) AS t(id, x)
+ORDER BY id;
+----
+1 NaN
+2 NaN
+3 NaN
+4 NaN
+5 NaN
+6 NaN
+7 NaN
+8 30.977451
+9 30.702
+10 32.202
+11 33.052
+12 33.256667
+13 33.222667
+14 33.35
+15 32.2
+
+# Finite frame after each exceptional value leaves: moments recover too.
+query IRRRRRRR
+SELECT * FROM (
+SELECT id, var_pop(x) OVER w, var_samp(x) OVER w,
+stddev_pop(x) OVER w, stddev_samp(x) OVER w,
+covar_pop(x, y) OVER w, corr(x, y) OVER w, regr_slope(y, x) OVER w
+FROM (VALUES (1, 'NaN'::DOUBLE, 'NaN'::DOUBLE), (2, 1.0, 2.0),
+(3, 3.0, 6.0), (4, 'inf'::DOUBLE, 'inf'::DOUBLE), (5, 1.0, 2.0),
+(6, 3.0, 6.0), (7, '-inf'::DOUBLE, '-inf'::DOUBLE),
+(8, 1.0, 2.0), (9, 3.0, 6.0)) AS t(id, x, y)
+WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+) WHERE id IN (3, 6, 9)
+ORDER BY id;
+----
+3 1 2 1 1.414213562373 2 1 2
+6 1 2 1 1.414213562373 2 1 2
+9 1 2 1 1.414213562373 2 1 2
+
+# Finite downdates: expected values come from a fresh computation on the
+# remaining equal-price frame (variance/stddev 0; constant-X slope/corr NULL).
+query RRRRRR
+SELECT vp, vs, sp, ss, slope, cor FROM (
+SELECT id, var_pop(x) OVER w AS vp, var_samp(x) OVER w AS vs,
+stddev_pop(x) OVER w AS sp, stddev_samp(x) OVER w AS ss,
+regr_slope(y, x) OVER w AS slope, corr(x, y) OVER w AS cor
+FROM (VALUES (1, 9193063041.610329::DOUBLE, 4.0::DOUBLE), (2, 3.3, 1.0), (3, 3.3, 2.0)) AS t(id, x, y)
+WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+) WHERE id = 3;
+----
+0 0 0 0 NULL NULL
+
+query IRR
+SELECT g, v, s FROM (
+SELECT g, id, var_pop(x) OVER w AS v, stddev_pop(x) OVER w AS s
+FROM (VALUES (1, 1, 10000.0::DOUBLE), (1, 2, 3.3), (1, 3, 3.3), (1, 4, 3.3), (1, 5, 3.3),
+(2, 1, 10000000.0::DOUBLE), (2, 2, 3.3), (2, 3, 3.3), (2, 4, 3.3), (2, 5, 3.3)) AS t(g, id, x)
+WINDOW w AS (PARTITION BY g ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)
+) WHERE id = 5 ORDER BY g;
+----
+1 0 0
+2 0 0
+
+# Each one-pair frame has zero population covariance and undefined correlation.
+query IRR
+SELECT id, covar_pop(x, x) OVER w, corr(x, x) OVER w
+FROM (VALUES (1, 9193063041.610329::DOUBLE), (2, 3.3), (3, 3.3)) AS t(id, x)
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW);
+----
+1 0 NULL
+2 0 NULL
+3 0 NULL
+
+# Removing the large value leaves [1, 1]: SUM=2 and AVG=1.
+query RR
+SELECT s, a FROM (
+SELECT id, sum(x) OVER w AS s, avg(x) OVER w AS a
+FROM (VALUES (1, 1e17::DOUBLE), (2, 1.0), (3, 1.0)) AS t(id, x)
+WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+) WHERE id = 3;
+----
+2 1
+
+# Positive residuals must also recover. Fresh equal frames have zero moments.
+query IRRRR
+SELECT g, vp, vs, sp, ss FROM (
+SELECT g, id, var_pop(x) OVER w AS vp, var_samp(x) OVER w AS vs,
+stddev_pop(x) OVER w AS sp, stddev_samp(x) OVER w AS ss
+FROM (VALUES (1, 1, 5071415981.588::DOUBLE), (1, 2, 3.3), (1, 3, 3.3),
+(2, 1, 123456789.0::DOUBLE), (2, 2, 3.3), (2, 3, 3.3)) AS t(g, id, x)
+WINDOW w AS (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+) WHERE id = 3 ORDER BY g;
+----
+1 0 0 0 0
+2 0 0 0 0
+
+query IRR
+SELECT g, v, s FROM (
+SELECT g, id, var_pop(x) OVER w AS v, stddev_pop(x) OVER w AS s
+FROM (SELECT g, id, CASE WHEN id = 1 THEN big ELSE 3.3 END AS x
+FROM (VALUES (1, 10000.0::DOUBLE), (2, 100000.0::DOUBLE),
+(3, 1000000.0::DOUBLE), (4, 10000000.0::DOUBLE)) AS outlier(g, big)
+CROSS JOIN (VALUES (1), (2), (3), (4), (5)) AS pos(id)) AS t
+WINDOW w AS (PARTITION BY g ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)
+) WHERE id = 5 ORDER BY g;
+----
+1 0 0
+2 0 0
+3 0 0
+4 0 0
+
+query RRRRR
+SELECT v, c, slope, intercept, r2 FROM (
+SELECT id, var_pop(x) OVER w AS v, covar_pop(x, x) OVER w AS c,
+regr_slope(y, x) OVER w AS slope, regr_intercept(y, x) OVER w AS intercept,
+regr_r2(y, x) OVER w AS r2
+FROM (VALUES (1, 1e9::DOUBLE, 4.0::DOUBLE), (2, 3.3, 1.0), (3, 3.3, 2.0)) AS t(id, x, y)
+WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+) WHERE id = 3;
+----
+0 0 NULL NULL NULL
+
+query RRIRRRRRR
+SELECT slope, intercept, n, r2, ax, ay, sxx, syy, sxy FROM (
+SELECT id, regr_slope(y, x) OVER w AS slope, regr_intercept(y, x) OVER w AS intercept,
+regr_count(y,x) OVER w AS n, regr_r2(y, x) OVER w AS r2,
+regr_avgx(y,x) OVER w AS ax, regr_avgy(y,x) OVER w AS ay,
+regr_sxx(y,x) OVER w AS sxx, regr_syy(y,x) OVER w AS syy, regr_sxy(y,x) OVER w AS sxy
+FROM (VALUES (1, 123456789.0::DOUBLE, 4.0::DOUBLE), (2, 3.3, 1.0), (3, 3.3, 2.0)) AS t(id,x,y)
+WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+) WHERE id = 3;
+----
+NULL NULL 2 NULL 3.3 1.5 0 0.5 0
+
+# Expected from current-frame IEEE classification and finite pairs (1,2),(3,6).
+# Non-finite centered moments are NaN; singleton population variance is 0.
+statement ok
+CREATE TABLE sliding_stats_nonfinite AS
+SELECT * FROM (VALUES (1, 'NaN'::DOUBLE, 'NaN'::DOUBLE), (2, 1.0, 2.0), (3, 3.0, 6.0),
+(4, 'inf'::DOUBLE, 'inf'::DOUBLE), (5, 1.0, 2.0), (6, 3.0, 6.0),
+(7, '-inf'::DOUBLE, '-inf'::DOUBLE), (8, 1.0, 2.0), (9, 3.0, 6.0),
+(10, 'inf'::DOUBLE, 'inf'::DOUBLE), (11, '-inf'::DOUBLE, '-inf'::DOUBLE),
+(12, 1.0, 2.0), (13, 3.0, 6.0)) AS t(id,x,y);
+
+query IRRRRRRR
+SELECT * FROM (
+SELECT id, var_pop(x) OVER w, var_samp(x) OVER w, stddev_pop(x) OVER w,
+stddev_samp(x) OVER w, covar_pop(x,y) OVER w, covar_samp(x,y) OVER w, corr(x,y) OVER w
+FROM sliding_stats_nonfinite
+WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+) WHERE id IN (1,2,3,5,6,8,9,11,12,13) ORDER BY id;
+----
+1 0 NULL 0 NULL NaN NULL NaN
+2 NaN NaN NaN NaN NaN NaN NaN
+3 1 2 1 1.414213562373 2 4 1
+5 NaN NaN NaN NaN NaN NaN NaN
+6 1 2 1 1.414213562373 2 4 1
+8 NaN NaN NaN NaN NaN NaN NaN
+9 1 2 1 1.414213562373 2 4 1
+11 NaN NaN NaN NaN NaN NaN NaN
+12 NaN NaN NaN NaN NaN NaN NaN
+13 1 2 1 1.414213562373 2 4 1
+
+# All nine REGR variants, with non-finite rows present and after they leave.
+# Unlike ordinary upstream arithmetic, infinite centered moments are NaN,
+# independent of insertion order. Means keep their signed infinity semantics.
+query IRRIRRRRRR
+SELECT * FROM (
+SELECT id, regr_slope(y,x) OVER w, regr_intercept(y,x) OVER w, regr_count(y,x) OVER w,
+regr_r2(y,x) OVER w, regr_avgx(y,x) OVER w, regr_avgy(y,x) OVER w,
+regr_sxx(y,x) OVER w, regr_syy(y,x) OVER w, regr_sxy(y,x) OVER w
+FROM sliding_stats_nonfinite
+WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+) WHERE id IN (1,2,3,5,6,8,9,11,12,13) ORDER BY id;
+----
+1 NULL NULL 1 NULL NaN NaN NaN NaN NaN
+2 NaN NaN 2 NaN NaN NaN NaN NaN NaN
+3 2 0 2 1 2 4 2 8 4
+5 NaN NaN 2 NaN Infinity Infinity NaN NaN NaN
+6 2 0 2 1 2 4 2 8 4
+8 NaN NaN 2 NaN -Infinity -Infinity NaN NaN NaN
+9 2 0 2 1 2 4 2 8 4
+11 NaN NaN 2 NaN NaN NaN NaN NaN NaN
+12 NaN NaN 2 NaN -Infinity -Infinity NaN NaN NaN
+13 2 0 2 1 2 4 2 8 4
+
+# A NULL in either axis excludes the whole pair, including its NaN/inf partner.
+query IRRRRRIRRRRRR
+SELECT * FROM (
+SELECT id, covar_pop(x,y) OVER w, covar_samp(x,y) OVER w, corr(x,y) OVER w,
+regr_slope(y,x) OVER w, regr_intercept(y,x) OVER w, regr_count(y,x) OVER w,
+regr_r2(y,x) OVER w, regr_avgx(y,x) OVER w, regr_avgy(y,x) OVER w,
+regr_sxx(y,x) OVER w, regr_syy(y,x) OVER w, regr_sxy(y,x) OVER w
+FROM (VALUES (1, 1.0::DOUBLE, 2.0::DOUBLE), (2, NULL, 'inf'::DOUBLE),
+(3, 'NaN'::DOUBLE, NULL), (4, 3.0, 6.0), (5, 5.0, 10.0)) AS t(id,x,y)
+WINDOW w AS (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+) WHERE id IN (3,4,5) ORDER BY id;
+----
+3 0 NULL NULL NULL NULL 1 NULL 1 2 0 0 0
+4 0 NULL NULL NULL NULL 1 NULL 3 6 0 0 0
+5 2 4 1 2 0 2 1 4 8 2 8 4
+
+# Fresh reference for window.slt's five variance/stddev frames. Source:
+# testing/data/csv/aggregate_test_100.csv; exact integer/Fraction variance and
+# Decimal(80) square roots rounded to six places. An extra outlier is removed
+# first so the retained frame must rebuild to this fresh reference.
+query IRRRR
+SELECT g, vs, vp, ss, sp FROM (
+SELECT g, pos, round(var_samp(x) OVER w, 6) AS vs,
+round(var_pop(x) OVER w, 6) AS vp, round(stddev_samp(x) OVER w, 6) AS ss,
+round(stddev_pop(x) OVER w, 6) AS sp
+FROM (VALUES (1, 0, 1e12::DOUBLE),
+(1, 1, -16312.0::DOUBLE),
+(1, 2, -16110.0::DOUBLE),
+(1, 3, -15880.0::DOUBLE),
+(2, 0, 1e12::DOUBLE),
+(2, 1, 2045.0::DOUBLE),
+(2, 2, 3917.0::DOUBLE),
+(2, 3, 5281.0::DOUBLE),
+(3, 0, 1e12::DOUBLE),
+(3, 1, -18025.0::DOUBLE),
+(3, 2, -16974.0::DOUBLE),
+(3, 3, -16312.0::DOUBLE),
+(4, 0, 1e12::DOUBLE),
+(4, 1, -1471.0::DOUBLE),
+(4, 2, -1114.0::DOUBLE),
+(4, 3, 194.0::DOUBLE),
+(5, 0, 1e12::DOUBLE),
+(5, 1, 15295.0::DOUBLE),
+(5, 2, 15673.0::DOUBLE),
+(5, 3, 15788.0::DOUBLE)) AS t(g,pos,x)
+WINDOW w AS (PARTITION BY g ORDER BY pos ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+) WHERE pos = 3 ORDER BY g;
+----
+1 46721.333333 31147.555556 216.151182 176.486701
+2 2639429.333333 1759619.555556 1624.632061 1326.506523
+3 746202.333333 497468.222222 863.830037 705.314272
+4 768423 512282 876.597399 715.738779
+5 66526.333333 44350.888889 257.926992 210.596507
+
+# A constant tail must have exactly zero moments, even when the departing
+# value differs by only one ulp. Boolean comparisons retain the tiny residual.
+query BBBBB
+SELECT vp = 0.0, sp = 0.0, cp = 0.0, slope IS NULL, cor IS NULL FROM (
+SELECT id, var_pop(x) OVER w AS vp, stddev_pop(x) OVER w AS sp,
+covar_pop(x,x) OVER w AS cp, regr_slope(x,x) OVER w AS slope, corr(x,x) OVER w AS cor
+FROM (VALUES (1, 3.3000000000000007::DOUBLE), (2, 3.3), (3, 3.3), (4, 3.3), (5, 3.3)) AS t(id,x)
+WINDOW w AS (ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)
+) WHERE id = 5;
+----
+true true true true true
+
+# Exact compensated SUM after retracting the large value from a single batch.
+query BB
+SELECT s = 1.1, a = 1.1 FROM (
+SELECT id, sum(x) OVER w AS s, avg(x) OVER w AS a
+FROM (VALUES (0, NULL::DOUBLE), (1, 67108864.0::DOUBLE), (2, 1.1)) AS t(id,x)
+WINDOW w AS (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING)
+) WHERE id = 1;
+----
+true true
+
+query BB
+SELECT s = 0.6, abs(a - 0.2) < 1e-15 FROM (
+SELECT id, sum(x) OVER w AS s, avg(x) OVER w AS a
+FROM (VALUES (0, NULL::DOUBLE), (1, 1e6::DOUBLE), (2, 0.1), (3, 0.2), (4, 0.3)) AS t(id,x)
+WINDOW w AS (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 4 FOLLOWING)
+) WHERE id = 1;
+----
+true true
+
+# Slow decay: compare against fresh non-sliding groups over the identical
+# input rows. The relative error bound is 1e-10 for each 20-row frame.
+query B
+WITH prices AS (SELECT i, 1e9 * power(0.97, i) AS x FROM generate_series(0,1199) AS t(i)),
+rolling AS (SELECT i, var_pop(x) OVER (ORDER BY i ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS v FROM prices),
+fresh AS (SELECT a.i, var_pop(b.x) AS v FROM prices a JOIN prices b ON b.i BETWEEN a.i - 19 AND a.i GROUP BY a.i)
+SELECT max(abs(rolling.v - fresh.v) / fresh.v) <= 1e-10
+FROM rolling JOIN fresh ON rolling.i = fresh.i WHERE rolling.i >= 19;
+----
+true
+
+# Gaussian pair trace: fresh grouped covariance is independent of the sliding
+# queue. Compare with absolute/relative bound 1e-10 near a zero covariance.
+query B
+WITH points AS (
+SELECT i, sqrt(-2.0 * ln(((i * 37) % 997 + 0.5) / 997.0)) *
+cos(6.283185307179586 * ((i * 67) % 991 + 0.5) / 991.0) AS x,
+sqrt(-2.0 * ln(((i * 37) % 997 + 0.5) / 997.0)) *
+sin(6.283185307179586 * ((i * 67) % 991 + 0.5) / 991.0) AS y
+FROM generate_series(0, 255) AS t(i)
+), rolling AS (
+SELECT i, covar_pop(x,y) OVER (ORDER BY i ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS c
+FROM points
+), fresh AS (
+SELECT a.i, covar_pop(b.x,b.y) AS c FROM points a JOIN points b
+ON b.i BETWEEN a.i - 19 AND a.i GROUP BY a.i
+)
+SELECT max(abs(rolling.c - fresh.c) / (1.0 + abs(fresh.c))) <= 1e-10
+FROM rolling JOIN fresh ON rolling.i = fresh.i WHERE rolling.i >= 19;
+----
+true

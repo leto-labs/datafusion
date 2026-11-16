@@ -397,6 +397,9 @@ impl AggregateUDFImpl for Sum {
                 ),
             }
         } else {
+            if args.return_type() == &DataType::Float64 {
+                return Ok(Box::new(SlidingFloatSumAccumulator::new(false)));
+            }
             // non‐distinct path: existing sliding sum
             macro_rules! helper {
                 ($t:ty, $dt:expr) => {
@@ -650,6 +653,207 @@ impl<T: ArrowNumericType> Accumulator for SlidingSumAccumulator<T> {
 
     fn supports_retract_batch(&self) -> bool {
         true
+    }
+}
+
+// Non-finite inputs cannot participate in reversible arithmetic: NaN - NaN
+// and infinity - infinity remain NaN. Keep their multiplicities separately.
+#[derive(Debug, Default)]
+pub(crate) struct NonFiniteCounts {
+    nan: u64,
+    positive: u64,
+    negative: u64,
+}
+
+impl NonFiniteCounts {
+    pub(crate) fn update(&mut self, value: f64, retract: bool) -> bool {
+        let count = if value.is_nan() {
+            &mut self.nan
+        } else if value == f64::INFINITY {
+            &mut self.positive
+        } else if value == f64::NEG_INFINITY {
+            &mut self.negative
+        } else {
+            return false;
+        };
+        if retract {
+            *count -= 1;
+        } else {
+            *count += 1;
+        }
+        true
+    }
+
+    pub(crate) fn count(&self) -> u64 {
+        self.nan + self.positive + self.negative
+    }
+
+    pub(crate) fn value(&self) -> Option<f64> {
+        if self.nan > 0 || (self.positive > 0 && self.negative > 0) {
+            Some(f64::NAN)
+        } else if self.positive > 0 {
+            Some(f64::INFINITY)
+        } else if self.negative > 0 {
+            Some(f64::NEG_INFINITY)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn state(&self) -> Vec<ScalarValue> {
+        vec![self.nan.into(), self.positive.into(), self.negative.into()]
+    }
+
+    pub(crate) fn merge(&mut self, states: &[ArrayRef]) {
+        for (count, array) in [&mut self.nan, &mut self.positive, &mut self.negative]
+            .into_iter()
+            .zip(states)
+        {
+            *count += arrow::compute::sum(array.as_primitive::<UInt64Type>())
+                .unwrap_or_default();
+        }
+    }
+}
+
+/// Neumaier summation retains low-order terms when a large finite value is
+/// added and later retracted. Both components must survive a state round trip.
+#[derive(Debug, Default)]
+pub(crate) struct CompensatedSum {
+    sum: f64,
+    correction: f64,
+}
+
+impl CompensatedSum {
+    pub(crate) fn add(&mut self, value: f64) {
+        let next = self.sum + value;
+        if next.is_finite() {
+            self.correction += if self.sum.abs() >= value.abs() {
+                (self.sum - next) + value
+            } else {
+                (value - next) + self.sum
+            };
+        } else {
+            // Finite-input overflow remains an infinity, rather than producing
+            // NaN merely through the compensation formula's infinity-infinity.
+            self.correction = 0.0;
+        }
+        self.sum = next;
+    }
+
+    pub(crate) fn value(&self) -> f64 {
+        self.sum + self.correction
+    }
+
+    pub(crate) fn state(&self) -> [ScalarValue; 2] {
+        [self.sum.into(), self.correction.into()]
+    }
+
+    pub(crate) fn merge(&mut self, states: &[ArrayRef]) {
+        for (sum, correction) in states[0]
+            .as_primitive::<Float64Type>()
+            .iter()
+            .zip(states[1].as_primitive::<Float64Type>().iter())
+        {
+            if let Some(sum) = sum {
+                self.add(sum);
+            }
+            if let Some(correction) = correction {
+                self.add(correction);
+            }
+        }
+    }
+}
+
+/// SUM/AVG's floating input types are coerced to Float64 before accumulation.
+/// This state belongs only to sliding windows; grouped and ordinary aggregate
+/// state layouts remain unchanged. Its sliding-only state is [finite sum,
+/// correction, non-NULL count, NaN count, +inf count, -inf count].
+///
+/// Non-finite inputs use IEEE sum rules. Overflow caused solely by finite
+/// values stays in the finite sum until no finite values remain in the frame.
+/// Every finite input uses Neumaier compensation individually, including
+/// retractions as additions of the negated value; batch reductions can lose
+/// small terms before the compensated state sees them.
+#[derive(Debug, Default)]
+pub(crate) struct SlidingFloatSumAccumulator {
+    finite_sum: CompensatedSum,
+    count: u64,
+    non_finite: NonFiniteCounts,
+    average: bool,
+}
+
+impl SlidingFloatSumAccumulator {
+    pub(crate) fn new(average: bool) -> Self {
+        Self {
+            average,
+            ..Self::default()
+        }
+    }
+
+    fn apply(&mut self, values: &[ArrayRef], retract: bool) {
+        for value in values[0].as_primitive::<Float64Type>().iter().flatten() {
+            if retract {
+                self.count -= 1;
+            } else {
+                self.count += 1;
+            }
+            if !self.non_finite.update(value, retract) {
+                self.finite_sum.add(if retract { -value } else { value });
+            }
+        }
+        if self.count == self.non_finite.count() {
+            self.finite_sum = CompensatedSum::default();
+        }
+    }
+}
+
+impl Accumulator for SlidingFloatSumAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.apply(values, false);
+        Ok(())
+    }
+
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.apply(values, true);
+        Ok(())
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        let value = (self.count > 0).then(|| {
+            let sum = self
+                .non_finite
+                .value()
+                .unwrap_or_else(|| self.finite_sum.value());
+            if self.average {
+                sum / self.count as f64
+            } else {
+                sum
+            }
+        });
+        Ok(ScalarValue::Float64(value))
+    }
+
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        let mut state = self.finite_sum.state().to_vec();
+        state.push(self.count.into());
+        state.extend(self.non_finite.state());
+        Ok(state)
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        self.finite_sum.merge(&states[..2]);
+        self.count += arrow::compute::sum(states[2].as_primitive::<UInt64Type>())
+            .unwrap_or_default();
+        self.non_finite.merge(&states[3..6]);
+        Ok(())
+    }
+
+    fn supports_retract_batch(&self) -> bool {
+        true
+    }
+
+    fn size(&self) -> usize {
+        size_of_val(self)
     }
 }
 
@@ -1027,5 +1231,1056 @@ mod tests {
                 .create_sliding_accumulator(args))
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod sliding_nonfinite_tests {
+    use super::*;
+    use arrow::array::Float64Array;
+    use arrow::datatypes::Schema;
+    use std::sync::Arc;
+
+    fn accumulator(
+        udf: &dyn AggregateUDFImpl,
+        arity: usize,
+    ) -> Result<Box<dyn Accumulator>> {
+        let schema = Schema::empty();
+        let field = Arc::new(Field::new("x", DataType::Float64, true));
+        let fields = vec![field; arity];
+        udf.create_sliding_accumulator(AccumulatorArgs {
+            return_field: Arc::new(Field::new("result", DataType::Float64, true)),
+            schema: &schema,
+            expr_fields: &fields,
+            ignore_nulls: false,
+            order_bys: &[],
+            is_distinct: false,
+            name: udf.name(),
+            is_reversed: false,
+            exprs: &[],
+        })
+    }
+
+    fn arrays(values: &[Option<f64>], arity: usize) -> Vec<ArrayRef> {
+        vec![Arc::new(Float64Array::from(values.to_vec())) as ArrayRef; arity]
+    }
+
+    fn assert_float(actual: ScalarValue, expected: f64) {
+        let ScalarValue::Float64(Some(actual)) = actual else {
+            panic!("expected {expected}, got {actual:?}");
+        };
+        if expected.is_nan() {
+            assert!(actual.is_nan(), "expected NaN, got {actual}");
+        } else if expected.is_infinite() {
+            assert_eq!(actual, expected);
+        } else {
+            assert!(
+                (actual - expected).abs() <= 1e-10 * expected.abs().max(1.0),
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    // A finite-only accumulator over the remaining frame is the oracle. This
+    // checks recovery without prescribing the result while non-finites remain.
+    fn recovers(udf: &dyn AggregateUDFImpl, arity: usize) -> Result<()> {
+        let mut results = vec![];
+        for special in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut sliding = accumulator(udf, arity)?;
+            sliding.update_batch(&arrays(
+                &[Some(special), None, Some(1.0), Some(3.0)],
+                arity,
+            ))?;
+            sliding.retract_batch(&arrays(&[Some(special), None], arity))?;
+            let mut fresh = accumulator(udf, arity)?;
+            fresh.update_batch(&arrays(&[Some(1.0), Some(3.0)], arity))?;
+            let expected = fresh.evaluate()?;
+            let actual = sliding.evaluate()?;
+            eprintln!(
+                "{} after retracting {special}: {actual:?}; expected {expected:?}",
+                udf.name()
+            );
+            results.push((actual, expected));
+        }
+        for (actual, expected) in results {
+            assert_same(actual, expected);
+        }
+        Ok(())
+    }
+
+    macro_rules! recovery_test {
+        ($name:ident, $udf:expr, $arity:expr) => {
+            #[test]
+            fn $name() -> Result<()> {
+                recovers(&$udf, $arity)
+            }
+        };
+    }
+    recovery_test!(sliding_nonfinite_sum, Sum::new(), 1);
+    recovery_test!(sliding_nonfinite_avg, crate::average::Avg::new(), 1);
+    recovery_test!(
+        sliding_nonfinite_variance,
+        crate::variance::VariancePopulation::new(),
+        1
+    );
+    recovery_test!(
+        sliding_nonfinite_variance_sample,
+        crate::variance::VarianceSample::new(),
+        1
+    );
+    recovery_test!(sliding_nonfinite_stddev, crate::stddev::StddevPop::new(), 1);
+    recovery_test!(
+        sliding_nonfinite_stddev_sample,
+        crate::stddev::Stddev::new(),
+        1
+    );
+    recovery_test!(
+        sliding_nonfinite_covariance,
+        crate::covariance::CovariancePopulation::new(),
+        2
+    );
+    recovery_test!(
+        sliding_nonfinite_covariance_sample,
+        crate::covariance::CovarianceSample::new(),
+        2
+    );
+    recovery_test!(
+        sliding_nonfinite_correlation,
+        crate::correlation::Correlation::new(),
+        2
+    );
+    recovery_test!(
+        sliding_nonfinite_regr,
+        crate::regr::Regr::new(crate::regr::RegrType::Slope, "regr_slope"),
+        2
+    );
+    recovery_test!(sliding_nonfinite_min, crate::min_max::Min::new(), 1);
+    recovery_test!(sliding_nonfinite_max, crate::min_max::Max::new(), 1);
+
+    #[test]
+    fn sliding_nonfinite_sum_avg_frames() -> Result<()> {
+        for (udf, average) in [
+            (&Sum::new() as &dyn AggregateUDFImpl, false),
+            (&crate::average::Avg::new(), true),
+        ] {
+            let mut acc = accumulator(udf, 1)?;
+            acc.update_batch(&arrays(&[Some(f64::NAN), Some(f64::NAN)], 1))?;
+            assert_float(acc.evaluate()?, f64::NAN);
+            acc.update_batch(&arrays(
+                &[
+                    None,
+                    Some(2.0),
+                    Some(f64::INFINITY),
+                    Some(f64::NEG_INFINITY),
+                ],
+                1,
+            ))?;
+            acc.retract_batch(&arrays(&[Some(f64::NAN), Some(f64::NAN)], 1))?;
+            assert_float(acc.evaluate()?, f64::NAN);
+            acc.retract_batch(&arrays(&[None, Some(2.0), Some(f64::INFINITY)], 1))?;
+            assert_float(acc.evaluate()?, f64::NEG_INFINITY);
+            acc.update_batch(&arrays(&[Some(6.0), None, Some(2.0)], 1))?;
+            acc.retract_batch(&arrays(&[Some(f64::NEG_INFINITY)], 1))?;
+            assert_float(acc.evaluate()?, if average { 4.0 } else { 8.0 });
+            acc.retract_batch(&arrays(&[Some(6.0), None, Some(2.0)], 1))?;
+            assert_eq!(acc.evaluate()?, ScalarValue::Float64(None));
+            acc.update_batch(&arrays(&[None], 1))?;
+            assert_eq!(acc.evaluate()?, ScalarValue::Float64(None));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_nonfinite_t05_first_frame() -> Result<()> {
+        // MKR4-20261116/T05-first-frame.csv: Float32 mid values and DuckDB
+        // rolling_mid, ROWS BETWEEN 4 PRECEDING AND CURRENT ROW. The CSV is
+        // rounded for display; restore each mid to Float32 before widening.
+        let mid = [
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            31.99059,
+            29.5,
+            30.75,
+            31.226667,
+            31.42,
+            30.613333,
+            37.0,
+            35.0,
+            32.25,
+            31.25,
+            31.25,
+            31.25,
+        ]
+        .map(|x| x as f32 as f64);
+        let expected = [
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            30.97745132446289,
+            30.702000045776366,
+            32.202000045776366,
+            33.05200004577637,
+            33.256666564941405,
+            33.222666549682614,
+            33.35,
+            32.2,
+        ];
+        let mut avg = accumulator(&crate::average::Avg::new(), 1)?;
+        for (i, value) in mid.into_iter().enumerate() {
+            avg.update_batch(&arrays(&[Some(value)], 1))?;
+            if i >= 5 {
+                avg.retract_batch(&arrays(&[Some(mid[i - 5])], 1))?;
+            }
+            assert_float(avg.evaluate()?, expected[i]);
+        }
+        Ok(())
+    }
+    fn moment_udfs() -> Vec<(Box<dyn AggregateUDFImpl>, usize)> {
+        use crate::regr::{Regr, RegrType};
+        let mut udfs: Vec<(Box<dyn AggregateUDFImpl>, usize)> = vec![
+            (Box::new(Sum::new()), 1),
+            (Box::new(crate::average::Avg::new()), 1),
+            (Box::new(crate::variance::VariancePopulation::new()), 1),
+            (Box::new(crate::variance::VarianceSample::new()), 1),
+            (Box::new(crate::stddev::StddevPop::new()), 1),
+            (Box::new(crate::stddev::Stddev::new()), 1),
+            (Box::new(crate::covariance::CovariancePopulation::new()), 2),
+            (Box::new(crate::covariance::CovarianceSample::new()), 2),
+            (Box::new(crate::correlation::Correlation::new()), 2),
+        ];
+        for (kind, name) in [
+            (RegrType::Slope, "regr_slope"),
+            (RegrType::Intercept, "regr_intercept"),
+            (RegrType::Count, "regr_count"),
+            (RegrType::R2, "regr_r2"),
+            (RegrType::AvgX, "regr_avgx"),
+            (RegrType::AvgY, "regr_avgy"),
+            (RegrType::SXX, "regr_sxx"),
+            (RegrType::SYY, "regr_syy"),
+            (RegrType::SXY, "regr_sxy"),
+        ] {
+            udfs.push((Box::new(Regr::new(kind, name)), 2));
+        }
+        udfs
+    }
+
+    fn assert_same(actual: ScalarValue, expected: ScalarValue) {
+        match expected {
+            ScalarValue::Float64(Some(x)) => assert_float(actual, x),
+            _ => assert_eq!(actual, expected),
+        }
+    }
+
+    #[test]
+    fn sliding_nonfinite_state_roundtrip_and_retract() -> Result<()> {
+        for (udf, arity) in moment_udfs() {
+            let mut partial = accumulator(udf.as_ref(), arity)?;
+            let special = arrays(
+                &[
+                    Some(f64::NAN),
+                    Some(f64::INFINITY),
+                    Some(f64::NEG_INFINITY),
+                    None,
+                ],
+                arity,
+            );
+            partial.update_batch(&special)?;
+            let state = partial
+                .state()?
+                .into_iter()
+                .map(|x| x.to_array())
+                .collect::<Result<Vec<_>>>()?;
+            let mut merged = accumulator(udf.as_ref(), arity)?;
+            merged.merge_batch(&state)?;
+            assert_same(merged.evaluate()?, partial.evaluate()?);
+            let state = merged
+                .state()?
+                .into_iter()
+                .map(|s| s.to_array())
+                .collect::<Result<Vec<_>>>()?;
+            merged = accumulator(udf.as_ref(), arity)?;
+            merged.merge_batch(&state)?;
+            let finite = arrays(&[Some(1.0), None, Some(3.0)], arity);
+            merged.update_batch(&finite)?;
+            merged.retract_batch(&special)?;
+            let mut partial = accumulator(udf.as_ref(), arity)?;
+            partial.update_batch(&finite)?;
+            let state = partial
+                .state()?
+                .into_iter()
+                .map(|s| s.to_array())
+                .collect::<Result<Vec<_>>>()?;
+            let mut fresh = accumulator(udf.as_ref(), arity)?;
+            fresh.merge_batch(&state)?;
+            assert_same(merged.evaluate()?, fresh.evaluate()?);
+            merged.retract_batch(&finite)?;
+            fresh.retract_batch(&finite)?;
+            assert_same(merged.evaluate()?, fresh.evaluate()?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_nonfinite_pairwise_and_finite_frames() -> Result<()> {
+        // Asymmetric axes catch swapped REGR(Y, X) arguments. One-sided
+        // NULLs must exclude the entire pair, including non-finite partners.
+        let x = vec![
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(9.0),
+            None,
+            Some(1.0),
+            Some(2.0),
+            Some(4.0),
+            Some(8.0),
+            Some(16.0),
+        ];
+        let y = vec![
+            Some(11.0),
+            Some(12.0),
+            Some(13.0),
+            None,
+            Some(f64::NAN),
+            Some(3.0),
+            Some(5.0),
+            Some(9.0),
+            Some(17.0),
+            Some(33.0),
+        ];
+        for (udf, arity) in moment_udfs() {
+            for swap in [false, true] {
+                let input = if arity == 1 {
+                    arrays(&x, 1)
+                } else {
+                    let mut values: Vec<ArrayRef> = vec![
+                        Arc::new(Float64Array::from(x.clone())),
+                        Arc::new(Float64Array::from(y.clone())),
+                    ];
+                    if swap {
+                        values.swap(0, 1);
+                    }
+                    values
+                };
+                let mut sliding = accumulator(udf.as_ref(), arity)?;
+                for i in 0..x.len() {
+                    sliding.update_batch(
+                        &input.iter().map(|a| a.slice(i, 1)).collect::<Vec<_>>(),
+                    )?;
+                    if i >= 3 {
+                        sliding.retract_batch(
+                            &input.iter().map(|a| a.slice(i - 3, 1)).collect::<Vec<_>>(),
+                        )?;
+                    }
+                    // Compare the finite tail against the unchanged non-sliding
+                    // accumulator, independently of the sliding implementation.
+                    if i >= 7 {
+                        let schema = Schema::empty();
+                        let field = Arc::new(Field::new("x", DataType::Float64, true));
+                        let fields = vec![field; arity];
+                        let mut fresh = udf.accumulator(AccumulatorArgs {
+                            return_field: Arc::new(Field::new(
+                                "result",
+                                DataType::Float64,
+                                true,
+                            )),
+                            schema: &schema,
+                            expr_fields: &fields,
+                            ignore_nulls: false,
+                            order_bys: &[],
+                            is_distinct: false,
+                            name: udf.name(),
+                            is_reversed: false,
+                            exprs: &[],
+                        })?;
+                        fresh.update_batch(
+                            &input.iter().map(|a| a.slice(i - 2, 3)).collect::<Vec<_>>(),
+                        )?;
+                        assert_same(sliding.evaluate()?, fresh.evaluate()?);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_nonfinite_regression_independent_axes() -> Result<()> {
+        use crate::regr::{Regr, RegrType};
+        let values = vec![
+            Arc::new(Float64Array::from(vec![
+                Some(f64::NAN),
+                Some(3.0),
+                Some(5.0),
+            ])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![Some(0.0), Some(1.0), Some(2.0)]))
+                as ArrayRef,
+        ];
+        for (kind, expected) in [
+            (RegrType::AvgX, 1.0),
+            (RegrType::AvgY, f64::NAN),
+            (RegrType::SXX, 2.0),
+            (RegrType::SYY, f64::NAN),
+            (RegrType::SXY, f64::NAN),
+        ] {
+            let mut acc = accumulator(&Regr::new(kind, "regr"), 2)?;
+            acc.update_batch(&values)?;
+            assert_float(acc.evaluate()?, expected);
+        }
+        Ok(())
+    }
+
+    fn final_frame(
+        udf: &dyn AggregateUDFImpl,
+        input: &[ArrayRef],
+        width: usize,
+    ) -> Result<ScalarValue> {
+        let mut acc = accumulator(udf, input.len())?;
+        for i in 0..input[0].len() {
+            acc.update_batch(&input.iter().map(|a| a.slice(i, 1)).collect::<Vec<_>>())?;
+            if i >= width {
+                acc.retract_batch(
+                    &input
+                        .iter()
+                        .map(|a| a.slice(i - width, 1))
+                        .collect::<Vec<_>>(),
+                )?;
+            }
+        }
+        acc.evaluate()
+    }
+
+    #[test]
+    fn sliding_finite_variance_outlier() -> Result<()> {
+        for (udf, arity) in moment_udfs().into_iter().filter(|(u, _)| {
+            ["var_pop", "var_samp", "stddev_pop", "stddev"].contains(&u.name())
+        }) {
+            for values in [
+                vec![9193063041.610329, 3.3, 3.3],
+                vec![1e4, 3.3, 3.3, 3.3, 3.3],
+                vec![1e7, 3.3, 3.3, 3.3, 3.3],
+            ] {
+                let width = values.len() - 1;
+                let input =
+                    arrays(&values.into_iter().map(Some).collect::<Vec<_>>(), arity);
+                // Fresh moments over an all-equal finite frame are exactly zero.
+                assert_float(final_frame(udf.as_ref(), &input, width)?, 0.0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_finite_covariance_singleton() -> Result<()> {
+        let udf = crate::covariance::CovariancePopulation::new();
+        assert_float(
+            final_frame(
+                &udf,
+                &arrays(&[Some(9193063041.610329), Some(3.3), Some(3.3)], 2),
+                1,
+            )?,
+            0.0,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_finite_constant_regression() -> Result<()> {
+        use crate::regr::{Regr, RegrType};
+        let x =
+            Arc::new(Float64Array::from(vec![9193063041.610329, 3.3, 3.3])) as ArrayRef;
+        let y = Arc::new(Float64Array::from(vec![4.0, 1.0, 2.0])) as ArrayRef;
+        for kind in [RegrType::Slope, RegrType::Intercept, RegrType::R2] {
+            assert_eq!(
+                final_frame(
+                    &Regr::new(kind, "regr"),
+                    &[Arc::clone(&y), Arc::clone(&x)],
+                    2
+                )?,
+                ScalarValue::Float64(None)
+            );
+        }
+        assert_eq!(
+            final_frame(&crate::correlation::Correlation::new(), &[x, y], 2)?,
+            ScalarValue::Float64(None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_finite_sum_compensation() -> Result<()> {
+        for (udf, expected) in [
+            (&Sum::new() as &dyn AggregateUDFImpl, 2.0),
+            (&crate::average::Avg::new(), 1.0),
+        ] {
+            for outlier in [1e17, -1e17] {
+                let values = arrays(&[Some(outlier), Some(1.0), Some(1.0)], 1);
+                assert_float(final_frame(udf, &values, 2)?, expected);
+                let mut partial = accumulator(udf, 1)?;
+                partial.update_batch(&values)?;
+                let state = partial
+                    .state()?
+                    .into_iter()
+                    .map(|s| s.to_array())
+                    .collect::<Result<Vec<_>>>()?;
+                let mut merged = accumulator(udf, 1)?;
+                merged.merge_batch(&state)?;
+                merged.retract_batch(&arrays(&[Some(outlier)], 1))?;
+                assert_float(merged.evaluate()?, expected);
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn sliding_finite_singleton_state_then_update() -> Result<()> {
+        // Verify the reset itself, then grow the singleton again. Population
+        // variance alone always returns zero for one value, even with bad m2.
+        for (udf, arity) in moment_udfs() {
+            let mut partial = accumulator(udf.as_ref(), arity)?;
+            partial
+                .update_batch(&arrays(&[Some(9193063041.610329), Some(3.3)], arity))?;
+            partial.retract_batch(&arrays(&[Some(9193063041.610329)], arity))?;
+            let states = partial
+                .state()?
+                .into_iter()
+                .map(|s| s.to_array())
+                .collect::<Result<Vec<_>>>()?;
+            let mut merged = accumulator(udf.as_ref(), arity)?;
+            merged.merge_batch(&states)?;
+            merged.update_batch(&arrays(&[Some(6.6)], arity))?;
+            let mut fresh = accumulator(udf.as_ref(), arity)?;
+            fresh.update_batch(&arrays(&[Some(3.3), Some(6.6)], arity))?;
+            assert_same(merged.evaluate()?, fresh.evaluate()?);
+        }
+        Ok(())
+    }
+    #[test]
+    fn sliding_v3_positive_variance_residuals() -> Result<()> {
+        for (udf, _) in moment_udfs().into_iter().filter(|(u, _)| {
+            ["var_pop", "var_samp", "stddev_pop", "stddev"].contains(&u.name())
+        }) {
+            for outlier in [5071415981.588, 123456789.0] {
+                assert_float(
+                    final_frame(
+                        udf.as_ref(),
+                        &arrays(&[Some(outlier), Some(3.3), Some(3.3)], 1),
+                        2,
+                    )?,
+                    0.0,
+                );
+            }
+            for outlier in [1e4, 1e5, 1e6, 1e7] {
+                assert_float(
+                    final_frame(
+                        udf.as_ref(),
+                        &arrays(
+                            &[Some(outlier), Some(3.3), Some(3.3), Some(3.3), Some(3.3)],
+                            1,
+                        ),
+                        4,
+                    )?,
+                    0.0,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_v3_covariance_constant_frame() -> Result<()> {
+        for (udf, _) in moment_udfs()
+            .into_iter()
+            .filter(|(u, _)| ["covar_pop", "covar_samp"].contains(&u.name()))
+        {
+            assert_float(
+                final_frame(
+                    udf.as_ref(),
+                    &arrays(&[Some(1e9), Some(3.3), Some(3.3)], 2),
+                    2,
+                )?,
+                0.0,
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_v3_all_regression_constant_x() -> Result<()> {
+        let y = Arc::new(Float64Array::from(vec![4.0, 1.0, 2.0])) as ArrayRef;
+        let x = Arc::new(Float64Array::from(vec![123456789.0, 3.3, 3.3])) as ArrayRef;
+        for (udf, arity) in moment_udfs()
+            .into_iter()
+            .filter(|(u, _)| u.name().starts_with("regr_"))
+        {
+            let input = [Arc::clone(&y), Arc::clone(&x)];
+            let mut fresh = accumulator(udf.as_ref(), arity)?;
+            fresh
+                .update_batch(&input.iter().map(|a| a.slice(1, 2)).collect::<Vec<_>>())?;
+            assert_same(final_frame(udf.as_ref(), &input, 2)?, fresh.evaluate()?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_v3_correlation_bound() -> Result<()> {
+        for sign in [1.0, -1.0] {
+            let x = Arc::new(Float64Array::from(vec![1.0, 4.0])) as ArrayRef;
+            let y = Arc::new(Float64Array::from(vec![sign, 4.0 * sign])) as ArrayRef;
+            let actual =
+                final_frame(&crate::correlation::Correlation::new(), &[x, y], 2)?;
+            let ScalarValue::Float64(Some(value)) = actual else {
+                panic!("{actual:?}");
+            };
+            assert!((-1.0..=1.0).contains(&value), "{value}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_v3_deque_memory_accounting() -> Result<()> {
+        for (udf, arity) in moment_udfs()
+            .into_iter()
+            .filter(|(u, _)| !["sum", "avg"].contains(&u.name()))
+        {
+            let mut acc = accumulator(udf.as_ref(), arity)?;
+            let initial = acc.size();
+            let values =
+                arrays(&(0..128).map(|i| Some(i as f64)).collect::<Vec<_>>(), arity);
+            acc.update_batch(&values)?;
+            assert!(
+                acc.size() >= initial + 128 * arity * size_of::<f64>(),
+                "{} must charge retained values",
+                udf.name()
+            );
+            acc.retract_batch(&values)?;
+            assert!(acc.size() >= initial + 128 * arity * size_of::<f64>());
+        }
+        Ok(())
+    }
+    #[test]
+    fn sliding_v3_retained_state_recovers_after_merge() -> Result<()> {
+        let x = Arc::new(Float64Array::from(vec![5071415981.588, 3.3, 3.3])) as ArrayRef;
+        let y = Arc::new(Float64Array::from(vec![1e9, 1.0, 2.0])) as ArrayRef;
+        for (udf, arity) in moment_udfs() {
+            let input = if arity == 1 {
+                vec![Arc::clone(&x)]
+            } else {
+                vec![Arc::clone(&y), Arc::clone(&x)]
+            };
+            let mut partial = accumulator(udf.as_ref(), arity)?;
+            partial.update_batch(&input)?;
+            let state = partial
+                .state()?
+                .into_iter()
+                .map(|s| s.to_array())
+                .collect::<Result<Vec<_>>>()?;
+            let mut merged = accumulator(udf.as_ref(), arity)?;
+            merged.merge_batch(&state)?;
+            merged.retract_batch(
+                &input.iter().map(|a| a.slice(0, 1)).collect::<Vec<_>>(),
+            )?;
+            let mut fresh = accumulator(udf.as_ref(), arity)?;
+            fresh
+                .update_batch(&input.iter().map(|a| a.slice(1, 2)).collect::<Vec<_>>())?;
+            assert_same(merged.evaluate()?, fresh.evaluate()?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_sum_overflow_limit() -> Result<()> {
+        let mut acc = accumulator(&Sum::new(), 1)?;
+        acc.update_batch(&arrays(&[Some(f64::MAX), Some(f64::MAX), Some(1.0)], 1))?;
+        acc.retract_batch(&arrays(&[Some(f64::MAX), Some(f64::MAX)], 1))?;
+        assert_float(acc.evaluate()?, f64::INFINITY);
+        acc.retract_batch(&arrays(&[Some(1.0)], 1))?;
+        assert_eq!(acc.evaluate()?, ScalarValue::Float64(None));
+        acc.update_batch(&arrays(&[Some(2.0)], 1))?;
+        assert_float(acc.evaluate()?, 2.0);
+        Ok(())
+    }
+    #[test]
+    fn sliding_v3_recompute_matches_fresh_frames() -> Result<()> {
+        let x = (0..40)
+            .map(|i| {
+                if i % 11 == 0 {
+                    Some(1e9 + i as f64)
+                } else if i % 7 == 0 {
+                    None
+                } else {
+                    Some(3.3 + (i % 3) as f64)
+                }
+            })
+            .collect::<Vec<_>>();
+        let y = (0..40)
+            .map(|i| {
+                if i % 13 == 0 {
+                    None
+                } else {
+                    Some(2.0 + (i % 5) as f64)
+                }
+            })
+            .collect::<Vec<_>>();
+        for (udf, arity) in moment_udfs() {
+            for width in [1, 2, 4, 8] {
+                let input = if arity == 1 {
+                    arrays(&x, 1)
+                } else {
+                    vec![
+                        Arc::new(Float64Array::from(y.clone())) as ArrayRef,
+                        Arc::new(Float64Array::from(x.clone())) as ArrayRef,
+                    ]
+                };
+                let mut sliding = accumulator(udf.as_ref(), arity)?;
+                for i in 0..x.len() {
+                    sliding.update_batch(
+                        &input.iter().map(|a| a.slice(i, 1)).collect::<Vec<_>>(),
+                    )?;
+                    if i >= width {
+                        sliding.retract_batch(
+                            &input
+                                .iter()
+                                .map(|a| a.slice(i - width, 1))
+                                .collect::<Vec<_>>(),
+                        )?;
+                    }
+                    let start = (i + 1).saturating_sub(width);
+                    let mut fresh = accumulator(udf.as_ref(), arity)?;
+                    fresh.update_batch(
+                        &input
+                            .iter()
+                            .map(|a| a.slice(start, i + 1 - start))
+                            .collect::<Vec<_>>(),
+                    )?;
+                    let actual = sliding.evaluate()?;
+                    let expected = fresh.evaluate()?;
+                    if ["covar_pop", "covar_samp", "regr_sxy"].contains(&udf.name()) {
+                        // Chan merges change the association of cross-moment
+                        // sums. A near-zero covariance next to a 1e9 outlier is
+                        // ill-conditioned in result-relative units. Keep the
+                        // fresh answer and bound normalized error by 64 ulps of
+                        // sqrt(m2_x*m2_y), with an absolute floor near zero.
+                        let xs = input[0].as_primitive::<Float64Type>();
+                        let ys = input[1].as_primitive::<Float64Type>();
+                        let pairs = (start..=i)
+                            .filter(|&j| xs.is_valid(j) && ys.is_valid(j))
+                            .map(|j| (xs.value(j), ys.value(j)))
+                            .collect::<Vec<_>>();
+                        if let (
+                            ScalarValue::Float64(Some(actual)),
+                            ScalarValue::Float64(Some(expected)),
+                        ) = (&actual, &expected)
+                        {
+                            let n = pairs.len() as f64;
+                            let mx = pairs.iter().map(|p| p.0).sum::<f64>() / n;
+                            let my = pairs.iter().map(|p| p.1).sum::<f64>() / n;
+                            let m2x =
+                                pairs.iter().map(|p| (p.0 - mx).powi(2)).sum::<f64>();
+                            let m2y =
+                                pairs.iter().map(|p| (p.1 - my).powi(2)).sum::<f64>();
+                            let denominator = match udf.name() {
+                                "covar_pop" => n,
+                                "covar_samp" => n - 1.0,
+                                _ => 1.0,
+                            };
+                            let scale = m2x.sqrt() * m2y.sqrt() / denominator;
+                            assert!(
+                                (actual - expected).abs()
+                                    <= 64.0 * f64::EPSILON * scale.max(1.0),
+                                "{}: {actual} vs {expected}, scale {scale}",
+                                udf.name()
+                            );
+                        } else {
+                            assert_same(actual, expected);
+                        }
+                    } else {
+                        assert_same(actual, expected);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn sliding_v4_constant_tail_ulp() -> Result<()> {
+        let values = arrays(
+            &[
+                Some(3.3000000000000007),
+                Some(3.3),
+                Some(3.3),
+                Some(3.3),
+                Some(3.3),
+            ],
+            1,
+        );
+        for (udf, arity) in moment_udfs().into_iter().filter(|(u, _)| {
+            [
+                "var_pop",
+                "var_samp",
+                "stddev_pop",
+                "stddev",
+                "covar_pop",
+                "covar_samp",
+            ]
+            .contains(&u.name())
+        }) {
+            let input = vec![Arc::clone(&values[0]); arity];
+            assert_eq!(
+                final_frame(udf.as_ref(), &input, 4)?,
+                ScalarValue::Float64(Some(0.0)),
+                "{}",
+                udf.name()
+            );
+        }
+        for (udf, arity) in moment_udfs()
+            .into_iter()
+            .filter(|(u, _)| u.name() == "corr" || u.name().starts_with("regr_"))
+        {
+            let input = vec![Arc::clone(&values[0]); arity];
+            let mut fresh = accumulator(udf.as_ref(), arity)?;
+            fresh
+                .update_batch(&input.iter().map(|a| a.slice(1, 4)).collect::<Vec<_>>())?;
+            assert_eq!(
+                final_frame(udf.as_ref(), &input, 4)?,
+                fresh.evaluate()?,
+                "{}",
+                udf.name()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_v4_geometric_decay() -> Result<()> {
+        // Independent two-pass fresh variance. Relative error must be <=1e-10
+        // for every complete 20-value frame, not just an absolute tolerance
+        // that would hide drift as the values become small.
+        let values = (0..1200)
+            .map(|i| 1e9 * 0.97_f64.powi(i))
+            .collect::<Vec<_>>();
+        let input = arrays(&values.iter().copied().map(Some).collect::<Vec<_>>(), 1);
+        let mut acc = accumulator(&crate::variance::VariancePopulation::new(), 1)?;
+        for i in 0..values.len() {
+            acc.update_batch(&[input[0].slice(i, 1)])?;
+            if i >= 20 {
+                acc.retract_batch(&[input[0].slice(i - 20, 1)])?;
+            }
+            if i >= 19 {
+                let frame = &values[i - 19..=i];
+                let mean = frame.iter().sum::<f64>() / 20.0;
+                let expected =
+                    frame.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / 20.0;
+                let ScalarValue::Float64(Some(actual)) = acc.evaluate()? else {
+                    panic!("missing variance");
+                };
+                let relative = (actual - expected).abs() / expected;
+                assert!(
+                    relative <= 1e-10,
+                    "row {i}: relative error {relative}, {actual} vs {expected}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_v4_sum_small_terms() -> Result<()> {
+        for (values, expected) in [
+            (vec![67108864.0, 1.1], 1.1),
+            (vec![1e6, 0.1, 0.2, 0.3], 0.6),
+        ] {
+            let mut acc = accumulator(&Sum::new(), 1)?;
+            acc.update_batch(&arrays(
+                &values.iter().copied().map(Some).collect::<Vec<_>>(),
+                1,
+            ))?;
+            acc.retract_batch(&arrays(&[Some(values[0])], 1))?;
+            assert_eq!(acc.evaluate()?, ScalarValue::Float64(Some(expected)));
+            let mut avg = accumulator(&crate::average::Avg::new(), 1)?;
+            avg.update_batch(&arrays(
+                &values.iter().copied().map(Some).collect::<Vec<_>>(),
+                1,
+            ))?;
+            avg.retract_batch(&arrays(&[Some(values[0])], 1))?;
+            assert_float(avg.evaluate()?, expected / (values.len() - 1) as f64);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_v4_non_fifo_is_internal_error() -> Result<()> {
+        for (udf, arity) in moment_udfs()
+            .into_iter()
+            .filter(|(u, _)| !["sum", "avg"].contains(&u.name()))
+        {
+            for bad in [Some(2.0), Some(f64::NAN)] {
+                let mut acc = accumulator(udf.as_ref(), arity)?;
+                acc.update_batch(&arrays(
+                    &[Some(1.0), Some(2.0), Some(f64::NAN)],
+                    arity,
+                ))?;
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        acc.retract_batch(&arrays(&[bad], arity))
+                    }));
+                let Ok(Err(error)) = result else {
+                    panic!("{} must return an error without panicking", udf.name());
+                };
+                assert!(
+                    matches!(error, datafusion_common::DataFusionError::Internal(_)),
+                    "{error}"
+                );
+                assert!(error.to_string().contains("FIFO"), "{error}");
+            }
+        }
+        Ok(())
+    }
+    fn gaussian_pairs(len: usize) -> Vec<(f64, f64)> {
+        let mut seed = 0x51f0_5eed_1234_9876_u64;
+        let mut uniform = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 11) as f64 + 0.5) / 9007199254740992.0
+        };
+        (0..len)
+            .map(|_| {
+                let radius = (-2.0 * uniform().ln()).sqrt();
+                let angle = std::f64::consts::TAU * uniform();
+                (radius * angle.cos(), radius * angle.sin())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sliding_v4_gaussian_linear_work() -> Result<()> {
+        use crate::covariance::PairMoments;
+        use crate::variance::{SlidingMoment, SlidingMomentQueue};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COMBINATIONS: AtomicUsize = AtomicUsize::new(0);
+        #[derive(Clone, Copy, Default, Debug)]
+        struct Counted(PairMoments);
+        impl SlidingMoment for Counted {
+            type Value = (f64, f64);
+            fn singleton(value: Self::Value) -> Self {
+                Self(PairMoments::singleton(value))
+            }
+            fn combine(self, other: Self) -> Self {
+                COMBINATIONS.fetch_add(1, Ordering::Relaxed);
+                Self(self.0.combine(other.0))
+            }
+            fn same_value(a: Self::Value, b: Self::Value) -> bool {
+                PairMoments::same_value(a, b)
+            }
+        }
+        let values = gaussian_pairs(4096);
+        let mut queue = SlidingMomentQueue::<Counted>::default();
+        COMBINATIONS.store(0, Ordering::Relaxed);
+        for (i, &pair) in values.iter().enumerate() {
+            queue.push(pair);
+            if i >= 20 {
+                queue.pop(values[i - 20])?;
+            }
+            queue.aggregate();
+        }
+        // One prefix combine per push, at most one suffix combine per value
+        // transferred, and one combine per evaluation. This checks actual
+        // moment-combine work, not wall time or a Gaussian rebuild threshold.
+        let count = COMBINATIONS.load(Ordering::Relaxed);
+        eprintln!(
+            "Gaussian queue: {count} combinations / {} pushes / {} FIFO pops / {} evaluations",
+            values.len(),
+            values.len() - 20,
+            values.len()
+        );
+        assert!(
+            count <= 3 * values.len(),
+            "{count} combines for {} rows",
+            values.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_v4_randomized_fresh_comparison() -> Result<()> {
+        // Deterministic Gaussian pairs, independently accumulated by unchanged
+        // ordinary UDFs. Bound every finite result by relative error 1e-10
+        // plus absolute error 1e-12 near zero; NULL/count results match exactly.
+        let values = gaussian_pairs(512);
+        let x = Arc::new(Float64Array::from(
+            values.iter().map(|p| p.0).collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let y = Arc::new(Float64Array::from(
+            values.iter().map(|p| p.1).collect::<Vec<_>>(),
+        )) as ArrayRef;
+        for (udf, arity) in moment_udfs() {
+            let input = if arity == 1 {
+                vec![Arc::clone(&x)]
+            } else {
+                vec![Arc::clone(&y), Arc::clone(&x)]
+            };
+            for width in [1, 2, 20, 63] {
+                let mut sliding = accumulator(udf.as_ref(), arity)?;
+                for i in 0..values.len() {
+                    sliding.update_batch(
+                        &input.iter().map(|a| a.slice(i, 1)).collect::<Vec<_>>(),
+                    )?;
+                    if i >= width {
+                        sliding.retract_batch(
+                            &input
+                                .iter()
+                                .map(|a| a.slice(i - width, 1))
+                                .collect::<Vec<_>>(),
+                        )?;
+                    }
+                    let schema = Schema::empty();
+                    let field = Arc::new(Field::new("x", DataType::Float64, true));
+                    let fields = vec![field; arity];
+                    let mut fresh = udf.accumulator(AccumulatorArgs {
+                        return_field: Arc::new(Field::new(
+                            "result",
+                            DataType::Float64,
+                            true,
+                        )),
+                        schema: &schema,
+                        expr_fields: &fields,
+                        ignore_nulls: false,
+                        order_bys: &[],
+                        is_distinct: false,
+                        name: udf.name(),
+                        is_reversed: false,
+                        exprs: &[],
+                    })?;
+                    let start = (i + 1).saturating_sub(width);
+                    fresh.update_batch(
+                        &input
+                            .iter()
+                            .map(|a| a.slice(start, i + 1 - start))
+                            .collect::<Vec<_>>(),
+                    )?;
+                    let actual = sliding.evaluate()?;
+                    let expected = fresh.evaluate()?;
+                    if let (
+                        ScalarValue::Float64(Some(actual)),
+                        ScalarValue::Float64(Some(expected)),
+                    ) = (&actual, &expected)
+                    {
+                        assert!(
+                            (actual - expected).abs() <= 1e-12 + 1e-10 * expected.abs(),
+                            "{} row {i} width {width}: {actual} vs {expected}",
+                            udf.name()
+                        );
+                    } else {
+                        assert_same(actual, expected);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

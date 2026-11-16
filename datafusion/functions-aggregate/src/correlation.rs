@@ -102,6 +102,18 @@ impl AggregateUDFImpl for Correlation {
         Ok(Box::new(CorrelationAccumulator::try_new()?))
     }
 
+    fn create_sliding_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn Accumulator>> {
+        if args.is_distinct {
+            return self.accumulator(args);
+        }
+        Ok(Box::new(SlidingCorrelationAccumulator(
+            crate::covariance::SlidingCovarianceAccumulator::new(StatsType::Population)?,
+        )))
+    }
+
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
         let name = args.name;
         Ok(vec![
@@ -286,6 +298,51 @@ impl Accumulator for CorrelationAccumulator {
 
     fn supports_retract_batch(&self) -> bool {
         true
+    }
+}
+
+/// Sliding-only state is SlidingCovarianceAccumulator's ten-field retained
+/// frame state; ordinary CORR state is unchanged. Finite results are bounded
+/// to [-1, 1]; existing NULL rules apply to singular and NaN-mean axes.
+#[derive(Debug)]
+struct SlidingCorrelationAccumulator(crate::covariance::SlidingCovarianceAccumulator);
+
+impl Accumulator for SlidingCorrelationAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.0.update_batch(values)
+    }
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.0.retract_batch(values)
+    }
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        self.0.state()
+    }
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        self.0.merge_batch(states)
+    }
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        let x = &self.0.x;
+        let y = &self.0.y;
+        // Preserve correlation's NULL behavior for an undefined single axis.
+        let result = if x.mean().is_nan() && y.mean().is_nan() {
+            Some(f64::NAN)
+        } else if x.mean().is_nan()
+            || y.mean().is_nan()
+            || self.0.count() < 2
+            || x.m2() == 0.0
+            || y.m2() == 0.0
+        {
+            None
+        } else {
+            Some((self.0.co_moment() / x.m2().sqrt() / y.m2().sqrt()).clamp(-1.0, 1.0))
+        };
+        Ok(ScalarValue::Float64(result))
+    }
+    fn supports_retract_batch(&self) -> bool {
+        true
+    }
+    fn size(&self) -> usize {
+        size_of_val(self) - size_of_val(&self.0) + self.0.size()
     }
 }
 

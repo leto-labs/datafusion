@@ -15,6 +15,7 @@ use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Documentation, Signature, Volatility,
 };
+use datafusion_functions_aggregate_common::stats::StatsType;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::mem::size_of_val;
@@ -477,6 +478,21 @@ impl AggregateUDFImpl for Regr {
         Ok(Box::new(RegrAccumulator::try_new(&self.regr_type)?))
     }
 
+    fn create_sliding_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn Accumulator>> {
+        if args.is_distinct {
+            return self.accumulator(args);
+        }
+        Ok(Box::new(SlidingRegrAccumulator {
+            moments: crate::covariance::SlidingCovarianceAccumulator::new(
+                StatsType::Population,
+            )?,
+            regr_type: self.regr_type.clone(),
+        }))
+    }
+
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
         Ok(vec![
             Field::new(
@@ -776,5 +792,52 @@ impl Accumulator for RegrAccumulator {
 
     fn size(&self) -> usize {
         size_of_val(self)
+    }
+}
+/// Sliding-only state is SlidingCovarianceAccumulator's ten-field retained
+/// frame state; ordinary REGR state is unchanged. Affected centered statistics
+/// are NaN while an infinite complete pair remains, instead of inheriting the
+/// ordinary accumulator's order-dependent +/-inf arithmetic. Counts, means,
+/// independent axes and the existing singular/NULL rules remain defined.
+#[derive(Debug)]
+struct SlidingRegrAccumulator {
+    moments: crate::covariance::SlidingCovarianceAccumulator,
+    regr_type: RegrType,
+}
+
+impl Accumulator for SlidingRegrAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.moments
+            .update_batch(&[Arc::clone(&values[1]), Arc::clone(&values[0])])
+    }
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.moments
+            .retract_batch(&[Arc::clone(&values[1]), Arc::clone(&values[0])])
+    }
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        self.moments.state()
+    }
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        self.moments.merge_batch(states)
+    }
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        // Reuse the existing result rules on moments reconstructed for the
+        // current frame. No poisoned value is written to the finite state.
+        let mut result = RegrAccumulator {
+            count: self.moments.count(),
+            mean_x: self.moments.x.mean(),
+            mean_y: self.moments.y.mean(),
+            m2_x: self.moments.x.m2(),
+            m2_y: self.moments.y.m2(),
+            algo_const: self.moments.co_moment(),
+            regr_type: self.regr_type.clone(),
+        };
+        result.evaluate()
+    }
+    fn supports_retract_batch(&self) -> bool {
+        true
+    }
+    fn size(&self) -> usize {
+        size_of_val(self) - size_of_val(&self.moments) + self.moments.size()
     }
 }

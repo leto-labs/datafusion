@@ -83,6 +83,18 @@ impl AggregateUDFImpl for Stddev {
         Ok(DataType::Float64)
     }
 
+    fn create_sliding_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn Accumulator>> {
+        if args.is_distinct {
+            return self.accumulator(args);
+        }
+        Ok(Box::new(SlidingStddevAccumulator(
+            crate::variance::SlidingVarianceAccumulator::new(StatsType::Sample)?,
+        )))
+    }
+
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
         Ok(vec![
             Field::new(
@@ -189,6 +201,18 @@ impl AggregateUDFImpl for StddevPop {
 
     fn signature(&self) -> &Signature {
         &self.signature
+    }
+
+    fn create_sliding_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn Accumulator>> {
+        if args.is_distinct {
+            return self.accumulator(args);
+        }
+        Ok(Box::new(SlidingStddevAccumulator(
+            crate::variance::SlidingVarianceAccumulator::new(StatsType::Population)?,
+        )))
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
@@ -304,6 +328,38 @@ impl Accumulator for StddevAccumulator {
 
     fn supports_retract_batch(&self) -> bool {
         self.variance.supports_retract_batch()
+    }
+}
+
+/// Sliding-only state is the ordered non-NULL values list and non-finite
+/// counts of SlidingVarianceAccumulator; ordinary STDDEV state is unchanged.
+#[derive(Debug)]
+struct SlidingStddevAccumulator(crate::variance::SlidingVarianceAccumulator);
+
+impl Accumulator for SlidingStddevAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.0.update_batch(values)
+    }
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.0.retract_batch(values)
+    }
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        self.0.state()
+    }
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        self.0.merge_batch(states)
+    }
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        let ScalarValue::Float64(value) = self.0.evaluate()? else {
+            unreachable!()
+        };
+        Ok(ScalarValue::Float64(value.map(f64::sqrt)))
+    }
+    fn supports_retract_batch(&self) -> bool {
+        true
+    }
+    fn size(&self) -> usize {
+        size_of_val(self) - size_of_val(&self.0) + self.0.size()
     }
 }
 

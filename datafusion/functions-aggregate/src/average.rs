@@ -687,6 +687,20 @@ impl AggregateUDFImpl for Avg {
         }
     }
 
+    fn create_sliding_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn Accumulator>> {
+        if self.logical_input.is_none()
+            && !args.is_distinct
+            && args.expr_fields[0].data_type() == &DataType::Float64
+        {
+            Ok(Box::new(crate::sum::SlidingFloatSumAccumulator::new(true)))
+        } else {
+            self.accumulator(args)
+        }
+    }
+
     fn aliases(&self) -> &[String] {
         &self.aliases
     }

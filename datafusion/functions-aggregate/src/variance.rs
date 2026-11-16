@@ -7,12 +7,12 @@
 
 use arrow::datatypes::{FieldRef, Float64Type};
 use arrow::{
-    array::{Array, ArrayRef, BooleanArray, Float64Array, UInt64Array},
+    array::{Array, ArrayRef, AsArray, BooleanArray, Float64Array, UInt64Array},
     buffer::NullBuffer,
     datatypes::{DataType, Field},
 };
 use datafusion_common::cast::{as_float64_array, as_uint64_array};
-use datafusion_common::{Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, internal_err};
 use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Documentation, GroupSelection, GroupsAccumulator,
     Signature, Volatility,
@@ -81,6 +81,18 @@ impl AggregateUDFImpl for VarianceSample {
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Float64)
+    }
+
+    fn create_sliding_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn Accumulator>> {
+        if args.is_distinct {
+            return self.accumulator(args);
+        }
+        Ok(Box::new(SlidingVarianceAccumulator::new(
+            StatsType::Sample,
+        )?))
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
@@ -184,6 +196,18 @@ impl AggregateUDFImpl for VariancePopulation {
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Float64)
+    }
+
+    fn create_sliding_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn Accumulator>> {
+        if args.is_distinct {
+            return self.accumulator(args);
+        }
+        Ok(Box::new(SlidingVarianceAccumulator::new(
+            StatsType::Population,
+        )?))
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
@@ -426,6 +450,217 @@ impl Accumulator for VarianceAccumulator {
 
     fn supports_retract_batch(&self) -> bool {
         true
+    }
+}
+
+/// Additive partial moments used by a FIFO two-stack aggregate. Retraction
+/// removes records; it never subtracts one set of moments from another.
+pub(crate) trait SlidingMoment: Copy + Default + Debug {
+    type Value: Copy + Debug;
+    fn singleton(value: Self::Value) -> Self;
+    fn combine(self, other: Self) -> Self;
+    fn same_value(a: Self::Value, b: Self::Value) -> bool;
+}
+
+/// Back records cache prefix aggregates; front records cache suffix aggregates.
+/// Each value moves from back to front at most once, so push/pop/evaluate take
+/// amortized O(1) combinations per row and O(frame size) charged memory.
+#[derive(Debug)]
+pub(crate) struct SlidingMomentQueue<M: SlidingMoment> {
+    front: Vec<(M::Value, M)>,
+    back: Vec<(M::Value, M)>,
+}
+
+impl<M: SlidingMoment> Default for SlidingMomentQueue<M> {
+    fn default() -> Self {
+        Self {
+            front: vec![],
+            back: vec![],
+        }
+    }
+}
+
+impl<M: SlidingMoment> SlidingMomentQueue<M> {
+    pub(crate) fn push(&mut self, value: M::Value) {
+        let prefix = self.back.last().map(|(_, m)| *m).unwrap_or_default();
+        self.back.push((value, prefix.combine(M::singleton(value))));
+    }
+    pub(crate) fn pop(&mut self, value: M::Value) -> Result<()> {
+        if self.front.is_empty() {
+            while let Some((value, _)) = self.back.pop() {
+                let suffix = self.front.last().map(|(_, m)| *m).unwrap_or_default();
+                self.front
+                    .push((value, M::singleton(value).combine(suffix)));
+            }
+        }
+        if !self
+            .front
+            .last()
+            .is_some_and(|(old, _)| M::same_value(*old, value))
+        {
+            return internal_err!(
+                "Sliding moments require FIFO retraction of the oldest value"
+            );
+        }
+        self.front.pop();
+        Ok(())
+    }
+    pub(crate) fn aggregate(&self) -> M {
+        self.front
+            .last()
+            .map(|(_, m)| *m)
+            .unwrap_or_default()
+            .combine(self.back.last().map(|(_, m)| *m).unwrap_or_default())
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.front.len() + self.back.len()
+    }
+    pub(crate) fn values(&self) -> impl Iterator<Item = M::Value> + '_ {
+        self.front.iter().rev().chain(&self.back).map(|(v, _)| *v)
+    }
+    pub(crate) fn heap_size(&self) -> usize {
+        (self.front.capacity() + self.back.capacity()) * size_of::<(M::Value, M)>()
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct VarianceMoments {
+    pub(crate) count: u64,
+    pub(crate) mean: f64,
+    pub(crate) m2: f64,
+}
+
+impl SlidingMoment for VarianceMoments {
+    type Value = f64;
+    fn singleton(value: f64) -> Self {
+        if value.is_finite() {
+            Self {
+                count: 1,
+                mean: value,
+                m2: 0.0,
+            }
+        } else {
+            Self::default()
+        }
+    }
+    fn combine(self, other: Self) -> Self {
+        if self.count == 0 {
+            return other;
+        }
+        if other.count == 0 {
+            return self;
+        }
+        let count = self.count + other.count;
+        let ratio = other.count as f64 / count as f64;
+        let weight = self.count as f64 * ratio;
+        let delta = other.mean - self.mean;
+        Self {
+            count,
+            mean: self.mean + delta * ratio,
+            m2: self.m2 + other.m2 + delta * delta * weight,
+        }
+    }
+    fn same_value(a: f64, b: f64) -> bool {
+        a.to_bits() == b.to_bits()
+    }
+}
+
+pub(crate) fn sliding_values_state(values: impl Iterator<Item = f64>) -> ScalarValue {
+    let values = values.map(ScalarValue::from).collect::<Vec<_>>();
+    ScalarValue::List(ScalarValue::new_list_nullable(&values, &DataType::Float64))
+}
+
+/// FIFO two-stack moments combined with Chan's parallel merge; no downdates or
+/// cancellation thresholds. A constant finite run has exactly zero m2.
+/// Non-finite entries carry empty moments and retain their arrival positions
+/// so non-FIFO calls fail with an internal error in release builds too.
+///
+/// State is sliding-only: [ordered non-NULL values, NaN count, +inf count,
+/// -inf count]. Ordinary/grouped states are unchanged. Non-finite values make
+/// centered moments NaN while present; existing singleton result rules apply.
+#[derive(Debug)]
+pub(crate) struct SlidingVarianceAccumulator {
+    moments: SlidingMomentQueue<VarianceMoments>,
+    stats_type: StatsType,
+    non_finite: crate::sum::NonFiniteCounts,
+}
+
+impl SlidingVarianceAccumulator {
+    pub(crate) fn new(stats_type: StatsType) -> Result<Self> {
+        Ok(Self {
+            moments: Default::default(),
+            stats_type,
+            non_finite: Default::default(),
+        })
+    }
+    pub(crate) fn count(&self) -> u64 {
+        self.moments.len() as u64
+    }
+    pub(crate) fn mean(&self) -> f64 {
+        self.non_finite
+            .value()
+            .unwrap_or_else(|| self.moments.aggregate().mean)
+    }
+    pub(crate) fn m2(&self) -> f64 {
+        if self.non_finite.count() > 0 {
+            f64::NAN
+        } else {
+            self.moments.aggregate().m2.clamp(0.0, f64::INFINITY)
+        }
+    }
+    pub(crate) fn apply(&mut self, value: f64, retracting: bool) -> Result<()> {
+        if retracting {
+            self.moments.pop(value)?;
+        } else {
+            self.moments.push(value);
+        }
+        self.non_finite.update(value, retracting);
+        Ok(())
+    }
+}
+
+impl Accumulator for SlidingVarianceAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        for value in as_float64_array(&values[0])?.iter().flatten() {
+            self.apply(value, false)?;
+        }
+        Ok(())
+    }
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        for value in as_float64_array(&values[0])?.iter().flatten() {
+            self.apply(value, true)?;
+        }
+        Ok(())
+    }
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        let count = self.count();
+        let value = match (count, &self.stats_type) {
+            (0, _) | (1, StatsType::Sample) => None,
+            (1, StatsType::Population) => Some(0.0),
+            (_, StatsType::Population) => Some(self.m2() / count as f64),
+            (_, StatsType::Sample) => Some(self.m2() / (count - 1) as f64),
+        };
+        Ok(ScalarValue::Float64(value))
+    }
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        let mut state = vec![sliding_values_state(self.moments.values())];
+        state.extend(self.non_finite.state());
+        Ok(state)
+    }
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        for values in states[0].as_list::<i32>().iter().flatten() {
+            for value in as_float64_array(&values)?.iter().flatten() {
+                self.moments.push(value);
+            }
+        }
+        self.non_finite.merge(&states[1..4]);
+        Ok(())
+    }
+    fn supports_retract_batch(&self) -> bool {
+        true
+    }
+    fn size(&self) -> usize {
+        size_of_val(self) + self.moments.heap_size()
     }
 }
 
