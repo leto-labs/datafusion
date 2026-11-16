@@ -42,6 +42,10 @@ use datafusion_physical_expr_common::sort_expr::{
 
 use futures::{Stream, StreamExt, ready};
 
+#[path = "window_buffer_memory.rs"]
+mod window_buffer_memory;
+use window_buffer_memory::WindowBufferMemory;
+
 /// Window execution plan
 #[derive(Debug, Clone)]
 pub struct WindowAggExec {
@@ -294,15 +298,20 @@ impl ExecutionPlan for WindowAggExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let memory =
+            WindowBufferMemory::try_new(&self.schema, &self.window_expr, &context)?;
         let input = self.input.execute(partition, context)?;
-        let stream = Box::pin(WindowAggStream::new(
-            Arc::clone(&self.schema),
-            self.window_expr.clone(),
-            input,
-            BaselineMetrics::new(&self.metrics, partition),
-            self.partition_by_sort_keys()?,
-            self.ordered_partition_by_indices.clone(),
-        )?);
+        let stream = Box::pin(
+            WindowAggStream::new(
+                Arc::clone(&self.schema),
+                self.window_expr.clone(),
+                input,
+                BaselineMetrics::new(&self.metrics, partition),
+                self.partition_by_sort_keys()?,
+                self.ordered_partition_by_indices.clone(),
+            )?
+            .with_buffer_memory(memory),
+        );
         Ok(stream)
     }
 
@@ -495,6 +504,7 @@ pub struct WindowAggStream {
     partition_by_sort_keys: Vec<PhysicalSortExpr>,
     baseline_metrics: BaselineMetrics,
     ordered_partition_by_indices: Vec<usize>,
+    buffer_memory: Option<WindowBufferMemory>,
 }
 
 impl WindowAggStream {
@@ -522,7 +532,25 @@ impl WindowAggStream {
             baseline_metrics,
             partition_by_sort_keys,
             ordered_partition_by_indices,
+            buffer_memory: None,
         })
+    }
+
+    fn with_buffer_memory(mut self, memory: Option<WindowBufferMemory>) -> Self {
+        self.buffer_memory = memory;
+        self
+    }
+
+    fn fail(
+        &mut self,
+        error: datafusion_common::DataFusionError,
+    ) -> Poll<Option<Result<RecordBatch>>> {
+        self.finished = true;
+        let schema = self.input.schema();
+        self.input = Box::pin(EmptyRecordBatchStream::new(schema));
+        self.batches.clear();
+        self.buffer_memory = None;
+        Poll::Ready(Some(Err(error)))
     }
 
     fn compute_aggregates(&self) -> Result<Option<RecordBatch>> {
@@ -594,19 +622,30 @@ impl WindowAggStream {
         loop {
             return Poll::Ready(Some(match ready!(self.input.poll_next_unpin(cx)) {
                 Some(Ok(batch)) => {
+                    if let Some(memory) = &mut self.buffer_memory
+                        && let Err(error) = memory.retain(&batch)
+                    {
+                        return self.fail(error);
+                    }
                     self.batches.push(batch);
                     continue;
                 }
-                Some(Err(e)) => Err(e),
+                Some(Err(e)) => return self.fail(e),
                 None => {
                     // Release the input pipeline's resources before computing
                     // the final aggregates.
                     let input_schema = self.input.schema();
                     self.input = Box::pin(EmptyRecordBatchStream::new(input_schema));
-                    let Some(result) = self.compute_aggregates()? else {
-                        return Poll::Ready(None);
-                    };
                     self.finished = true;
+                    let result = match self.compute_aggregates() {
+                        Ok(Some(result)) => result,
+                        Ok(None) => {
+                            self.batches.clear();
+                            self.buffer_memory = None;
+                            return Poll::Ready(None);
+                        }
+                        Err(error) => return self.fail(error),
+                    };
                     // Empty record batches should not be emitted.
                     // They need to be treated as  [`Option<RecordBatch>`]es and handled separately
                     debug_assert!(result.num_rows() > 0);
