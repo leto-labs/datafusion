@@ -11,6 +11,7 @@ use crate::analyzer::type_coercion::TypeCoercionRewriter;
 use crate::decorrelate::{
     PullUpCorrelatedExpr, UN_MATCHED_ROW_INDICATOR, build_join_filter,
 };
+use crate::eliminate_cross_join::EliminateCrossJoin;
 use crate::extract_equijoin_predicate::split_eq_and_noneq_join_predicate;
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
@@ -97,6 +98,24 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
         if !has_subquery(&filter.predicate) {
             return Ok(Transformed::no(LogicalPlan::Filter(filter)));
         }
+
+        // Build the FROM join graph while sibling WHERE equalities are still
+        // visible, before semi/anti/mark joins introduce pruning boundaries.
+        let filter = if matches!(filter.input.as_ref(), LogicalPlan::Join(join)
+            if join.join_type == JoinType::Inner)
+        {
+            let plan = EliminateCrossJoin::new()
+                .rewrite(LogicalPlan::Filter(filter), config)?
+                .data;
+            match plan {
+                LogicalPlan::Filter(filter) if has_subquery(&filter.predicate) => filter,
+                // Removing common keys from OR branches may also remove a
+                // redundant subquery, leaving no decorrelation work.
+                plan => return Ok(Transformed::yes(plan)),
+            }
+        } else {
+            filter
+        };
 
         let (with_subqueries, mut other_exprs): (Vec<_>, Vec<_>) =
             split_conjunction_owned(filter.predicate)
@@ -3563,6 +3582,39 @@ mod tests {
                     TableScan: sq [a:UInt32, b:UInt32, c:UInt32]
         "
         )
+    }
+
+    #[test]
+    fn common_join_key_can_make_a_predicate_subquery_redundant() -> Result<()> {
+        for residual in [None, Some(col("t1.b").gt(lit(0u32)))] {
+            let key = col("t1.a").eq(col("t2.a"));
+            let predicate = key
+                .clone()
+                .or(key.and(in_subquery(col("t1.c"), test_subquery_with_name("sq")?)));
+            let predicate = match &residual {
+                Some(residual) => predicate.and(residual.clone()),
+                None => predicate,
+            };
+            let plan = LogicalPlanBuilder::from(test_table_scan_with_name("t1")?)
+                .cross_join(test_table_scan_with_name("t2")?)?
+                .filter(predicate)?
+                .build()?;
+            let actual = DecorrelatePredicateSubquery::new()
+                .rewrite(plan, &crate::optimizer::OptimizerContext::new())?
+                .data;
+            let mut expected = LogicalPlanBuilder::from(test_table_scan_with_name("t1")?)
+                .join(
+                    test_table_scan_with_name("t2")?,
+                    JoinType::Inner,
+                    (vec!["t1.a"], vec!["t2.a"]),
+                    None,
+                )?;
+            if let Some(residual) = residual {
+                expected = expected.filter(residual)?;
+            }
+            assert_eq!(actual, expected.build()?);
+        }
+        Ok(())
     }
 }
 
