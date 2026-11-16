@@ -280,7 +280,7 @@ impl ScalarUDFImpl for DateTruncFunc {
             let parsed_tz = parse_tz(tz_opt)?;
             let array = as_primitive_array::<T>(array)?;
 
-            if truncates_in_input_unit(granularity, parsed_tz.as_ref()) {
+            if truncates_in_input_unit(granularity, tz_opt.map(|tz| tz.as_ref())) {
                 let result = general_date_trunc_array_fine_granularity(
                     T::UNIT,
                     array,
@@ -307,7 +307,12 @@ impl ScalarUDFImpl for DateTruncFunc {
                 // scalar accepts every timestamp a column accepts.
                 // `general_date_trunc` converts to nanoseconds first and so rejects
                 // values outside the nanosecond range.
-                Some(v) if truncates_in_input_unit(granularity, parsed_tz.as_ref()) => {
+                Some(v)
+                    if truncates_in_input_unit(
+                        granularity,
+                        tz_opt.map(|tz| tz.as_ref()),
+                    ) =>
+                {
                     match fine_granularity_unit(T::UNIT, granularity) {
                         Some(unit) => {
                             Some(truncate_to_unit(*v, unit.get(), granularity)?)
@@ -1188,7 +1193,7 @@ fn date_trunc_coarse(granularity: DatePart, value: i64, tz: Option<Tz>) -> Resul
 /// with simple arithmetic operations without calendar complexity.
 ///
 /// This function is timezone-agnostic and should only be used when:
-/// - No timezone is specified in the input, OR
+/// - No timezone or explicit UTC is specified in the input, OR
 /// - The granularity is less than hour as hour can be affected by DST transitions in some cases
 fn general_date_trunc_array_fine_granularity<T: ArrowTimestampType>(
     tu: TimeUnit,
@@ -1233,9 +1238,9 @@ fn general_date_trunc_array_fine_granularity<T: ArrowTimestampType>(
 /// Both datafusion and arrow are ignoring historical timezone's non-minute granularity
 /// bias (e.g., Asia/Kathmandu before 1919 is UTC+05:41:16).
 /// In UTC, "hour" and "day" have uniform durations and can be truncated with simple arithmetic
-fn truncates_in_input_unit(granularity: DatePart, tz: Option<&Tz>) -> bool {
+fn truncates_in_input_unit(granularity: DatePart, tz: Option<&str>) -> bool {
     granularity.is_fine_granularity()
-        || (tz.is_none() && granularity.is_fine_granularity_utc())
+        || (matches!(tz, None | Some("UTC")) && granularity.is_fine_granularity_utc())
 }
 
 /// The length of `granularity` in `tu`, or `None` when `granularity` is no
@@ -1354,8 +1359,8 @@ mod tests {
     use arrow::compute::kernels::cast_utils::string_to_timestamp_nanos;
     use arrow::compute::{DatePart, SortOptions};
     use arrow::datatypes::{DataType, Field, TimeUnit};
-    use datafusion_common::ScalarValue;
     use datafusion_common::config::ConfigOptions;
+    use datafusion_common::{DataFusionError, ScalarValue};
     use datafusion_expr::interval_arithmetic::Interval;
     use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
     use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
@@ -2368,5 +2373,184 @@ mod tests {
                 panic!("unexpected column type");
             }
         }
+    }
+    fn invoke_utc_bucket(
+        input: ColumnarValue,
+        granularity: &str,
+    ) -> Result<ColumnarValue, DataFusionError> {
+        let field = Arc::new(Field::new("time", input.data_type(), true));
+        let number_rows = match &input {
+            ColumnarValue::Array(array) => array.len(),
+            ColumnarValue::Scalar(_) => 1,
+        };
+        DateTruncFunc::new().invoke_with_args(ScalarFunctionArgs {
+            args: vec![ColumnarValue::Scalar(ScalarValue::from(granularity)), input],
+            arg_fields: vec![
+                Arc::new(Field::new("unit", DataType::Utf8, false)),
+                Arc::clone(&field),
+            ],
+            number_rows,
+            return_field: field,
+            config_options: Arc::new(ConfigOptions::default()),
+        })
+    }
+
+    // The calendar path is independent of the arithmetic path, within its
+    // nanosecond range. Full input-unit boundaries are covered separately.
+    fn utc_hour_day_matches_calendar<T: ArrowTimestampType>() {
+        let scale = match T::UNIT {
+            TimeUnit::Second => 1_000_000_000,
+            TimeUnit::Millisecond => 1_000_000,
+            TimeUnit::Microsecond => 1_000,
+            TimeUnit::Nanosecond => 1,
+        };
+        let mut values = vec![None, Some(-1), Some(0), Some(1)];
+        for nanos in [
+            i64::MIN + 86_400_000_000_000,
+            -86_400_000_000_001,
+            -86_400_000_000_000,
+            -3_600_000_000_001,
+            -3_600_000_000_000,
+            951_868_799_999_999_999,
+            1_451_606_400_000_000_000,
+            i64::MAX,
+        ] {
+            values.push(Some(nanos / scale));
+        }
+        let mut seed = 0x1234_5678_9abc_def0_u64;
+        for _ in 0..512 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            values.push(Some((seed as i64) / scale));
+        }
+        for granularity in ["hour", "day"] {
+            let gran = parse_granularity(granularity).unwrap();
+            let expected = values
+                .iter()
+                .map(|value| {
+                    value.map(|v| {
+                        general_date_trunc(T::UNIT, v, Some("UTC".parse().unwrap()), gran)
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let input =
+                PrimitiveArray::<T>::from_iter(values.clone()).with_timezone("UTC");
+            let actual =
+                invoke_utc_bucket(ColumnarValue::Array(Arc::new(input)), granularity)
+                    .unwrap();
+            let ColumnarValue::Array(actual) = actual else {
+                panic!("expected array")
+            };
+            let actual = as_primitive_array::<T>(&actual);
+            assert_eq!(
+                actual.data_type(),
+                &DataType::Timestamp(T::UNIT, Some("UTC".into()))
+            );
+            assert_eq!(
+                actual.iter().collect::<Vec<_>>(),
+                expected,
+                "{} {granularity}",
+                T::UNIT
+            );
+        }
+    }
+
+    #[test]
+    fn utc_hour_day_arrays_match_calendar_for_all_timestamp_units() {
+        utc_hour_day_matches_calendar::<TimestampSecondType>();
+        utc_hour_day_matches_calendar::<TimestampMillisecondType>();
+        utc_hour_day_matches_calendar::<TimestampMicrosecondType>();
+        utc_hour_day_matches_calendar::<TimestampNanosecondType>();
+    }
+
+    fn utc_hour_day_boundaries<T: ArrowTimestampType>() {
+        let units_per_second = match T::UNIT {
+            TimeUnit::Second => 1_i128,
+            TimeUnit::Millisecond => 1_000,
+            TimeUnit::Microsecond => 1_000_000,
+            TimeUnit::Nanosecond => 1_000_000_000,
+        };
+        for (granularity, seconds) in [("hour", 3_600), ("day", 86_400)] {
+            let unit = seconds * units_per_second;
+            let first_bucket = ((i64::MIN as i128).div_euclid(unit) + 1) * unit;
+            for value in [
+                None,
+                Some(i64::MIN),
+                Some(first_bucket as i64 - 1),
+                Some(first_bucket as i64),
+                Some(-1),
+                Some(0),
+                Some(i64::MAX),
+            ] {
+                let expected =
+                    value.map(|v| i64::try_from((v as i128).div_euclid(unit) * unit));
+                let input = PrimitiveArray::<T>::from_iter([value]).with_timezone("UTC");
+                let inputs = [
+                    ColumnarValue::Array(Arc::new(input)),
+                    ColumnarValue::Scalar(ScalarValue::new_timestamp::<T>(
+                        value,
+                        Some("UTC".into()),
+                    )),
+                ];
+                for input in inputs {
+                    let result = invoke_utc_bucket(input, granularity);
+                    if matches!(expected, Some(Err(_))) {
+                        let message = result.unwrap_err().to_string();
+                        assert!(message.contains("out of range"), "{message}");
+                    } else {
+                        let expected = expected.map(|v| v.unwrap());
+                        let actual = match result.unwrap() {
+                            ColumnarValue::Array(array) => {
+                                assert_eq!(
+                                    array.data_type(),
+                                    &DataType::Timestamp(T::UNIT, Some("UTC".into()))
+                                );
+                                as_primitive_array::<T>(&array).iter().next().unwrap()
+                            }
+                            ColumnarValue::Scalar(scalar) => {
+                                assert_eq!(
+                                    scalar,
+                                    ScalarValue::new_timestamp::<T>(
+                                        expected,
+                                        Some("UTC".into())
+                                    )
+                                );
+                                expected
+                            }
+                        };
+                        assert_eq!(
+                            actual,
+                            expected,
+                            "{} {granularity} {value:?}",
+                            T::UNIT
+                        );
+                    }
+                }
+            }
+            // An out-of-range physical value under a NULL bit must not error.
+            let input = PrimitiveArray::<T>::new(
+                vec![i64::MIN, 0].into(),
+                Some(NullBuffer::from(vec![false, true])),
+            )
+            .with_timezone("UTC");
+            let actual =
+                invoke_utc_bucket(ColumnarValue::Array(Arc::new(input)), granularity)
+                    .unwrap();
+            let ColumnarValue::Array(actual) = actual else {
+                panic!("expected array")
+            };
+            assert_eq!(
+                as_primitive_array::<T>(&actual).iter().collect::<Vec<_>>(),
+                vec![None, Some(0)]
+            );
+        }
+    }
+
+    #[test]
+    fn utc_hour_day_keeps_checked_input_unit_boundaries() {
+        utc_hour_day_boundaries::<TimestampSecondType>();
+        utc_hour_day_boundaries::<TimestampMillisecondType>();
+        utc_hour_day_boundaries::<TimestampMicrosecondType>();
+        utc_hour_day_boundaries::<TimestampNanosecondType>();
     }
 }
