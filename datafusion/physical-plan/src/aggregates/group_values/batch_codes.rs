@@ -15,7 +15,7 @@ use datafusion_common::Result;
 use datafusion_expr::{EmitTo, GroupSelection};
 use std::mem::size_of;
 
-const SLOTS: usize = 1024;
+pub(super) const SLOTS: usize = 1024;
 const SAMPLE: usize = 512;
 const EMPTY: usize = usize::MAX;
 
@@ -51,7 +51,7 @@ impl BatchCodes {
         array.views()[left] == array.views()[right]
             || array.value(left) == array.value(right)
     }
-    fn slot(key: u128) -> usize {
+    pub(super) fn slot(key: u128) -> usize {
         #[cfg(feature = "force_hash_collisions")]
         {
             let _ = key;

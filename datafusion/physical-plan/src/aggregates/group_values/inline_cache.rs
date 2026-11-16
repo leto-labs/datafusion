@@ -16,7 +16,10 @@ use datafusion_common::hash_utils::RandomState;
 use datafusion_expr::{EmitTo, GroupSelection};
 use hashbrown::HashTable;
 
-use super::GroupValues;
+use super::{
+    GroupValues,
+    batch_codes::{BatchCodes, SLOTS},
+};
 
 const MAX_GROUPS: usize = 16_384;
 // An inline view has a length at most 12; this is an unambiguous NULL key.
@@ -25,6 +28,7 @@ const NULL_KEY: u128 = u128::MAX;
 pub(super) struct InlineCache<const N: usize> {
     inner: Box<dyn GroupValues>,
     cache: HashTable<([u128; N], usize)>,
+    front: Vec<(u128, usize)>,
     state: RandomState,
     disabled: bool,
 }
@@ -34,6 +38,7 @@ impl<const N: usize> InlineCache<N> {
         Self {
             inner,
             cache: HashTable::new(),
+            front: Vec::new(),
             state: crate::aggregates::AGGREGATION_HASH_SEED,
             disabled: false,
         }
@@ -68,7 +73,7 @@ impl<const N: usize> InlineCache<N> {
     }
 
     fn cached_groups<const CHECK_LENGTHS: bool>(
-        &self,
+        &mut self,
         arrays: &[&StringViewArray; N],
         groups: &mut Vec<usize>,
     ) -> bool {
@@ -81,10 +86,25 @@ impl<const N: usize> InlineCache<N> {
             {
                 return false;
             }
+            // Complete inline values can reuse a canonical group code before
+            // hashing. Collisions fall through to the exact-key table.
+            if N == 1 && !self.front.is_empty() {
+                let (stored, group) = self.front[BatchCodes::slot(key[0])];
+                if group != usize::MAX && stored == key[0] {
+                    groups.push(group);
+                    continue;
+                }
+            }
             let hash = self.hash_key(&key);
-            if let Some((_, group)) = self.cache.find(hash, |(stored, _)| *stored == key)
+            if let Some(group) = self
+                .cache
+                .find(hash, |(stored, _)| *stored == key)
+                .map(|(_, group)| *group)
             {
-                groups.push(*group);
+                if N == 1 && !self.front.is_empty() {
+                    self.front[BatchCodes::slot(key[0])] = (key[0], group);
+                }
+                groups.push(group);
             } else {
                 return false;
             }
@@ -94,6 +114,7 @@ impl<const N: usize> InlineCache<N> {
 
     fn reset(&mut self) {
         self.cache.clear();
+        self.front.clear();
         self.disabled = false;
     }
 }
@@ -131,11 +152,24 @@ impl<const N: usize> GroupValues for InlineCache<N> {
         if self.inner.len() > MAX_GROUPS {
             self.cache.clear();
             self.cache.shrink_to(0, |_| 0);
+            self.front.clear();
+            self.front.shrink_to_fit();
             self.disabled = true;
             return Ok(());
         }
+        if N == 1 {
+            if self.inner.len() <= SLOTS / 2 {
+                self.front.resize(SLOTS, (0, usize::MAX));
+            } else {
+                self.front.clear();
+                self.front.shrink_to_fit();
+            }
+        }
         for (row, &group) in groups.iter().enumerate() {
             let key = Self::key(&arrays, row);
+            if N == 1 && !self.front.is_empty() {
+                self.front[BatchCodes::slot(key[0])] = (key[0], group);
+            }
             let hash = self.hash_key(&key);
             self.cache
                 .entry(
@@ -149,7 +183,10 @@ impl<const N: usize> GroupValues for InlineCache<N> {
     }
 
     fn size(&self) -> usize {
-        self.inner.size() + size_of::<Self>() + self.cache.allocation_size()
+        self.inner.size()
+            + size_of::<Self>()
+            + self.cache.allocation_size()
+            + self.front.capacity() * size_of::<(u128, usize)>()
     }
     fn is_empty(&self) -> bool {
         self.inner.is_empty()
@@ -173,11 +210,13 @@ impl<const N: usize> GroupValues for InlineCache<N> {
     fn shrink_to_fit(&mut self) {
         self.reset();
         self.cache.shrink_to(0, |_| 0);
+        self.front.shrink_to_fit();
         self.inner.shrink_to_fit();
     }
     fn clear_shrink(&mut self, num_rows: usize) {
         self.reset();
         self.cache.shrink_to(0, |_| 0);
+        self.front.shrink_to_fit();
         self.inner.clear_shrink(num_rows);
     }
 }
@@ -261,6 +300,63 @@ mod tests {
     #[test]
     fn inline_cache_pair_keys_nulls_long_keys_and_emission() {
         mixed::<2>();
+    }
+    #[test]
+    fn direct_code_collisions_keep_complete_keys_and_shifted_group_ids() -> Result<()> {
+        use super::super::batch_codes::{BatchCodes, SLOTS};
+        let mut seen = std::collections::HashMap::new();
+        let (left, right) = (0..SLOTS * 2)
+            .find_map(|id| {
+                let text = format!("c{id}");
+                let array = StringViewArray::from(vec![text.as_str()]);
+                seen.insert(BatchCodes::slot(array.views()[0]), text.clone())
+                    .map(|prior| (prior, text))
+            })
+            .unwrap();
+        let mut cache = InlineCache::<1>::new(base::<1>());
+        let mut reference = base::<1>();
+        for batch in 0..8 {
+            let array =
+                Arc::new(StringViewArray::from_iter((0..8192).map(|row| {
+                    match (row / 128 + batch) % 3 {
+                        0 => Some(left.as_str()),
+                        1 => Some(right.as_str()),
+                        _ => None,
+                    }
+                }))) as ArrayRef;
+            let (mut actual, mut expected) = (Vec::new(), Vec::new());
+            cache.intern(std::slice::from_ref(&array), &mut actual)?;
+            reference.intern(&[array], &mut expected)?;
+            assert_eq!(actual, expected, "batch {batch}");
+            if batch == 2 || batch == 5 {
+                compare_emit(
+                    &mut cache,
+                    reference.as_mut(),
+                    if batch == 2 {
+                        EmitTo::First(1)
+                    } else {
+                        EmitTo::All
+                    },
+                );
+            }
+        }
+        compare_emit(&mut cache, reference.as_mut(), EmitTo::All);
+        Ok(())
+    }
+    #[test]
+    fn direct_front_budget_preserves_the_exact_key_cache() -> Result<()> {
+        let array = Arc::new(StringViewArray::from_iter_values(
+            (0..=SLOTS / 2).map(|id| format!("k{id}")),
+        )) as ArrayRef;
+        let mut cache = InlineCache::<1>::new(base::<1>());
+        let (mut first, mut second) = (Vec::new(), Vec::new());
+        cache.intern(std::slice::from_ref(&array), &mut first)?;
+        assert!(cache.front.is_empty());
+        assert_eq!(cache.front.capacity(), 0);
+        assert_eq!(cache.cache.len(), SLOTS / 2 + 1);
+        cache.intern(&[array], &mut second)?;
+        assert_eq!(first, second);
+        Ok(())
     }
     #[test]
     fn inline_cache_stops_at_its_cardinality_budget() {
