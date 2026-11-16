@@ -1,0 +1,2386 @@
+# NULL-aware membership (NI1). Expected rows: DuckDB v2.0.0.
+# Generator: ~/data/longbow/benchmarks/NI1-20261114/make-slt.py
+
+statement ok
+CREATE TABLE ni_probe AS SELECT * FROM (VALUES (1,1,1,true),(2,2,1,false),(3,NULL,1,false),(4,NULL,2,true),(5,3,2,false),(6,9,3,false),(7,NULL,3,false),(8,5,4,false),(9,NULL,4,false),(10,9,NULL,false),(11,2,2,NULL),(12,NULL,NULL,false),(13,1,1,false)) t(id,x,g,flag);
+
+statement ok
+CREATE TABLE ni_set AS SELECT * FROM (VALUES (1,1),(1,NULL),(1,1),(2,2),(2,3),(4,NULL),(NULL,9),(NULL,NULL)) t(g,y);
+
+# 0: uncorrelated NULL and duplicate: IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=1);
+----
+1
+13
+
+# 1: uncorrelated NULL and duplicate: IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=1) OR p.flag;
+----
+1
+13
+4
+
+# 2: uncorrelated NULL and duplicate: IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=1) AND p.flag;
+----
+1
+
+# 3: uncorrelated NULL and duplicate: IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=1) OR p.id=13;
+----
+1
+13
+
+# 4: uncorrelated NULL and duplicate: value IN
+query IB rowsort
+SELECT p.id,p.x IN (SELECT y FROM ni_set WHERE g=1) FROM ni_probe p;
+----
+1 true
+10 NULL
+11 NULL
+12 NULL
+13 true
+2 NULL
+3 NULL
+4 NULL
+5 NULL
+6 NULL
+7 NULL
+8 NULL
+9 NULL
+
+# 5: uncorrelated NULL and duplicate: projected OR and AND IN
+query IBB rowsort
+SELECT p.id,(p.x IN (SELECT y FROM ni_set WHERE g=1)) OR p.flag,(p.x IN (SELECT y FROM ni_set WHERE g=1)) AND p.flag FROM ni_probe p;
+----
+1 true true
+10 NULL false
+11 NULL NULL
+12 NULL false
+13 true false
+2 NULL false
+3 NULL false
+4 true NULL
+5 NULL false
+6 NULL false
+7 NULL false
+8 NULL false
+9 NULL false
+
+# 6: uncorrelated NULL and duplicate: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT y FROM ni_set WHERE g=1)) OR p.flag);
+----
+
+# 7: uncorrelated NULL and duplicate: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT y FROM ni_set WHERE g=1)) AND p.flag);
+----
+10
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 8: uncorrelated NULL and duplicate: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT y FROM ni_set WHERE g=1)) IS NOT TRUE;
+----
+10
+11
+12
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 9: uncorrelated NULL and duplicate: observable (p.x IN (SELECT y FROM ni_set WHERE g=1)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT y FROM ni_set WHERE g=1)) IS NULL;
+----
+10
+11
+12
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 10: uncorrelated NULL and duplicate: observable NOT (p.x IN (SELECT y FROM ni_set WHERE g=1))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x IN (SELECT y FROM ni_set WHERE g=1));
+----
+
+# 11: uncorrelated NULL and duplicate: observable (p.x IN (SELECT y FROM ni_set WHERE g=1)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT y FROM ni_set WHERE g=1)) IS FALSE;
+----
+
+# 12: uncorrelated NULL and duplicate: NOT IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=1);
+----
+
+# 13: uncorrelated NULL and duplicate: NOT IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=1) OR p.flag;
+----
+1
+4
+
+# 14: uncorrelated NULL and duplicate: NOT IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=1) AND p.flag;
+----
+
+# 15: uncorrelated NULL and duplicate: NOT IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=1) OR p.id=13;
+----
+13
+
+# 16: uncorrelated NULL and duplicate: value NOT IN
+query IB rowsort
+SELECT p.id,p.x NOT IN (SELECT y FROM ni_set WHERE g=1) FROM ni_probe p;
+----
+1 false
+10 NULL
+11 NULL
+12 NULL
+13 false
+2 NULL
+3 NULL
+4 NULL
+5 NULL
+6 NULL
+7 NULL
+8 NULL
+9 NULL
+
+# 17: uncorrelated NULL and duplicate: projected OR and AND NOT IN
+query IBB rowsort
+SELECT p.id,(p.x NOT IN (SELECT y FROM ni_set WHERE g=1)) OR p.flag,(p.x NOT IN (SELECT y FROM ni_set WHERE g=1)) AND p.flag FROM ni_probe p;
+----
+1 true false
+10 NULL false
+11 NULL NULL
+12 NULL false
+13 false false
+2 NULL false
+3 NULL false
+4 true NULL
+5 NULL false
+6 NULL false
+7 NULL false
+8 NULL false
+9 NULL false
+
+# 18: uncorrelated NULL and duplicate: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT y FROM ni_set WHERE g=1)) OR p.flag);
+----
+13
+
+# 19: uncorrelated NULL and duplicate: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT y FROM ni_set WHERE g=1)) AND p.flag);
+----
+1
+10
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 20: uncorrelated NULL and duplicate: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT y FROM ni_set WHERE g=1)) IS NOT TRUE;
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 21: uncorrelated NULL and duplicate: observable (p.x NOT IN (SELECT y FROM ni_set WHERE g=1)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT y FROM ni_set WHERE g=1)) IS NULL;
+----
+10
+11
+12
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 22: uncorrelated NULL and duplicate: observable NOT (p.x NOT IN (SELECT y FROM ni_set WHERE g=1))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x NOT IN (SELECT y FROM ni_set WHERE g=1));
+----
+1
+13
+
+# 23: uncorrelated NULL and duplicate: observable (p.x NOT IN (SELECT y FROM ni_set WHERE g=1)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT y FROM ni_set WHERE g=1)) IS FALSE;
+----
+1
+13
+
+# 24: uncorrelated NULL and duplicate: NOT EXISTS
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT y FROM ni_set WHERE g=1);
+----
+
+# 25: uncorrelated NULL and duplicate: NOT EXISTS OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT y FROM ni_set WHERE g=1) OR p.flag;
+----
+1
+4
+
+# 26: uncorrelated NULL and duplicate: NOT EXISTS AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT y FROM ni_set WHERE g=1) AND p.flag;
+----
+
+# 27: uncorrelated NULL and duplicate: NOT EXISTS value
+query IB rowsort
+SELECT p.id,NOT EXISTS (SELECT y FROM ni_set WHERE g=1) FROM ni_probe p;
+----
+1 false
+10 false
+11 false
+12 false
+13 false
+2 false
+3 false
+4 false
+5 false
+6 false
+7 false
+8 false
+9 false
+
+# 28: uncorrelated non-NULL: IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=2);
+----
+11
+2
+5
+
+# 29: uncorrelated non-NULL: IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=2) OR p.flag;
+----
+1
+11
+2
+4
+5
+
+# 30: uncorrelated non-NULL: IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=2) AND p.flag;
+----
+
+# 31: uncorrelated non-NULL: IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=2) OR p.id=13;
+----
+11
+13
+2
+5
+
+# 32: uncorrelated non-NULL: value IN
+query IB rowsort
+SELECT p.id,p.x IN (SELECT y FROM ni_set WHERE g=2) FROM ni_probe p;
+----
+1 false
+10 false
+11 true
+12 NULL
+13 false
+2 true
+3 NULL
+4 NULL
+5 true
+6 false
+7 NULL
+8 false
+9 NULL
+
+# 33: uncorrelated non-NULL: projected OR and AND IN
+query IBB rowsort
+SELECT p.id,(p.x IN (SELECT y FROM ni_set WHERE g=2)) OR p.flag,(p.x IN (SELECT y FROM ni_set WHERE g=2)) AND p.flag FROM ni_probe p;
+----
+1 true false
+10 false false
+11 true NULL
+12 NULL false
+13 false false
+2 true false
+3 NULL false
+4 true NULL
+5 true false
+6 false false
+7 NULL false
+8 false false
+9 NULL false
+
+# 34: uncorrelated non-NULL: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT y FROM ni_set WHERE g=2)) OR p.flag);
+----
+10
+13
+6
+8
+
+# 35: uncorrelated non-NULL: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT y FROM ni_set WHERE g=2)) AND p.flag);
+----
+1
+10
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 36: uncorrelated non-NULL: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT y FROM ni_set WHERE g=2)) IS NOT TRUE;
+----
+1
+10
+12
+13
+3
+4
+6
+7
+8
+9
+
+# 37: uncorrelated non-NULL: observable (p.x IN (SELECT y FROM ni_set WHERE g=2)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT y FROM ni_set WHERE g=2)) IS NULL;
+----
+12
+3
+4
+7
+9
+
+# 38: uncorrelated non-NULL: observable NOT (p.x IN (SELECT y FROM ni_set WHERE g=2))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x IN (SELECT y FROM ni_set WHERE g=2));
+----
+1
+10
+13
+6
+8
+
+# 39: uncorrelated non-NULL: observable (p.x IN (SELECT y FROM ni_set WHERE g=2)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT y FROM ni_set WHERE g=2)) IS FALSE;
+----
+1
+10
+13
+6
+8
+
+# 40: uncorrelated non-NULL: NOT IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=2);
+----
+1
+10
+13
+6
+8
+
+# 41: uncorrelated non-NULL: NOT IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=2) OR p.flag;
+----
+1
+10
+13
+4
+6
+8
+
+# 42: uncorrelated non-NULL: NOT IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=2) AND p.flag;
+----
+1
+
+# 43: uncorrelated non-NULL: NOT IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=2) OR p.id=13;
+----
+1
+10
+13
+6
+8
+
+# 44: uncorrelated non-NULL: value NOT IN
+query IB rowsort
+SELECT p.id,p.x NOT IN (SELECT y FROM ni_set WHERE g=2) FROM ni_probe p;
+----
+1 true
+10 true
+11 false
+12 NULL
+13 true
+2 false
+3 NULL
+4 NULL
+5 false
+6 true
+7 NULL
+8 true
+9 NULL
+
+# 45: uncorrelated non-NULL: projected OR and AND NOT IN
+query IBB rowsort
+SELECT p.id,(p.x NOT IN (SELECT y FROM ni_set WHERE g=2)) OR p.flag,(p.x NOT IN (SELECT y FROM ni_set WHERE g=2)) AND p.flag FROM ni_probe p;
+----
+1 true true
+10 true false
+11 NULL false
+12 NULL false
+13 true false
+2 false false
+3 NULL false
+4 true NULL
+5 false false
+6 true false
+7 NULL false
+8 true false
+9 NULL false
+
+# 46: uncorrelated non-NULL: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT y FROM ni_set WHERE g=2)) OR p.flag);
+----
+2
+5
+
+# 47: uncorrelated non-NULL: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT y FROM ni_set WHERE g=2)) AND p.flag);
+----
+10
+11
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 48: uncorrelated non-NULL: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT y FROM ni_set WHERE g=2)) IS NOT TRUE;
+----
+11
+12
+2
+3
+4
+5
+7
+9
+
+# 49: uncorrelated non-NULL: observable (p.x NOT IN (SELECT y FROM ni_set WHERE g=2)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT y FROM ni_set WHERE g=2)) IS NULL;
+----
+12
+3
+4
+7
+9
+
+# 50: uncorrelated non-NULL: observable NOT (p.x NOT IN (SELECT y FROM ni_set WHERE g=2))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x NOT IN (SELECT y FROM ni_set WHERE g=2));
+----
+11
+2
+5
+
+# 51: uncorrelated non-NULL: observable (p.x NOT IN (SELECT y FROM ni_set WHERE g=2)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT y FROM ni_set WHERE g=2)) IS FALSE;
+----
+11
+2
+5
+
+# 52: uncorrelated non-NULL: NOT EXISTS
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT y FROM ni_set WHERE g=2);
+----
+
+# 53: uncorrelated non-NULL: NOT EXISTS OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT y FROM ni_set WHERE g=2) OR p.flag;
+----
+1
+4
+
+# 54: uncorrelated non-NULL: NOT EXISTS AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT y FROM ni_set WHERE g=2) AND p.flag;
+----
+
+# 55: uncorrelated non-NULL: NOT EXISTS value
+query IB rowsort
+SELECT p.id,NOT EXISTS (SELECT y FROM ni_set WHERE g=2) FROM ni_probe p;
+----
+1 false
+10 false
+11 false
+12 false
+13 false
+2 false
+3 false
+4 false
+5 false
+6 false
+7 false
+8 false
+9 false
+
+# 56: uncorrelated empty: IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=3);
+----
+
+# 57: uncorrelated empty: IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=3) OR p.flag;
+----
+1
+4
+
+# 58: uncorrelated empty: IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=3) AND p.flag;
+----
+
+# 59: uncorrelated empty: IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=3) OR p.id=13;
+----
+13
+
+# 60: uncorrelated empty: value IN
+query IB rowsort
+SELECT p.id,p.x IN (SELECT y FROM ni_set WHERE g=3) FROM ni_probe p;
+----
+1 false
+10 false
+11 false
+12 false
+13 false
+2 false
+3 false
+4 false
+5 false
+6 false
+7 false
+8 false
+9 false
+
+# 61: uncorrelated empty: projected OR and AND IN
+query IBB rowsort
+SELECT p.id,(p.x IN (SELECT y FROM ni_set WHERE g=3)) OR p.flag,(p.x IN (SELECT y FROM ni_set WHERE g=3)) AND p.flag FROM ni_probe p;
+----
+1 true false
+10 false false
+11 NULL false
+12 false false
+13 false false
+2 false false
+3 false false
+4 true false
+5 false false
+6 false false
+7 false false
+8 false false
+9 false false
+
+# 62: uncorrelated empty: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT y FROM ni_set WHERE g=3)) OR p.flag);
+----
+10
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 63: uncorrelated empty: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT y FROM ni_set WHERE g=3)) AND p.flag);
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 64: uncorrelated empty: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT y FROM ni_set WHERE g=3)) IS NOT TRUE;
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 65: uncorrelated empty: observable (p.x IN (SELECT y FROM ni_set WHERE g=3)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT y FROM ni_set WHERE g=3)) IS NULL;
+----
+
+# 66: uncorrelated empty: observable NOT (p.x IN (SELECT y FROM ni_set WHERE g=3))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x IN (SELECT y FROM ni_set WHERE g=3));
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 67: uncorrelated empty: observable (p.x IN (SELECT y FROM ni_set WHERE g=3)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT y FROM ni_set WHERE g=3)) IS FALSE;
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 68: uncorrelated empty: NOT IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=3);
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 69: uncorrelated empty: NOT IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=3) OR p.flag;
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 70: uncorrelated empty: NOT IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=3) AND p.flag;
+----
+1
+4
+
+# 71: uncorrelated empty: NOT IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=3) OR p.id=13;
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 72: uncorrelated empty: value NOT IN
+query IB rowsort
+SELECT p.id,p.x NOT IN (SELECT y FROM ni_set WHERE g=3) FROM ni_probe p;
+----
+1 true
+10 true
+11 true
+12 true
+13 true
+2 true
+3 true
+4 true
+5 true
+6 true
+7 true
+8 true
+9 true
+
+# 73: uncorrelated empty: projected OR and AND NOT IN
+query IBB rowsort
+SELECT p.id,(p.x NOT IN (SELECT y FROM ni_set WHERE g=3)) OR p.flag,(p.x NOT IN (SELECT y FROM ni_set WHERE g=3)) AND p.flag FROM ni_probe p;
+----
+1 true true
+10 true false
+11 true NULL
+12 true false
+13 true false
+2 true false
+3 true false
+4 true true
+5 true false
+6 true false
+7 true false
+8 true false
+9 true false
+
+# 74: uncorrelated empty: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT y FROM ni_set WHERE g=3)) OR p.flag);
+----
+
+# 75: uncorrelated empty: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT y FROM ni_set WHERE g=3)) AND p.flag);
+----
+10
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 76: uncorrelated empty: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT y FROM ni_set WHERE g=3)) IS NOT TRUE;
+----
+
+# 77: uncorrelated empty: observable (p.x NOT IN (SELECT y FROM ni_set WHERE g=3)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT y FROM ni_set WHERE g=3)) IS NULL;
+----
+
+# 78: uncorrelated empty: observable NOT (p.x NOT IN (SELECT y FROM ni_set WHERE g=3))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x NOT IN (SELECT y FROM ni_set WHERE g=3));
+----
+
+# 79: uncorrelated empty: observable (p.x NOT IN (SELECT y FROM ni_set WHERE g=3)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT y FROM ni_set WHERE g=3)) IS FALSE;
+----
+
+# 80: uncorrelated empty: NOT EXISTS
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT y FROM ni_set WHERE g=3);
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 81: uncorrelated empty: NOT EXISTS OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT y FROM ni_set WHERE g=3) OR p.flag;
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 82: uncorrelated empty: NOT EXISTS AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT y FROM ni_set WHERE g=3) AND p.flag;
+----
+1
+4
+
+# 83: uncorrelated empty: NOT EXISTS value
+query IB rowsort
+SELECT p.id,NOT EXISTS (SELECT y FROM ni_set WHERE g=3) FROM ni_probe p;
+----
+1 true
+10 true
+11 true
+12 true
+13 true
+2 true
+3 true
+4 true
+5 true
+6 true
+7 true
+8 true
+9 true
+
+# 84: uncorrelated only NULL: IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=4);
+----
+
+# 85: uncorrelated only NULL: IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=4) OR p.flag;
+----
+1
+4
+
+# 86: uncorrelated only NULL: IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=4) AND p.flag;
+----
+
+# 87: uncorrelated only NULL: IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT y FROM ni_set WHERE g=4) OR p.id=13;
+----
+13
+
+# 88: uncorrelated only NULL: value IN
+query IB rowsort
+SELECT p.id,p.x IN (SELECT y FROM ni_set WHERE g=4) FROM ni_probe p;
+----
+1 NULL
+10 NULL
+11 NULL
+12 NULL
+13 NULL
+2 NULL
+3 NULL
+4 NULL
+5 NULL
+6 NULL
+7 NULL
+8 NULL
+9 NULL
+
+# 89: uncorrelated only NULL: projected OR and AND IN
+query IBB rowsort
+SELECT p.id,(p.x IN (SELECT y FROM ni_set WHERE g=4)) OR p.flag,(p.x IN (SELECT y FROM ni_set WHERE g=4)) AND p.flag FROM ni_probe p;
+----
+1 true NULL
+10 NULL false
+11 NULL NULL
+12 NULL false
+13 NULL false
+2 NULL false
+3 NULL false
+4 true NULL
+5 NULL false
+6 NULL false
+7 NULL false
+8 NULL false
+9 NULL false
+
+# 90: uncorrelated only NULL: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT y FROM ni_set WHERE g=4)) OR p.flag);
+----
+
+# 91: uncorrelated only NULL: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT y FROM ni_set WHERE g=4)) AND p.flag);
+----
+10
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 92: uncorrelated only NULL: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT y FROM ni_set WHERE g=4)) IS NOT TRUE;
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 93: uncorrelated only NULL: observable (p.x IN (SELECT y FROM ni_set WHERE g=4)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT y FROM ni_set WHERE g=4)) IS NULL;
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 94: uncorrelated only NULL: observable NOT (p.x IN (SELECT y FROM ni_set WHERE g=4))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x IN (SELECT y FROM ni_set WHERE g=4));
+----
+
+# 95: uncorrelated only NULL: observable (p.x IN (SELECT y FROM ni_set WHERE g=4)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT y FROM ni_set WHERE g=4)) IS FALSE;
+----
+
+# 96: uncorrelated only NULL: NOT IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=4);
+----
+
+# 97: uncorrelated only NULL: NOT IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=4) OR p.flag;
+----
+1
+4
+
+# 98: uncorrelated only NULL: NOT IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=4) AND p.flag;
+----
+
+# 99: uncorrelated only NULL: NOT IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE g=4) OR p.id=13;
+----
+13
+
+# 100: uncorrelated only NULL: value NOT IN
+query IB rowsort
+SELECT p.id,p.x NOT IN (SELECT y FROM ni_set WHERE g=4) FROM ni_probe p;
+----
+1 NULL
+10 NULL
+11 NULL
+12 NULL
+13 NULL
+2 NULL
+3 NULL
+4 NULL
+5 NULL
+6 NULL
+7 NULL
+8 NULL
+9 NULL
+
+# 101: uncorrelated only NULL: projected OR and AND NOT IN
+query IBB rowsort
+SELECT p.id,(p.x NOT IN (SELECT y FROM ni_set WHERE g=4)) OR p.flag,(p.x NOT IN (SELECT y FROM ni_set WHERE g=4)) AND p.flag FROM ni_probe p;
+----
+1 true NULL
+10 NULL false
+11 NULL NULL
+12 NULL false
+13 NULL false
+2 NULL false
+3 NULL false
+4 true NULL
+5 NULL false
+6 NULL false
+7 NULL false
+8 NULL false
+9 NULL false
+
+# 102: uncorrelated only NULL: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT y FROM ni_set WHERE g=4)) OR p.flag);
+----
+
+# 103: uncorrelated only NULL: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT y FROM ni_set WHERE g=4)) AND p.flag);
+----
+10
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 104: uncorrelated only NULL: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT y FROM ni_set WHERE g=4)) IS NOT TRUE;
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 105: uncorrelated only NULL: observable (p.x NOT IN (SELECT y FROM ni_set WHERE g=4)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT y FROM ni_set WHERE g=4)) IS NULL;
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 106: uncorrelated only NULL: observable NOT (p.x NOT IN (SELECT y FROM ni_set WHERE g=4))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x NOT IN (SELECT y FROM ni_set WHERE g=4));
+----
+
+# 107: uncorrelated only NULL: observable (p.x NOT IN (SELECT y FROM ni_set WHERE g=4)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT y FROM ni_set WHERE g=4)) IS FALSE;
+----
+
+# 108: uncorrelated only NULL: NOT EXISTS
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT y FROM ni_set WHERE g=4);
+----
+
+# 109: uncorrelated only NULL: NOT EXISTS OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT y FROM ni_set WHERE g=4) OR p.flag;
+----
+1
+4
+
+# 110: uncorrelated only NULL: NOT EXISTS AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT y FROM ni_set WHERE g=4) AND p.flag;
+----
+
+# 111: uncorrelated only NULL: NOT EXISTS value
+query IB rowsort
+SELECT p.id,NOT EXISTS (SELECT y FROM ni_set WHERE g=4) FROM ni_probe p;
+----
+1 false
+10 false
+11 false
+12 false
+13 false
+2 false
+3 false
+4 false
+5 false
+6 false
+7 false
+8 false
+9 false
+
+# 112: correlated equality: IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g);
+----
+1
+11
+13
+5
+
+# 113: correlated equality: IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g) OR p.flag;
+----
+1
+11
+13
+4
+5
+
+# 114: correlated equality: IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g) AND p.flag;
+----
+1
+
+# 115: correlated equality: IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g) OR p.id=13;
+----
+1
+11
+13
+5
+
+# 116: correlated equality: value IN
+query IB rowsort
+SELECT p.id,p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g) FROM ni_probe p;
+----
+1 true
+10 false
+11 true
+12 false
+13 true
+2 NULL
+3 NULL
+4 NULL
+5 true
+6 false
+7 false
+8 NULL
+9 NULL
+
+# 117: correlated equality: projected OR and AND IN
+query IBB rowsort
+SELECT p.id,(p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) OR p.flag,(p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) AND p.flag FROM ni_probe p;
+----
+1 true true
+10 false false
+11 true NULL
+12 false false
+13 true false
+2 NULL false
+3 NULL false
+4 true NULL
+5 true false
+6 false false
+7 false false
+8 NULL false
+9 NULL false
+
+# 118: correlated equality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) OR p.flag);
+----
+10
+12
+6
+7
+
+# 119: correlated equality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) AND p.flag);
+----
+10
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 120: correlated equality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) IS NOT TRUE;
+----
+10
+12
+2
+3
+4
+6
+7
+8
+9
+
+# 121: correlated equality: observable (p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) IS NULL;
+----
+2
+3
+4
+8
+9
+
+# 122: correlated equality: observable NOT (p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g));
+----
+10
+12
+6
+7
+
+# 123: correlated equality: observable (p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) IS FALSE;
+----
+10
+12
+6
+7
+
+# 124: correlated equality: NOT IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g);
+----
+10
+12
+6
+7
+
+# 125: correlated equality: NOT IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g) OR p.flag;
+----
+1
+10
+12
+4
+6
+7
+
+# 126: correlated equality: NOT IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g) AND p.flag;
+----
+
+# 127: correlated equality: NOT IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g) OR p.id=13;
+----
+10
+12
+13
+6
+7
+
+# 128: correlated equality: value NOT IN
+query IB rowsort
+SELECT p.id,p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g) FROM ni_probe p;
+----
+1 false
+10 true
+11 false
+12 true
+13 false
+2 NULL
+3 NULL
+4 NULL
+5 false
+6 true
+7 true
+8 NULL
+9 NULL
+
+# 129: correlated equality: projected OR and AND NOT IN
+query IBB rowsort
+SELECT p.id,(p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) OR p.flag,(p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) AND p.flag FROM ni_probe p;
+----
+1 true false
+10 true false
+11 NULL false
+12 true false
+13 false false
+2 NULL false
+3 NULL false
+4 true NULL
+5 false false
+6 true false
+7 true false
+8 NULL false
+9 NULL false
+
+# 130: correlated equality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) OR p.flag);
+----
+13
+5
+
+# 131: correlated equality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) AND p.flag);
+----
+1
+10
+11
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 132: correlated equality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) IS NOT TRUE;
+----
+1
+11
+13
+2
+3
+4
+5
+8
+9
+
+# 133: correlated equality: observable (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) IS NULL;
+----
+2
+3
+4
+8
+9
+
+# 134: correlated equality: observable NOT (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g));
+----
+1
+11
+13
+5
+
+# 135: correlated equality: observable (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g=p.g)) IS FALSE;
+----
+1
+11
+13
+5
+
+# 136: correlated equality: NOT EXISTS
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT s.y FROM ni_set s WHERE s.g=p.g);
+----
+10
+12
+6
+7
+
+# 137: correlated equality: NOT EXISTS OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT s.y FROM ni_set s WHERE s.g=p.g) OR p.flag;
+----
+1
+10
+12
+4
+6
+7
+
+# 138: correlated equality: NOT EXISTS AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT s.y FROM ni_set s WHERE s.g=p.g) AND p.flag;
+----
+
+# 139: correlated equality: NOT EXISTS value
+query IB rowsort
+SELECT p.id,NOT EXISTS (SELECT s.y FROM ni_set s WHERE s.g=p.g) FROM ni_probe p;
+----
+1 false
+10 true
+11 false
+12 true
+13 false
+2 false
+3 false
+4 false
+5 false
+6 true
+7 true
+8 false
+9 false
+
+# 140: correlated inequality: IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g);
+----
+
+# 141: correlated inequality: IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g) OR p.flag;
+----
+1
+4
+
+# 142: correlated inequality: IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g) AND p.flag;
+----
+
+# 143: correlated inequality: IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g) OR p.id=13;
+----
+13
+
+# 144: correlated inequality: value IN
+query IB rowsort
+SELECT p.id,p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g) FROM ni_probe p;
+----
+1 false
+10 false
+11 NULL
+12 false
+13 false
+2 false
+3 false
+4 NULL
+5 NULL
+6 NULL
+7 NULL
+8 NULL
+9 NULL
+
+# 145: correlated inequality: projected OR and AND IN
+query IBB rowsort
+SELECT p.id,(p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) OR p.flag,(p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) AND p.flag FROM ni_probe p;
+----
+1 true false
+10 false false
+11 NULL NULL
+12 false false
+13 false false
+2 false false
+3 false false
+4 true NULL
+5 NULL false
+6 NULL false
+7 NULL false
+8 NULL false
+9 NULL false
+
+# 146: correlated inequality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) OR p.flag);
+----
+10
+12
+13
+2
+3
+
+# 147: correlated inequality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) AND p.flag);
+----
+1
+10
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 148: correlated inequality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) IS NOT TRUE;
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+6
+7
+8
+9
+
+# 149: correlated inequality: observable (p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) IS NULL;
+----
+11
+4
+5
+6
+7
+8
+9
+
+# 150: correlated inequality: observable NOT (p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g));
+----
+1
+10
+12
+13
+2
+3
+
+# 151: correlated inequality: observable (p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) IS FALSE;
+----
+1
+10
+12
+13
+2
+3
+
+# 152: correlated inequality: NOT IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g);
+----
+1
+10
+12
+13
+2
+3
+
+# 153: correlated inequality: NOT IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g) OR p.flag;
+----
+1
+10
+12
+13
+2
+3
+4
+
+# 154: correlated inequality: NOT IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g) AND p.flag;
+----
+1
+
+# 155: correlated inequality: NOT IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g) OR p.id=13;
+----
+1
+10
+12
+13
+2
+3
+
+# 156: correlated inequality: value NOT IN
+query IB rowsort
+SELECT p.id,p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g) FROM ni_probe p;
+----
+1 true
+10 true
+11 NULL
+12 true
+13 true
+2 true
+3 true
+4 NULL
+5 NULL
+6 NULL
+7 NULL
+8 NULL
+9 NULL
+
+# 157: correlated inequality: projected OR and AND NOT IN
+query IBB rowsort
+SELECT p.id,(p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) OR p.flag,(p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) AND p.flag FROM ni_probe p;
+----
+1 true true
+10 true false
+11 NULL NULL
+12 true false
+13 true false
+2 true false
+3 true false
+4 true NULL
+5 NULL false
+6 NULL false
+7 NULL false
+8 NULL false
+9 NULL false
+
+# 158: correlated inequality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) OR p.flag);
+----
+
+# 159: correlated inequality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) AND p.flag);
+----
+10
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 160: correlated inequality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) IS NOT TRUE;
+----
+11
+4
+5
+6
+7
+8
+9
+
+# 161: correlated inequality: observable (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) IS NULL;
+----
+11
+4
+5
+6
+7
+8
+9
+
+# 162: correlated inequality: observable NOT (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g));
+----
+
+# 163: correlated inequality: observable (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g<p.g)) IS FALSE;
+----
+
+# 164: correlated inequality: NOT EXISTS
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT s.y FROM ni_set s WHERE s.g<p.g);
+----
+1
+10
+12
+13
+2
+3
+
+# 165: correlated inequality: NOT EXISTS OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT s.y FROM ni_set s WHERE s.g<p.g) OR p.flag;
+----
+1
+10
+12
+13
+2
+3
+4
+
+# 166: correlated inequality: NOT EXISTS AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT s.y FROM ni_set s WHERE s.g<p.g) AND p.flag;
+----
+1
+
+# 167: correlated inequality: NOT EXISTS value
+query IB rowsort
+SELECT p.id,NOT EXISTS (SELECT s.y FROM ni_set s WHERE s.g<p.g) FROM ni_probe p;
+----
+1 true
+10 true
+11 false
+12 true
+13 true
+2 true
+3 true
+4 false
+5 false
+6 false
+7 false
+8 false
+9 false
+
+# 168: correlated NULL-safe equality: IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g);
+----
+1
+10
+11
+13
+5
+
+# 169: correlated NULL-safe equality: IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g) OR p.flag;
+----
+1
+10
+11
+13
+4
+5
+
+# 170: correlated NULL-safe equality: IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g) AND p.flag;
+----
+1
+
+# 171: correlated NULL-safe equality: IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g) OR p.id=13;
+----
+1
+10
+11
+13
+5
+
+# 172: correlated NULL-safe equality: value IN
+query IB rowsort
+SELECT p.id,p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g) FROM ni_probe p;
+----
+1 true
+10 true
+11 true
+12 NULL
+13 true
+2 NULL
+3 NULL
+4 NULL
+5 true
+6 false
+7 false
+8 NULL
+9 NULL
+
+# 173: correlated NULL-safe equality: projected OR and AND IN
+query IBB rowsort
+SELECT p.id,(p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) OR p.flag,(p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) AND p.flag FROM ni_probe p;
+----
+1 true true
+10 true false
+11 true NULL
+12 NULL false
+13 true false
+2 NULL false
+3 NULL false
+4 true NULL
+5 true false
+6 false false
+7 false false
+8 NULL false
+9 NULL false
+
+# 174: correlated NULL-safe equality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) OR p.flag);
+----
+6
+7
+
+# 175: correlated NULL-safe equality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) AND p.flag);
+----
+10
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 176: correlated NULL-safe equality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) IS NOT TRUE;
+----
+12
+2
+3
+4
+6
+7
+8
+9
+
+# 177: correlated NULL-safe equality: observable (p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) IS NULL;
+----
+12
+2
+3
+4
+8
+9
+
+# 178: correlated NULL-safe equality: observable NOT (p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g));
+----
+6
+7
+
+# 179: correlated NULL-safe equality: observable (p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) IS FALSE;
+----
+6
+7
+
+# 180: correlated NULL-safe equality: NOT IN
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g);
+----
+6
+7
+
+# 181: correlated NULL-safe equality: NOT IN OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g) OR p.flag;
+----
+1
+4
+6
+7
+
+# 182: correlated NULL-safe equality: NOT IN AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g) AND p.flag;
+----
+
+# 183: correlated NULL-safe equality: NOT IN OR p.id=13
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g) OR p.id=13;
+----
+13
+6
+7
+
+# 184: correlated NULL-safe equality: value NOT IN
+query IB rowsort
+SELECT p.id,p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g) FROM ni_probe p;
+----
+1 false
+10 false
+11 false
+12 NULL
+13 false
+2 NULL
+3 NULL
+4 NULL
+5 false
+6 true
+7 true
+8 NULL
+9 NULL
+
+# 185: correlated NULL-safe equality: projected OR and AND NOT IN
+query IBB rowsort
+SELECT p.id,(p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) OR p.flag,(p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) AND p.flag FROM ni_probe p;
+----
+1 true false
+10 false false
+11 NULL false
+12 NULL false
+13 false false
+2 NULL false
+3 NULL false
+4 true NULL
+5 false false
+6 true false
+7 true false
+8 NULL false
+9 NULL false
+
+# 186: correlated NULL-safe equality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) OR p.flag);
+----
+10
+13
+5
+
+# 187: correlated NULL-safe equality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT ((p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) AND p.flag);
+----
+1
+10
+11
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 188: correlated NULL-safe equality: nullable Boolean context
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) IS NOT TRUE;
+----
+1
+10
+11
+12
+13
+2
+3
+4
+5
+8
+9
+
+# 189: correlated NULL-safe equality: observable (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) IS NULL
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) IS NULL;
+----
+12
+2
+3
+4
+8
+9
+
+# 190: correlated NULL-safe equality: observable NOT (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g))
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g));
+----
+1
+10
+11
+13
+5
+
+# 191: correlated NULL-safe equality: observable (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) IS FALSE
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE (p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g)) IS FALSE;
+----
+1
+10
+11
+13
+5
+
+# 192: correlated NULL-safe equality: NOT EXISTS
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g);
+----
+6
+7
+
+# 193: correlated NULL-safe equality: NOT EXISTS OR p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g) OR p.flag;
+----
+1
+4
+6
+7
+
+# 194: correlated NULL-safe equality: NOT EXISTS AND p.flag
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE NOT EXISTS (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g) AND p.flag;
+----
+
+# 195: correlated NULL-safe equality: NOT EXISTS value
+query IB rowsort
+SELECT p.id,NOT EXISTS (SELECT s.y FROM ni_set s WHERE s.g IS NOT DISTINCT FROM p.g) FROM ni_probe p;
+----
+1 false
+10 false
+11 false
+12 false
+13 false
+2 false
+3 false
+4 false
+5 false
+6 true
+7 true
+8 false
+9 false
+
+# 196: projection schema alias survives derived table
+query B rowsort
+SELECT q.member FROM (SELECT p.x IN (SELECT y FROM ni_set WHERE g=1) AS member FROM ni_probe p) q;
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+true
+true
+
+# 197: multiple membership expressions and CASE
+query IBBB rowsort
+SELECT p.id,p.x IN (SELECT y FROM ni_set WHERE g=1),p.x NOT IN (SELECT y FROM ni_set WHERE g=2),CASE WHEN p.flag THEN p.x IN (SELECT y FROM ni_set WHERE g=3) ELSE p.x NOT IN (SELECT y FROM ni_set WHERE g=4) END FROM ni_probe p;
+----
+1 true true false
+10 NULL true NULL
+11 NULL false NULL
+12 NULL NULL NULL
+13 true true NULL
+2 NULL false NULL
+3 NULL NULL NULL
+4 NULL NULL false
+5 NULL false NULL
+6 NULL true NULL
+7 NULL NULL NULL
+8 NULL true NULL
+9 NULL NULL NULL
+
+# 198: identical membership and correlation comparison
+query IB rowsort
+SELECT p.id,p.x IN (SELECT s.y FROM ni_set s WHERE s.y=p.x) FROM ni_probe p;
+----
+1 true
+10 true
+11 true
+12 false
+13 true
+2 true
+3 false
+4 false
+5 true
+6 true
+7 false
+8 false
+9 false
+
+# 199: identical membership and correlation in OR
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x IN (SELECT s.y FROM ni_set s WHERE s.y=p.x) OR p.flag;
+----
+1
+10
+11
+13
+2
+4
+5
+6
+
+# 200: identical membership and correlation comparison
+query IB rowsort
+SELECT p.id,p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.y=p.x) FROM ni_probe p;
+----
+1 false
+10 false
+11 false
+12 true
+13 false
+2 false
+3 true
+4 true
+5 false
+6 false
+7 true
+8 true
+9 true
+
+# 201: identical membership and correlation in OR
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT s.y FROM ni_set s WHERE s.y=p.x) OR p.flag;
+----
+1
+12
+3
+4
+7
+8
+9
+
+# 202: outer-only correlated filter
+query IB rowsort
+SELECT p.id,p.x NOT IN (SELECT y FROM ni_set WHERE p.flag) FROM ni_probe p;
+----
+1 false
+10 true
+11 true
+12 true
+13 true
+2 true
+3 true
+4 NULL
+5 true
+6 true
+7 true
+8 true
+9 true
+
+# 203: outer-only correlated filter under OR
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.x NOT IN (SELECT y FROM ni_set WHERE p.flag) OR p.id=2;
+----
+10
+11
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 204: pinned corpus NOT IN OR regression
+query IT rowsort
+SELECT id,v FROM (VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(NULL,'e')) outer_table(id,v) WHERE id NOT IN (SELECT id FROM (VALUES (2),(4)) inner_table_no_null(id)) OR id NOT IN (SELECT id FROM (VALUES (1),(3)) inner_table2(id));
+----
+1 a
+2 b
+3 c
+4 d
+
+# 205: correlated computed membership under OR
+query I rowsort
+SELECT p.id FROM ni_probe p WHERE p.id=1 OR p.x+12 NOT IN (SELECT s.y+1 FROM ni_set s WHERE p.flag);
+----
+1
+10
+11
+12
+13
+2
+3
+5
+6
+7
+8
+9
+
+# 206: minimal NOT IN with a NULL in the set
+query I rowsort
+SELECT id FROM (VALUES (1,1),(2,2),(3,NULL)) p(id,x) WHERE x NOT IN (SELECT y FROM (VALUES (1),(NULL)) s(y)) OR id=1;
+----
+1
+
+# 207: minimal NULL probe and no NULL in the set
+query I rowsort
+SELECT id FROM (VALUES (1,1),(2,2),(3,NULL)) p(id,x) WHERE x NOT IN (SELECT y FROM (VALUES (1)) s(y)) OR id=1;
+----
+1
+2
+
+# 208: uncorrelated DISTINCT preserves membership NULLs
+query IB rowsort
+SELECT p.id,p.x IN (SELECT DISTINCT y FROM ni_set) FROM ni_probe p;
+----
+1 true
+10 true
+11 true
+12 NULL
+13 true
+2 true
+3 NULL
+4 NULL
+5 true
+6 true
+7 NULL
+8 NULL
+9 NULL
+
+# 209: nested membership keeps nullable expression values
+query IB rowsort
+SELECT p.id,(p.x IN (SELECT y FROM ni_set WHERE g=1)) IN (SELECT v FROM (VALUES (true),(NULL)) q(v)) FROM ni_probe p;
+----
+1 true
+10 NULL
+11 NULL
+12 NULL
+13 true
+2 NULL
+3 NULL
+4 NULL
+5 NULL
+6 NULL
+7 NULL
+8 NULL
+9 NULL
+
