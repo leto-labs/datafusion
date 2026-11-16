@@ -32,14 +32,23 @@ async fn test_repartition_memory_limit() {
         .with_batch_size(32)
         .with_target_partitions(2);
     let ctx = SessionContext::new_with_config_rt(config, Arc::new(runtime));
+    // The scan slices this one batch into `batch_size` rows, and every queued
+    // slice retains the whole allocation of the column. Allocate more than the
+    // memory limit, so that one queued slice really pins more memory than the
+    // pool holds: an exchange that charges each retained buffer once must
+    // spill, as one that charges every slice for the whole buffer does. (With
+    // a 400 KB allocation the queued slices retain less than the pool, and only
+    // charging the shared buffer once per slice forced the spill.)
+    let mut values = Vec::with_capacity(400_000);
+    values.extend((0..10).cycle().take(100_000));
     let batches = vec![
         RecordBatch::try_from_iter(vec![(
             "c1",
-            Arc::new(Int32Array::from_iter_values((0..10).cycle().take(100_000)))
-                as ArrayRef,
+            Arc::new(Int32Array::from(values)) as ArrayRef,
         )])
         .unwrap(),
     ];
+    assert!(batches[0].column(0).get_buffer_memory_size() > 1024 * 1024);
     let table = Arc::new(MemTable::try_new(batches[0].schema(), vec![batches]).unwrap());
     ctx.register_table("t", table).unwrap();
     let plan = ctx

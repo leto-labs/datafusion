@@ -658,7 +658,10 @@ impl MaterializedAggregateOutput {
     }
 
     pub(super) fn memory_size(&self) -> usize {
-        self.batch.get_array_memory_size()
+        // Count each buffer once: output columns can share buffers, for
+        // example the data buffers of string views.
+        datafusion_common::utils::memory::RecordBatchMemoryCounter::new()
+            .count_batch_with_array_overhead(&self.batch)
     }
 }
 
@@ -1058,6 +1061,27 @@ mod tests {
             .unwrap()
             .iter()
             .collect()
+    }
+
+    #[test]
+    fn memory_accounting_materialized_shared_string_views() {
+        use arrow::array::{Array, StringViewArray};
+        let values = Arc::new(StringViewArray::from(vec![
+            "a string longer than twelve bytes",
+            "another long string value",
+        ]));
+        // Both columns are the same array: one view buffer, one data buffer
+        // and one array object, which is exactly what one column reports.
+        let one_column = values.get_array_memory_size();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("first", Arc::clone(&values) as ArrayRef),
+            ("second", values as ArrayRef),
+        ])
+        .unwrap();
+        // The per-column method charges the shared array twice.
+        assert_eq!(batch.get_array_memory_size(), 2 * one_column);
+        let output = MaterializedAggregateOutput::new(batch);
+        assert_eq!(output.memory_size(), one_column);
     }
 
     fn int32_values(batch: &RecordBatch, column: usize) -> Vec<i32> {

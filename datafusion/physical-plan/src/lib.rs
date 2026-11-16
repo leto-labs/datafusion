@@ -50,6 +50,7 @@ pub use crate::visitor::{ExecutionPlanVisitor, accept, visit_execution_plan};
 pub use crate::work_table::WorkTable;
 pub use spill::spill_manager::SpillManager;
 
+mod batch_memory;
 mod ordering;
 mod render_tree;
 mod topk;

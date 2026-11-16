@@ -915,7 +915,20 @@ mod tests {
         let rb = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)])?;
         let schema = rb.schema();
 
-        let rbs = std::iter::repeat_n(rb, 256).collect::<Vec<_>>();
+        // This fixture tests real queue pressure. Clones of rb retain the same
+        // buffers, which the exchange's allocation-based accounting charges
+        // once; distinct copies keep the non-round-robin case over the limit.
+        let indices = arrow::array::UInt32Array::from_iter_values(0..row_size as u32);
+        let rbs = (0..256)
+            .map(|_| {
+                let columns = rb
+                    .columns()
+                    .iter()
+                    .map(|array| arrow::compute::take(array.as_ref(), &indices, None))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                RecordBatch::try_new(Arc::clone(&schema), columns)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let sort = [
             PhysicalSortExpr {
                 expr: col("b", &schema)?,
