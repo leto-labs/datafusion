@@ -1853,3 +1853,6 @@ mod test {
         assert_eq!(inner_gen, WRITER_ITERS as u64 + 1);
     }
 }
+
+#[cfg(test)]
+mod watch_state_tests;
