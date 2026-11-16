@@ -1732,4 +1732,21 @@ mod tests {
     fn composite_primary_key_on_id_x() -> Constraints {
         Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 1])])
     }
+    #[test]
+    fn grouped_nullable_unique_is_unique_for_strict_join_keys() -> Result<()> {
+        let right = LogicalPlanBuilder::from(scan("r", &test_schema(), unique_on_x())?)
+            .aggregate(vec![col("r.x"), col("r.y")], vec![count(lit(true))])?
+            .build()?;
+        assert!(super::side_unique_on_join(
+            right.schema(),
+            [col("r.x")].iter(),
+            NullEquality::NullEqualsNothing
+        ));
+        assert!(!super::side_unique_on_join(
+            right.schema(),
+            [col("r.x")].iter(),
+            NullEquality::NullEqualsNull
+        ));
+        Ok(())
+    }
 }

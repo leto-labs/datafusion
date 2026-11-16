@@ -5892,7 +5892,7 @@ mod tests {
     -> Result<()> {
         // Grouping guarantees uniqueness of the GROUP BY key regardless of
         // whether the input table carries any PRIMARY KEY / UNIQUE
-        // constraints, so `aggregate_functional_dependencies` must still
+        // constraints, so aggregate dependency inference must still
         // report a `Single` dependency spanning the whole aggregate output.
         // This pins that behavior so the early return added for the (far
         // more common) case of an input with no functional dependencies at
@@ -7822,3 +7822,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "aggregate_dependency_tests.rs"]
+mod aggregate_dependency_tests;

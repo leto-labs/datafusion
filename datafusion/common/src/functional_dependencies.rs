@@ -440,125 +440,130 @@ impl Deref for FunctionalDependencies {
 
 /// Calculates functional dependencies for aggregate output, when there is a GROUP BY expression.
 ///
-/// `group_by_input_indices[i]` is the index of the input field that GROUP BY
+/// `group_indices[i]` is the index of the input field that GROUP BY
 /// expression `i` passes through unchanged (a column reference), or `None` if
 /// the expression computes a new value. Only a column reference can carry an
 /// input dependency; a computed expression such as `CAST(pk AS INT)` cannot,
 /// even though its output name may equal the column's name.
 pub fn aggregate_functional_dependencies(
-    aggr_input_schema: &DFSchema,
-    group_by_input_indices: &[Option<usize>],
-    aggr_schema: &DFSchema,
+    input: &DFSchema,
+    group_indices: &[Option<usize>],
+    output: &DFSchema,
 ) -> FunctionalDependencies {
-    let mut aggregate_func_dependencies = vec![];
-    let aggr_fields = aggr_schema.fields();
-    // Association covers the whole table:
-    let target_indices = (0..aggr_schema.fields().len()).collect::<Vec<_>>();
-    // Get functional dependencies of the schema:
-    let func_dependencies = aggr_input_schema.functional_dependencies();
-    // The loop below only re-expresses input dependencies. Skip it when the
-    // input has none. The GROUP BY-key dependency below always runs.
-    if !func_dependencies.is_empty() {
-        // Compare the columns covered by every dependency, whatever its NULL
-        // semantics: leaving out the ones that do not hold across NULLs would
-        // hide GROUP BY expressions this determinant does not cover and
-        // upgrade its mode to `Single` wrongly.
-        let existing_target_indices = get_target_indices_from_dependencies(
-            func_dependencies.iter(),
-            group_by_input_indices,
-        );
-        for FunctionalDependence {
-            source_indices,
-            nullable,
-            null_equality,
-            mode,
-            ..
-        } in &func_dependencies.deps
-        {
-            // Indices into the GROUP BY list for this determinant:
-            let mut new_source_indices = vec![];
-            let mut new_source_input_indices = vec![];
-            for (idx, input_idx) in group_by_input_indices.iter().enumerate() {
-                // When one of the input determinant columns is a GROUP BY
-                // expression, add the index of the GROUP BY expression as a new
-                // determinant key:
-                if let Some(input_idx) = input_idx
-                    && source_indices.contains(input_idx)
-                    // A key column can be in the GROUP BY list more than one
-                    // time (`x, x AS k`). Count it one time.
-                    && !new_source_input_indices.contains(&Some(*input_idx))
-                {
-                    new_source_indices.push(idx);
-                    new_source_input_indices.push(Some(*input_idx));
-                }
-            }
-            let new_target_indices = get_target_indices_from_dependencies(
-                func_dependencies.iter(),
-                &new_source_input_indices,
-            );
-            let mode = if existing_target_indices == new_target_indices
-                && new_target_indices.is_some()
-            {
-                // If dependency covers all GROUP BY expressions, mode will be `Single`:
-                Dependency::Single
-            } else {
-                // Otherwise, existing mode is preserved:
-                *mode
-            };
-            // All of the composite indices occur in the GROUP BY expression:
-            if new_source_indices.len() == source_indices.len() {
-                // GROUP BY treats NULLs as equal: a determinant covering the
-                // complete grouping key gets at most one output row per NULL too.
-                let output_null_equality =
-                    if new_source_indices.len() == group_by_input_indices.len() {
-                        NullEquality::NullEqualsNull
-                    } else {
-                        *null_equality
-                    };
-                aggregate_func_dependencies.push(
+    if group_indices.is_empty() {
+        return FunctionalDependencies::empty();
+    }
+    let valid = input
+        .functional_dependencies()
+        .iter()
+        .filter(|dep| dep.is_valid_across_nulls(input))
+        .collect::<Vec<_>>();
+    let mut result = vec![];
+    for dep in input.functional_dependencies().iter() {
+        if dep.source_indices.is_empty() {
+            continue;
+        }
+        let Some(sources) = dep
+            .source_indices
+            .iter()
+            .map(|source| {
+                group_indices
+                    .iter()
+                    .position(|index| *index == Some(*source))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if !dep.is_valid_across_nulls(input) {
+            // A nullable UNIQUE key still identifies at most one input row
+            // for each non-NULL key. Preserve that conditional uniqueness,
+            // but do not use this fact to close dependencies across NULLs.
+            if dep.mode == Dependency::Single {
+                result.push(
                     FunctionalDependence::new(
-                        new_source_indices,
-                        target_indices.clone(),
-                        *nullable,
+                        sources,
+                        (0..output.fields().len()).collect(),
+                        dep.nullable,
                     )
-                    .with_mode(mode)
-                    .with_null_equality(output_null_equality),
+                    .with_mode(Dependency::Single)
+                    .with_null_equality(NullEquality::NullEqualsNothing),
                 );
             }
+            continue;
         }
+        let mut closure = dep.source_indices.iter().copied().collect::<HashSet<_>>();
+        loop {
+            let previous_len = closure.len();
+            for candidate in &valid {
+                if candidate
+                    .source_indices
+                    .iter()
+                    .all(|index| closure.contains(index))
+                {
+                    closure.extend(candidate.target_indices.iter().copied());
+                }
+            }
+            if closure.len() == previous_len {
+                break;
+            }
+        }
+        // An input-unique determinant remains unique even with computed keys.
+        // A repeated determinant must determine every group before it can
+        // determine aggregate outputs. Unrelated and computed groups cannot
+        // disappear merely because they added no input dependency targets.
+        let complete = dep.mode == Dependency::Single
+            || group_indices
+                .iter()
+                .all(|index| index.is_some_and(|i| closure.contains(&i)));
+        let (targets, mode) = if complete {
+            ((0..output.fields().len()).collect(), Dependency::Single)
+        } else {
+            (
+                group_indices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, source)| {
+                        source
+                            .is_some_and(|i| closure.contains(&i))
+                            .then_some(index)
+                    })
+                    .collect(),
+                Dependency::Multi,
+            )
+        };
+        result.push(
+            FunctionalDependence::new(sources, targets, dep.nullable)
+                .with_mode(mode)
+                .with_null_equality(dep.null_equality),
+        );
     }
-
-    // When we have a GROUP BY key, we can guarantee uniqueness after
-    // aggregation:
-    if !group_by_input_indices.is_empty() {
-        let count = group_by_input_indices.len();
-        let source_indices = (0..count).collect::<Vec<_>>();
-        let nullable = source_indices
+    // GROUP BY is unique on the entire key, including NULL groups. An
+    // already-unique determinant also guarantees this; a Multi dependency
+    // on only part of the key cannot replace the complete-key guarantee.
+    let group_key = (0..group_indices.len()).collect::<Vec<_>>();
+    if let Some(dep) = result
+        .iter_mut()
+        .find(|dep| dep.mode == Dependency::Single && dep.is_valid_across_nulls(output))
+    {
+        if dep.source_indices == group_key {
+            dep.null_equality = NullEquality::NullEqualsNull;
+        }
+    } else {
+        let nullable = group_key
             .iter()
-            .any(|idx| aggr_fields[*idx].is_nullable());
-        // If GROUP BY expressions do not already act as a determinant:
-        if !aggregate_func_dependencies.iter().any(|item| {
-            // If `item.source_indices` is a subset of GROUP BY expressions, we shouldn't add
-            // them since `item.source_indices` defines this relation already.
-
-            // The following simple comparison is working well because
-            // GROUP BY expressions come here as a prefix.
-            item.source_indices.iter().all(|idx| idx < &count)
-                // A dependency that is not valid across NULLs cannot replace
-                // the whole GROUP BY key dependency:
-                && item.is_valid_across_nulls(aggr_schema)
-        }) {
-            // Add a new functional dependency associated with the whole table:
-            // Use nullable property of the GROUP BY expression:
-            aggregate_func_dependencies.push(
-                FunctionalDependence::new(source_indices, target_indices, nullable)
-                    .with_mode(Dependency::Single)
-                    // Grouping collapses NULL keys into a single group:
-                    .with_null_equality(NullEquality::NullEqualsNull),
-            );
-        }
+            .any(|&index| output.field(index).is_nullable());
+        result.push(
+            FunctionalDependence::new(
+                group_key,
+                (0..output.fields().len()).collect(),
+                nullable,
+            )
+            .with_mode(Dependency::Single)
+            .with_null_equality(NullEquality::NullEqualsNull),
+        );
     }
-    FunctionalDependencies::new(aggregate_func_dependencies)
+    FunctionalDependencies::new(result)
 }
 
 /// Returns target indices, for the determinant keys that are inside
@@ -769,5 +774,66 @@ mod tests {
             true,
         )]);
         assert_eq!(res, expected);
+    }
+}
+
+#[cfg(test)]
+mod aggregate_dependency_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn schemas(dep: FunctionalDependence, nullable: bool) -> (DFSchema, DFSchema) {
+        let input = DFSchema::try_from(Schema::new(
+            (0..4)
+                .map(|i| Field::new(format!("c{i}"), DataType::Int64, nullable))
+                .collect::<Vec<_>>(),
+        ))
+        .unwrap()
+        .with_functional_dependencies(FunctionalDependencies::new(vec![dep]))
+        .unwrap();
+        let output = DFSchema::try_from(Schema::new(vec![
+            Field::new("c0", DataType::Int64, nullable),
+            Field::new("group", DataType::Int64, nullable),
+            Field::new("count", DataType::Int64, false),
+        ]))
+        .unwrap();
+        (input, output)
+    }
+
+    #[test]
+    fn aggregate_public_helper_does_not_promote_partial_keys() {
+        let (input, output) =
+            schemas(FunctionalDependence::new(vec![0], vec![0, 1], false), false);
+        for group in [vec![Some(0), Some(2)], vec![Some(0), None]] {
+            let deps = aggregate_functional_dependencies(&input, &group, &output);
+            assert_eq!(deps.len(), 2);
+            assert_eq!(deps[0].source_indices, [0]);
+            assert_eq!(deps[0].target_indices, [0]);
+            assert_eq!(deps[0].mode, Dependency::Multi);
+            assert_eq!(deps[1].source_indices, [0, 1]);
+            assert_eq!(deps[1].target_indices, [0, 1, 2]);
+            assert_eq!(deps[1].mode, Dependency::Single);
+            assert_eq!(deps[1].null_equality, NullEquality::NullEqualsNull);
+        }
+    }
+
+    #[test]
+    fn aggregate_public_helper_retains_strict_nullable_uniqueness() {
+        let (input, output) = schemas(
+            FunctionalDependence::new(vec![0], vec![0, 1, 2, 3], true)
+                .with_mode(Dependency::Single),
+            true,
+        );
+        let deps =
+            aggregate_functional_dependencies(&input, &[Some(0), Some(1)], &output);
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].source_indices, [0]);
+        assert_eq!(deps[0].target_indices, [0, 1, 2]);
+        assert_eq!(deps[0].mode, Dependency::Single);
+        assert!(deps[0].nullable);
+        assert_eq!(deps[0].null_equality, NullEquality::NullEqualsNothing);
+        assert!(!deps[0].is_valid_across_nulls(&output));
+        assert_eq!(deps[1].source_indices, [0, 1]);
+        assert_eq!(deps[1].null_equality, NullEquality::NullEqualsNull);
     }
 }
