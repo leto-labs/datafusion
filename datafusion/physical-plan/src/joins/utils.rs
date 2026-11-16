@@ -159,66 +159,44 @@ pub fn adjust_right_output_partitioning(
 }
 
 /// Calculate the output ordering of a given join operation.
+///
+/// Longbow family SO: this agrees with `join_equivalence_properties`. The
+/// output keeps only the ordering of the side whose input order is
+/// maintained; the other side's ordering is never appended, because the rows
+/// that match tied maintained-side rows restart their order. A NULL-padded
+/// side (the left of RIGHT and FULL joins, the right of LEFT and FULL joins)
+/// supplies no ordering. `probe_side` no longer changes the result.
 pub fn calculate_join_output_ordering(
     left_ordering: Option<&LexOrdering>,
     right_ordering: Option<&LexOrdering>,
     join_type: JoinType,
     left_columns_len: usize,
     maintains_input_order: &[bool],
-    probe_side: Option<JoinSide>,
+    _probe_side: Option<JoinSide>,
 ) -> Result<Option<LexOrdering>> {
     match maintains_input_order {
         [true, false] => {
-            // Special case, we can prefix ordering of right side with the ordering of left side.
-            if join_type == JoinType::Inner
-                && probe_side == Some(JoinSide::Left)
-                && let Some(right_ordering) = right_ordering.cloned()
-            {
-                let right_offset = add_offset_to_physical_sort_exprs(
-                    right_ordering,
-                    left_columns_len as _,
-                )?;
-                return if let Some(left_ordering) = left_ordering {
-                    let mut result = left_ordering.clone();
-                    result.extend(right_offset);
-                    Ok(Some(result))
-                } else {
-                    Ok(LexOrdering::new(right_offset))
-                };
+            if matches!(join_type, JoinType::Right | JoinType::Full) {
+                return Ok(None);
             }
             Ok(left_ordering.cloned())
         }
         [false, true] => {
-            // Special case, we can prefix ordering of left side with the ordering of right side.
-            if join_type == JoinType::Inner && probe_side == Some(JoinSide::Right) {
-                return if let Some(right_ordering) = right_ordering.cloned() {
-                    let mut right_offset = add_offset_to_physical_sort_exprs(
-                        right_ordering,
-                        left_columns_len as _,
-                    )?;
-                    if let Some(left_ordering) = left_ordering {
-                        right_offset.extend(left_ordering.clone());
-                    }
-                    Ok(LexOrdering::new(right_offset))
-                } else {
-                    Ok(left_ordering.cloned())
-                };
+            if matches!(join_type, JoinType::Left | JoinType::Full) {
+                return Ok(None);
             }
             let Some(right_ordering) = right_ordering else {
                 return Ok(None);
             };
             match join_type {
-                JoinType::Inner | JoinType::Left | JoinType::Full | JoinType::Right => {
-                    add_offset_to_physical_sort_exprs(
-                        right_ordering.clone(),
-                        left_columns_len as _,
-                    )
-                    .map(LexOrdering::new)
-                }
+                JoinType::Inner | JoinType::Right => add_offset_to_physical_sort_exprs(
+                    right_ordering.clone(),
+                    left_columns_len as _,
+                )
+                .map(LexOrdering::new),
                 _ => Ok(Some(right_ordering.clone())),
             }
         }
-        // Doesn't maintain ordering, output ordering is None.
         [false, false] => Ok(None),
         [true, true] => unreachable!("Cannot maintain ordering of both sides"),
         _ => unreachable!("Join operators can not have more than two children"),
@@ -5115,6 +5093,9 @@ mod tests {
         Ok(())
     }
 
+    /// Family SO: the output keeps only the maintained side's ordering (no
+    /// lexicographic suffix of the other side, whatever the probe side), and
+    /// a NULL-padded maintained side supplies none.
     #[test]
     fn test_calculate_join_output_ordering() -> Result<()> {
         let left_ordering = LexOrdering::new(vec![
@@ -5126,44 +5107,36 @@ mod tests {
             PhysicalSortExpr::new_default(Arc::new(Column::new("z", 2))),
             PhysicalSortExpr::new_default(Arc::new(Column::new("y", 1))),
         ]);
-        let join_type = JoinType::Inner;
+        let right_offset = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(Arc::new(Column::new("z", 7))),
+            PhysicalSortExpr::new_default(Arc::new(Column::new("y", 6))),
+        ]);
         let left_columns_len = 5;
-        let maintains_input_orders = [[true, false], [false, true]];
-        let probe_sides = [Some(JoinSide::Left), Some(JoinSide::Right)];
-
-        let expected = [
-            LexOrdering::new(vec![
-                PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0))),
-                PhysicalSortExpr::new_default(Arc::new(Column::new("c", 2))),
-                PhysicalSortExpr::new_default(Arc::new(Column::new("d", 3))),
-                PhysicalSortExpr::new_default(Arc::new(Column::new("z", 7))),
-                PhysicalSortExpr::new_default(Arc::new(Column::new("y", 6))),
-            ]),
-            LexOrdering::new(vec![
-                PhysicalSortExpr::new_default(Arc::new(Column::new("z", 7))),
-                PhysicalSortExpr::new_default(Arc::new(Column::new("y", 6))),
-                PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0))),
-                PhysicalSortExpr::new_default(Arc::new(Column::new("c", 2))),
-                PhysicalSortExpr::new_default(Arc::new(Column::new("d", 3))),
-            ]),
+        let cases = [
+            (JoinType::Inner, [true, false], left_ordering.clone()),
+            (JoinType::Left, [true, false], left_ordering.clone()),
+            (JoinType::Full, [true, false], None),
+            (JoinType::Inner, [false, true], right_offset.clone()),
+            (JoinType::Right, [false, true], right_offset),
+            (JoinType::Left, [false, true], None),
+            (JoinType::RightSemi, [false, true], right_ordering.clone()),
         ];
-
-        for (i, (maintains_input_order, probe_side)) in
-            maintains_input_orders.iter().zip(probe_sides).enumerate()
-        {
-            assert_eq!(
-                calculate_join_output_ordering(
-                    left_ordering.as_ref(),
-                    right_ordering.as_ref(),
-                    join_type,
-                    left_columns_len,
-                    maintains_input_order,
-                    probe_side,
-                )?,
-                expected[i]
-            );
+        for (join_type, maintains_input_order, expected) in cases {
+            for probe_side in [Some(JoinSide::Left), Some(JoinSide::Right), None] {
+                assert_eq!(
+                    calculate_join_output_ordering(
+                        left_ordering.as_ref(),
+                        right_ordering.as_ref(),
+                        join_type,
+                        left_columns_len,
+                        &maintains_input_order,
+                        probe_side,
+                    )?,
+                    expected,
+                    "{join_type} {maintains_input_order:?} {probe_side:?}"
+                );
+            }
         }
-
         Ok(())
     }
 

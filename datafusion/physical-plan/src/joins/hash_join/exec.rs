@@ -1320,7 +1320,6 @@ impl HashJoinExec {
             &join_type,
             Arc::clone(schema),
             &Self::maintains_input_order(join_type),
-            Some(Self::probe_side()),
             on,
         )?;
 
@@ -11974,6 +11973,96 @@ mod tests {
             let keeps_zeros = mask.as_boolean().iter().all(|keep| keep == Some(true));
             assert_eq!(keeps_zeros, build.contains(&0.0), "{filter}");
         }
+        Ok(())
+    }
+
+    /// Family SO: a hash join that keeps the probe order claims only that
+    /// order. With repeated probe sort keys, the build rows that match
+    /// consecutive probe rows restart the build order, so `probe order, build
+    /// order` is not an ordering of the output, even though 56 keeps each
+    /// chain in build input order (#26228).
+    #[tokio::test]
+    async fn repeated_probe_keys_do_not_order_build_suffixes() -> Result<()> {
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("bid", DataType::Int32, false),
+            Field::new("bk", DataType::Int32, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int32, false),
+            Field::new("pk", DataType::Int32, false),
+        ]));
+        // Build sorted by `bid`; probe sorted by `g` with ties.
+        let left_batch = RecordBatch::try_new(
+            Arc::clone(&left_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Int32Array::from(vec![0, 1, 0, 1])),
+            ],
+        )?;
+        let right_batch = RecordBatch::try_new(
+            Arc::clone(&right_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![7, 7])),
+                Arc::new(Int32Array::from(vec![1, 0])),
+            ],
+        )?;
+        use datafusion_physical_expr::LexOrdering;
+        let sorted = |schema: &SchemaRef, name: &str| -> Result<LexOrdering> {
+            Ok(
+                LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(
+                    Column::new_with_schema(name, schema)?,
+                ))])
+                .unwrap(),
+            )
+        };
+        let left = Arc::new(
+            TestMemoryExec::try_new(&[vec![left_batch]], Arc::clone(&left_schema), None)?
+                .try_with_sort_information(vec![sorted(&left_schema, "bid")?])?,
+        );
+        let right = Arc::new(
+            TestMemoryExec::try_new(
+                &[vec![right_batch]],
+                Arc::clone(&right_schema),
+                None,
+            )?
+            .try_with_sort_information(vec![sorted(&right_schema, "g")?])?,
+        );
+        let on: JoinOn = vec![(
+            Arc::new(Column::new_with_schema("bk", &left_schema)?) as _,
+            Arc::new(Column::new_with_schema("pk", &right_schema)?) as _,
+        )];
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        let claimed = join
+            .properties()
+            .output_ordering()
+            .map(|ordering| format!("{ordering}"));
+        assert_eq!(claimed.as_deref(), Some("g@2 ASC"));
+        let batches =
+            common::collect(join.execute(0, prepare_task_ctx(8192, false))?).await?;
+        let rows: Vec<(i32, i32)> = batches
+            .iter()
+            .flat_map(|batch| {
+                let g = batch.column(2).as_primitive::<Int32Type>().clone();
+                let bid = batch.column(0).as_primitive::<Int32Type>().clone();
+                (0..batch.num_rows()).map(move |i| (g.value(i), bid.value(i)))
+            })
+            .collect();
+        // Probe row 1 matches builds 2 and 4, probe row 2 builds 1 and 3.
+        assert_eq!(rows, vec![(7, 2), (7, 4), (7, 1), (7, 3)]);
+        assert!(
+            rows.windows(2).any(|w| w[0] > w[1]),
+            "not sorted by (g, bid)"
+        );
         Ok(())
     }
 }

@@ -147,7 +147,6 @@ impl CrossJoinExec {
             &JoinType::Inner,
             schema,
             &[false, false],
-            None,
             &[],
         )?;
 

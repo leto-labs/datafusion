@@ -434,7 +434,6 @@ impl PiecewiseMergeJoinExec {
             &join_type,
             schema,
             &Self::maintains_input_order(join_type),
-            Some(Self::probe_side(&join_type)),
             // `PiecewiseMergeJoin`'s `on` is a range predicate (e.g. `l < r`),
             // not an equijoin key. Passing it here would register a false
             // `left == right` output equivalence, letting the optimizer drop a

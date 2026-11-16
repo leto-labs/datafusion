@@ -261,8 +261,6 @@ impl SymmetricHashJoinExec {
             &join_type,
             schema,
             &[false, false],
-            // Has alternating probe side
-            None,
             join_on,
         )?;
 
