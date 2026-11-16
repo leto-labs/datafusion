@@ -243,6 +243,20 @@ impl PreparedParquetFile {
     /// pages are one buffer, so a full-column decoder request is also covered.
     /// Fetch once and share these immutable buffers between oversized RG slices.
     pub fn byte_ranges(&self, group: usize, batch_size: usize) -> Vec<Range<u64>> {
+        self.byte_ranges_with_cached_columns(group, batch_size, |_| false)
+    }
+
+    /// Like `byte_ranges`, omitting a compressed, unencrypted column only when
+    /// `cached` pins every page of all its required ranges. The pins must stay
+    /// visible through this file's page-cache handle until decode finishes.
+    /// Partial column hits cannot omit ranges: the push decoder fetches a
+    /// column unless all pages that its selection needs are resident.
+    pub fn byte_ranges_with_cached_columns(
+        &self,
+        group: usize,
+        batch_size: usize,
+        mut cached: impl FnMut(&[Range<u64>]) -> bool,
+    ) -> Vec<Range<u64>> {
         assert!(batch_size > 0, "prepared scan batch size must be positive");
         let meta = self.metadata.metadata();
         let rg = meta.row_group(group);
@@ -261,6 +275,7 @@ impl PreparedParquetFile {
                 continue;
             }
             let (start, len) = chunk.byte_range();
+            let mut column_ranges = Vec::new();
             if let Some(selection) = &selection
                 && let Some(index) = meta
                     .offset_index()
@@ -271,12 +286,19 @@ impl PreparedParquetFile {
                 if let Some(first) = index.page_locations().first() {
                     let page = first.offset as u64;
                     if start < page {
-                        ranges.push(start..page);
+                        column_ranges.push(start..page);
                     }
                 }
-                ranges.extend(selection.scan_ranges(index.page_locations()));
+                column_ranges.extend(selection.scan_ranges(index.page_locations()));
             } else {
-                ranges.push(start..start + len);
+                column_ranges.push(start..start + len);
+            }
+            let cacheable =
+                chunk.compression() != parquet::basic::Compression::UNCOMPRESSED;
+            #[cfg(feature = "parquet_encryption")]
+            let cacheable = cacheable && chunk.crypto_metadata().is_none();
+            if !cacheable || !cached(&column_ranges) {
+                ranges.extend(column_ranges);
             }
         }
         ranges.sort_unstable_by_key(|r| r.start);
@@ -599,7 +621,7 @@ mod tests {
                     let intervals = if sliced {
                         vec![0..1, 1..rows]
                     } else {
-                        vec![0..rows]
+                        std::iter::once(0..rows).collect()
                     };
                     for interval in intervals {
                         let mut decoder =

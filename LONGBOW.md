@@ -728,3 +728,20 @@ during an overflow), the 16-bit direct boundary, prefix and full emission,
 Removing the rebase delta, the conversion map or the vacant-entry guard fails
 them. Regression command in the Longbow consumer:
 `scripts/vendored-tests.py datafusion-physical-plan -E 'test(group_values::packed)'`.
+
+## Family NFC: pin resident pages across native scan prefetch
+
+NFC / NATIVE-SCAN-PAGE-CACHE / UPSTREAMABLE. The prepared byte-range planner
+can omit a compressed, unencrypted column only when the caller atomically
+leases every page of all required ranges through the existing generation
+cache handle (Arrow DPC). The engine retains their visibility and memory
+charge until decode ends. No per-scan metadata copy, schema rebuild or cache
+handle replacement is needed. Partial hits keep the existing column fetch,
+including predicate-cache batch boundaries. The original `byte_ranges` API
+retains its fetch-all behavior.
+
+The consumer owns the leases and the prefetch window. Native integration
+tests cover reclamation before claim, dictionary pages, oversized slices,
+partial hits and metadata/schema Arc reuse. The prepared-scan regression
+checks narrow decimals, predicates, projections and selections:
+`scripts/vendored-tests.py datafusion-datasource-parquet -E 'test(pq_prepared_scan)'`.
