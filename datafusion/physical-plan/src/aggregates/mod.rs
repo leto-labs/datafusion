@@ -208,6 +208,8 @@ mod clustered_test_util;
 pub mod group_values;
 mod grouped_hash_stream;
 mod grouped_topk_stream;
+#[cfg(test)]
+mod grouping_set_spill_tests;
 mod hash_stream;
 mod optimizations;
 pub mod order;
