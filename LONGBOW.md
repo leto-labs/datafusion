@@ -179,3 +179,32 @@ publication; it still takes work that is already queued
 (`file_stream_publication_waits_suppressed` counts these streams). Scans with
 a declared ordering read in file order and do not share work (upstream
 `FileScanConfig::preserves_file_order`, #26434).
+
+## Family PQ: prepared Parquet file scans
+
+Purpose: let the Longbow morsel engine run the opener's complete file
+preparation (schema adaptation, coercions including narrow decimals, file,
+statistics, Bloom-filter, limit and page-index pruning, virtual columns) and
+then decode row-group intervals with its own drivers. Dependent Longbow
+feature: MORSEL-SCAN. Audit classification: UPSTREAMABLE (keep and upstream
+later).
+
+`ParquetSource::prepare_file` drives the ordinary open state machine with the
+scan's reader factory and stops after `RowGroupsPrunedParquetOpen::finish_pruning`,
+the first half of upstream's `build_stream`. `PreparedParquetFile` holds the
+metadata, the pruned `ParquetAccessPlan`, the row groups in the requested
+order (statistics reorder and reverse), the `DecoderProjection` and
+upstream's `RowFilterContext` from `DecoderReadPlans`. A decoder for one
+row-group interval uses a row-group-local selection
+(`with_row_group_selections`, #25608) intersected with the prepared
+selection, plus a fresh `RowFilter` from the shared candidates and any extra
+caller predicates (which must read only prepared columns). `byte_ranges`
+plans the encoded ranges of one row group, including predicate-cache batch
+boundaries for selections. One runtime `RowGroupPruner` per prepared file
+serves every driver: callers lock it only to refresh the pruning predicate
+for the current dynamic-filter generation, evaluate outside the lock, and
+cache one verdict per row group and generation. A prepared file has a runtime pruner
+only while its predicate has a dynamic filter that can still change. A
+prepared scan without a batch size uses the scan config's, else 8192. The
+default reader ties the prepared footer and every later data read to the
+file's ETag/version (family D).

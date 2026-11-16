@@ -7,6 +7,8 @@
 mod early_stop;
 #[cfg(feature = "parquet_encryption")]
 mod encryption;
+mod prepared;
+pub use prepared::{PreparedParquetFile, PreparedParquetScan};
 
 use self::early_stop::EarlyStoppingStream;
 #[cfg(feature = "parquet_encryption")]
@@ -1663,9 +1665,21 @@ impl BloomFiltersLoadedParquetOpen {
     }
 }
 
+/// Result of all static pruning (statistics, Bloom filters, limit and page
+/// index): the input of both [`RowGroupsPrunedParquetOpen::build_stream`] and
+/// a prepared file scan (Longbow family PQ). No record batch was decoded.
+struct PrunedParquetOpen {
+    prepared: PreparedParquetOpen,
+    reader_metadata: ArrowReaderMetadata,
+    options: ArrowReaderOptions,
+    access_plan: ParquetAccessPlan,
+    decoder_read_plans: DecoderReadPlans,
+}
+
 impl RowGroupsPrunedParquetOpen {
-    /// Build the final parquet stream once all pruning work is complete.
-    fn build_stream(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    /// Finish static pruning: apply limit and page-index pruning and build the
+    /// file's decoder projection and row-filter plans.
+    fn finish_pruning(self) -> Result<PrunedParquetOpen> {
         let RowGroupsPrunedParquetOpen {
             prepared,
             mut row_groups,
@@ -1679,7 +1693,7 @@ impl RowGroupsPrunedParquetOpen {
         let MetadataLoadedParquetOpen {
             prepared,
             reader_metadata,
-            options: _,
+            options,
         } = loaded;
 
         let file_metadata = Arc::clone(reader_metadata.metadata());
@@ -1729,6 +1743,33 @@ impl RowGroupsPrunedParquetOpen {
                 page_pruning_result.limit_pruned_rows,
             );
         }
+
+        // Reuse plans built for the external-selection index check. Other
+        // scans defer this work until the stream is built.
+        let decoder_read_plans = match decoder_read_plans {
+            Some(plans) => plans,
+            None => DecoderReadPlans::try_new(&prepared, &reader_metadata)?,
+        };
+        Ok(PrunedParquetOpen {
+            prepared,
+            reader_metadata,
+            options,
+            access_plan,
+            decoder_read_plans,
+        })
+    }
+
+    /// Build the final parquet stream once all pruning work is complete.
+    fn build_stream(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        let PrunedParquetOpen {
+            prepared,
+            reader_metadata,
+            options: _,
+            access_plan,
+            decoder_read_plans,
+        } = self.finish_pruning()?;
+        let file_metadata = Arc::clone(reader_metadata.metadata());
+        let rg_metadata = file_metadata.row_groups();
 
         // Prepare access plans, then apply row-group ordering tweaks per
         // run. Two composable steps:
@@ -1816,15 +1857,10 @@ impl RowGroupsPrunedParquetOpen {
             lease.release();
         }
 
-        // Reuse plans built for the external-selection index check. Other
-        // scans defer this work until the stream is built.
         let DecoderReadPlans {
             projection: decoder_projection,
             row_filter_context: precomputed_context,
-        } = match decoder_read_plans {
-            Some(plans) => plans,
-            None => DecoderReadPlans::try_new(&prepared, &reader_metadata)?,
-        };
+        } = decoder_read_plans;
 
         // Lazily-registered suppression counter shared by the open-time first-RG
         // skip below and the stream's per-RG toggle (registered on first use so

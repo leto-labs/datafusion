@@ -168,6 +168,9 @@ pub(crate) struct RowGroupPruner {
     /// container-level pruning. Sourced from
     /// `datafusion.execution.parquet.max_in_list_size`.
     max_in_list_size: usize,
+    /// Number of predicate builds so far: the generation of
+    /// `pruning_predicate`. Zero before the first build.
+    generation: u64,
 }
 
 impl RowGroupPruner {
@@ -190,6 +193,7 @@ impl RowGroupPruner {
             predicate_creation_errors,
             predicate_evaluation_errors,
             max_in_list_size,
+            generation: 0,
         }
     }
 
@@ -204,11 +208,28 @@ impl RowGroupPruner {
         if row_group_indices.is_empty() {
             return false;
         }
+        let Some(pp) = self.current().1 else {
+            return false;
+        };
+        prune_row_groups(
+            &pp,
+            &self.parquet_metadata,
+            &self.arrow_schema,
+            row_group_indices,
+            &self.predicate_evaluation_errors,
+        )
+    }
 
-        // Refresh the cached `PruningPredicate` on the first call and
-        // whenever a watched dynamic filter has advanced since we last
-        // looked. `changed()` is a single atomic load per still-incomplete
-        // filter — no tree walk on every check.
+    /// The pruning predicate for the current dynamic-filter generation, with
+    /// that generation: a positive number that grows with each rebuild.
+    ///
+    /// Refreshes the cached `PruningPredicate` on the first call and
+    /// whenever a watched dynamic filter has advanced since we last
+    /// looked. `changed()` is a single atomic load per still-incomplete
+    /// filter — no tree walk on every check. Shared callers (Longbow family
+    /// PQ) hold their lock only for this refresh and evaluate the returned
+    /// predicate outside it.
+    pub(crate) fn current(&mut self) -> (u64, Option<Arc<PruningPredicate>>) {
         let dynamic_changed = self
             .tracking
             .watcher()
@@ -220,43 +241,60 @@ impl RowGroupPruner {
                 .with_max_in_list_size(self.max_in_list_size)
                 .build(Arc::clone(&self.predicate));
             self.needs_initial_build = false;
+            #[cfg(test)]
+            PRUNING_PREDICATE_BUILDS.with(|builds| builds.set(builds.get() + 1));
+            self.generation += 1;
         }
+        (self.generation, self.pruning_predicate.clone())
+    }
+}
 
-        let Some(pp) = self.pruning_predicate.as_ref() else {
-            return false;
-        };
+#[cfg(test)]
+thread_local! {
+    /// Runtime pruning predicates built on this thread.
+    pub(crate) static PRUNING_PREDICATE_BUILDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
-        let row_group_metadatas = row_group_indices
-            .iter()
-            .map(|&i| self.parquet_metadata.row_group(i))
-            .collect::<Vec<_>>();
-        let stats = RowGroupPruningStatistics {
-            parquet_schema: self.parquet_metadata.file_metadata().schema_descr(),
-            column_orders: self
-                .parquet_metadata
-                .file_metadata()
-                .column_orders()
-                .map(Vec::as_slice),
-            row_group_metadatas,
-            arrow_schema: self.arrow_schema.as_ref(),
-        };
+/// Whether `pp` proves that every row group in `row_group_indices` can be
+/// skipped. Evaluation errors are counted and conservatively keep the groups.
+pub(crate) fn prune_row_groups(
+    pp: &PruningPredicate,
+    parquet_metadata: &ParquetMetaData,
+    arrow_schema: &SchemaRef,
+    row_group_indices: &[usize],
+    predicate_evaluation_errors: &Count,
+) -> bool {
+    if row_group_indices.is_empty() {
+        return false;
+    }
+    let row_group_metadatas = row_group_indices
+        .iter()
+        .map(|&i| parquet_metadata.row_group(i))
+        .collect::<Vec<_>>();
+    let stats = RowGroupPruningStatistics {
+        parquet_schema: parquet_metadata.file_metadata().schema_descr(),
+        column_orders: parquet_metadata
+            .file_metadata()
+            .column_orders()
+            .map(Vec::as_slice),
+        row_group_metadatas,
+        arrow_schema: arrow_schema.as_ref(),
+    };
 
-        match pp.prune(&stats) {
-            // `prune` returns `false` per container that the predicate proves
-            // cannot contain matching rows. We can skip the run only when
-            // every requested row group is in that state.
-            Ok(values) => values.iter().all(|&keep| !keep),
-            Err(e) => {
-                // The predicate was already built successfully (we hold `pp`);
-                // this failure is in *evaluating* it against the row-group
-                // stats, so it belongs in the evaluation-errors counter, not
-                // creation-errors.
-                debug!(
-                    "Ignoring error evaluating runtime row-group pruning predicate: {e}"
-                );
-                self.predicate_evaluation_errors.add(1);
-                false
-            }
+    match pp.prune(&stats) {
+        // `prune` returns `false` per container that the predicate proves
+        // cannot contain matching rows. We can skip the run only when
+        // every requested row group is in that state.
+        Ok(values) => values.iter().all(|&keep| !keep),
+        Err(e) => {
+            // The predicate was already built successfully (we hold `pp`);
+            // this failure is in *evaluating* it against the row-group
+            // stats, so it belongs in the evaluation-errors counter, not
+            // creation-errors.
+            debug!("Ignoring error evaluating runtime row-group pruning predicate: {e}");
+            predicate_evaluation_errors.add(1);
+            false
         }
     }
 }

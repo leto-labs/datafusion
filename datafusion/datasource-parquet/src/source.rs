@@ -557,24 +557,15 @@ impl From<ParquetSource> for Arc<dyn FileSource> {
     }
 }
 
-impl FileSource for ParquetSource {
-    fn create_file_opener(
-        &self,
-        _object_store: Arc<dyn ObjectStore>,
-        _base_config: &FileScanConfig,
-        _partition: usize,
-    ) -> datafusion_common::Result<Arc<dyn FileOpener>> {
-        datafusion_common::internal_err!(
-            "ParquetSource::create_file_opener called but it supports the Morsel API, please use that instead"
-        )
-    }
-
-    fn create_morselizer(
+impl ParquetSource {
+    /// The concrete morselizer of [`FileSource::create_morselizer`], also
+    /// used to open prepared files (Longbow family PQ).
+    pub(crate) fn prepared_morselizer(
         &self,
         object_store: Arc<dyn ObjectStore>,
         base_config: &FileScanConfig,
         partition: usize,
-    ) -> datafusion_common::Result<Box<dyn Morselizer>> {
+    ) -> datafusion_common::Result<ParquetMorselizer> {
         let expr_adapter_factory = base_config
             .expr_adapter_factory
             .clone()
@@ -628,7 +619,7 @@ impl FileSource for ParquetSource {
             self.pushdown_filters(),
         )?;
 
-        Ok(Box::new(ParquetMorselizer {
+        Ok(ParquetMorselizer {
             partition_index: partition,
             projection: self.projection.clone(),
             batch_size: self
@@ -669,7 +660,33 @@ impl FileSource for ParquetSource {
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             virtual_state,
             shared_work_source: None,
-        }))
+        })
+    }
+}
+
+impl FileSource for ParquetSource {
+    fn create_file_opener(
+        &self,
+        _object_store: Arc<dyn ObjectStore>,
+        _base_config: &FileScanConfig,
+        _partition: usize,
+    ) -> datafusion_common::Result<Arc<dyn FileOpener>> {
+        datafusion_common::internal_err!(
+            "ParquetSource::create_file_opener called but it supports the Morsel API, please use that instead"
+        )
+    }
+
+    fn create_morselizer(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> datafusion_common::Result<Box<dyn Morselizer>> {
+        Ok(Box::new(self.prepared_morselizer(
+            object_store,
+            base_config,
+            partition,
+        )?))
     }
 
     fn reorder_files(
