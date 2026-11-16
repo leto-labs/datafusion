@@ -1840,6 +1840,15 @@ impl ExecutionPlan for RepartitionExec {
         let partitioning = self.partitioning().clone();
         let metrics = self.metrics.clone();
         let preserve_order = self.sort_exprs().is_some();
+        let num_input_partitions = input.output_partitioning().partition_count();
+        // Ordered outputs merge selectively polled input queues. A full queue
+        // can stall a producer, so its scans must not await sibling publication.
+        // Preserve any inherited requirement in the unordered/single-input case.
+        let context = if preserve_order && num_input_partitions > 1 {
+            context.with_partition_independence(true)
+        } else {
+            context
+        };
         let name = self.name().to_owned();
         let schema = self.schema();
         let schema_captured = Arc::clone(&schema);
@@ -1862,8 +1871,6 @@ impl ExecutionPlan for RepartitionExec {
         if let Some(mut state) = state.try_lock() {
             state.ensure_input_streams_initialized(&input, &metrics, &context)?;
         }
-
-        let num_input_partitions = input.output_partitioning().partition_count();
 
         let stream = futures::stream::once(async move {
             // lock scope

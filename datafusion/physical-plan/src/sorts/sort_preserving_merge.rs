@@ -358,6 +358,10 @@ impl ExecutionPlan for SortPreservingMergeExec {
                 }
             },
             _ => {
+                // A full sibling merge channel may stop that scan from polling.
+                // Scope publication independence to these streaming inputs;
+                // blocking sorts clear it before executing their children.
+                let context = context.with_partition_independence(true);
                 let scope = AttemptTasks::from_task(&context);
                 let receivers = (0..input_partitions)
                     .map(|partition| {

@@ -35,7 +35,7 @@ use std::{collections::HashMap, sync::Arc};
 ///
 /// [`SessionContext`]: https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html
 /// [`ExecutionProps`]: datafusion_expr::execution_props::ExecutionProps
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TaskContext {
     /// Session Id
     session_id: String,
@@ -51,6 +51,8 @@ pub struct TaskContext {
     aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
     /// Window functions associated with this task context
     window_functions: HashMap<String, Arc<WindowUDF>>,
+    /// Selectively polled pipelines must progress without sibling publication.
+    require_independent_partitions: bool,
     /// Runtime environment associated with this task context
     runtime: Arc<RuntimeEnv>,
 }
@@ -68,6 +70,7 @@ impl Default for TaskContext {
             higher_order_functions: HashMap::new(),
             aggregate_functions: HashMap::new(),
             window_functions: HashMap::new(),
+            require_independent_partitions: false,
             runtime,
         }
     }
@@ -98,7 +101,29 @@ impl TaskContext {
             higher_order_functions,
             aggregate_functions,
             window_functions,
+            require_independent_partitions: false,
             runtime,
+        }
+    }
+
+    /// Whether this demand-driven pipeline requires partitions to make progress
+    /// without sibling work publication. This is an execution requirement, not
+    /// a session option. Operators that consume or close their inputs before
+    /// emitting can clear it at that boundary.
+    pub fn requires_independent_partitions(&self) -> bool {
+        self.require_independent_partitions
+    }
+
+    /// Scope partition independence to a pipeline, retaining runtime services,
+    /// function registries and session extensions (including attempt ownership).
+    pub fn with_partition_independence(self: &Arc<Self>, required: bool) -> Arc<Self> {
+        if self.require_independent_partitions == required {
+            Arc::clone(self)
+        } else {
+            Arc::new(Self {
+                require_independent_partitions: required,
+                ..self.as_ref().clone()
+            })
         }
     }
 
@@ -347,5 +372,44 @@ mod tests {
         assert_eq!(test.unwrap().option_value, None);
 
         Ok(())
+    }
+    #[test]
+    fn partition_independence_preserves_context_services_and_extensions() {
+        #[derive(Debug)]
+        struct Marker;
+        let marker = Arc::new(Marker);
+        let config = SessionConfig::new().with_extension(Arc::clone(&marker));
+        let context = Arc::new(TaskContext::default().with_session_config(config));
+        assert!(!context.requires_independent_partitions());
+        assert!(Arc::ptr_eq(
+            &context,
+            &context.with_partition_independence(false)
+        ));
+        let independent = context.with_partition_independence(true);
+        assert!(independent.requires_independent_partitions());
+        assert!(!context.requires_independent_partitions());
+        assert!(Arc::ptr_eq(
+            &context.runtime_env(),
+            &independent.runtime_env()
+        ));
+        assert!(Arc::ptr_eq(
+            &marker,
+            &independent
+                .session_config()
+                .get_extension::<Marker>()
+                .unwrap()
+        ));
+        assert_eq!(context.session_id(), independent.session_id());
+        assert_eq!(context.task_id(), independent.task_id());
+        assert!(Arc::ptr_eq(
+            &independent,
+            &independent.with_partition_independence(true)
+        ));
+        let cleared = independent.with_partition_independence(false);
+        assert!(!cleared.requires_independent_partitions());
+        assert!(Arc::ptr_eq(
+            &marker,
+            &cleared.session_config().get_extension::<Marker>().unwrap()
+        ));
     }
 }

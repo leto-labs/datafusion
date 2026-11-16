@@ -72,6 +72,8 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::Semaphore;
 
 #[cfg(test)]
+mod scope_tests;
+#[cfg(test)]
 mod spill_tests;
 
 struct ExternalSorterMetrics {
@@ -1905,16 +1907,19 @@ impl ExecutionPlan for SortExec {
             context.task_id()
         );
 
-        let mut input = self.input.execute(partition, Arc::clone(&context))?;
-
-        let execution_options = &context.session_config().options().execution;
-
-        trace!("End SortExec's input.execute for partition: {partition}");
-
         let sort_satisfied = self
             .input
             .equivalence_properties()
             .ordering_satisfy(self.expr.clone())?;
+        // An actual sort consumes or closes its input before emitting. Its
+        // scans can wait for sibling publication independently of downstream
+        // merge demand. Pass-through sorts retain the caller's requirement.
+        let context = context.with_partition_independence(
+            context.requires_independent_partitions() && sort_satisfied,
+        );
+        let mut input = self.input.execute(partition, Arc::clone(&context))?;
+        let execution_options = &context.session_config().options().execution;
+        trace!("End SortExec's input.execute for partition: {partition}");
 
         match (sort_satisfied, self.fetch.as_ref()) {
             (true, Some(fetch)) => Ok(Box::pin(LimitStream::new(
