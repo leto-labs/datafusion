@@ -253,8 +253,12 @@ impl ScanState {
         }
 
         // No outstanding work remains, so begin planning the next unopened file.
-        let Some(part_file) = self.work_source.pop_front() else {
-            return ScanAndReturn::Done(None);
+        // A shared source can return `Pending` while a sibling is planning or
+        // reading, or still owns unopened files that can produce more work.
+        let part_file = match self.work_source.poll_next_file(cx) {
+            Poll::Ready(Some(part_file)) => part_file,
+            Poll::Ready(None) => return ScanAndReturn::Done(None),
+            Poll::Pending => return ScanAndReturn::Return(Poll::Pending),
         };
 
         self.metrics.time_opening.start();

@@ -764,19 +764,39 @@ impl DataSource for FileScanConfig {
         let source = self.file_source.with_batch_size(batch_size);
         let source = source.with_task_context(&context).unwrap_or(source);
 
-        let morselizer = source.create_morselizer(object_store, self, partition)?;
-
         // Extract the shared work source from the sibling state if it exists.
-        // This allows multiple sibling streams to steal work from a single
-        // shared queue of unopened files.
+        // Each sibling keeps its planned files and can consume finer work
+        // units offered by eligible readers after pruning.
         let shared_work_source = sibling_state
             .as_ref()
+            // The execution's queue owns the files once initialized. Every
+            // partition must claim from that same queue, even when task
+            // contexts differ; falling back to local groups duplicates work.
             .and_then(|state| state.downcast_ref::<SharedWorkSource>())
             .cloned();
+
+        // A selective consumer (a streaming merge above this scan, family SO)
+        // can stop polling one partition while it awaits another, so no
+        // partition of this stream may wait for a sibling's future publication.
+        let independent_partitions = context.requires_independent_partitions();
+        datafusion_physical_plan::metrics::MetricBuilder::new(source.metrics())
+            .counter("file_stream_publication_waits_suppressed", partition)
+            .add(usize::from(
+                sibling_state.is_some() && independent_partitions,
+            ));
+        datafusion_physical_plan::metrics::MetricBuilder::new(source.metrics())
+            .counter("file_stream_work_sharing_enabled", partition)
+            .add(usize::from(shared_work_source.is_some()));
+
+        let mut morselizer = source.create_morselizer(object_store, self, partition)?;
+        if let Some(shared_work_source) = &shared_work_source {
+            morselizer.attach_shared_work_source(shared_work_source);
+        }
 
         let stream = FileStreamBuilder::new(self)
             .with_partition(partition)
             .with_shared_work_source(shared_work_source)
+            .with_independent_partitions(independent_partitions)
             .with_morselizer(morselizer)
             .with_metrics(source.metrics())
             .build()?;

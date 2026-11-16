@@ -384,6 +384,25 @@ impl ParquetFileMetrics {
         count.add(n);
     }
 
+    /// Record runs of unopened whole row groups donated to idle siblings.
+    /// The count is work units, not the number of groups within those units.
+    pub(crate) fn add_row_group_units_published(
+        metrics: &ExecutionPlanMetricsSet,
+        partition: usize,
+        filename: &str,
+        n: usize,
+    ) {
+        if n == 0 {
+            return;
+        }
+
+        let count = MetricBuilder::new(metrics)
+            .with_new_label("filename", filename.to_string())
+            .with_type(MetricType::Summary)
+            .counter("row_group_units_published", partition);
+        count.add(n);
+    }
+
     /// Record that page index I/O was skipped because row-group statistics
     /// already proved page index could not prune further.
     pub(crate) fn add_page_index_load_skipped(

@@ -39,6 +39,9 @@ mod supported_predicates;
 #[cfg(test)]
 mod test_util;
 mod virtual_column;
+mod work_sharing;
+#[cfg(test)]
+mod work_sharing_tests;
 mod writer;
 
 pub use access_plan::{ParquetAccessPlan, ParquetRowSelection, RowGroupAccess};

@@ -20,6 +20,7 @@ use crate::push_decoder::{
     RowFilterContext, RowGroupPruner,
 };
 use crate::row_group_filter::{RowGroupAccessPlanFilter, row_group_in_range};
+use crate::work_sharing::{DonatedRowGroups, RowGroupSharing};
 use crate::{
     BloomFilterStatistics, Int96Coercer, ParquetAccessPlan, ParquetFileMetrics,
     ParquetFileReaderFactory, ParquetRowPositions, ParquetRowSelection,
@@ -28,6 +29,7 @@ use crate::{
 };
 use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
+use datafusion_datasource::file_stream::work_source::{PublishLease, SharedWorkSource};
 use datafusion_datasource::morsel::{Morsel, MorselPlan, MorselPlanner, Morselizer};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr_adapter::rewrite::rewrite_input_file_name_in_projection;
@@ -302,6 +304,9 @@ pub(super) struct ParquetMorselizer {
     /// Per-scan virtual-column state (validation already performed). `None`
     /// when no virtual columns are requested — the common path.
     pub(crate) virtual_state: Option<Arc<VirtualColumnsState>>,
+    /// Longbow family S: the execution's source for sharing unopened row
+    /// groups with idle siblings after pruning.
+    pub(crate) shared_work_source: Option<SharedWorkSource>,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -318,6 +323,21 @@ impl fmt::Debug for ParquetMorselizer {
 impl Morselizer for ParquetMorselizer {
     fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>> {
         Ok(Box::new(ParquetMorselPlanner::try_new(self, file)?))
+    }
+
+    /// Share unread whole row groups for scans whose order and row count do
+    /// not depend on the reading stream. Ordered, limited, reordered and
+    /// reversed scans retain their planned ownership.
+    fn attach_shared_work_source(&mut self, source: &SharedWorkSource) {
+        if self.preserve_order
+            || self.limit.is_some()
+            || self.reverse_row_groups
+            || self.sort_order_for_reorder.is_some()
+        {
+            return;
+        }
+        source.enable_publishing();
+        self.shared_work_source = Some(source.clone());
     }
 }
 
@@ -495,6 +515,9 @@ struct PreparedParquetOpen {
     reverse_row_groups: bool,
     sort_order_for_reorder: Option<LexOrdering>,
     preserve_order: bool,
+    /// Longbow family WS: eligible readers can offer their unread tail to
+    /// idle siblings. Published units remain eligible for later donation.
+    shared_work_source: Option<SharedWorkSource>,
     #[cfg(feature = "parquet_encryption")]
     file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
 }
@@ -831,6 +854,15 @@ impl ParquetMorselizer {
     ) -> Result<PreparedParquetOpen> {
         let file_range = partitioned_file.range.clone();
         let extensions = partitioned_file.extensions.clone();
+        // External file selections must not publish access-plan descriptors:
+        // a published ParquetAccessPlan cannot be composed with them.
+        let shared_work_source = self.shared_work_source.clone().filter(|_| {
+            extensions.get::<ParquetRowSelection>().is_none()
+                && extensions.get::<ParquetRowPositions>().is_none()
+        });
+        // A donated unit's bytes were credited by its donor (see
+        // `DonatedRowGroups`), so the scan counts every byte once.
+        let donated = extensions.get::<DonatedRowGroups>().is_some();
         let file_name = partitioned_file.object_meta.location.to_string();
         let file_metrics =
             ParquetFileMetrics::new(self.partition_index, &file_name, &self.metrics);
@@ -967,7 +999,11 @@ impl ParquetMorselizer {
         });
 
         let byte_progress = ByteProgress::new(
-            partitioned_file.effective_size(),
+            if donated {
+                0
+            } else {
+                partitioned_file.effective_size()
+            },
             ParquetFileMetrics::bytes_processed_counter(
                 &self.metrics,
                 self.partition_index,
@@ -1017,6 +1053,7 @@ impl ParquetMorselizer {
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             preserve_order: self.preserve_order,
+            shared_work_source,
             #[cfg(feature = "parquet_encryption")]
             file_decryption_properties: None,
         })
@@ -1085,7 +1122,11 @@ impl PreparedParquetOpen {
         // the returned metadata may actually include page indexes as some
         // readers may return page indexes even when not requested -- for
         // example when they are cached)
-        let metadata = self.async_file_reader.get_metadata(Some(&options)).await?;
+        // Longbow family WS: a donated unit reuses its donor's footer.
+        let metadata = match self.extensions.get::<DonatedRowGroups>() {
+            Some(donated) => Arc::clone(&donated.metadata),
+            None => self.async_file_reader.get_metadata(Some(&options)).await?,
+        };
         if self.partitioned_file.arrow_schema.is_none()
             && let Some(provider) = &self.schema_provider
         {
@@ -1726,6 +1767,55 @@ impl RowGroupsPrunedParquetOpen {
 
         let arrow_reader_metrics = ArrowReaderMetrics::enabled();
 
+        // Longbow family WS: the complete post-pruning plan stays with this
+        // reader. Sharing is reconsidered at row-group boundaries when
+        // siblings run dry. While a dynamic filter can still change, the
+        // runtime pruner may drop future row groups before their boundary:
+        // such a stream keeps its work (`RowGroupSharing::wants_work`) and
+        // reserves no read-ahead window.
+        let predicate_watching = prepared.predicate.as_ref().is_some_and(|predicate| {
+            matches!(
+                DynamicFilterTracking::classify(predicate),
+                DynamicFilterTracking::Watching(_)
+            )
+        });
+        let row_group_sharing = prepared.shared_work_source.clone().and_then(|source| {
+            let selected = access_plan.row_group_index_iter().count();
+            let lookahead = if predicate_watching {
+                0
+            } else {
+                prepared
+                    .parquet_file_reader_factory
+                    .read_ahead_row_groups(selected)
+            };
+            if selected / lookahead.saturating_add(1) < 2 {
+                // This stream can only get shorter. Do not retain a copy of a
+                // plan that can never offer a useful whole-group run.
+                return None;
+            }
+            let lease = prepared
+                .partitioned_file
+                .extension::<PublishLease>()
+                .cloned();
+            Some(Box::new(RowGroupSharing {
+                source,
+                file: prepared.partitioned_file.clone(),
+                plan: access_plan.clone(),
+                metadata: Arc::clone(&file_metadata),
+                predicate: prepared.predicate.clone().filter(|_| predicate_watching),
+                lookahead,
+                metrics: prepared.metrics.clone(),
+                partition: prepared.partition_index,
+                lease,
+            }))
+        });
+        if row_group_sharing.is_none()
+            && let Some(lease) = prepared.partitioned_file.extension::<PublishLease>()
+        {
+            // This reader cannot publish: let idle siblings finish now.
+            lease.release();
+        }
+
         // Reuse plans built for the external-selection index check. Other
         // scans defer this work until the stream is built.
         let DecoderReadPlans {
@@ -1923,6 +2013,7 @@ impl RowGroupsPrunedParquetOpen {
             filter_installed,
             row_filter_skipped_fully_matched,
             byte_progress,
+            row_group_sharing,
         }
         .into_stream();
 
@@ -2166,6 +2257,9 @@ async fn load_page_index<T: AsyncFileReader>(
 }
 
 #[cfg(test)]
+mod split_tests;
+
+#[cfg(test)]
 mod test {
     use super::*;
     use super::{ConstantColumns, ParquetMorselizer, constant_columns_from_stats};
@@ -2253,6 +2347,48 @@ mod test {
         row_group_range_assignment: RowGroupRangeAssignment,
         reverse_row_groups: bool,
         preserve_order: bool,
+    }
+
+    #[test]
+    fn sharing_attachment_guards_order_limit_reverse_and_statistics_reorder() {
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_datasource::source::DataSource;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+        use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(ParquetSource::new(Arc::clone(&schema))),
+        )
+        .build();
+        let state = config
+            .create_sibling_state(&datafusion_common::config::ConfigOptions::default())
+            .unwrap();
+        let shared = state.downcast_ref::<SharedWorkSource>().unwrap();
+        for guard in 0..5 {
+            let mut opener = ParquetMorselizerBuilder::new()
+                .with_store(Arc::new(InMemory::new()))
+                .with_schema(Arc::clone(&schema))
+                .build();
+            match guard {
+                0 => opener.preserve_order = true,
+                1 => opener.limit = Some(10),
+                2 => opener.reverse_row_groups = true,
+                3 => {
+                    opener.sort_order_for_reorder =
+                        LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(
+                            Column::new("k", 0),
+                        ))])
+                }
+                _ => {}
+            }
+            opener.attach_shared_work_source(shared);
+            assert_eq!(
+                opener.shared_work_source.is_some(),
+                guard == 4,
+                "guard {guard}"
+            );
+        }
     }
 
     #[test]
@@ -2703,6 +2839,7 @@ mod test {
                 reverse_row_groups: self.reverse_row_groups,
                 sort_order_for_reorder: None,
                 virtual_state,
+                shared_work_source: None,
             })
         }
     }

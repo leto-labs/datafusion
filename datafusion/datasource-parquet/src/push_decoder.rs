@@ -55,6 +55,7 @@ use crate::row_filter::{
     PrebuiltRowFilterCandidate, prebuild_row_filter_candidates, row_filter_from_prebuilt,
 };
 use crate::row_group_filter::RowGroupPruningStatistics;
+use crate::work_sharing::RowGroupSharing;
 
 /// Shared options applied to the [`ParquetPushDecoderBuilder`] for a file
 /// scan, and to any later rebuilds performed via
@@ -307,6 +308,10 @@ pub(crate) struct PushDecoderStreamState {
     /// group at a time as they are decoded or skipped, and topped up to the
     /// full range when the stream is dropped.
     pub(crate) byte_progress: ByteProgress,
+    /// Longbow family WS: unordered, unlimited streams can donate their
+    /// unread tail after a sibling becomes idle, also after the first row
+    /// group was read. `None` when the stream is not eligible.
+    pub(crate) row_group_sharing: Option<Box<RowGroupSharing>>,
 }
 
 /// A reusable, `Arc`-shared list of prebuilt row-filter candidates.
@@ -429,6 +434,10 @@ impl PushDecoderStreamState {
         // Cloning `Time` shares the underlying counter and keeps the guard
         // from borrowing `self`. The guard records on drop, which covers
         // every return.
+        // A failed decoder rebuild (row-group donation or the boundary rebuild)
+        // consumed the decoder after its error was returned: the stream is in
+        // a terminal error state and ends instead of panicking on a later poll.
+        self.decoder.as_ref()?;
         let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
         let mut timer = elapsed_compute.timer();
         loop {
@@ -493,6 +502,27 @@ impl PushDecoderStreamState {
                     Ok(false) => {}
                     Err(e) => return Some((Err(e), self)),
                 }
+            }
+            // Longbow family WS: a tail too short to share ends sharing, which
+            // releases the file's lease so waiting siblings can finish.
+            if at_boundary
+                && self
+                    .row_group_sharing
+                    .as_ref()
+                    .is_some_and(|sharing| sharing.exhausted(self.rg_plan.len()))
+            {
+                self.row_group_sharing = None;
+            }
+            // Longbow family WS: offer the unread tail to idle siblings. The
+            // check is one relaxed load while no sibling is idle.
+            if at_boundary
+                && self
+                    .row_group_sharing
+                    .as_ref()
+                    .is_some_and(|sharing| sharing.wants_work(self.rg_plan.len()))
+                && let Err(e) = self.donate_unread_tail()
+            {
+                return Some((Err(e), self));
             }
 
             // Step 3: drive the decoder.
@@ -690,6 +720,23 @@ impl PushDecoderStreamState {
         }
         self.decoder = Some(builder.build().map_err(DataFusionError::from)?);
         Ok(false)
+    }
+
+    /// Publish whole unread row groups beyond the retained window to idle
+    /// siblings, and rebuild the decoder over the retained row groups.
+    fn donate_unread_tail(&mut self) -> Result<()> {
+        // A row filter can silently finish a row group without producing a
+        // reader. Never donate such an already-read group: align `rg_plan`
+        // with the decoder's frontier first.
+        self.sync_rg_plan_to_decoder_frontier()?;
+        let decoder = self.decoder.take().expect("decoder present");
+        let sharing = self.row_group_sharing.as_ref().expect("sharing present");
+        let (decoder, donated_bytes) = sharing.offer(decoder, &mut self.rg_plan)?;
+        self.decoder = Some(decoder);
+        // The donor's range no longer includes these bytes; the reader of
+        // the donated unit credits none (see `DonatedRowGroups`).
+        self.byte_progress.credit(donated_bytes);
+        Ok(())
     }
 
     /// Copies metrics from ArrowReaderMetrics (the metrics collected by the

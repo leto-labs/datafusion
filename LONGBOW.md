@@ -120,3 +120,62 @@ Compatibility: a stock upstream decoder ignores the unknown tag 902, so it
 would decode the virtual suffix as file columns. Plans that carry virtual
 columns must be decoded by this fork (Longbow's codec identity changes with
 the fork pins).
+
+## Families S and WS: row-group work sharing between sibling scan streams
+
+Purpose: keep every stream of a pruned or skewed Parquet scan busy by
+giving idle siblings unread whole row groups, instead of stealing whole files
+only (upstream 56 still emits one morsel per file). Dependent Longbow
+features: Q39-SPARSE-SCAN (S, KEEP) and PARTITIONED-SCAN-BALANCE (WS,
+UPSTREAMABLE).
+
+`SharedWorkSource` keeps each stream's planned files in its own queue. A
+stream drains its own files, then takes published units, then another
+owner's unopened file (the last file of the longest queue), so skewed file
+groups are shared as upstream's global queue would share them. When
+publishing is enabled (a `Morselizer` calls `attach_shared_work_source` and
+`enable_publishing`), every file a stream takes carries a `PublishLease`
+extension. The format releases it as soon as it cannot publish from that file
+any more (Parquet: the reader is not eligible, its unread tail is too short
+for a useful run, or its stream ended); the stream releases it at the latest
+when it takes its next file or is dropped. An idle stream waits only while a
+lease is held and no file or unit is left; otherwise it finishes. A stream that runs
+under `TaskContext::requires_independent_partitions` never waits, so its
+files hold no counted lease (nobody waits on a stream whose consumer may not
+poll it); a published unit it takes drops its donor's lease. Scans that
+do not publish keep upstream's single reordered queue of whole files.
+
+Liveness obligation for callers: a waiting stream makes progress only when a
+lease holder is polled. A consumer that polls one partition and then waits on
+another partition of the same scan (for example Longbow's pull-island bridge
+or compute-pool drivers that park a partition) must either keep polling every
+partition or execute the scan under
+`TaskContext::with_partition_independence(true)`, under which no stream
+waits.
+
+`ParquetMorselizer` publishes only for unordered, unlimited scans that are
+not reversed or reordered by statistics, and never for files with an
+external `ParquetRowSelection` or `ParquetRowPositions`. At each row-group
+boundary where a sibling is idle, the stream aligns its plan with the
+decoder's frontier (so a silently finished group is never donated), keeps
+`ceil(remaining / parts)` row groups and at least its read-ahead window
+(`ParquetFileReaderFactory::read_ahead_row_groups`), rebuilds its decoder
+with upstream's row-group-local selections
+(`ParquetPushDecoderBuilder::with_row_group_selections`, #25608) and only
+then publishes the rest as `ParquetAccessPlan` units that keep their
+selections and fully-matched flags (#23696). A stream whose dynamic filter
+can still change keeps its work until the filter completes. A donor credits
+the donated bytes to `bytes_processed`; the reader of a donated unit credits
+none, so the metric counts each byte of the scanned ranges once. A donated
+unit carries the donor's footer and its reader reuses it instead of reading
+the footer again, so both decode with one object generation. A failed decoder
+rebuild leaves the stream in a terminal error state. The metric
+`row_group_units_published` counts the published units.
+
+Publication waits respect the execution scope of family SO
+(`TaskContext::requires_independent_partitions`): below a streaming merge
+or an ordered repartition, a stream never waits for a sibling's future
+publication; it still takes work that is already queued
+(`file_stream_publication_waits_suppressed` counts these streams). Scans with
+a declared ordering read in file order and do not share work (upstream
+`FileScanConfig::preserves_file_order`, #26434).
