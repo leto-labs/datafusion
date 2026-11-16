@@ -259,3 +259,17 @@ order-sensitive consumers exact.)
 Statistics that reach a scan from outside (`PartitionedFile::statistics`, for
 example from a catalog or a consumer's statistics codec) do not pass through
 these rules; the supplier must apply them.
+
+## Family SO (scan part): publication waits below streaming merges
+
+Purpose: correct order and termination for scans below order-dependent
+operators. Dependent Longbow feature: CORE-ORDERING-CORRECTNESS. Audit
+classification: UPSTREAMABLE.
+
+Upstream 56 covers the scan ordering hunks (`preserves_file_order`, #26434).
+This fork keeps only the publication-wait scoping of families S and WS on
+DF5's `TaskContext::requires_independent_partitions`. The scan regressions in
+`core/tests/parquet/stock_ordering.rs` cover a merge over a filtered union, a
+declared order under a filtered limit, scan sharing kept below a blocking
+sort, mixed sharing settings across partitions of one scan, and grouping sets
+over constants. The join regressions of the same file belong to lane DF6.

@@ -2,8 +2,10 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-// Family SO join regressions: ORDER BY over joins must agree with a Rust
-// sort, including when no SortExec remains.
+// Family SO regressions. Joins: ORDER BY over joins must agree with a Rust
+// sort, including when no SortExec remains. Scans: a scan below a streaming
+// merge never waits for sibling publication, and declared orderings survive
+// scans and grouping sets.
 use std::{fs::File, sync::Arc, time::Duration};
 
 use datafusion::arrow::array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch};
@@ -306,4 +308,174 @@ async fn full_merge_join_filter_handles_null_padded_columns() {
     let mut actual = rows(&merge, inner).await;
     actual.sort();
     assert_eq!(actual, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_over_filtered_union_finishes() {
+    let fixture = Fixture::new();
+    let ctx = fixture.session(3, true, 7).await;
+    for inner in [
+        "SELECT 1 AS x, id, v AS w FROM raw WHERE id % 2 = 0 UNION ALL SELECT 2 AS x, id, v AS w FROM raw WHERE id % 2 = 1",
+        "SELECT 1 AS x, id, v AS w FROM raw WHERE id = -1 UNION ALL SELECT 2 AS x, id, v AS w FROM raw WHERE id % 2 = 1",
+    ] {
+        let mut want = rows(&ctx, inner).await;
+        want.sort_by(|a, b| b[0].cmp(&a[0]));
+        let got = rows(&ctx, &format!("SELECT * FROM ({inner}) u ORDER BY x DESC")).await;
+        assert_eq!(
+            got.iter().map(|r| r[0]).collect::<Vec<_>>(),
+            want.iter().map(|r| r[0]).collect::<Vec<_>>()
+        );
+        let mut bag = got;
+        bag.sort();
+        want.sort();
+        assert_eq!(bag, want);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declared_order_survives_filtered_limit() {
+    let fixture = Fixture::new();
+    for pushdown in [false, true] {
+        let ctx = fixture.session(4, pushdown, 8192).await;
+        let mut want = rows(&ctx, "SELECT id, v FROM st WHERE v = 4").await;
+        want.sort();
+        want.truncate(400);
+        let got = rows(
+            &ctx,
+            "SELECT id, v FROM st WHERE v = 4 ORDER BY id LIMIT 400",
+        )
+        .await;
+        assert_eq!(got, want, "pushdown={pushdown}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocking_sort_keeps_scan_work_sharing() {
+    let fixture = Fixture::new();
+    let ctx = fixture.session(3, true, 7).await;
+    let plan = ctx
+        .sql("SELECT id, v FROM raw ORDER BY id % 5, id DESC")
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let text = displayable(plan.as_ref()).indent(false).to_string();
+    assert!(text.contains("SortPreservingMergeExec"), "{text}");
+    assert!(text.contains("SortExec"), "{text}");
+    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .unwrap();
+    let ids: Vec<_> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    let mut expected: Vec<_> = (0..238).collect();
+    expected.sort_by(|a, b| (a % 5).cmp(&(b % 5)).then_with(|| b.cmp(a)));
+    assert_eq!(ids, expected);
+    fn counter(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        name: &str,
+    ) -> usize {
+        plan.metrics()
+            .and_then(|m| m.sum_by_name(name))
+            .map_or(0, |m| m.as_usize())
+            + plan
+                .children()
+                .iter()
+                .map(|p| counter(p, name))
+                .sum::<usize>()
+    }
+    assert_eq!(
+        counter(&plan, "file_stream_publication_waits_suppressed"),
+        0
+    );
+    assert!(
+        counter(&plan, "file_stream_work_sharing_enabled") > 0,
+        "blocking sort must retain scan sharing: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_scan_contexts_do_not_duplicate_files() {
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use futures::StreamExt;
+    let fixture = Fixture::new();
+    let ctx = fixture.session(2, true, 100).await;
+    for shared_first in [true, false] {
+        let scan = ctx
+            .sql("SELECT id FROM raw")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        assert_eq!(scan.output_partitioning().partition_count(), 2);
+        let shared = ctx.task_ctx();
+        let mut config = shared.session_config().clone();
+        config
+            .options_mut()
+            .execution
+            .enable_file_stream_work_stealing = false;
+        let local = Arc::new(shared.as_ref().clone().with_session_config(config));
+        let (a, b) = if shared_first {
+            (shared, local)
+        } else {
+            (local, shared)
+        };
+        let mut a = scan.execute(0, a).unwrap();
+        let mut b = scan.execute(1, b).unwrap();
+        let mut ids = vec![];
+        for stream in [&mut a, &mut b] {
+            while let Some(batch) = stream.next().await {
+                let batch = batch.unwrap();
+                ids.extend_from_slice(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values(),
+                );
+            }
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..238).collect::<Vec<_>>(),
+            "shared_first={shared_first}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grouping_sets_forget_null_filled_constants() {
+    let fixture = Fixture::new();
+    for partitions in [1, 3] {
+        let ctx = fixture.session(partitions, true, 7).await;
+        for groups in [
+            "ROLLUP(k, v % 5)",
+            "GROUPING SETS ((k, v % 5), (v % 5), ())",
+            "CUBE(k, v % 5)",
+        ] {
+            let inner = format!(
+                "SELECT k AS x, v % 5 AS w, count(*) AS id FROM raw WHERE k = 1 GROUP BY {groups}"
+            );
+            let mut expected = rows(&ctx, &inner).await;
+            expected.sort_by_key(|r| (r[0].is_none(), r[0], r[2], r[1].is_none(), r[1]));
+            let actual = rows(
+                &ctx,
+                &format!("{inner} ORDER BY x NULLS LAST, id, w NULLS LAST LIMIT 60"),
+            )
+            .await;
+            assert_eq!(actual, expected, "p={partitions}, groups={groups}");
+        }
+    }
 }
