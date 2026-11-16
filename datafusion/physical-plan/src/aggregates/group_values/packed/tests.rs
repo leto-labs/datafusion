@@ -829,6 +829,54 @@ fn short_strings_convert_to_a_dictionary() {
     }
 }
 
+/// TSBS host names (`host_0` to `host_45999`) are inline views with equal low
+/// halves. The inline table takes a bucket from the low bits of their hash,
+/// so those bits must spread: a uniform hash fills about 38,800 of 2^17
+/// buckets with 46,000 values and all 128 tags. The multiplicative view mix
+/// filled 9 buckets, and q9 to q11 ran 5 to 12 times slower (leto-rle.39).
+#[test]
+#[cfg(not(feature = "force_hash_collisions"))]
+fn inline_view_hashes_spread_over_low_bits_and_tags() {
+    let names =
+        StringViewArray::from_iter_values((0..46_000).map(|i| format!("host_{i}")));
+    let state = crate::aggregates::AGGREGATION_HASH_SEED;
+    let hashes: Vec<u64> = names
+        .views()
+        .iter()
+        .map(|&view| super::bytes::inline_hash(&state, view))
+        .collect();
+    let mask = (1 << 17) - 1;
+    let buckets: std::collections::HashSet<u64> =
+        hashes.iter().map(|h| h & mask).collect();
+    let tags: std::collections::HashSet<u64> = hashes.iter().map(|h| h >> 57).collect();
+    assert!(
+        buckets.len() > 36_000,
+        "{} home buckets of 2^17",
+        buckets.len()
+    );
+    assert_eq!(tags.len(), 128);
+}
+
+/// Many inline values with one prefix and length keep the general
+/// interner's group ids across batches and emissions.
+#[test]
+fn many_inline_values_with_one_prefix() {
+    let mut check = Differential::new(&[DataType::Utf8View, DataType::Int32]);
+    let hosts = |range: std::ops::Range<i32>| {
+        Arc::new(StringViewArray::from_iter_values(
+            range.map(|i| format!("host_{i}")),
+        )) as ArrayRef
+    };
+    let buckets = |n: i32| {
+        Arc::new(Int32Array::from_iter_values((0..n).map(|i| i % 3))) as ArrayRef
+    };
+    check.intern(&[hosts(0..20_000), buckets(20_000)]);
+    check.intern(&[hosts(10_000..30_000), buckets(20_000)]);
+    check.emit(EmitTo::First(5_000));
+    check.intern(&[hosts(0..30_000), buckets(30_000)]);
+    check.emit(EmitTo::All);
+}
+
 /// A conversion and an overflow in one batch: the general interner receives
 /// the groups decoded through the pending conversion.
 #[test]

@@ -224,16 +224,16 @@ impl<T: ByteViewType> BytesColumn<T> {
     }
 
     fn code_of_inline(&mut self, view: u128) -> u32 {
-        let hash = mix_view(view);
+        let hash = inline_hash(&self.state, view);
         let views = &self.views;
         if let Some(&index) = self.inline.find(hash, |&i| views[i as usize] == view) {
             return index + 1;
         }
         let index = self.views.len() as u32;
         self.views.push(view);
-        let views = &self.views;
+        let (views, state) = (&self.views, &self.state);
         self.inline
-            .insert_unique(hash, index, |&i| mix_view(views[i as usize]));
+            .insert_unique(hash, index, |&i| inline_hash(state, views[i as usize]));
         index + 1
     }
 
@@ -427,6 +427,10 @@ impl Emitted {
     }
 }
 
+/// The front cache's hash of a view. The multiply moves every bit of the
+/// view into the top bits, which select a front set (`>> shift`); its low
+/// bits depend only on the view's low bits. Hash tables that take a bucket
+/// from the low bits use [`inline_hash`].
 fn mix_view(view: u128) -> u64 {
     #[cfg(feature = "force_hash_collisions")]
     {
@@ -437,6 +441,26 @@ fn mix_view(view: u128) -> u64 {
     {
         let mixed = (view as u64) ^ ((view >> 64) as u64).rotate_left(23);
         mixed.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
+}
+
+/// The hash of an inline view in the `inline` table. hashbrown takes a
+/// bucket from the low bits of a hash and a tag from its top seven bits, so
+/// both ends must depend on the whole view. Short values that share their
+/// length and first four bytes (`host_0` to `host_45999`) differ only in the
+/// high half of their views; under [`mix_view`] they fell into nine home
+/// buckets, and every new value probed a chain of all earlier ones
+/// (leto-rle.39).
+#[inline]
+pub(super) fn inline_hash(state: &RandomState, view: u128) -> u64 {
+    #[cfg(feature = "force_hash_collisions")]
+    {
+        let _ = (state, view);
+        0
+    }
+    #[cfg(not(feature = "force_hash_collisions"))]
+    {
+        state.hash_one(view)
     }
 }
 
