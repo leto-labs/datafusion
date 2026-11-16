@@ -12,6 +12,7 @@ use datafusion_expr::{EmitTo, GroupSelection};
 
 pub mod multi_group_by;
 
+mod inline_cache;
 mod row;
 pub use row::GroupValuesRows;
 mod single_group_by;
@@ -178,7 +179,9 @@ pub fn new_group_values(
                 return Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Utf8)));
             }
             DataType::Utf8View => {
-                return Ok(Box::new(GroupValuesBytesView::new(OutputType::Utf8View)));
+                return Ok(Box::new(inline_cache::InlineCache::<1>::new(Box::new(
+                    GroupValuesBytesView::new(OutputType::Utf8View),
+                ))));
             }
             DataType::Binary => {
                 return Ok(Box::new(GroupValuesBytes::<i32>::new(OutputType::Binary)));
@@ -194,6 +197,18 @@ pub fn new_group_values(
             }
             _ => {}
         }
+    }
+
+    if matches!(group_clustering, GroupClustering::None)
+        && schema.fields().len() == 2
+        && schema
+            .fields()
+            .iter()
+            .all(|field| field.data_type() == &DataType::Utf8View)
+    {
+        return Ok(Box::new(inline_cache::InlineCache::<2>::new(Box::new(
+            GroupValuesColumn::<false>::try_new(schema)?,
+        ))));
     }
 
     if multi_group_by::supported_schema(schema.as_ref()) {
