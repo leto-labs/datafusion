@@ -234,6 +234,20 @@ impl PreparedParquetFile {
     /// pages are one buffer, so a full-column decoder request is also covered.
     /// Fetch once and share these immutable buffers between oversized RG slices.
     pub fn byte_ranges(&self, group: usize, batch_size: usize) -> Vec<Range<u64>> {
+        self.byte_ranges_with_cached_columns(group, batch_size, |_| false)
+    }
+
+    /// Like `byte_ranges`, omitting a compressed, unencrypted column only when
+    /// `cached` pins every page of all its required ranges. The pins must stay
+    /// visible through this file's page-cache handle until decode finishes.
+    /// Partial column hits cannot omit ranges: the push decoder fetches a
+    /// column unless all pages that its selection needs are resident.
+    pub fn byte_ranges_with_cached_columns(
+        &self,
+        group: usize,
+        batch_size: usize,
+        mut cached: impl FnMut(&[Range<u64>]) -> bool,
+    ) -> Vec<Range<u64>> {
         assert!(batch_size > 0, "prepared scan batch size must be positive");
         let meta = self.metadata.metadata();
         let rg = meta.row_group(group);
@@ -252,6 +266,7 @@ impl PreparedParquetFile {
                 continue;
             }
             let (start, len) = chunk.byte_range();
+            let mut column_ranges = Vec::new();
             if let Some(selection) = &selection
                 && let Some(index) = meta
                     .page_index()
@@ -261,12 +276,19 @@ impl PreparedParquetFile {
                 if let Some(first) = index.page_locations().first() {
                     let page = first.offset as u64;
                     if start < page {
-                        ranges.push(start..page);
+                        column_ranges.push(start..page);
                     }
                 }
-                ranges.extend(selection.scan_ranges(index.page_locations()));
+                column_ranges.extend(selection.scan_ranges(index.page_locations()));
             } else {
-                ranges.push(start..start + len);
+                column_ranges.push(start..start + len);
+            }
+            let cacheable =
+                chunk.compression() != parquet::basic::Compression::UNCOMPRESSED;
+            #[cfg(feature = "parquet_encryption")]
+            let cacheable = cacheable && chunk.crypto_metadata().is_none();
+            if !cacheable || !cached(&column_ranges) {
+                ranges.extend(column_ranges);
             }
         }
         merge_ranges(ranges)
@@ -665,6 +687,159 @@ mod tests {
         Ok(())
     }
 
+    /// Families PQ and NFC with a page-index `Selection` access (`key > 2`
+    /// prunes the first page of 3 rows): interval decoders intersect the
+    /// prepared selection, `byte_ranges` widens to predicate-cache batch
+    /// boundaries (`batch_selection`), a slice starting mid-batch decodes from
+    /// the planned ranges alone, and `cached` is asked exactly about each
+    /// column's dictionary prefix and selected pages.
+    #[tokio::test]
+    async fn pq_prepared_selection_intervals_batch_ranges_and_cache_queries() -> Result<()>
+    {
+        use parquet::basic::Compression;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..12)),
+                Arc::new(Int32Array::from_iter_values(100..112)),
+            ],
+        )?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_data_page_row_count_limit(3)
+            .set_write_batch_size(3)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(props))?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("selection.parquet");
+        store.put(&path, bytes.into()).await?;
+        let file = PartitionedFile::new_from_meta(store.head(&path).await?);
+        let predicate = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("key", 0)),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(2)))),
+        ));
+        let source = crate::source::ParquetSource::new(Arc::clone(&schema))
+            .with_predicate(predicate)
+            .with_enable_page_index(true);
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(source.clone()),
+        )
+        .with_file(file.clone())
+        .build();
+        let scan = source
+            .prepare_file(Arc::clone(&store), &config, file, 0)
+            .await?
+            .unwrap();
+        assert_eq!(
+            scan.file.access_plan().inner()[0],
+            RowGroupAccess::Selection(
+                vec![RowSelector::skip(3), RowSelector::select(9)].into()
+            )
+        );
+        let meta = scan.file.metadata().metadata();
+        let pages = |column: usize| {
+            meta.page_index()
+                .unwrap()
+                .offset_index(0, column)
+                .unwrap()
+                .page_locations()
+                .clone()
+        };
+        let page_range =
+            |location: &parquet::file::page_index::offset_index::PageLocation| {
+                location.offset as u64
+                    ..location.offset as u64 + location.compressed_page_size as u64
+            };
+        let covers = |ranges: &[Range<u64>], wanted: Range<u64>| {
+            ranges
+                .iter()
+                .any(|range| range.start <= wanted.start && wanted.end <= range.end)
+        };
+        // Batch size 2 quantizes the selected rows 3..12 to 2..12, which needs
+        // the first page (rows 0..3); batch size 3 does not.
+        let first_page = page_range(&pages(0)[0]);
+        assert!(covers(&scan.file.byte_ranges(0, 2), first_page.clone()));
+        assert!(!covers(&scan.file.byte_ranges(0, 3), first_page));
+
+        // A slice that starts mid-batch decodes from the planned ranges only.
+        let ranges = scan.file.byte_ranges(0, 3);
+        let mut reader = scan.file.reader()?;
+        let buffers = reader.get_byte_ranges(ranges.clone()).await?;
+        let mut decoder = scan.file.decoder_builder(0, 4..10, 3)?.build()?;
+        decoder.push_ranges(ranges.clone(), buffers)?;
+        let mut keys = vec![];
+        loop {
+            match decoder.try_decode()? {
+                DecodeResult::Data(batch) => {
+                    let batch = scan.file.project(&batch)?;
+                    keys.extend_from_slice(
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values(),
+                    );
+                }
+                DecodeResult::Finished => break,
+                DecodeResult::NeedsData(ranges) => {
+                    panic!("missing planned ranges {ranges:?}")
+                }
+            }
+        }
+        assert_eq!(keys, (4..10).collect::<Vec<_>>());
+        // A slice outside the prepared selection is empty.
+        let mut empty = scan.file.decoder_builder(0, 0..3, 3)?.build()?;
+        assert!(matches!(
+            empty.try_decode()?,
+            DecodeResult::Finished | DecodeResult::NeedsData(_)
+        ));
+
+        // NFC: `cached` is asked about each compressed column's dictionary
+        // prefix and selected pages (rows 3..12: pages 1..4), nothing else.
+        let mut asked = vec![];
+        let fetched = scan.file.byte_ranges_with_cached_columns(0, 3, |ranges| {
+            asked.push(ranges.to_vec());
+            true
+        });
+        assert!(fetched.is_empty(), "every column was pinned: {fetched:?}");
+        let expected: Vec<Vec<Range<u64>>> = (0..2)
+            .map(|column| {
+                let chunk = meta.row_group(0).column(column);
+                let (start, _) = chunk.byte_range();
+                let locations = pages(column);
+                let mut ranges = vec![];
+                if start < locations[0].offset as u64 {
+                    ranges.push(start..locations[0].offset as u64);
+                }
+                ranges.extend(locations[1..].iter().map(page_range));
+                ranges
+            })
+            .collect();
+        let merged = |ranges: &[Range<u64>]| merge_ranges(ranges.to_vec());
+        assert_eq!(
+            asked
+                .iter()
+                .map(|ranges| merged(ranges))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|ranges| merged(ranges))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
     /// Family D: a prepared footer and its later data reads belong to one
     /// object generation. After a same-size overwrite, a reader of the planned
     /// ETag fails instead of decoding new bytes with old offsets.
@@ -711,6 +886,67 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("precondition"), "{error}");
+        Ok(())
+    }
+
+    /// Family NFC: a compressed, unencrypted column is omitted only when the
+    /// caller pins all of its required ranges; an uncompressed column is
+    /// always fetched, and nothing is omitted without pins.
+    #[tokio::test]
+    async fn byte_ranges_with_cached_columns_omits_only_pinned_compressed_columns()
+    -> Result<()> {
+        use parquet::basic::Compression;
+        use parquet::schema::types::ColumnPath;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(Int32Array::from_iter_values(100..200)),
+            ],
+        )?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_column_compression(ColumnPath::from("key"), Compression::UNCOMPRESSED)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(props))?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("nfc.parquet");
+        store.put(&path, bytes.into()).await?;
+        let file = PartitionedFile::new_from_meta(store.head(&path).await?);
+        let source = crate::source::ParquetSource::new(Arc::clone(&schema));
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(source.clone()),
+        )
+        .with_file(file.clone())
+        .build();
+        let scan = source.prepare_file(store, &config, file, 0).await?.unwrap();
+        let rg = scan.file.metadata().metadata().row_group(0);
+        let column = |index: usize| {
+            let (start, len) = rg.column(index).byte_range();
+            start..start + len
+        };
+        let all = scan.file.byte_ranges(0, 8);
+        assert_eq!(
+            scan.file.byte_ranges_with_cached_columns(0, 8, |_| false),
+            all
+        );
+        let mut asked = Vec::new();
+        let pinned = scan.file.byte_ranges_with_cached_columns(0, 8, |ranges| {
+            asked.extend(ranges.iter().cloned());
+            true
+        });
+        // Only the compressed column is offered to the cache, and it is omitted.
+        assert_eq!(asked, vec![column(1)]);
+        assert_eq!(pinned, vec![column(0)]);
         Ok(())
     }
 }

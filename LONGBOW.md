@@ -208,3 +208,16 @@ only while its predicate has a dynamic filter that can still change. A
 prepared scan without a batch size uses the scan config's, else 8192. The
 default reader ties the prepared footer and every later data read to the
 file's ETag/version (family D).
+
+## Family NFC: plan native fetches through charged page leases
+
+Purpose: let a prepared scan skip fetching a column whose pages the caller
+already holds in its page cache. Dependent Longbow feature:
+NATIVE-SCAN-PAGE-CACHE. Audit classification: UPSTREAMABLE.
+
+`PreparedParquetFile::byte_ranges_with_cached_columns` omits a compressed,
+unencrypted column only when the caller's callback leases every page of all
+of the column's required ranges through the file's page-cache generation
+handle (Arrow family DPC); the leases and their memory charge stay with the
+caller until decode ends. Partial hits fetch the whole column, including
+predicate-cache batch boundaries. `byte_ranges` keeps its fetch-all behaviour.
