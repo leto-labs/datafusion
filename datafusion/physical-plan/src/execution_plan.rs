@@ -982,6 +982,13 @@ pub trait ExecutionPlan: Any + Debug + DisplayAs + Send + Sync {
         None
     }
 
+    /// Whether this consumer performs the global merge of its first input's
+    /// locally sorted candidates. Sort pushdown must preserve that local scope.
+    /// Extension operators such as positional payload retrieval opt in here.
+    fn owns_input_sort_merge(&self) -> bool {
+        false
+    }
+
     /// Try to push down sort ordering requirements to this node.
     ///
     /// This method is called during sort pushdown optimization to determine if this
