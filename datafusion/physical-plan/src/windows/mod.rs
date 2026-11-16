@@ -43,7 +43,7 @@ use itertools::Itertools;
 // Public interface:
 pub use bounded_window_agg_exec::{BoundedWindowAggExec, WindowStateObserver};
 pub use datafusion_physical_expr::window::{
-    PlainAggregateWindowExpr, StandardWindowExpr, WindowExpr,
+    AggregateWindowExpr, PlainAggregateWindowExpr, StandardWindowExpr, WindowExpr,
 };
 pub use window_agg_exec::WindowAggExec;
 

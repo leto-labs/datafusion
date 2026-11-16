@@ -784,6 +784,12 @@ impl AggregateFunctionExpr {
         &self.order_bys
     }
 
+    /// Returns the complete stored ordering for plan serialization and fidelity checks.
+    /// The builder normalizes ignored and duplicate sort keys before storing them.
+    pub fn stored_order_bys(&self) -> &[PhysicalSortExpr] {
+        &self.order_bys
+    }
+
     /// Indicates whether aggregator can produce the correct result with any
     /// arbitrary input ordering. By default, we assume that aggregate expressions
     /// are order insensitive.
@@ -1332,6 +1338,7 @@ mod tests {
     fn order_insensitive_aggregate_discards_order_by() -> Result<()> {
         let expr = build_with_order_by(true)?;
         assert!(expr.order_bys().is_empty());
+        assert!(expr.stored_order_bys().is_empty());
         assert!(expr.all_expressions().order_by_exprs.is_empty());
         // Only the value: the default `state_fields` has no ordering fields to append
         assert_eq!(expr.state_fields()?.len(), 1);
@@ -1352,6 +1359,11 @@ mod tests {
     fn order_sensitive_aggregate_keeps_order_by() -> Result<()> {
         let expr = build_with_order_by(false)?;
         assert_eq!(expr.order_bys().len(), 1);
+        assert_eq!(expr.stored_order_bys(), expr.order_bys());
+        assert!(Arc::ptr_eq(
+            &expr.stored_order_bys()[0].expr,
+            &expr.order_bys()[0].expr
+        ));
         assert_eq!(expr.all_expressions().order_by_exprs.len(), 1);
         // The value, followed by the ordering field
         assert_eq!(expr.state_fields()?.len(), 2);
