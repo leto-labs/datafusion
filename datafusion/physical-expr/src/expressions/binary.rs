@@ -1348,6 +1348,13 @@ fn pre_selection_scatter(
     let mut last_end = 0;
     match right_result {
         Some(right_result) => {
+            let expected = mask.true_count();
+            if right_result.len() != expected {
+                return internal_err!(
+                    "pre_selection_scatter expected {expected} RHS rows, got {}",
+                    right_result.len()
+                );
+            }
             // Borrow the RHS buffers once. `BooleanArray::slice` clones and
             // drops an `Arc` for every run, which dominates this loop when the
             // mask selects many short runs.
@@ -7352,3 +7359,6 @@ mod tests {
         assert_eq!(eq_result.into_array(4).unwrap().as_boolean(), &expected);
     }
 }
+
+#[cfg(test)]
+mod filter_tests;
