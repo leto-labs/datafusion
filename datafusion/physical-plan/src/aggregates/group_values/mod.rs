@@ -38,6 +38,7 @@ mod batch_codes_spill;
 #[cfg(test)]
 mod compact_mixed_tests;
 mod inline_cache;
+pub mod packed;
 mod row;
 pub use row::GroupValuesRows;
 mod single_group_by;
@@ -214,23 +215,38 @@ pub fn new_group_values(
         }
     }
 
+    if !matches!(group_ordering, GroupOrdering::None) {
+        return if multi_group_by::supported_schema(schema.as_ref()) {
+            Ok(Box::new(GroupValuesColumn::<true>::try_new(schema)?))
+        } else {
+            Ok(Box::new(GroupValuesRows::try_new(schema)?))
+        };
+    }
+    // Several columns whose codes can pack into one integer key. Wider keys
+    // move, with their group ids, into the general interner below.
+    if schema.fields().len() >= 2 && packed::supported(&schema) {
+        return Ok(Box::new(packed::GroupValuesPacked::try_new(
+            schema,
+            unordered_multi_column,
+        )?));
+    }
+    unordered_multi_column(schema)
+}
+
+/// The general interner of unordered keys with several columns.
+fn unordered_multi_column(schema: SchemaRef) -> Result<Box<dyn GroupValues>> {
     if schema.fields().len() == 2
         && schema
             .fields()
             .iter()
             .all(|field| field.data_type() == &DataType::Utf8View)
-        && matches!(group_ordering, GroupOrdering::None)
     {
         return Ok(Box::new(inline_cache::InlineCache::<2>::new(Box::new(
             GroupValuesColumn::<false>::try_new(schema)?,
         ))));
     }
     if multi_group_by::supported_schema(schema.as_ref()) {
-        if matches!(group_ordering, GroupOrdering::None) {
-            Ok(Box::new(GroupValuesColumn::<false>::try_new(schema)?))
-        } else {
-            Ok(Box::new(GroupValuesColumn::<true>::try_new(schema)?))
-        }
+        Ok(Box::new(GroupValuesColumn::<false>::try_new(schema)?))
     } else {
         Ok(Box::new(GroupValuesRows::try_new(schema)?))
     }

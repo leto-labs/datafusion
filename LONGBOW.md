@@ -660,3 +660,71 @@ keys are unchanged.
 Native regression: `joins::hash_join::exec::tests::float_keys_produce_no_dynamic_filter`.
 Consumer reproducer: `longbow-testkit` integration test
 `rle13_float_keys::rle13_float_key_filters_keep_every_matching_probe_row`.
+
+
+## Family PK: packed multi-column group keys
+
+PK / CORE-AGGREGATION / UPSTREAMABLE. Unordered keys of two or more
+columns whose types have dense codes intern through one packed `u64`.
+Code 0 is NULL in every column. Integers, dates, times, timestamps,
+durations and Decimal128 use the offset from an observed minimum, with the
+observed span again as spare on each side, so a growing domain relayouts
+(and rehashes) a logarithmic number of times; booleans
+use three codes. Utf8View and BinaryView start with short codes: while every
+value has at most four bytes and their range needs at most 16 bits, the view
+itself is the integer (bytes, then length), coded without lookups. A longer
+value converts the column to a per-column dictionary and remaps the existing
+groups. The concatenated codes are the complete group identity:
+`PackedKeyTable` interns them with one hash (one xor-shift-multiply; the
+two-round splitmix64 finalizer measured 1 to 2 ns per row slower on
+cache-resident tables and no better on near-unique pairs) and one integer
+compare in an open-addressing table (load at most 3/4) that stores the key
+next to the group id (8-byte slots for keys of at most 32 bits, where a
+layout with exact widths is preferred when spare room would pass 32 bits;
+16-byte slots above) and prefetches above 1 MiB. Slots are indexed by the
+hash's top bits, so growth reads the old slots in order and writes the new
+table nearly sequentially. Domains of at most 16 bits
+index a flat table instead, when it has at most eight entries per expected
+group.
+
+Dictionary front caches compare complete keys in a two-way set: an inline
+view, or an external view whose buffer index is replaced by the id of a
+pinned input buffer. Up to eight buffers per column are held until the next
+emission, so their addresses cannot be reused while their ids are live; ids
+are never reissued. Pinned buffers of at most 4 MiB count in `size()`; a
+larger one is a join's build side, which its join reserves while the
+aggregate consumes its output. A dictionary column is
+costly when over a quarter of its external rows miss the front and either,
+after 4 Ki rows, it holds over 1,024 values, or, checked every 1 Ki rows of
+a batch, over three quarters of its rows were new values: each such row
+hashes and compares its bytes as the general interner does, before the
+packed probe. A costly column, over 2^16 values, or a layout above 64 bits
+moves every group in order into the general interner (`GroupValuesColumn`,
+`InlineCache<2>` or `GroupValuesRows`), which keeps the ids and takes every
+later batch. The general interner can number a batch's new groups out of row
+order when hashes collide, so a mismatch re-interns the keys one row at a
+time; a further mismatch is an internal error.
+
+Tables are allocated and filled with a nonzero vacant marker: zeroed
+allocations of large tables took fresh pages and unmapped them on growth,
+and the TLB shootdowns cost TPC-DS q23 a third of its CPU. `clear_shrink`
+keeps hash slots for the retained groups across relayouts, so bounded
+partial aggregation flushes without regrowing them. The keys vector is reserved
+exactly to the table's load limit at each growth: an independently doubling
+vector added 4 GiB of retained address space over the TPC-DS SF100 suite
+and exceeded the screen's 96 GiB limit once the page cache filled the pool. Emission builds columns
+from the keys; an emitted byte-view column holds a copy of only the external
+values its groups reference. A full emission resets every column, so
+dictionaries and their counters describe only the groups that follow. Ordered
+aggregation keeps `GroupValuesColumn<true>`.
+
+The kernel is engine-neutral: any operator that encodes its keys as `u64`
+can share `PackedKeyTable`; the native aggregate already obtains PK through
+`new_group_values`. Native differential tests compare ids and emitted values
+with `GroupValuesRows` over NULLs, mixed widths, booleans alone, falling
+minima, inline/external/empty strings, short-to-dictionary conversion (also
+during an overflow), the 16-bit direct boundary, prefix and full emission,
+`clear_shrink`, costly dictionaries and overflow to the general path.
+Removing the rebase delta, the conversion map or the vacant-entry guard fails
+them. Regression command in the Longbow consumer:
+`scripts/vendored-tests.py datafusion-physical-plan -E 'test(group_values::packed)'`.
