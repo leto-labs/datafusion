@@ -8,7 +8,10 @@ use crate::arrow::util::pretty::pretty_format_batches_with_options;
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::error::ArrowError;
 use std::fmt::Display;
-use std::{error::Error, path::PathBuf};
+use std::{
+    error::Error,
+    path::{Component, Path, PathBuf},
+};
 
 /// Converts a vector or array into an ArrayRef.
 pub trait IntoArrayRef {
@@ -287,22 +290,37 @@ pub fn get_data_dir(
 
     // The env is undefined or its value is trimmed to empty, let's try default dir.
 
-    // env "CARGO_MANIFEST_DIR" is "the directory containing the manifest of your package",
-    // set by `cargo run` or `cargo test`, see:
-    // https://doc.rust-lang.org/cargo/reference/environment-variables.html
-    let dir = env!("CARGO_MANIFEST_DIR");
-
-    let pb = PathBuf::from(dir).join(submodule_data);
-    if pb.is_dir() {
-        Ok(pb)
-    } else {
-        Err(format!(
-            "env `{}` is undefined or has empty value, and the pre-defined data dir `{}` not found\n\
-             HINT: try running `git submodule update --init`",
-            udf_env,
-            pb.display(),
-        ).into())
+    // Resolve the default directory at run time instead of embedding this
+    // crate's build-time `CARGO_MANIFEST_DIR`.
+    // The embedded absolute path made every checkout's build of this library,
+    // and of every crate that depends on it, a distinct compiler cache entry.
+    // `submodule_data` is relative to this crate (for example
+    // `../../testing/data`): strip its leading `..` components and search the
+    // ancestors of the running package (`CARGO_MANIFEST_DIR`, which `cargo test`
+    // and `cargo run` set at run time) or of the current directory for the rest.
+    let relative: PathBuf = Path::new(submodule_data)
+        .components()
+        .skip_while(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        .collect();
+    let start = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    if let Some(start) = start
+        && let Some(found) = start
+            .ancestors()
+            .map(|dir| dir.join(&relative))
+            .find(|candidate| candidate.is_dir())
+    {
+        return Ok(found);
     }
+    Err(format!(
+        "env `{}` is undefined or has empty value, and no ancestor of the running \
+         package contains the data dir `{}`\n\
+         HINT: try running `git submodule update --init`",
+        udf_env,
+        relative.display(),
+    )
+    .into())
 }
 
 #[macro_export]
