@@ -366,6 +366,72 @@ mod file_scan_config_serde {
         Ok(())
     }
 
+    /// Family FC (dropped, upstream fields #24930, #25057, #24483): order
+    /// intent and scan limits round-trip on upstream's fields. A limit above
+    /// `u32::MAX` does not fit `ScanLimit.limit` (uint32) and is a typed
+    /// encode error; the 55.2 fork widened the field to uint64 instead.
+    #[test]
+    fn file_scan_serde_retains_order_intent_and_limit_boundaries() -> Result<()> {
+        let serde = FileScanSerdeHarness::new();
+        for ordered in [false, true] {
+            for preserve in [false, true] {
+                for limit in [None, Some(0), Some(17), Some(u32::MAX as usize)] {
+                    let mut config = test_config(None);
+                    if !ordered {
+                        config.output_ordering.clear();
+                    }
+                    config.preserve_order = preserve;
+                    config.limit = limit;
+                    let decoded = serde.decode(&serde.encode(&config)?)?;
+                    assert_eq!(
+                        decoded.preserve_order, preserve,
+                        "ordered={ordered}, limit={limit:?}"
+                    );
+                    assert_eq!(decoded.output_ordering, config.output_ordering);
+                    assert_eq!(decoded.limit, limit);
+                }
+                let mut config = test_config(None);
+                config.limit = Some(u32::MAX as usize + 1);
+                let error = serde.encode(&config).unwrap_err().to_string();
+                assert!(error.contains("out of range"), "{error}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Family FC (dropped): computed, renamed and duplicated projections and
+    /// the output partitioning round-trip unchanged.
+    #[test]
+    fn file_scan_serde_preserves_computed_and_reordered_projection() -> Result<()> {
+        use datafusion_physical_expr::expressions::{BinaryExpr, lit};
+        let serde = FileScanSerdeHarness::new();
+        let projection = FileProjectionExprs::new(vec![
+            FileProjectionExpr::new(Arc::new(Column::new("label", 1)), "renamed"),
+            FileProjectionExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("value", 0)),
+                    datafusion_expr::Operator::Plus,
+                    lit(1_i32),
+                )),
+                "computed",
+            ),
+            FileProjectionExpr::new(Arc::new(Column::new("value", 0)), "duplicate"),
+        ]);
+        let config =
+            test_config_with_projection(Some(hash_partitioning()), Some(projection));
+        let encoded = serde.encode(&config)?;
+        let decoded = serde.decode(&encoded)?;
+        assert_eq!(
+            serde.encode(&decoded)?.projection_exprs,
+            encoded.projection_exprs
+        );
+        assert_eq!(
+            serde.encode(&decoded)?.output_partitioning,
+            encoded.output_partitioning
+        );
+        Ok(())
+    }
+
     #[test]
     fn new_file_scan_config_serde_preserves_complete_fixture() -> Result<()> {
         let serde = FileScanSerdeHarness::new();

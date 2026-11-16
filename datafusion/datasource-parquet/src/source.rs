@@ -544,9 +544,15 @@ impl ParquetSource {
         self.reverse_row_groups = reverse_row_groups;
         self
     }
-    #[cfg(test)]
-    pub(crate) fn reverse_row_groups(&self) -> bool {
+    /// Whether row groups are read in reverse order.
+    pub fn reverse_row_groups(&self) -> bool {
         self.reverse_row_groups
+    }
+
+    /// Advisory sort expressions, in table coordinates before projection,
+    /// used to reorder row groups by their statistics.
+    pub fn sort_order_for_reorder(&self) -> Option<&LexOrdering> {
+        self.sort_order_for_reorder.as_ref()
     }
 }
 

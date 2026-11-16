@@ -290,3 +290,20 @@ decoder and after every rebuild (filter toggle, donation). It gives no advice
 while the predicate has a dynamic filter that can still change. The fork
 contains no read-ahead logic. Prepared scans (family PQ) own their decoders
 and call `scan_plan` themselves.
+
+## Family FC (dropped): native scan fields are upstream's
+
+Family FC of the 55.2 fork is dropped: upstream 56 serializes
+`FileScanExecConf.preserve_order` (17), `ParquetScanExecNode.sort_order_for_reorder`
+(5), `reverse_row_groups` (6) and `metadata_size_hint` (7). Its regressions run
+on the upstream codec in `datafusion/proto` (`file_scan_serde_*`,
+`roundtrip_parquet_inexact_sort_settings_and_order_intent`,
+`parquet_reverse_without_reorder_and_malformed_reorder`).
+
+Regression from 55.2: the fork widened `ScanLimit` to uint64, upstream keeps
+uint32. A scan limit above `u32::MAX` is now a typed encode error
+(`FileScanConfig: limit value ... is out of range for the plan wire format`)
+instead of a round trip. Longbow keeps the typed error (owner decision). An
+empty reorder ordering now decodes as "no hint" instead of an error.
+`ParquetSource::reverse_row_groups` and `sort_order_for_reorder` are public
+read-only accessors for the consumer's scan statistics.
