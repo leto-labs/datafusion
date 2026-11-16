@@ -259,7 +259,6 @@ enum BuildReportState {
 /// Owns the stream-side lifecycle for one partition's build-data report.
 struct BuildReportHandle {
     partition: usize,
-    mode: PartitionMode,
     build_accumulator: Option<Arc<SharedBuildAccumulator>>,
     waiter: Option<OnceFut<()>>,
     state: BuildReportState,
@@ -268,12 +267,10 @@ struct BuildReportHandle {
 impl BuildReportHandle {
     fn new(
         partition: usize,
-        mode: PartitionMode,
         build_accumulator: Option<Arc<SharedBuildAccumulator>>,
     ) -> Self {
         Self {
             partition,
-            mode,
             build_accumulator,
             waiter: None,
             state: BuildReportState::NotReported,
@@ -321,9 +318,10 @@ impl BuildReportHandle {
             return;
         }
 
-        if self.mode == PartitionMode::Partitioned
-            && let Some(build_accumulator) = &self.build_accumulator
-        {
+        // Family SF: CollectLeft streams cancel too. A task-scoped
+        // accumulator counts the cancellation toward completion; the
+        // whole-plan CollectLeft barrier ignores it, as before.
+        if let Some(build_accumulator) = &self.build_accumulator {
             build_accumulator.report_canceled_partition(self.partition);
             self.state = BuildReportState::Canceled;
         } else {
@@ -582,7 +580,7 @@ impl HashJoinStream {
             build_indices_buffer: Vec::with_capacity(batch_size),
             not_in: NotInProbe::default(),
             right_side_ordered,
-            build_report: BuildReportHandle::new(partition, mode, build_accumulator),
+            build_report: BuildReportHandle::new(partition, build_accumulator),
             mode,
             output_buffer,
         }
@@ -646,6 +644,7 @@ impl HashJoinStream {
                 keys_have_null,
             },
             PartitionMode::CollectLeft => PartitionBuildData::CollectLeft {
+                partition_id: self.partition,
                 pushdown,
                 bounds,
                 keys_have_null,
@@ -1242,7 +1241,7 @@ mod tests {
     }
 
     fn partitioned_handle(acc: &Arc<SharedBuildAccumulator>) -> BuildReportHandle {
-        BuildReportHandle::new(0, PartitionMode::Partitioned, Some(Arc::clone(acc)))
+        BuildReportHandle::new(0, Some(Arc::clone(acc)))
     }
 
     #[test]
@@ -1288,7 +1287,7 @@ mod tests {
 
     #[test]
     fn build_report_handle_no_accumulator_finalizes() {
-        let mut handle = BuildReportHandle::new(0, PartitionMode::Partitioned, None);
+        let mut handle = BuildReportHandle::new(0, None);
 
         handle.schedule(empty_build_data(0));
         handle.cancel_pending();

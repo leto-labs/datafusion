@@ -122,6 +122,7 @@ fn with_probe_filter(join: HashJoinExec) -> Result<HashJoinExec> {
         .with_dynamic_filter(Some(HashJoinExecDynamicFilter {
             filter,
             build_accumulator: OnceLock::new(),
+            execution_partitions: OnceLock::new(),
         }))
         .build()
 }

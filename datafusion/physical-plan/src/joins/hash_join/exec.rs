@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::mem::size_of;
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use std::vec;
 
@@ -889,6 +890,10 @@ struct HashJoinExecDynamicFilter {
     /// Build accumulator to collect build-side information (hash maps and/or bounds) from each partition.
     /// It is lazily initialized during execution to make sure we use the actual execution time partition counts.
     build_accumulator: OnceLock<Arc<SharedBuildAccumulator>>,
+    /// Family SF: the output partitions that this fresh plan instance
+    /// executes, bound before any of them runs. It outlives `reset_state`,
+    /// which re-executes the same partitions.
+    execution_partitions: OnceLock<Range<usize>>,
 }
 
 impl fmt::Debug for HashJoinExec {
@@ -1088,9 +1093,26 @@ impl HashJoinExec {
             self.right.output_partitioning(),
         ) {
             (
-                Partitioning::Hash(_, left_partition_count),
-                Partitioning::Hash(_, right_partition_count),
-            ) => left_partition_count == right_partition_count,
+                Partitioning::Hash(left_exprs, left_partition_count),
+                Partitioning::Hash(right_exprs, right_partition_count),
+            ) => {
+                // Family SF: the filter routes probe rows with
+                // `hash(on_right) % N` and trusts build partition `p` to hold
+                // every build row with `hash(on_left) % N == p`. Equal counts
+                // alone do not prove that: both inputs must be hashed by the
+                // join keys, in order (up to each input's equivalences).
+                left_partition_count == right_partition_count
+                    && hash_routes_by_keys(
+                        &self.left,
+                        left_exprs,
+                        self.on.iter().map(|(left, _)| left),
+                    )
+                    && hash_routes_by_keys(
+                        &self.right,
+                        right_exprs,
+                        self.on.iter().map(|(_, right)| right),
+                    )
+            }
             (Partitioning::Range(_), Partitioning::Range(_)) => {
                 let children = [self.left.as_ref(), self.right.as_ref()];
                 matches!(
@@ -1156,6 +1178,38 @@ impl HashJoinExec {
         self.dynamic_filter.as_ref().map(|df| &df.filter)
     }
 
+    /// Family SF: scopes dynamic-filter reports to the output partitions that
+    /// this fresh plan instance executes. Call before any partition runs.
+    /// Scoped reports never wait for sibling streams: unassigned and
+    /// unfinished buckets keep every probe row until their complete build is
+    /// known, and a CollectLeft filter is published once per complete build.
+    /// Without a dynamic filter this is a no-op.
+    pub fn set_dynamic_filter_partitions(&self, partitions: Range<usize>) -> Result<()> {
+        assert_or_internal_err!(
+            !partitions.is_empty()
+                && partitions.end <= self.right.output_partitioning().partition_count(),
+            "invalid dynamic-filter execution partitions {partitions:?}"
+        );
+        if let Some(df) = &self.dynamic_filter {
+            assert_or_internal_err!(
+                df.build_accumulator.get().is_none(),
+                "cannot scope an executing join dynamic filter"
+            );
+            match df.execution_partitions.get() {
+                Some(existing) => assert_or_internal_err!(
+                    existing == &partitions,
+                    "conflicting dynamic-filter execution partitions {existing:?} and {partitions:?}"
+                ),
+                None => df.execution_partitions.set(partitions).map_err(|_| {
+                    datafusion_common::internal_datafusion_err!(
+                        "concurrent dynamic-filter partition binding"
+                    )
+                })?,
+            }
+        }
+        Ok(())
+    }
+
     /// Set the dynamic filter on this hash join.
     ///
     /// Setting a dynamic filter is what makes the join compute and publish
@@ -1198,6 +1252,7 @@ impl HashJoinExec {
             // Initialize with an empty accumulator which will be lazily populated
             // during execution.
             build_accumulator: OnceLock::new(),
+            execution_partitions: OnceLock::new(),
         });
         Ok(self)
     }
@@ -1392,6 +1447,26 @@ impl HashJoinExec {
             reorder_output_after_swap(Arc::new(new_join), &left.schema(), &right.schema())
         }
     }
+}
+
+/// Family SF: whether `exprs`, the hash partitioning of `input`, are `keys`
+/// in order, up to `input`'s equivalence classes. Partitioned dynamic
+/// filters route by the join keys and require exactly this layout.
+fn hash_routes_by_keys<'a>(
+    input: &Arc<dyn ExecutionPlan>,
+    exprs: &[PhysicalExprRef],
+    keys: impl ExactSizeIterator<Item = &'a PhysicalExprRef>,
+) -> bool {
+    if exprs.len() != keys.len() {
+        return false;
+    }
+    let equivalences = input.equivalence_properties();
+    let group = equivalences.eq_group();
+    exprs.iter().zip(keys).all(|(expr, key)| {
+        expr.eq(key)
+            || group.normalize_expr(Arc::clone(expr))
+                == group.normalize_expr(Arc::clone(key))
+    })
 }
 
 impl DisplayAs for HashJoinExec {
@@ -1689,17 +1764,22 @@ impl ExecutionPlan for HashJoinExec {
                         .map(|(_, right_expr)| Arc::clone(right_expr))
                         .collect::<Vec<_>>();
                     Some(Arc::clone(df.build_accumulator.get_or_init(|| {
-                        Arc::new(SharedBuildAccumulator::new_from_partition_mode(
-                            self.mode,
-                            self.left.as_ref(),
-                            self.right.as_ref(),
-                            filter,
-                            on_right,
-                            repartition_random_state,
-                            self.null_equality,
-                            not_in,
-                            &context.session_config().options().optimizer,
-                        ))
+                        Arc::new(
+                            SharedBuildAccumulator::new_from_partition_mode(
+                                self.mode,
+                                self.left.as_ref(),
+                                self.right.as_ref(),
+                                filter,
+                                on_right,
+                                repartition_random_state,
+                                self.null_equality,
+                                not_in,
+                                &context.session_config().options().optimizer,
+                            )
+                            .with_execution_partitions(
+                                df.execution_partitions.get().cloned(),
+                            ),
+                        )
                     })))
                 })
             })
@@ -2056,6 +2136,7 @@ impl ExecutionPlan for HashJoinExec {
                         .with_dynamic_filter(Some(HashJoinExecDynamicFilter {
                             filter: dynamic_filter,
                             build_accumulator: OnceLock::new(),
+                            execution_partitions: OnceLock::new(),
                         }))
                         .build_exec()?;
                     result = result.with_updated_node(new_node);
@@ -3998,6 +4079,7 @@ mod tests {
         join.dynamic_filter = Some(HashJoinExecDynamicFilter {
             filter: Arc::clone(&dynamic_filter),
             build_accumulator: OnceLock::new(),
+            execution_partitions: OnceLock::new(),
         });
 
         Ok((join, dynamic_filter))
@@ -9851,6 +9933,7 @@ mod tests {
         join.dynamic_filter = Some(HashJoinExecDynamicFilter {
             filter: Arc::clone(&dynamic_filter),
             build_accumulator: OnceLock::new(),
+            execution_partitions: OnceLock::new(),
         });
 
         // (1) Building the hash table must not fail on the dictionary key.
@@ -9961,6 +10044,7 @@ mod tests {
         join.dynamic_filter = Some(HashJoinExecDynamicFilter {
             filter: Arc::clone(&dynamic_filter),
             build_accumulator: OnceLock::new(),
+            execution_partitions: OnceLock::new(),
         });
 
         let batches = crate::execution_plan::collect(Arc::new(join), task_ctx).await?;
@@ -11683,6 +11767,155 @@ mod tests {
             .await
             .unwrap_err();
         assert_contains!(error.to_string(), "Resources exhausted");
+        Ok(())
+    }
+
+    // Family SF: equal Hash counts are not enough. The filter routes with the
+    // join keys, so an input hashed by another column must be refused.
+    #[test]
+    fn test_partitioned_dynamic_filter_pushdown_rejects_hash_by_non_key() -> Result<()> {
+        let (range_join, on) = range_partitioned_dynamic_filter_test_join(10, 10)?;
+        let mut session_config = SessionConfig::default();
+        session_config
+            .options_mut()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown = true;
+        let hashed = |left: &str, right: &str| -> Result<HashJoinExec> {
+            let column = |schema: &SchemaRef, name: &str| -> Result<PhysicalExprRef> {
+                Ok(Arc::new(Column::new_with_schema(name, schema)?) as _)
+            };
+            range_join
+                .builder()
+                .with_new_children(vec![
+                    Arc::new(PartitionedTestExec::try_new(
+                        range_join.left().schema(),
+                        Partitioning::Hash(
+                            vec![column(&range_join.left().schema(), left)?],
+                            2,
+                        ),
+                    )?),
+                    Arc::new(PartitionedTestExec::try_new(
+                        range_join.right().schema(),
+                        Partitioning::Hash(
+                            vec![column(&range_join.right().schema(), right)?],
+                            2,
+                        ),
+                    )?),
+                ])?
+                .build()
+        };
+        assert_eq!(on.len(), 1);
+        assert!(
+            hashed("b1", "b1")?
+                .allow_join_dynamic_filter_pushdown(session_config.options())
+        );
+        assert!(
+            !hashed("b1", "a2")?
+                .allow_join_dynamic_filter_pushdown(session_config.options())
+        );
+        assert!(
+            !hashed("a1", "b1")?
+                .allow_join_dynamic_filter_pushdown(session_config.options())
+        );
+        Ok(())
+    }
+
+    /// Family SF: a task that runs output partitions 1..3 of a four-partition
+    /// CollectLeft join one after another finishes (the whole-plan barrier
+    /// would wait for partitions 0 and 3), returns the rows the unfiltered
+    /// join returns for those partitions, publishes the filter once, and
+    /// completes it after its last partition. The scope outlives
+    /// `reset_state`, and is bound only before execution, within the probe
+    /// partitions, and only once.
+    #[tokio::test]
+    async fn task_scoped_collect_left_runs_partitions_serially() -> Result<()> {
+        let left = build_table(
+            ("a1", &vec![1, 2, 3]),
+            ("b1", &vec![4, 5, 6]),
+            ("c1", &vec![7, 8, 9]),
+        );
+        let right_batch = build_table_i32(
+            ("a2", &vec![10, 20, 30, 40]),
+            ("b1", &vec![4, 5, 9, 6]),
+            ("c2", &vec![70, 80, 90, 100]),
+        );
+        let right_schema = right_batch.schema();
+        let parts: Vec<Vec<RecordBatch>> =
+            (0..4).map(|i| vec![right_batch.slice(i, 1)]).collect();
+        let right: Arc<dyn ExecutionPlan> =
+            TestMemoryExec::try_new_exec(&parts, right_schema, None)?;
+        let on: JoinOn = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+        let mut config = SessionConfig::default();
+        config
+            .options_mut()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown = true;
+        let context = Arc::new(TaskContext::default().with_session_config(config));
+
+        let (join, dynamic_filter) = hash_join_with_dynamic_filter(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on.clone(),
+            JoinType::Inner,
+        )?;
+        let join = Arc::new(join);
+        assert!(join.set_dynamic_filter_partitions(0..5).is_err());
+        assert!(join.set_dynamic_filter_partitions(2..2).is_err());
+        join.set_dynamic_filter_partitions(1..3)?;
+        join.set_dynamic_filter_partitions(1..3)?;
+        assert!(join.set_dynamic_filter_partitions(1..4).is_err());
+        let reset = Arc::clone(&join).reset_state()?;
+        let reset = reset.downcast_ref::<HashJoinExec>().unwrap();
+        assert_eq!(
+            reset
+                .dynamic_filter
+                .as_ref()
+                .and_then(|df| df.execution_partitions.get().cloned()),
+            Some(1..3)
+        );
+
+        let unfiltered = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        let generation = || dynamic_filter.snapshot_generation();
+        let initial = generation();
+        let mut published = None;
+        for partition in [1, 2] {
+            let scoped = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                common::collect(join.execute(partition, Arc::clone(&context))?),
+            )
+            .await
+            .expect("a scoped partition must not wait for unscheduled siblings")?;
+            let expected =
+                common::collect(unfiltered.execute(partition, Arc::clone(&context))?)
+                    .await?;
+            assert_eq!(
+                batches_to_sort_string(&scoped),
+                batches_to_sort_string(&expected),
+                "partition {partition}"
+            );
+            // The second partition reports the same shared build: no new
+            // generation for consumers to compile.
+            assert_ne!(generation(), initial);
+            assert_eq!(*published.get_or_insert_with(generation), generation());
+            let complete = {
+                use futures::FutureExt;
+                dynamic_filter.wait_complete().now_or_never().is_some()
+            };
+            assert_eq!(complete, partition == 2);
+        }
         Ok(())
     }
 }

@@ -1286,6 +1286,7 @@ async fn dynamic_hash_lookup_and_null_aware_builds_match_native() -> Result<()> 
                 join.dynamic_filter = Some(HashJoinExecDynamicFilter {
                     filter: Arc::clone(&dynamic_filter),
                     build_accumulator: OnceLock::new(),
+                    execution_partitions: OnceLock::new(),
                 });
             }
             let mut config = SessionConfig::new()

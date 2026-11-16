@@ -6,6 +6,7 @@
 // TODO: include the link to the Dynamic Filter blog post.
 
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::ExecutionPlan;
@@ -246,6 +247,13 @@ fn combine_membership_and_bounds(
 ///
 /// ## Synchronization Strategy
 ///
+/// Without an execution scope, the whole plan uses the barrier below. A
+/// Longbow task scope ([`Self::with_execution_partitions`], family SF)
+/// instead publishes a conservative snapshot after each assigned report and
+/// never parks a stream behind a sibling that has not started: unknown
+/// buckets keep every row. Completion still requires every assigned report
+/// or cancellation; dropping the last owner closes retained observers.
+///
 /// 1. Each partition computes information from its build-side data (hash maps and/or bounds)
 /// 2. Information is stored in the shared state, which tracks how many partitions have reported
 /// 3. When the last partition reports, one waiter is elected as the finalizer; it merges the
@@ -326,6 +334,8 @@ pub(crate) enum PartitionBuildData {
         keys_have_null: bool,
     },
     CollectLeft {
+        /// The reporting output partition; a task scope deduplicates by it.
+        partition_id: usize,
         pushdown: PushdownStrategy,
         bounds: PartitionBounds,
         keys_have_null: bool,
@@ -364,6 +374,19 @@ enum CompletionState {
 struct AccumulatorState {
     data: AccumulatedBuildData,
     completion: CompletionState,
+    /// Family SF: the output partitions of a task scope and which of them
+    /// reported or cancelled; `None` for the whole-plan barrier.
+    task_reports: Option<TaskReports>,
+}
+
+/// Family SF: the output partitions that one execution instance runs.
+struct TaskReports {
+    partitions: Range<usize>,
+    reported: Vec<bool>,
+    /// The filter generation this accumulator created or last published. A
+    /// different generation at drop means someone else (a recursive-CTE
+    /// `reset_state` for the next iteration) owns the filter now.
+    generation: u64,
 }
 
 #[derive(Clone)]
@@ -464,6 +487,7 @@ impl SharedBuildAccumulator {
             inner: Mutex::new(AccumulatorState {
                 data: mode_data,
                 completion: CompletionState::Pending,
+                task_reports: None,
             }),
             completion_notify: Notify::new(),
             dynamic_filter,
@@ -476,6 +500,98 @@ impl SharedBuildAccumulator {
             in_list_max_size: optimizer.hash_join_inlist_pushdown_max_size,
             in_list_max_values: optimizer.hash_join_inlist_pushdown_max_distinct_values,
         }
+    }
+
+    /// Family SF: binds a freshly constructed accumulator to the output
+    /// partitions that its execution instance runs; `None` keeps the
+    /// whole-plan barrier. Partitioned routing still covers every bucket of
+    /// the stage: unassigned buckets stay unknown and keep their rows.
+    pub(crate) fn with_execution_partitions(
+        mut self,
+        partitions: Option<Range<usize>>,
+    ) -> Self {
+        let generation = self.dynamic_filter.snapshot_generation();
+        self.inner.get_mut().task_reports = partitions.map(|partitions| TaskReports {
+            reported: vec![false; partitions.len()],
+            partitions,
+            generation,
+        });
+        self
+    }
+
+    /// Family SF: records the first report or cancellation of `partition`
+    /// under a task scope. `Ok(false)` for a repeat; an error for a partition
+    /// outside the scope.
+    fn record_task_report(
+        &self,
+        state: &mut AccumulatorState,
+        partition: usize,
+    ) -> Result<bool> {
+        let reports = state.task_reports.as_mut().expect("scoped accumulator");
+        assert_or_internal_err!(
+            reports.partitions.contains(&partition),
+            "dynamic-filter report of partition {partition} outside the executed partitions {:?}",
+            reports.partitions
+        );
+        let reported = &mut reports.reported[partition - reports.partitions.start];
+        Ok(!std::mem::replace(reported, true))
+    }
+
+    /// Family SF: publishes a conservative snapshot without a cross-stream
+    /// barrier. A task can run its partitions one after another (a retry on
+    /// a worker with fewer slots), so waiting for every build before probing
+    /// could keep later partitions from ever starting. The state lock
+    /// serializes publication, so an older permissive snapshot never
+    /// overwrites a newer one. Pending buckets are finalized as
+    /// `CanceledUnknown` and keep every row (including NULL keys).
+    ///
+    /// `changed` is false when the report adds no build information to the
+    /// last snapshot: a cancellation, or a repeated CollectLeft report of the
+    /// one shared build. Such a report only records completion; it does not
+    /// rebuild the predicate or advance its generation.
+    fn publish_task_snapshot(
+        &self,
+        state: &mut AccumulatorState,
+        changed: bool,
+    ) -> Result<()> {
+        if let CompletionState::Ready(Err(error)) = &state.completion {
+            return Err(DataFusionError::Shared(Arc::clone(error)));
+        }
+        let reports = state.task_reports.as_ref().expect("scoped accumulator");
+        let complete = reports.reported.iter().all(|reported| *reported);
+        let result = if changed {
+            let known_or_unknown = |status: &PartitionStatus| match status {
+                PartitionStatus::Pending => PartitionStatus::CanceledUnknown,
+                status => status.clone(),
+            };
+            let snapshot = match &state.data {
+                AccumulatedBuildData::Partitioned { partitions, .. } => {
+                    FinalizeInput::Partitioned(
+                        partitions.iter().map(known_or_unknown).collect(),
+                    )
+                }
+                AccumulatedBuildData::CollectLeft { data, .. } => {
+                    FinalizeInput::CollectLeft(known_or_unknown(data))
+                }
+            };
+            let result = self.build_filter(snapshot);
+            let generation = self.dynamic_filter.snapshot_generation();
+            if let Some(reports) = state.task_reports.as_mut() {
+                reports.generation = generation;
+            }
+            result
+        } else {
+            Ok(())
+        };
+        if complete || result.is_err() {
+            self.dynamic_filter.mark_complete();
+            state.completion = CompletionState::Ready(result.map_err(Arc::new));
+            self.completion_notify.notify_waiters();
+            if let CompletionState::Ready(Err(error)) = &state.completion {
+                return Err(DataFusionError::Shared(Arc::clone(error)));
+            }
+        }
+        Ok(())
     }
 
     /// Report build-side data from a partition
@@ -493,6 +609,28 @@ impl SharedBuildAccumulator {
     pub(crate) async fn report_build_data(&self, data: PartitionBuildData) -> Result<()> {
         let finalize_input = {
             let mut guard = self.inner.lock();
+            if guard.task_reports.is_some() {
+                let partition = match &data {
+                    PartitionBuildData::Partitioned { partition_id, .. }
+                    | PartitionBuildData::CollectLeft { partition_id, .. } => {
+                        *partition_id
+                    }
+                };
+                if !self.record_task_report(&mut guard, partition)? {
+                    return Ok(());
+                }
+                // Every CollectLeft stream reports the same complete shared
+                // build; only the first report changes the predicate.
+                let changed = !matches!(
+                    &guard.data,
+                    AccumulatedBuildData::CollectLeft {
+                        data: PartitionStatus::Reported(_),
+                        ..
+                    }
+                );
+                self.store_build_data(&mut guard, data)?;
+                return self.publish_task_snapshot(&mut guard, changed);
+            }
             self.store_build_data(&mut guard, data)?;
             self.take_finalize_input_if_ready(&mut guard)
         };
@@ -507,6 +645,20 @@ impl SharedBuildAccumulator {
     pub(crate) fn report_canceled_partition(&self, partition_id: usize) {
         let finalize_input = {
             let mut guard = self.inner.lock();
+            if guard.task_reports.is_some() {
+                // A partition outside the scope never reports; only a first
+                // report or cancellation of an assigned one counts.
+                if !matches!(self.record_task_report(&mut guard, partition_id), Ok(true))
+                {
+                    return;
+                }
+                self.store_canceled_partition(&mut guard, partition_id);
+                // An unknown bucket keeps TRUE, as Pending did in the last
+                // snapshot, so a cancellation only records completion. A
+                // failed snapshot stays in `completion` for later reports.
+                let _ = self.publish_task_snapshot(&mut guard, false);
+                return;
+            }
             self.store_canceled_partition(&mut guard, partition_id);
             self.take_finalize_input_if_ready(&mut guard)
         };
@@ -545,6 +697,7 @@ impl SharedBuildAccumulator {
             }
             (
                 PartitionBuildData::CollectLeft {
+                    partition_id: _,
                     pushdown,
                     bounds,
                     keys_have_null,
@@ -685,9 +838,10 @@ impl SharedBuildAccumulator {
             PartitionStatus::Pending => datafusion_common::internal_err!(
                 "attempted to finalize collect-left dynamic filter without reported build data"
             ),
-            PartitionStatus::CanceledUnknown => datafusion_common::internal_err!(
-                "collect-left dynamic filter cannot finalize with canceled build data"
-            ),
+            // Family SF: only a task scope gets here, when no stream of the
+            // task has reported the shared build yet (or none ever will).
+            // Keep the initial TRUE predicate.
+            PartitionStatus::CanceledUnknown => Ok(()),
         }
     }
 
@@ -709,8 +863,12 @@ impl SharedBuildAccumulator {
             match partition {
                 PartitionStatus::Reported(PartitionData {
                     pushdown: PushdownStrategy::Empty,
+                    keys_have_null: partition_keys_have_null,
                     ..
                 }) => {
+                    // A NULL-only key set has no ordinary membership values,
+                    // but a null-equal join can still match it.
+                    keys_have_null |= partition_keys_have_null;
                     empty_partition_ids.push(partition_id);
                     partition_filters.push(lit(false));
                 }
@@ -1066,6 +1224,23 @@ impl SharedBuildAccumulator {
     }
 }
 
+// Family SF: once the last accumulator owner is gone, every stream and report
+// future is gone too. The assigned partitions that have not reported never
+// started or were abandoned by teardown: close the retained filter observers
+// without waiting for them, unless the filter was reset for another
+// execution since this accumulator last published it.
+impl Drop for SharedBuildAccumulator {
+    fn drop(&mut self) {
+        let state = self.inner.get_mut();
+        if let Some(reports) = &state.task_reports
+            && matches!(state.completion, CompletionState::Pending)
+            && reports.generation == self.dynamic_filter.snapshot_generation()
+        {
+            self.dynamic_filter.mark_complete();
+        }
+    }
+}
+
 impl fmt::Debug for SharedBuildAccumulator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SharedBuildAccumulator")
@@ -1089,6 +1264,7 @@ pub(super) fn make_partitioned_accumulator_for_test(
                 completed_partitions: 0,
             },
             completion: CompletionState::Pending,
+            task_reports: None,
         }),
         completion_notify: Notify::new(),
         dynamic_filter,
@@ -1158,6 +1334,7 @@ mod tests {
             inner: Mutex::new(AccumulatorState {
                 data,
                 completion: CompletionState::Pending,
+                task_reports: None,
             }),
             completion_notify: Notify::new(),
             dynamic_filter,
@@ -1799,6 +1976,7 @@ mod tests {
                     completed_partitions: 0,
                 },
                 completion: CompletionState::Pending,
+                task_reports: None,
             }),
             completion_notify: Notify::new(),
             dynamic_filter: Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true))),
@@ -2016,6 +2194,7 @@ mod tests {
                         expected_reports: 1,
                     },
                     completion: CompletionState::Pending,
+                    task_reports: None,
                 }),
                 completion_notify: Notify::new(),
                 dynamic_filter,
@@ -2076,5 +2255,346 @@ mod tests {
                 .expect("expected column under IS NULL");
             out.push(column.index());
         }
+    }
+
+    // Family SF: a stage of four partitions executed by a task on 1..3.
+    #[tokio::test]
+    async fn split_task_reports_complete_and_prune() -> Result<()> {
+        let acc = make_partitioned_expr_accumulator_for_test(4)
+            .with_execution_partitions(Some(1..3));
+        let reports = futures::future::try_join(
+            acc.report_build_data(PartitionBuildData::Partitioned {
+                partition_id: 1,
+                pushdown: PushdownStrategy::InList(Arc::new(Int32Array::from(vec![7]))),
+                bounds: bounds(7, 7),
+                keys_have_null: false,
+            }),
+            acc.report_build_data(PartitionBuildData::Partitioned {
+                partition_id: 2,
+                pushdown: PushdownStrategy::Empty,
+                bounds: no_bounds(),
+                keys_have_null: false,
+            }),
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(100), reports)
+            .await
+            .expect("task-local reports must not wait for partitions 0 and 3")?;
+        Ok(())
+    }
+
+    // Family SF: bounded execution must also work when partitions run sequentially.
+    async fn task_report(
+        acc: &SharedBuildAccumulator,
+        data: PartitionBuildData,
+    ) -> Result<()> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acc.report_build_data(data),
+        )
+        .await
+        .expect("a task report cannot wait for an unscheduled sibling")
+    }
+
+    fn task_filter_values(acc: &SharedBuildAccumulator, values: Vec<i32>) -> Vec<bool> {
+        let batch = RecordBatch::try_new(
+            test_probe_schema(),
+            vec![Arc::new(Int32Array::from(values))],
+        )
+        .unwrap();
+        let array = acc
+            .dynamic_filter
+            .current()
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .values()
+            .iter()
+            .collect()
+    }
+
+    fn task_filter_complete(acc: &SharedBuildAccumulator) -> bool {
+        use futures::FutureExt;
+        acc.dynamic_filter.wait_complete().now_or_never().is_some()
+    }
+
+    #[tokio::test]
+    async fn split_collect_left_prunes_before_serial_sibling_and_completes_after_it()
+    -> Result<()> {
+        let acc = make_collect_left_accumulator_for_test()
+            .with_execution_partitions(Some(1..3));
+        let data = |partition_id| PartitionBuildData::CollectLeft {
+            partition_id,
+            pushdown: PushdownStrategy::InList(Arc::new(Int32Array::from(vec![7]))),
+            bounds: bounds(7, 7),
+            keys_have_null: false,
+        };
+        task_report(&acc, data(1)).await?;
+        assert_eq!(task_filter_values(&acc, vec![7, 8]), [true, false]);
+        assert!(!task_filter_complete(&acc));
+        let published = acc.dynamic_filter.snapshot_generation();
+        // A duplicate report cannot stand in for partition 2.
+        task_report(&acc, data(1)).await?;
+        assert!(!task_filter_complete(&acc));
+        task_report(&acc, data(2)).await?;
+        assert!(task_filter_complete(&acc));
+        // The second stream reports the same shared build: it completes the
+        // filter without publishing a new generation for consumers to compile.
+        assert_eq!(acc.dynamic_filter.snapshot_generation(), published);
+        assert_eq!(task_filter_values(&acc, vec![7, 8]), [true, false]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_cancellation_completes_without_republishing() -> Result<()> {
+        let acc = make_partitioned_expr_accumulator_for_test(4)
+            .with_execution_partitions(Some(1..3));
+        task_report(
+            &acc,
+            PartitionBuildData::Partitioned {
+                partition_id: 1,
+                pushdown: PushdownStrategy::Empty,
+                bounds: no_bounds(),
+                keys_have_null: false,
+            },
+        )
+        .await?;
+        let published = acc.dynamic_filter.snapshot_generation();
+        let before = task_filter_values(&acc, (0..64).collect());
+        acc.report_canceled_partition(2);
+        assert!(task_filter_complete(&acc));
+        assert_eq!(acc.dynamic_filter.snapshot_generation(), published);
+        assert_eq!(task_filter_values(&acc, (0..64).collect()), before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_partitioned_prunes_only_complete_buckets() -> Result<()> {
+        let acc = make_partitioned_expr_accumulator_for_test(4)
+            .with_execution_partitions(Some(1..3));
+        let values = (0..128).collect::<Vec<i32>>();
+        let batch = RecordBatch::try_new(
+            test_probe_schema(),
+            vec![Arc::new(Int32Array::from(values.clone()))],
+        )?;
+        let hashes = HashExpr::new(
+            test_on_right(),
+            acc.repartition_random_state.clone(),
+            "hash_repartition".into(),
+        )
+        .evaluate(&batch)?
+        .into_array(values.len())?;
+        let hashes = hashes
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        let key = values
+            .iter()
+            .copied()
+            .find(|v| hashes.value(*v as usize) % 4 == 1)
+            .unwrap();
+        task_report(
+            &acc,
+            PartitionBuildData::Partitioned {
+                partition_id: 1,
+                pushdown: PushdownStrategy::InList(Arc::new(Int32Array::from(vec![key]))),
+                bounds: bounds(key, key),
+                keys_have_null: false,
+            },
+        )
+        .await?;
+        assert!(!task_filter_complete(&acc));
+        let early = task_filter_values(&acc, values.clone());
+        for (index, value) in values.iter().enumerate() {
+            assert_eq!(early[index], hashes.value(index) % 4 != 1 || *value == key);
+        }
+        task_report(
+            &acc,
+            PartitionBuildData::Partitioned {
+                partition_id: 2,
+                pushdown: PushdownStrategy::Empty,
+                bounds: no_bounds(),
+                keys_have_null: false,
+            },
+        )
+        .await?;
+        assert!(task_filter_complete(&acc));
+        let final_values = task_filter_values(&acc, values.clone());
+        for (index, value) in values.iter().enumerate() {
+            let bucket = hashes.value(index) % 4;
+            assert_eq!(
+                final_values[index],
+                bucket == 0 || bucket == 3 || *value == key
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_membership_preserves_null_equal_probe_rows() -> Result<()> {
+        use arrow::array::Array;
+
+        for scope in [None, Some(0..1)] {
+            let mut acc = make_partitioned_expr_accumulator_for_test(1)
+                .with_execution_partitions(scope);
+            acc.null_equality = NullEquality::NullEqualsNull;
+            acc.probe_schema = Arc::new(Schema::new(vec![Field::new(
+                "probe_key",
+                DataType::Int32,
+                true,
+            )]));
+            task_report(
+                &acc,
+                PartitionBuildData::Partitioned {
+                    partition_id: 0,
+                    pushdown: PushdownStrategy::Empty,
+                    bounds: no_bounds(),
+                    keys_have_null: true,
+                },
+            )
+            .await?;
+            let input = RecordBatch::try_new(
+                Arc::clone(&acc.probe_schema),
+                vec![Arc::new(Int32Array::from(vec![Some(7), None]))],
+            )?;
+            let mask = acc.dynamic_filter.evaluate(&input)?.into_array(2)?;
+            let mask = mask.as_any().downcast_ref::<BooleanArray>().unwrap();
+            assert_eq!(mask.null_count(), 0);
+            assert!(!mask.value(0));
+            assert!(
+                mask.value(1),
+                "an empty membership set can still contain NULL"
+            );
+            assert!(task_filter_complete(&acc));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_empty_collect_left_and_cancellation_wake_completion() -> Result<()> {
+        for empty in [false, true] {
+            let acc = make_collect_left_accumulator_for_test()
+                .with_execution_partitions(Some(1..3));
+            if empty {
+                task_report(
+                    &acc,
+                    PartitionBuildData::CollectLeft {
+                        partition_id: 1,
+                        pushdown: PushdownStrategy::Empty,
+                        bounds: no_bounds(),
+                        keys_have_null: false,
+                    },
+                )
+                .await?;
+            } else {
+                acc.report_canceled_partition(1);
+            }
+            let waiter = acc.dynamic_filter.wait_complete();
+            futures::pin_mut!(waiter);
+            assert!(futures::poll!(&mut waiter).is_pending());
+            acc.report_canceled_partition(2);
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .unwrap();
+            // CollectLeft retains upstream's permissive empty-build predicate;
+            // the join itself returns its correct empty-build result.
+            assert_eq!(task_filter_values(&acc, vec![7, 8]), [true, true]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_partition_cancellation_preserves_unknown_rows() -> Result<()> {
+        let acc = make_partitioned_expr_accumulator_for_test(4)
+            .with_execution_partitions(Some(1..3));
+        task_report(
+            &acc,
+            PartitionBuildData::Partitioned {
+                partition_id: 1,
+                pushdown: PushdownStrategy::Empty,
+                bounds: no_bounds(),
+                keys_have_null: false,
+            },
+        )
+        .await?;
+        acc.report_canceled_partition(2);
+        assert!(task_filter_complete(&acc));
+        // Cancel is idempotent and cannot erase the known-empty bucket.
+        acc.report_canceled_partition(1);
+        assert!(
+            acc.report_build_data(PartitionBuildData::Partitioned {
+                partition_id: 0,
+                pushdown: PushdownStrategy::Empty,
+                bounds: no_bounds(),
+                keys_have_null: false,
+            })
+            .await
+            .is_err()
+        );
+        assert!(
+            task_filter_values(&acc, vec![0, 1, 2, 3])
+                .iter()
+                .any(|keep| *keep)
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn split_teardown_wakes_filter_observers_with_unstarted_partitions()
+    -> Result<()> {
+        let acc = make_partitioned_expr_accumulator_for_test(4)
+            .with_execution_partitions(Some(1..4));
+        task_report(
+            &acc,
+            PartitionBuildData::Partitioned {
+                partition_id: 1,
+                pushdown: PushdownStrategy::Empty,
+                bounds: no_bounds(),
+                keys_have_null: false,
+            },
+        )
+        .await?;
+        let filter = Arc::clone(&acc.dynamic_filter);
+        let waiter = filter.wait_complete();
+        futures::pin_mut!(waiter);
+        assert!(futures::poll!(&mut waiter).is_pending());
+        drop(acc);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    // Family SF: a recursive-CTE `reset_state` resets the shared filter for
+    // the next iteration; dropping the previous iteration's scoped
+    // accumulator afterwards must not complete the new iteration's filter.
+    #[tokio::test]
+    async fn split_teardown_after_reset_keeps_the_next_iteration_open() -> Result<()> {
+        let acc = make_partitioned_expr_accumulator_for_test(4)
+            .with_execution_partitions(Some(1..4));
+        task_report(
+            &acc,
+            PartitionBuildData::Partitioned {
+                partition_id: 1,
+                pushdown: PushdownStrategy::InList(Arc::new(Int32Array::from(vec![7]))),
+                bounds: bounds(7, 7),
+                keys_have_null: false,
+            },
+        )
+        .await?;
+        let filter = Arc::clone(&acc.dynamic_filter);
+        filter.reset();
+        drop(acc);
+        let waiter = filter.wait_complete();
+        futures::pin_mut!(waiter);
+        assert!(
+            futures::poll!(&mut waiter).is_pending(),
+            "the reset filter belongs to the next iteration"
+        );
+        Ok(())
     }
 }
