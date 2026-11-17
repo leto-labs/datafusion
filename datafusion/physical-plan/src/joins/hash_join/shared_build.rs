@@ -32,9 +32,10 @@
 //!
 //! 1. contiguous batch groups evaluate their keys and hashes in parallel and
 //!    scatter matchable rows by hash shard;
-//! 2. one task per shard fills that shard's `HashTable`, writing only its own
-//!    rows of one chain array that all shards share, while other tasks
-//!    concatenate the payload column by column;
+//! 2. one task per shard fills that shard's head table (a `HeadTable` of
+//!    `join_hash_map.rs`, patch family JT; a `hashbrown::HashTable` before),
+//!    writing only its own rows of one chain array that all shards share,
+//!    while other tasks concatenate the payload column by column;
 //! 3. the probe looks up `shards[hash >> 40 & mask]` and traverses the shared
 //!    chain exactly as [`JoinHashMapU32`](crate::joins::join_hash_map::JoinHashMapU32).
 //!
@@ -54,7 +55,7 @@ use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, GenericByteViewArray, NullBufferBuilder,
     RecordBatchOptions,
 };
-use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+use arrow::buffer::{Buffer, NullBuffer, ScalarBuffer};
 use arrow::compute::concat;
 use arrow::datatypes::ByteViewType;
 use arrow::datatypes::{DataType, SchemaRef};
@@ -69,13 +70,13 @@ use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
-use hashbrown::HashTable;
-use hashbrown::hash_table::Entry::{Occupied, Vacant};
 
 use crate::attempt_tasks::AttemptTasks;
 use crate::joins::MapOffset;
-use crate::joins::chain::traverse_chain;
-use crate::joins::join_hash_map::JoinHashMapType;
+use crate::joins::join_hash_map::{
+    HeadLookup, HeadTable, JoinHashMapType, heads_contain_hashes, heads_matched_indices,
+    heads_matched_indices_with_limit_offset, prefetch_pays,
+};
 use crate::joins::utils::matchable_join_keys;
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
 
@@ -86,8 +87,8 @@ pub(crate) const OPTION: &str = "longbow.execution.parallel_hash_build_rows";
 /// Each shard gets at least this many build rows.
 const MIN_SHARD_ROWS: usize = 65_536;
 
-/// Shard bits stay below hashbrown's 7 tag bits (57..64) and above its
-/// bucket bits for tables of fewer than 2^40 buckets.
+/// Shard bits: the head tables place a hash by all of its bits (patch family
+/// JT), so the shard bits do not crowd a shard's slots.
 const SHARD_SHIFT: u32 = 40;
 const MAX_SHARDS: usize = 256;
 
@@ -271,7 +272,7 @@ impl ParallelBuild {
         for (shard, count) in counts.into_iter().enumerate() {
             let groups = Arc::clone(&groups);
             let next = Arc::clone(&next);
-            tables.push(async move { Ok(fill_shard(&groups, shard, count, &next)) });
+            tables.push(async move { fill_shard(&groups, shard, count, &next) });
         }
         let mut columns = Vec::with_capacity(schema.fields().len());
         for column in 0..schema.fields().len() {
@@ -809,24 +810,18 @@ fn fill_shard(
     shard: usize,
     count: usize,
     next: &[AtomicU32],
-) -> HashTable<(u64, u32)> {
-    let mut table = HashTable::with_capacity(count);
-    for group in groups.iter().rev() {
-        for &row in group.rows[shard].iter().rev() {
-            let hash = group.hashes[row as usize - group.offset];
-            match table.entry(hash, |&(h, _)| h == hash, |&(h, _)| h) {
-                Occupied(mut entry) => {
-                    let head = &mut entry.get_mut().1;
-                    next[row as usize].store(*head, Ordering::Relaxed);
-                    *head = row + 1;
-                }
-                Vacant(entry) => {
-                    entry.insert((hash, row + 1));
-                }
-            }
-        }
-    }
-    table
+) -> Result<HeadTable<u32>> {
+    let mut table = HeadTable::with_capacity(count);
+    let rows = groups.iter().rev().flat_map(|group| {
+        group.rows[shard]
+            .iter()
+            .rev()
+            .map(move |&row| (row as usize, group.hashes[row as usize - group.offset]))
+    });
+    table.insert_all(rows, next.len(), |row, head| {
+        next[row].store(head, Ordering::Relaxed)
+    })?;
+    Ok(table)
 }
 
 /// Hash-sharded [`JoinHashMapType`] with one chain array over all rows.
@@ -834,32 +829,46 @@ fn fill_shard(
 /// Entries and the chain use the `JoinHashMapU32` encoding: a table entry
 /// holds its hash's head row + 1, and `next[row]` the following row + 1, or 0.
 pub(super) struct ShardedJoinHashMap {
-    shards: Vec<HashTable<(u64, u32)>>,
+    shards: Vec<HeadTable<u32>>,
     mask: usize,
     next: Vec<u32>,
     len: usize,
+    /// The shards together are large enough for prefetches to pay.
+    prefetch: bool,
 }
 
 impl ShardedJoinHashMap {
-    pub(super) fn new(shards: Vec<HashTable<(u64, u32)>>, next: Vec<u32>) -> Self {
+    pub(super) fn new(shards: Vec<HeadTable<u32>>, next: Vec<u32>) -> Self {
         assert!(
             shards.len().is_power_of_two(),
             "shard count must be a power of two"
         );
-        let len = shards.iter().map(HashTable::len).sum();
+        let len = shards.iter().map(HeadTable::len).sum();
+        let bytes = shards.iter().map(HeadTable::bytes).sum();
         Self {
             mask: shards.len() - 1,
+            prefetch: prefetch_pays(bytes),
             shards,
             next,
             len,
         }
     }
+}
 
-    #[inline]
-    fn head(&self, hash: u64) -> Option<u32> {
-        self.shards[shard_of(hash, self.mask)]
-            .find(hash, |&(h, _)| h == hash)
-            .map(|&(_, head)| head)
+impl HeadLookup for ShardedJoinHashMap {
+    #[inline(always)]
+    fn head(&self, hash: u64) -> u64 {
+        self.shards[shard_of(hash, self.mask)].head(hash)
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, hash: u64) {
+        self.shards[shard_of(hash, self.mask)].prefetch(hash)
+    }
+
+    #[inline(always)]
+    fn prefetches(&self) -> bool {
+        self.prefetch
     }
 }
 
@@ -890,17 +899,11 @@ impl JoinHashMapType for ShardedJoinHashMap {
                     self.next.len()
                 ));
             }
-            let table = &mut self.shards[shard_of(hash, self.mask)];
-            match table.entry(hash, |&(h, _)| h == hash, |&(h, _)| h) {
-                Occupied(mut entry) => {
-                    let head = &mut entry.get_mut().1;
-                    self.next[row - deleted_offset] = *head;
-                    *head = row_id;
-                }
-                Vacant(entry) => {
-                    entry.insert((hash, row_id));
-                    self.len += 1;
-                }
+            let shard = &mut self.shards[shard_of(hash, self.mask)];
+            match shard.insert(hash, u64::from(row_id)) {
+                Ok(0) => self.len += 1,
+                Ok(previous) => self.next[row - deleted_offset] = previous as u32,
+                Err(_) => return Err(shard.full_error()),
             }
         }
         Ok(())
@@ -911,29 +914,7 @@ impl JoinHashMapType for ShardedJoinHashMap {
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
         deleted_offset: Option<usize>,
     ) -> (Vec<u32>, Vec<u64>) {
-        let mut input_indices = vec![];
-        let mut match_indices = vec![];
-        let offset = deleted_offset.unwrap_or(0) as u64;
-        for (probe, &hash) in iter {
-            let Some(head) = self.head(hash) else {
-                continue;
-            };
-            let mut row = u64::from(head) - 1;
-            loop {
-                if row < offset {
-                    break;
-                }
-                let index = row - offset;
-                match_indices.push(index);
-                input_indices.push(probe as u32);
-                let next = self.next[index as usize];
-                if next == 0 {
-                    break;
-                }
-                row = u64::from(next) - 1;
-            }
-        }
-        (input_indices, match_indices)
+        heads_matched_indices(self, &self.next, iter, deleted_offset)
     }
 
     fn get_matched_indices_with_limit_offset(
@@ -945,75 +926,22 @@ impl JoinHashMapType for ShardedJoinHashMap {
         input_indices: &mut Vec<u32>,
         match_indices: &mut Vec<u64>,
     ) -> Option<MapOffset> {
-        input_indices.clear();
-        match_indices.clear();
-
         // Unique hashes: no chain to follow (as `JoinHashMapU32`).
-        if self.len == self.next.len() {
-            let start = offset.0;
-            let end = (start + limit).min(hash_values.len());
-            for (i, &hash) in hash_values[start..end].iter().enumerate() {
-                if valid_keys.is_some_and(|valid| valid.is_null(start + i)) {
-                    continue;
-                }
-                if let Some(head) = self.head(hash) {
-                    input_indices.push((start + i) as u32);
-                    match_indices.push(u64::from(head - 1));
-                }
-            }
-            return (end != hash_values.len()).then_some((end, None));
-        }
-
-        let mut remaining = limit;
-        let to_skip = match offset {
-            (idx, None) => idx,
-            (idx, Some(0)) => idx + 1,
-            (idx, Some(next)) => {
-                let is_last = idx == hash_values.len() - 1;
-                if let Some(resume) = traverse_chain(
-                    &self.next,
-                    idx,
-                    next as u32,
-                    &mut remaining,
-                    input_indices,
-                    match_indices,
-                    is_last,
-                ) {
-                    return Some(resume);
-                }
-                idx + 1
-            }
-        };
-        // An empty probe batch has no last row (and no match).
-        let Some(last) = hash_values.len().checked_sub(1) else {
-            return None;
-        };
-        for (i, &hash) in hash_values[to_skip..].iter().enumerate() {
-            let row = to_skip + i;
-            if valid_keys.is_some_and(|valid| valid.is_null(row)) {
-                continue;
-            }
-            if let Some(head) = self.head(hash)
-                && let Some(resume) = traverse_chain(
-                    &self.next,
-                    row,
-                    head,
-                    &mut remaining,
-                    input_indices,
-                    match_indices,
-                    row == last,
-                )
-            {
-                return Some(resume);
-            }
-        }
-        None
+        heads_matched_indices_with_limit_offset(
+            self,
+            &self.next,
+            self.len == self.next.len(),
+            hash_values,
+            valid_keys,
+            limit,
+            offset,
+            input_indices,
+            match_indices,
+        )
     }
 
     fn contain_hashes(&self, hash_values: &[u64]) -> BooleanArray {
-        let buffer =
-            BooleanBuffer::collect_bool(hash_values.len(), |i| self.head(hash_values[i]).is_some());
-        BooleanArray::new(buffer, None)
+        heads_contain_hashes(self, hash_values)
     }
 
     fn is_empty(&self) -> bool {

@@ -2470,8 +2470,12 @@ async fn collect_left_input(
             // `u64` indice variant
             // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
             let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
+                // Longbow patch (JT): the head table of a `u64` map can be
+                // larger than hashbrown's estimate; reserve the larger.
                 let estimated_hashtable_size =
-                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?.max(
+                        JoinHashMapU64::table_bytes(num_rows) + fixed_size_u64,
+                    );
                 reservation.try_grow(estimated_hashtable_size)?;
                 metrics.build_mem_used.add(estimated_hashtable_size);
                 Box::new(JoinHashMapU64::with_capacity(num_rows))
