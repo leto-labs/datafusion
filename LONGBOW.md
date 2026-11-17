@@ -307,3 +307,27 @@ instead of a round trip. Longbow keeps the typed error (owner decision). An
 empty reorder ordering now decodes as "no hint" instead of an error.
 `ParquetSource::reverse_row_groups` and `sort_order_for_reorder` are public
 read-only accessors for the consumer's scan statistics.
+
+## Family QI: continuous percentile interpolation
+
+Purpose: keep the full binary64 rank fraction in `percentile_cont` /
+`quantile_cont` instead of truncating it to six decimal places, and use
+DuckDB's weighted endpoint formula for DOUBLE. Dependent Longbow feature:
+MARKETDATA-SQL-CORRECTNESS. Audit classification: UPSTREAMABLE.
+
+Upstream 56 moved the interpolation into a `PercentileInterpolator` trait.
+The family changes only `FloatInterpolator`, which serves the scalar,
+grouped, DISTINCT and sliding-window accumulators, and in 56 also `median`
+(upstream routes `median` through the percentile accumulators). For Float64
+the result is `lower * (1 - f) + upper * f` (DuckDB 2.0.0 DOUBLE: no overflow
+in `upper - lower`; the median of two values is their correctly rounded
+midpoint). Float32 and Float16 keep widened delta arithmetic
+`lower + (upper - lower) * f` with the full fraction, as DuckDB's FLOAT
+overload does; identical infinite FLOAT endpoints therefore give NaN.
+
+Not changed: upstream 56's new `DecimalInterpolator` still quantizes the
+fraction to six decimal places (integer-exact `num / 1_000_000`). The 55.2
+fork coerced decimals to Float64; 56 keeps the decimal type.
+
+Regressions (fail on stock 56 with 6_299_999 for 0.9 of `0..8 * 1e6`):
+`scripts/vendored-tests.py datafusion-functions-aggregate -E 'test(percentile_cont::tests)'`.

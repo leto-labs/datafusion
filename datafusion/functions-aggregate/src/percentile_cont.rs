@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -66,8 +68,7 @@ use crate::utils::PercentileParam;
 /// is computed as: `lower + ((upper - lower) * (fraction * PRECISION)) / PRECISION`
 /// to avoid floating-point operations on integer types while maintaining precision.
 ///
-/// The interpolation arithmetic for floats is performed in f64 and then cast back to the
-/// native type to avoid overflowing Float16 intermediates.
+/// Only decimals use it; float interpolation keeps the full fraction.
 const INTERPOLATION_PRECISION: usize = 1_000_000;
 
 create_func!(PercentileCont, percentile_cont_udaf);
@@ -1060,18 +1061,20 @@ where
         upper: T::Native,
         fraction: f64,
     ) -> Result<T::Native> {
-        // Linear interpolation.
-        // We compute a quantized interpolation weight using `FLOAT_INTERPOLATION_PRECISION` because:
-        // 1. Both values come from the input data, so (upper - lower) is bounded by the value range
-        // 2. fraction is between 0 and 1; quantizing it provides stable, predictable results
-        // 3. The result is guaranteed to be between lower_value and upper_value (modulo cast rounding)
-        // 4. Arithmetic is performed in f64 and cast back to avoid overflowing Float16 intermediates
-        let scaled = (fraction * (INTERPOLATION_PRECISION as f64)) as usize;
-        let weight = scaled as f64 / (INTERPOLATION_PRECISION as f64);
-
+        // Use the full fraction. Quantizing it to six decimal places can
+        // move a result by a millionth of the neighbouring-value gap.
+        // Widen before arithmetic to retain Float16 overflow safety.
         let lower_f: f64 = lower.as_();
         let upper_f: f64 = upper.as_();
-        let interpolated_f = lower_f + (upper_f - lower_f) * weight;
+        let interpolated_f = if T::DATA_TYPE == DataType::Float64 {
+            // DuckDB specializes DOUBLE with weighted endpoints, which also
+            // avoid overflow in (upper - lower). Its FLOAT overload uses
+            // widened delta arithmetic instead (notably, identical infinite
+            // FLOAT endpoints interpolate to NaN).
+            lower_f * (1.0 - fraction) + upper_f * fraction
+        } else {
+            lower_f + (upper_f - lower_f) * fraction
+        };
         Ok(interpolated_f.as_())
     }
 }
@@ -1242,6 +1245,64 @@ mod tests {
             },
             DataType::Float64,
         )
+    }
+
+    fn float_percentile<T>(values: &mut [T::Native], percentile: f64) -> Option<T::Native>
+    where
+        T: ArrowNumericType,
+        T::Native: AsPrimitive<f64>,
+        f64: AsPrimitive<T::Native>,
+    {
+        calculate_percentile::<T, FloatInterpolator>(values, percentile)
+            .expect("float interpolation is infallible")
+    }
+
+    #[test]
+    fn interpolation_retains_full_fraction_and_weighted_endpoints() {
+        // 0.9 * 7 = 6.3: a six-decimal weight gives 6_299_999.
+        let mut values = (0..8)
+            .map(|n| f64::from(n) * 1_000_000.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            float_percentile::<Float64Type>(&mut values, 0.9),
+            Some(6_300_000.0)
+        );
+        // Weighted endpoints do not overflow in (upper - lower).
+        let mut values = [-f64::MAX, f64::MAX];
+        assert_eq!(float_percentile::<Float64Type>(&mut values, 0.5), Some(0.0));
+        // The median (fraction 0.5) of two values is their correctly rounded
+        // midpoint, as DuckDB's DOUBLE quantile_cont and median return.
+        let mut values = [f64::MAX, f64::MAX];
+        assert_eq!(
+            float_percentile::<Float64Type>(&mut values, 0.5),
+            Some(f64::MAX)
+        );
+        let mut values = [f64::from_bits(1); 2];
+        assert_eq!(float_percentile::<Float64Type>(&mut values, 0.5), Some(0.0));
+        assert_eq!(
+            float_percentile::<Float64Type>(&mut values, 0.0),
+            Some(f64::from_bits(1))
+        );
+        assert_eq!(float_percentile::<Float64Type>(&mut [], 0.5), None);
+    }
+
+    #[test]
+    fn float32_keeps_widened_delta_interpolation() {
+        // DuckDB's FLOAT overload uses delta arithmetic: identical infinite
+        // endpoints interpolate to NaN.
+        let mut values = [f32::INFINITY; 2];
+        assert!(
+            float_percentile::<Float32Type>(&mut values, 0.5)
+                .unwrap()
+                .is_nan()
+        );
+        let mut values = (0u8..8)
+            .map(|n| f32::from(n) * 1_000_000.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            float_percentile::<Float32Type>(&mut values, 0.9),
+            Some(6_300_000.0)
+        );
     }
 
     #[test]
