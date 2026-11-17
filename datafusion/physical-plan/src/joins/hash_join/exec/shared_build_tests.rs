@@ -1246,7 +1246,7 @@ async fn parallel_build_keeps_bounds_and_the_key_range_bitmap() -> Result<()> {
     };
     assert_eq!(bounds(&parallel), bounds(&native));
     let bitmap = |data: &JoinLeftData| match &data.build.membership {
-        PushdownStrategy::Map(_, Some(bitmap)) => (bitmap.size(), bitmap.fill_stats()),
+        PushdownStrategy::Map(_, Some(bitmap), _) => (bitmap.size(), bitmap.fill_stats()),
         _ => panic!("expected a map membership with a key-range bitmap"),
     };
     assert_eq!(bitmap(&parallel), bitmap(&native));

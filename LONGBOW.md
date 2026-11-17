@@ -381,3 +381,45 @@ rbc/stock 0.762 (pull, n=8, 0.724-0.815) and 0.777 (native, n=6); TPC-DS SF10
 rank/row_number queries unchanged (0.994, 1.003). The companion family CR was
 dropped: on upstream's `PartitionSlot` layout it regressed q8 to 1.62.
 
+## Family E: build keys and memory consumer of hash-join membership lookups
+
+Purpose: let Longbow replace a kept hash-join residual's `HashTableLookupExpr`
+with a key filter (an exact key bitmap or a blocked key Bloom filter) built from
+the join's own build keys and charged to the join's memory consumer. Dependent
+Longbow feature: WHOLEPLAN-RESIDUALS (`longbow-plan` `early_filter/membership`).
+Classification: KEEP (reworked on 56's `HashTableLookupExpr`).
+
+Accessors (all `#[doc(hidden)]` through `HashTableLookupExpr`):
+
+- `with_build_side(keys, memory)`: one entry per map given to
+  `HashTableLookupExpr::new` (so per build partition of a `Lookup::Routed`
+  lookup, one for `Lookup::Single`), each holding that partition's key arrays
+  weakly in one or more chunks (Longbow's native join keeps one chunk per
+  driver), plus an optional empty reservation of a build's memory consumer. Equality, hashing, display, evaluation and protobuf
+  encoding ignore it; `with_new_children` keeps it.
+- `build_keys()`: the key chunks of every non-empty partition while the join
+  holds them; `None` when a non-empty partition's keys are unknown or released.
+- `build_memory()`, `on_columns()`, `random_state()`.
+
+The join publishes the normalized build keys (`JoinBuildData::values`, now an
+`Arc<[ArrayRef]>`) weakly through `PushdownStrategy::Map`'s build side and an
+empty reservation of its `HashJoinInput` consumer. The 56 accumulator carries
+both through `PartitionData` into the published lookup: a collect-left or
+single-partition lookup gets its build's side; a merged routed lookup gets each
+hash-table partition's keys, owns the IN-list values of IN-list partitions, and
+names the first reported memory consumer. Prepared builds
+(`PreparedHashJoinBuild`) outlive any one join and expose no build side. 56's
+`Lookup::Routed` replaces the 55.2 Longbow `RoutedLookup` evaluator, so the
+55.2 `map()` accessor is not ported.
+
+Kept by the task 3.6 screen (leto-zca.23): on TPC-H SF100, 55.2 with E against
+stock 56 was 0.724 of total wall time in the pull strategy and 0.812 in the
+native strategy (queries 1, 3, 4, 5, 6, 7, 8, 10, 12, 20, 21); the residual join
+filters of Q3, 4, 5, 7, 8, 10, 20 and 21 used 25.3 s of CPU with E and 142.1 s
+on stock 56 for the same input rows. Replaces the 55.2 fork commit 9bca3f47e.
+
+Regressions: `scripts/vendored-tests.py datafusion-physical-plan -E
+'test(build_side_accessors_follow_partitions) |
+test(lookups_expose_partition_build_keys_and_memory) |
+test(lookup_exposes_build_keys_and_memory_while_the_join_holds_them) |
+test(prepared)'`.

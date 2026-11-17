@@ -787,9 +787,13 @@ async fn prepared_inlist_shares_accounted_build_buffers() -> Result<()> {
                     Arc::new(config),
                 )
                 .await?;
-            let PushdownStrategy::Map(_, bitmap) = &map.build.membership else {
+            let PushdownStrategy::Map(_, bitmap, build_side) = &map.build.membership
+            else {
                 panic!("expected hash-map membership");
             };
+            // Longbow family E: a prepared build is shared beyond any one join,
+            // so its lookups expose no build keys or memory consumer.
+            assert!(build_side.is_none());
             let bitmap_bytes = bitmap.as_ref().map_or(0, |bitmap| bitmap.size());
             assert_eq!(map.reserved_bytes(), bytes + bitmap_bytes);
             assert_eq!(pool.reserved(), 2 * bytes + bitmap_bytes);
@@ -883,7 +887,7 @@ async fn prepared_byte_keys_use_hash_membership() -> Result<()> {
         assert!(prepared.build.bounds.is_none());
         assert!(matches!(
             &prepared.build.membership,
-            PushdownStrategy::Map(_, _)
+            PushdownStrategy::Map(_, _, None)
         ));
         let task = with_probe_filter(base)?
             .builder()

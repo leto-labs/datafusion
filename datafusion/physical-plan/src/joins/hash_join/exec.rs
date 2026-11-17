@@ -24,7 +24,7 @@ use crate::joins::array_map::ArrayMap;
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::not_in::{NotIn, NotInBuild};
 use crate::joins::hash_join::shared_bounds::{
-    ColumnBounds, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
+    ColumnBounds, MapBuildSide, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
 };
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
@@ -206,8 +206,9 @@ struct JoinBuildData {
     /// `+0.0` so probe batches can compare against them without scanning the
     /// build side again. The dynamic filters (`bounds`, `membership`) and
     /// the `NOT IN` NULL masks were computed from the original keys in
-    /// `collect_left_input`.
-    values: Vec<ArrayRef>,
+    /// `collect_left_input`. Shared weakly with membership lookups (Longbow
+    /// family E).
+    values: Arc<[ArrayRef]>,
     /// Bounds computed from the build side; absent for an empty partition.
     bounds: Option<PartitionBounds>,
     /// IN-list values or a hash-table reference used for filter pushdown.
@@ -3415,7 +3416,7 @@ fn build_in_memory(
     // Rewrite float `-0.0` to `+0.0` once here, so the per probe batch key
     // comparison does not rescan the build side. Arrays without `-0.0`, and
     // non-float keys, are shared rather than copied.
-    let normalized_values: Vec<ArrayRef> =
+    let normalized_values: Arc<[ArrayRef]> =
         left_values.iter().map(normalize_floats).collect();
 
     // Join keys that are plain columns share the buffers of `batch`, any other
@@ -3425,7 +3426,7 @@ fn build_in_memory(
     key_counter.count_batch(&batch);
     let keys_size = left_values
         .iter()
-        .chain(&normalized_values)
+        .chain(normalized_values.iter())
         .map(|values| key_counter.count_array(values.as_ref()))
         .sum::<usize>();
     reservation.try_grow(keys_size)?;
@@ -3516,7 +3517,15 @@ fn build_in_memory(
                 }
                 ok
             });
-            PushdownStrategy::Map(Arc::clone(&map), pruning_bitmap)
+            // Longbow family E: the lookup exposes the build keys, held
+            // weakly, and an empty reservation of this build's consumer, so
+            // derived key filters are charged to the join. A prepared build
+            // outlives any one consuming join, so it exposes neither.
+            let build_side = (!prepared).then(|| MapBuildSide {
+                keys: Arc::downgrade(&normalized_values),
+                memory: Arc::new(reservation.new_empty()),
+            });
+            PushdownStrategy::Map(Arc::clone(&map), pruning_bitmap, build_side)
         }
     };
 
@@ -3752,6 +3761,89 @@ mod tests {
         assert!(build_mem_used(1_000_000, false).await? < 100_000);
         assert!(build_mem_used(1_000_000, true).await? > 100_000);
         build_mem_used(100_000, true).await?;
+        Ok(())
+    }
+
+    /// Longbow family E: the published hash lookup exposes the build keys and
+    /// an empty reservation of the build's memory consumer while the join holds
+    /// the build, and never keeps the keys alive after the join drops it.
+    #[tokio::test]
+    async fn lookup_exposes_build_keys_and_memory_while_the_join_holds_them() -> Result<()>
+    {
+        use crate::joins::HashTableLookupExpr;
+        use arrow::array::AsArray;
+        use arrow::datatypes::Int64Type;
+        use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+        use futures::StreamExt;
+        for mode in [PartitionMode::CollectLeft, PartitionMode::Partitioned] {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+            let batch = |keys: Vec<i64>| {
+                let column = Arc::new(Int64Array::from(keys)) as ArrayRef;
+                let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column])?;
+                TestMemoryExec::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+            };
+            let on = vec![(
+                Arc::new(Column::new_with_schema("k", &schema)?) as _,
+                Arc::new(Column::new_with_schema("k", &schema)?) as _,
+            )];
+            let build_keys: Vec<i64> = (0..200).map(|i| i * 7).collect();
+            let (join, dynamic_filter) = hash_join_with_dynamic_filter_and_mode(
+                batch(build_keys.clone())?,
+                batch(vec![0, 7, 8, 1_393])?,
+                on,
+                JoinType::Inner,
+                mode,
+            )?;
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_limit(1 << 30, 1.0)
+                .build_arc()?;
+            let pool = Arc::clone(&runtime.memory_pool);
+            let mut config = SessionConfig::new();
+            config
+                .options_mut()
+                .optimizer
+                .hash_join_inlist_pushdown_max_size = 0;
+            let task_ctx = Arc::new(
+                TaskContext::default()
+                    .with_runtime(runtime)
+                    .with_session_config(config),
+            );
+            // The stream holds the build until it ends; the filter is
+            // published before the first probe batch is joined.
+            let mut stream = join.execute(0, task_ctx)?;
+            let mut rows = stream.next().await.expect("an output batch")?.num_rows();
+
+            let mut lookup = None;
+            dynamic_filter.current()?.apply(|expr| {
+                if expr.downcast_ref::<HashTableLookupExpr>().is_some() {
+                    lookup = Some(Arc::clone(expr));
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            let lookup = lookup.expect("a hash lookup past the IN-list limit");
+            let lookup = lookup.downcast_ref::<HashTableLookupExpr>().unwrap();
+            let keys = lookup.build_keys().expect("the join holds its build");
+            assert_eq!(keys.len(), 1);
+            assert_eq!(
+                keys[0][0].as_primitive::<Int64Type>().values().to_vec(),
+                build_keys,
+                "{mode:?}"
+            );
+            drop(keys);
+            let memory = lookup.build_memory().expect("the build's consumer");
+            assert!(memory.consumer().name().starts_with("HashJoinInput"));
+            assert_eq!(memory.size(), 0);
+
+            while let Some(batch) = stream.next().await {
+                rows += batch?.num_rows();
+            }
+            assert_eq!(rows, 3);
+            drop(stream);
+            drop(join);
+            assert!(lookup.build_keys().is_none(), "{mode:?}");
+            assert_eq!(pool.reserved(), 0);
+        }
         Ok(())
     }
 

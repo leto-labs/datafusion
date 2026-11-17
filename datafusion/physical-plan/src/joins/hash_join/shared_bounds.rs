@@ -9,7 +9,7 @@
 
 use std::fmt;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::ExecutionPlan;
 use crate::ExecutionPlanProperties;
@@ -34,6 +34,7 @@ use datafusion_common::{
     DataFusionError, NullEquality, Result, ScalarValue, SharedResult,
     assert_or_internal_err, internal_err,
 };
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::Operator;
 use datafusion_functions::core::r#struct as struct_func;
 use datafusion_physical_expr::expressions::{
@@ -162,15 +163,23 @@ fn create_membership_predicate(
             )?)))
         }
         // Use hash table lookup for large build sides
-        PushdownStrategy::Map(hash_map, pruning_bitmap) => {
-            Ok(Some(Arc::new(HashTableLookupExpr::new(
+        PushdownStrategy::Map(hash_map, pruning_bitmap, build_side) => {
+            let lookup = HashTableLookupExpr::new(
                 on_right.to_vec(),
                 random_state.clone(),
                 None,
                 vec![Some(hash_map)],
                 "hash_lookup".to_string(),
                 pruning_bitmap,
-            )?) as Arc<dyn PhysicalExpr>))
+            )?;
+            // Longbow family E: the build keys and memory consumer behind the map.
+            let lookup = match build_side {
+                Some(MapBuildSide { keys, memory }) => {
+                    lookup.with_build_side(vec![vec![keys]], Some(memory))?
+                }
+                None => lookup,
+            };
+            Ok(Some(Arc::new(lookup) as Arc<dyn PhysicalExpr>))
         }
         // Empty partition - should not create a filter for this
         PushdownStrategy::Empty => Ok(None),
@@ -321,10 +330,22 @@ pub(crate) enum PushdownStrategy {
     /// Use InList for small build sides (< 128MB)
     InList(ArrayRef),
     /// Use map lookup for large build sides. If `Some` the second field
-    /// represents the build side's keys using a bucket bitmap.
-    Map(Arc<Map>, Option<Arc<KeyRangeBitmap>>),
+    /// represents the build side's keys using a bucket bitmap. The third field
+    /// is the build side behind the map (Longbow family E).
+    Map(Arc<Map>, Option<Arc<KeyRangeBitmap>>, Option<MapBuildSide>),
     /// There was no data in this partition, do not build a dynamic filter for it
     Empty,
+}
+
+/// The key arrays a [`PushdownStrategy::Map`] was built from and an empty
+/// reservation of the build's memory consumer, which the lookup exposes to
+/// structures derived from the build keys (Longbow family E).
+#[derive(Clone)]
+pub(crate) struct MapBuildSide {
+    /// The build's key arrays, one per join key, held weakly.
+    pub(crate) keys: Weak<[ArrayRef]>,
+    /// An empty reservation of the build's memory consumer.
+    pub(crate) memory: Arc<MemoryReservation>,
 }
 
 /// Build-side data reported by a single partition
@@ -882,7 +903,7 @@ impl SharedBuildAccumulator {
                     real_partition_ids.push(partition_id);
                     keys_have_null |= partition_keys_have_null;
                     let mergeable = match &pushdown {
-                        PushdownStrategy::Map(map, _) => {
+                        PushdownStrategy::Map(map, _, _) => {
                             matches!(map.as_ref(), Map::HashMap(_))
                         }
                         PushdownStrategy::InList(_) => true,
@@ -1065,23 +1086,46 @@ impl SharedBuildAccumulator {
             // routes to, so the partitions' tables are shared as they are: no
             // merged table to build while every probe stream waits on the filter.
             let mut maps = vec![None; num_partitions];
+            // Longbow family E: each partition's build keys, and the first
+            // reported build memory consumer, for structures derived from them.
+            // The lookup owns its IN-list partitions' key columns uncharged, as
+            // the IN-list strategy did; the IN-list limits bound them.
+            let mut keys = vec![vec![]; num_partitions];
+            let mut retained = Vec::new();
+            let mut memory = None;
             for (partition_id, pushdown, _) in members {
                 maps[*partition_id] = Some(match pushdown {
-                    PushdownStrategy::Map(map, _) => Arc::clone(map),
-                    PushdownStrategy::InList(values) => self.in_list_hash_map(values)?,
+                    PushdownStrategy::Map(map, _, build_side) => {
+                        if let Some(build_side) = build_side {
+                            keys[*partition_id] = vec![Weak::clone(&build_side.keys)];
+                            memory.get_or_insert_with(|| Arc::clone(&build_side.memory));
+                        }
+                        Arc::clone(map)
+                    }
+                    PushdownStrategy::InList(values) => {
+                        let columns: Arc<[ArrayRef]> =
+                            self.in_list_columns(values).into();
+                        let map = self.in_list_hash_map(&columns)?;
+                        keys[*partition_id] = vec![Arc::downgrade(&columns)];
+                        retained.push(columns);
+                        map
+                    }
                     PushdownStrategy::Empty => {
                         return internal_err!("empty partitions have no members");
                     }
                 });
             }
-            Arc::new(HashTableLookupExpr::new(
-                self.on_right.clone(),
-                HASH_JOIN_SEED,
-                Some(self.partition_router(num_partitions)?),
-                maps,
-                String::from("hash_lookup"),
-                self.merged_pruning_bitmap(members, merged_bounds.as_ref()),
-            )?)
+            Arc::new(
+                HashTableLookupExpr::new(
+                    self.on_right.clone(),
+                    HASH_JOIN_SEED,
+                    Some(self.partition_router(num_partitions)?),
+                    maps,
+                    String::from("hash_lookup"),
+                    self.merged_pruning_bitmap(members, merged_bounds.as_ref()),
+                )?
+                .with_build_keys(keys, retained, memory)?,
+            )
         };
 
         let bounds = merged_bounds
@@ -1113,16 +1157,21 @@ impl SharedBuildAccumulator {
 
     /// A hash table of an IN list partition's keys, hashed as the probe side
     /// hashes its join keys: one column per join key.
-    fn in_list_hash_map(&self, values: &ArrayRef) -> Result<Arc<Map>> {
-        let columns = match values.as_struct_opt() {
-            Some(columns) if self.on_right.len() > 1 => columns.columns(),
-            _ => std::slice::from_ref(values),
-        };
-        let mut hashes = vec![0; values.len()];
+    fn in_list_hash_map(&self, columns: &[ArrayRef]) -> Result<Arc<Map>> {
+        let rows = columns.first().map_or(0, |column| column.len());
+        let mut hashes = vec![0; rows];
         create_hashes(columns, HASH_JOIN_SEED.random_state(), &mut hashes)?;
         let mut map = JoinHashMapU32::with_capacity(hashes.len());
         map.update_from_iter(Box::new(hashes.iter().enumerate()), 0);
         Ok(Arc::new(Map::HashMap(Box::new(map))))
+    }
+
+    /// An IN list partition's keys as one column per join key.
+    fn in_list_columns(&self, values: &ArrayRef) -> Vec<ArrayRef> {
+        match values.as_struct_opt() {
+            Some(columns) if self.on_right.len() > 1 => columns.columns().to_vec(),
+            _ => vec![Arc::clone(values)],
+        }
     }
 
     /// Container pruning reads one bitmap, so merge the partitions' key ranges:
@@ -1141,7 +1190,7 @@ impl SharedBuildAccumulator {
         let parts = members
             .iter()
             .map(|(_, pushdown, bounds)| match pushdown {
-                PushdownStrategy::Map(_, Some(bitmap)) => {
+                PushdownStrategy::Map(_, Some(bitmap), _) => {
                     Some(KeyRangePart::Bitmap(bitmap))
                 }
                 PushdownStrategy::InList(keys) => Some(KeyRangePart::Keys(keys.as_ref())),
@@ -1523,6 +1572,7 @@ mod tests {
         PushdownStrategy::Map(
             Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(1)))),
             None,
+            None,
         )
     }
 
@@ -1554,7 +1604,7 @@ mod tests {
         create_hashes([&keys], HASH_JOIN_SEED.random_state(), &mut hashes).unwrap();
         let mut map = JoinHashMapU32::with_capacity(keys.len());
         map.update_from_iter(Box::new(hashes.iter().enumerate()), 0);
-        PushdownStrategy::Map(Arc::new(Map::HashMap(Box::new(map))), None)
+        PushdownStrategy::Map(Arc::new(Map::HashMap(Box::new(map))), None, None)
     }
 
     /// Splits `keys` across `num_partitions` build partitions as hash
@@ -1623,6 +1673,126 @@ mod tests {
         let probe: Vec<i32> = (0..40).collect();
         let expected: Vec<bool> = probe.iter().map(|key| key % 2 == 0).collect();
         assert_matches(&acc, &probe, &expected);
+    }
+
+    /// Longbow family E: the merged lookup exposes every non-empty partition's
+    /// build keys (a hash table's keys weakly, an IN list's values owned) and
+    /// the first reported build memory consumer; a collect-left lookup exposes
+    /// its build's.
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn lookups_expose_partition_build_keys_and_memory() {
+        use datafusion_execution::memory_pool::{
+            GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        };
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let memory = Arc::new(MemoryConsumer::new("HashJoinInput[0]").register(&pool));
+        let held = Mutex::new(Vec::<Arc<[ArrayRef]>>::new());
+        let with_side = |keys: &[i32]| {
+            let PushdownStrategy::Map(map, bitmap, None) = hash_map_of(keys) else {
+                unreachable!("a test map has no build side")
+            };
+            let array: Arc<[ArrayRef]> =
+                vec![Arc::new(Int32Array::from(keys.to_vec())) as ArrayRef].into();
+            let side = MapBuildSide {
+                keys: Arc::downgrade(&array),
+                memory: Arc::clone(&memory),
+            };
+            held.lock().push(array);
+            PushdownStrategy::Map(map, bitmap, Some(side))
+        };
+        let lookup_of = |expr: &PhysicalExprRef| {
+            expr.downcast_ref::<HashTableLookupExpr>()
+                .map(|lookup| {
+                    (
+                        lookup.build_keys().map(|keys| {
+                            let mut values = keys
+                                .iter()
+                                .flat_map(|keys| {
+                                    keys[0]
+                                        .as_primitive::<arrow::datatypes::Int32Type>()
+                                        .values()
+                                        .to_vec()
+                                })
+                                .collect::<Vec<_>>();
+                            values.sort_unstable();
+                            values
+                        }),
+                        lookup
+                            .build_memory()
+                            .map(|memory| memory.consumer().name().to_owned()),
+                    )
+                })
+                .unwrap_or_else(|| panic!("expected a hash lookup, got: {expr}"))
+        };
+
+        let acc = make_partitioned_expr_accumulator_for_test(4);
+        let build: Vec<i32> = (0..40).step_by(2).collect();
+        acc.build_filter(FinalizeInput::Partitioned(routed_partitions(
+            &acc,
+            4,
+            &build,
+            |partition, keys| {
+                if partition % 2 == 0 {
+                    with_side(keys)
+                } else {
+                    in_list(keys)
+                }
+            },
+        )))
+        .unwrap();
+        let expr = current_expr(&acc);
+        assert_eq!(
+            lookup_of(&expr),
+            (Some(build.clone()), Some("HashJoinInput[0]".to_owned()))
+        );
+        // The join released a hash table's keys; an IN list's stay with the lookup.
+        held.lock().clear();
+        assert_eq!(
+            lookup_of(&expr),
+            (None, Some("HashJoinInput[0]".to_owned()))
+        );
+
+        // Only IN list partitions: owned keys, no memory consumer.
+        let mut acc = make_partitioned_expr_accumulator_for_test(3);
+        acc.in_list_max_values = 2;
+        let build: Vec<i32> = (1..=9).collect();
+        acc.build_filter(FinalizeInput::Partitioned(routed_partitions(
+            &acc,
+            3,
+            &build,
+            |_, keys| in_list(keys),
+        )))
+        .unwrap();
+        assert_eq!(lookup_of(&current_expr(&acc)), (Some(build), None));
+
+        // A hash table without a build side exposes nothing.
+        let acc = make_partitioned_expr_accumulator_for_test(2);
+        acc.build_filter(FinalizeInput::Partitioned(routed_partitions(
+            &acc,
+            2,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            |_, keys| hash_map_of(keys),
+        )))
+        .unwrap();
+        assert_eq!(lookup_of(&current_expr(&acc)), (None, None));
+
+        // A collect-left build's single lookup.
+        let lookup = create_membership_predicate(
+            &test_on_right(),
+            with_side(&[5, 1, 3]),
+            &HASH_JOIN_SEED,
+            &test_probe_schema(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            lookup_of(&lookup),
+            (Some(vec![1, 3, 5]), Some("HashJoinInput[0]".to_owned()))
+        );
+        held.lock().clear();
+        assert_eq!(lookup_of(&lookup).0, None);
+        assert_eq!(pool.reserved(), 0);
     }
 
     /// IN list partitions whose combined list passes the IN list limits merge

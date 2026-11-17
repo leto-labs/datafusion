@@ -1,10 +1,16 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 //! Hash computation and hash table lookup expressions for dynamic filtering
 
-use std::{fmt::Display, hash::Hash, sync::Arc};
+use std::{
+    fmt::Display,
+    hash::Hash,
+    sync::{Arc, Weak},
+};
 
 use arrow::{
     array::{ArrayRef, BooleanArray, BooleanBufferBuilder, UInt64Array},
@@ -14,6 +20,7 @@ use arrow::{
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::hash_utils::{create_hashes, with_hashes};
 use datafusion_common::{Result, internal_err};
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::ColumnarValue;
 use datafusion_expr_common::dyn_eq::DynHash;
 use datafusion_physical_expr_common::physical_expr::{PhysicalExpr, PhysicalExprRef};
@@ -273,6 +280,24 @@ pub struct HashTableLookupExpr {
     description: String,
     /// Shared pruning-only view of the build side's key range
     pruning_bitmap: Option<Arc<KeyRangeBitmap>>,
+    /// Build-side key arrays and memory consumer of the maps (Longbow family
+    /// E). Evaluation, equality, hashing and display ignore it.
+    build_side: Option<Arc<LookupBuildSide>>,
+}
+
+/// The build side of a [`HashTableLookupExpr`]'s maps, for structures derived
+/// from it outside the join (Longbow family E).
+struct LookupBuildSide {
+    /// One entry per build partition, in the order of the maps given to
+    /// [`HashTableLookupExpr::new`]: the chunks of key arrays the partition's
+    /// map was built from, held weakly so a lookup never extends their
+    /// lifetime. No chunk means the partition's keys are unknown.
+    keys: Vec<Vec<Weak<[ArrayRef]>>>,
+    /// Key arrays that only this lookup owns (a partition's IN-list values),
+    /// which entries of `keys` point to.
+    _retained: Vec<Arc<[ArrayRef]>>,
+    /// An empty reservation of a build's memory consumer.
+    memory: Option<Arc<MemoryReservation>>,
 }
 
 /// The build side a [`HashTableLookupExpr`] checks probe keys against.
@@ -397,12 +422,100 @@ impl HashTableLookupExpr {
             lookup,
             description,
             pruning_bitmap,
+            build_side: None,
         })
     }
 
     /// Which parts of this build side's key range hold keys, for container pruning.
     pub fn pruning_bitmap(&self) -> Option<&Arc<KeyRangeBitmap>> {
         self.pruning_bitmap.as_ref()
+    }
+
+    /// Attaches the key arrays each map was built from and an empty
+    /// reservation of a build's memory consumer (Longbow family E).
+    ///
+    /// `keys` has one entry per entry of the `maps` given to [`Self::new`], in
+    /// the same order: that partition's build keys in one or more chunks, each
+    /// chunk holding one array per `on_columns` entry, held weakly so the
+    /// lookup never extends their lifetime. An entry without chunks means the
+    /// partition's keys are not available. Evaluation, equality, hashing and
+    /// display are unchanged.
+    ///
+    /// Only the number of entries is checked. The caller keeps every chunk
+    /// aligned with `on_columns` (one array per key, all of one length), and
+    /// consumers of [`Self::build_keys`] check widths and types before use.
+    pub fn with_build_side(
+        self,
+        keys: Vec<Vec<Weak<[ArrayRef]>>>,
+        memory: Option<Arc<MemoryReservation>>,
+    ) -> Result<Self> {
+        self.with_build_keys(keys, vec![], memory)
+    }
+
+    /// [`Self::with_build_side`], also owning `retained` key arrays that some
+    /// entries of `keys` point to.
+    pub(super) fn with_build_keys(
+        mut self,
+        keys: Vec<Vec<Weak<[ArrayRef]>>>,
+        retained: Vec<Arc<[ArrayRef]>>,
+        memory: Option<Arc<MemoryReservation>>,
+    ) -> Result<Self> {
+        let partitions = self.lookup.partitions();
+        if keys.len() != partitions {
+            return internal_err!(
+                "a lookup over {partitions} partitions takes {partitions} build key entries, got {}",
+                keys.len()
+            );
+        }
+        self.build_side = Some(Arc::new(LookupBuildSide {
+            keys,
+            _retained: retained,
+            memory,
+        }));
+        Ok(self)
+    }
+
+    /// The probe-side join key expressions (Longbow family E accessor).
+    pub fn on_columns(&self) -> &[PhysicalExprRef] {
+        &self.on_columns
+    }
+
+    /// The seeded hash state of the lookups (Longbow family E accessor).
+    pub fn random_state(&self) -> &SeededRandomState {
+        &self.random_state
+    }
+
+    /// The build key chunks of every non-empty partition, each chunk holding
+    /// one array per `on_columns` entry, while the join still holds them
+    /// (Longbow family E accessor). A probe row's key can match only a key in
+    /// these arrays.
+    ///
+    /// `None` when no build side was attached, or when a non-empty
+    /// partition's keys are unknown or already released.
+    pub fn build_keys(&self) -> Option<Vec<Arc<[ArrayRef]>>> {
+        let side = self.build_side.as_ref()?;
+        let mut keys = Vec::with_capacity(side.keys.len());
+        for (partition, map) in self.lookup.maps().enumerate() {
+            if map.is_none() {
+                // An empty partition holds no key.
+                continue;
+            }
+            let chunks = side.keys.get(partition)?;
+            if chunks.is_empty() {
+                return None;
+            }
+            for chunk in chunks {
+                keys.push(chunk.upgrade()?);
+            }
+        }
+        Some(keys)
+    }
+
+    /// An empty reservation of a build's memory consumer; structures derived
+    /// from the build keys charge it through `new_empty` (Longbow family E
+    /// accessor).
+    pub fn build_memory(&self) -> Option<&MemoryReservation> {
+        self.build_side.as_ref()?.memory.as_deref()
     }
 
     /// Membership of each row of `keys` in the hash table of its routed partition.
@@ -510,6 +623,26 @@ impl PartialEq for HashTableLookupExpr {
 impl Eq for HashTableLookupExpr {}
 
 impl Lookup {
+    /// The number of build partitions, one per map given to the constructor.
+    fn partitions(&self) -> usize {
+        match self {
+            Lookup::Single(_) => 1,
+            Lookup::Routed { maps, .. } => maps.len(),
+        }
+    }
+
+    /// Each partition's map, `None` for an empty partition.
+    fn maps(&self) -> impl Iterator<Item = Option<&Arc<Map>>> {
+        let (single, routed) = match self {
+            Lookup::Single(map) => (Some(map), None),
+            Lookup::Routed { maps, .. } => (None, Some(maps.iter().map(Option::as_ref))),
+        };
+        single
+            .map(Some)
+            .into_iter()
+            .chain(routed.into_iter().flatten())
+    }
+
     /// Identity of the immutable build-side maps. A routed lookup's router is
     /// created together with its maps, so the maps identify it as well.
     fn identity(&self) -> *const () {
@@ -541,6 +674,7 @@ impl PhysicalExpr for HashTableLookupExpr {
             lookup: self.lookup.clone(),
             description: self.description.clone(),
             pruning_bitmap: self.pruning_bitmap.clone(),
+            build_side: self.build_side.clone(),
         }))
     }
 
@@ -594,6 +728,7 @@ impl PhysicalExpr for HashTableLookupExpr {
             lookup: _,
             description: _,
             pruning_bitmap: _,
+            build_side: _,
         } = self;
 
         // HashTableLookupExpr holds a runtime Arc<Map> (the build-side hash
@@ -1123,6 +1258,125 @@ mod tests {
         let mut map = JoinHashMapU32::with_capacity(keys.len());
         map.update_from_iter(Box::new(hashes.iter().enumerate()), 0);
         Ok(Arc::new(Map::HashMap(Box::new(map))))
+    }
+
+    /// Longbow family E: a routed lookup exposes the build keys of every
+    /// non-empty partition and one memory consumer, without extending the
+    /// keys' lifetime; equality, hashing and evaluation ignore the build side.
+    #[test]
+    fn build_side_accessors_follow_partitions() -> Result<()> {
+        use datafusion_execution::memory_pool::{
+            GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        };
+        let random_state = SeededRandomState::with_seed(3);
+        let first: Arc<[ArrayRef]> =
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1, 4])) as ArrayRef].into();
+        let third: Arc<[ArrayRef]> =
+            vec![Arc::new(arrow::array::Int32Array::from(vec![3, 6])) as ArrayRef].into();
+        let maps = vec![
+            Some(hash_table(&first[0], &random_state)?),
+            None,
+            Some(hash_table(&third[0], &random_state)?),
+        ];
+        let column: PhysicalExprRef = Arc::new(Column::new("a", 0));
+        let new = || {
+            HashTableLookupExpr::new(
+                vec![Arc::clone(&column)],
+                random_state.clone(),
+                Some(PartitionRouter::Hash(SeededRandomState::with_seed(0))),
+                maps.clone(),
+                "hash_lookup".to_string(),
+                None,
+            )
+        };
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let memory = Arc::new(MemoryConsumer::new("HashJoinInput").register(&pool));
+
+        // Without a build side nothing is exposed.
+        let plain = new()?;
+        assert!(plain.build_keys().is_none());
+        assert!(plain.build_memory().is_none());
+        assert_eq!(plain.on_columns(), std::slice::from_ref(&column));
+        assert_eq!(plain.random_state().seed(), 3);
+
+        // One entry per map, including the empty partition.
+        assert!(
+            new()?
+                .with_build_side(vec![vec![Arc::downgrade(&first)]], None)
+                .is_err()
+        );
+
+        // The first partition's keys come in two chunks.
+        let second_chunk: Arc<[ArrayRef]> =
+            vec![Arc::new(arrow::array::Int32Array::from(vec![7])) as ArrayRef].into();
+        let exposed = Arc::new(new()?.with_build_side(
+            vec![
+                vec![Arc::downgrade(&first), Arc::downgrade(&second_chunk)],
+                vec![],
+                vec![Arc::downgrade(&third)],
+            ],
+            Some(Arc::clone(&memory)),
+        )?);
+        // A single map: equal maps, so equal expressions with or without keys.
+        let single = |keys: Option<&Arc<[ArrayRef]>>| {
+            let lookup = HashTableLookupExpr::new(
+                vec![Arc::clone(&column)],
+                random_state.clone(),
+                None,
+                vec![maps[0].clone()],
+                "hash_lookup".to_string(),
+                None,
+            )?;
+            match keys {
+                Some(keys) => lookup.with_build_side(
+                    vec![vec![Arc::downgrade(keys)]],
+                    Some(Arc::clone(&memory)),
+                ),
+                None => Ok(lookup),
+            }
+        };
+        let (with_keys, without) = (single(Some(&first))?, single(None)?);
+        assert_eq!(with_keys, without);
+        assert_eq!(compute_hash(&with_keys), compute_hash(&without));
+        assert_eq!(with_keys.build_keys().map(|keys| keys.len()), Some(1));
+        let keys = exposed.build_keys().expect("both non-empty partitions");
+        assert_eq!(keys.len(), 3);
+        assert!(Arc::ptr_eq(&keys[0], &first));
+        assert!(Arc::ptr_eq(&keys[1], &second_chunk));
+        assert!(Arc::ptr_eq(&keys[2], &third));
+        drop(keys);
+        let reservation = exposed.build_memory().expect("memory consumer");
+        assert_eq!(reservation.size(), 0);
+        assert_eq!(reservation.consumer().name(), "HashJoinInput");
+        let derived = reservation.new_empty();
+        derived.try_grow(100)?;
+        assert_eq!(pool.reserved(), 100);
+        drop(derived);
+        assert_eq!(pool.reserved(), 0);
+
+        let probe: ArrayRef =
+            Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3, 4, 5, 6]));
+        assert_eq!(lookup(&exposed, &probe)?, lookup(&plain, &probe)?);
+
+        // `with_new_children` keeps the build side.
+        let derived = Arc::clone(&exposed)
+            .with_new_children(vec![Arc::new(Column::new("a", 4))])?;
+        let derived = derived.downcast_ref::<HashTableLookupExpr>().unwrap();
+        assert_eq!(derived.build_keys().map(|keys| keys.len()), Some(3));
+        assert!(derived.build_memory().is_some());
+
+        // A released partition makes the build keys unknown.
+        drop(third);
+        assert!(exposed.build_keys().is_none());
+        assert!(derived.build_keys().is_none());
+
+        // A non-empty partition without keys also makes them unknown.
+        let partial = new()?.with_build_side(
+            vec![vec![Arc::downgrade(&first)], vec![], vec![]],
+            Some(memory),
+        )?;
+        assert!(partial.build_keys().is_none());
+        Ok(())
     }
 
     /// One randomly generated scenario, see [`routed_lookup_fuzz`].
