@@ -846,3 +846,19 @@ its table (`collect_left_input`). The hashbrown functions stay for the
 pruning map. Tests compare the table with the hashbrown reference
 (duplicates, NULL keys, every resume limit, both widths, both prefetch modes)
 and overfill it.
+
+### JT 3: partitioned build above 4 MiB
+
+Purpose: build a table larger than the caches with inserts that hit L2.
+Classification: UPSTREAMABLE. `collect_left_input` builds a `u32` map above
+4 MiB with `build_partitioned`: every row's hash, then a stable counting sort
+of (hash, row) into partitions of at most 256 KiB of slots, then the inserts
+partition by partition. Rows, row numbers, NULL handling and chains equal the
+row-by-row loop (reversed batches, each from its last row). The transient 20
+bytes per row are reserved and returned, and `build_mem_used` records the
+peak with them. A pool that refuses them gets the row-by-row build, not an
+error: CollectLeft cannot spill, and a build that fits without partitioning
+must not fail. Tests: the two builds against each other and against
+hashbrown with forced 32-bit tag collisions and NULL keys; a refused
+reservation touches nothing; a CollectLeft join whose pool refuses the
+transient arrays returns the rows of an unbounded run.

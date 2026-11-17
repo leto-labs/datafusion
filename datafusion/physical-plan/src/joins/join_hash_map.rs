@@ -901,6 +901,188 @@ impl<T: HeadWord> HeadTable<T> {
     }
 }
 
+/// Longbow patch (JT): tables from this size are built partition by
+/// partition ([`build_partitioned`]); smaller ones row by row.
+const PARTITIONED_BUILD_BYTES: usize = 4 << 20;
+
+/// Slot bytes of one partition of a partitioned build: about a quarter of
+/// the 1 MiB L2 of a Zen 4 core, so the partition's slots stay in L2.
+const PARTITION_BYTES: usize = 256 << 10;
+
+/// Longbow patch (JT): the build rows of a partitioned build: the hash of
+/// every row (row number = index), and the batches as (first row, rows,
+/// matchable rows). Rows are inserted as the row-by-row build inserts them:
+/// batch by batch, each batch's rows from its last.
+pub struct BuildRows<'a> {
+    pub hashes: &'a [u64],
+    pub batches: &'a [(usize, usize, Option<NullBuffer>)],
+}
+
+impl BuildRows<'_> {
+    /// The matchable rows in insertion order.
+    fn rows(&self) -> impl Iterator<Item = usize> + '_ {
+        self.batches.iter().flat_map(|(first, len, valid)| {
+            (0..*len).rev().filter_map(move |index| {
+                valid
+                    .as_ref()
+                    .is_none_or(|valid| valid.is_valid(index))
+                    .then_some(first + index)
+            })
+        })
+    }
+}
+
+/// Longbow patch (JT): a map whose build can be partitioned.
+pub trait PartitionedBuild: JoinHashMapType {
+    /// Whether a map made for `capacity` rows is built partition by
+    /// partition: its table is above `PARTITIONED_BUILD_BYTES`.
+    fn partitions_build(capacity: usize) -> bool
+    where
+        Self: Sized;
+
+    /// Inserts `rows` partition by partition, with the chains of
+    /// `update_from_iter` over the same rows in the same order.
+    fn update_partitioned(&mut self, rows: &BuildRows<'_>) -> Result<()>;
+}
+
+/// Transient bytes of [`build_partitioned`] for `rows` build rows: a hash
+/// for every row, then the scattered hashes and row numbers.
+pub fn partitioned_build_bytes(rows: usize) -> usize {
+    rows * (2 * size_of::<u64>() + size_of::<u32>())
+}
+
+macro_rules! partitioned_build {
+    ($map:ty, $width:ty) => {
+        impl PartitionedBuild for $map {
+            fn partitions_build(capacity: usize) -> bool {
+                HeadTable::<$width>::bytes_for(capacity) > PARTITIONED_BUILD_BYTES
+            }
+
+            fn update_partitioned(&mut self, rows: &BuildRows<'_>) -> Result<()> {
+                let next = &mut self.next;
+                let row_bound = next.len();
+                self.table
+                    .insert_partitioned(rows, row_bound, |row, prev| next[row] = prev)
+            }
+        }
+    };
+}
+// Row numbers of a partitioned build are `u32`: only the `u32` map has one.
+partitioned_build!(JoinHashMapU32, u32);
+
+impl<T: HeadWord> HeadTable<T> {
+    /// Inserts `rows` as [`Self::insert_all`] in their order, but partition
+    /// by partition: a counting sort by the top bits of the slot position
+    /// (stable, so equal hashes keep their order and chains are the same)
+    /// puts the rows of each `PARTITION_BYTES` range of slots together, and
+    /// their inserts then hit the cache instead of memory.
+    fn insert_partitioned<F>(
+        &mut self,
+        rows: &BuildRows<'_>,
+        row_bound: usize,
+        previous: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, T),
+    {
+        let hashes = rows.hashes;
+        let slot_bits = 64 - self.shift;
+        let partition_slots = (PARTITION_BYTES / (T::WORDS * size_of::<u64>())).max(1);
+        let partition_bits = slot_bits.saturating_sub(partition_slots.trailing_zeros());
+        if partition_bits == 0 {
+            return self.insert_all(
+                rows.rows().map(|row| (row, hashes[row])),
+                row_bound,
+                previous,
+            );
+        }
+        let low = slot_bits - partition_bits;
+        let partition_of = |hash: u64| self.position(hash) >> low;
+        let mut starts = vec![0_usize; (1 << partition_bits) + 1];
+        for row in rows.rows() {
+            starts[partition_of(hashes[row]) + 1] += 1;
+        }
+        for index in 1..starts.len() {
+            starts[index] += starts[index - 1];
+        }
+        let total = starts[starts.len() - 1];
+        let mut scattered_hashes = vec![0_u64; total];
+        let mut scattered_rows = vec![0_u32; total];
+        for row in rows.rows() {
+            let hash = hashes[row];
+            let at = &mut starts[partition_of(hash)];
+            scattered_hashes[*at] = hash;
+            scattered_rows[*at] = u32::try_from(row).map_err(|_| {
+                internal_datafusion_err!("partitioned join build above u32 rows")
+            })?;
+            *at += 1;
+        }
+        // In partition order and, within a partition, in the given order.
+        self.insert_all(
+            scattered_rows
+                .iter()
+                .zip(&scattered_hashes)
+                .map(|(&row, &hash)| (row as usize, hash)),
+            row_bound,
+            previous,
+        )
+    }
+}
+
+/// Longbow patch (JT): builds `map` from `batches`, in the order and with
+/// the row numbers of the row-by-row build of `collect_left_input` (rows
+/// numbered from the first batch given, each batch's rows inserted from its
+/// last), partition by partition. Charges its transient arrays
+/// ([`partitioned_build_bytes`]) to `reservation` while they live.
+///
+/// Returns the reservation's size with the transient arrays charged (the
+/// build's peak, for `build_mem_used`), or `None` without touching `map`
+/// when the pool refuses them: a CollectLeft build cannot spill, so the
+/// caller then builds row by row, which gives the same chains, instead of
+/// failing a query that fits without the partitioning.
+pub(crate) fn build_partitioned<'a, M: PartitionedBuild>(
+    map: &mut M,
+    on: &[datafusion_physical_expr::PhysicalExprRef],
+    batches: impl Iterator<Item = &'a arrow::record_batch::RecordBatch>,
+    num_rows: usize,
+    random_state: &datafusion_common::hash_utils::RandomState,
+    null_equality: datafusion_common::NullEquality,
+    reservation: &mut datafusion_execution::memory_pool::MemoryReservation,
+) -> Result<Option<usize>> {
+    let transient = partitioned_build_bytes(num_rows);
+    if reservation.try_grow(transient).is_err() {
+        return Ok(None);
+    }
+    let peak = reservation.size();
+    let result = (|| {
+        let mut hashes = vec![0_u64; num_rows];
+        let mut layout = Vec::new();
+        let mut offset = 0;
+        for batch in batches {
+            let rows = batch.num_rows();
+            let keys =
+                datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays(
+                    on, batch,
+                )?;
+            let Some(slice) = hashes.get_mut(offset..offset + rows) else {
+                return Err(internal_datafusion_err!(
+                    "join build batches hold more than {num_rows} rows"
+                ));
+            };
+            datafusion_common::hash_utils::create_hashes(&keys, random_state, slice)?;
+            let valid = crate::joins::utils::matchable_join_keys(&keys, null_equality);
+            layout.push((offset, rows, valid));
+            offset += rows;
+        }
+        map.update_partitioned(&BuildRows {
+            hashes: &hashes[..offset],
+            batches: &layout,
+        })
+    })();
+    reservation.shrink(transient);
+    result.map(|()| Some(peak))
+}
+
 /// Longbow patch (JT): chain heads by hash, for the probe functions below.
 pub(crate) trait HeadLookup {
     /// The chain head (row + 1) of `hash`, or 0.
@@ -1778,5 +1960,238 @@ mod tests {
         if std::env::var(HUGE_PAGES_ENV).is_err() {
             assert!(!huge_page_advice());
         }
+    }
+
+    /// The partitioned build gives the maps of the row-by-row build of
+    /// `collect_left_input`: same heads, chains and probe results, with
+    /// duplicates and NULL keys across several batches; its transient memory
+    /// is charged and returned.
+    #[test]
+    fn a_partitioned_build_equals_the_row_by_row_build() {
+        use crate::joins::utils::update_hash;
+        use arrow::array::{RecordBatch, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion_common::NullEquality;
+        use datafusion_common::hash_utils::{RandomState, create_hashes};
+        use datafusion_execution::memory_pool::{
+            MemoryConsumer, MemoryPool, UnboundedMemoryPool,
+        };
+        use datafusion_physical_expr::expressions::Column;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::UInt64, true)]));
+        let on: Vec<datafusion_physical_expr::PhysicalExprRef> =
+            vec![Arc::new(Column::new("k", 0))];
+        let mut state = 3;
+        let batches: Vec<RecordBatch> = [100_000_usize, 1, 0, 150_000, 70_000]
+            .iter()
+            .map(|&rows| {
+                let keys = UInt64Array::from_iter((0..rows).map(|_| {
+                    let value = splitmix(&mut state);
+                    // A seventh NULL; keys from 200,000 values, so duplicates.
+                    (value % 7 != 0).then_some(value % 200_000)
+                }));
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(keys)]).unwrap()
+            })
+            .collect();
+        let num_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert!(JoinHashMapU32::partitions_build(num_rows));
+        let random_state = RandomState::with_seed(0);
+        for null_equality in [
+            NullEquality::NullEqualsNothing,
+            NullEquality::NullEqualsNull,
+        ] {
+            let mut expected = JoinHashMapU32::with_capacity(num_rows);
+            let (mut offset, mut hashes) = (0, Vec::new());
+            for batch in batches.iter().rev() {
+                hashes.clear();
+                hashes.resize(batch.num_rows(), 0);
+                update_hash(
+                    &on,
+                    batch,
+                    &mut expected,
+                    offset,
+                    &random_state,
+                    &mut hashes,
+                    0,
+                    true,
+                    null_equality,
+                )
+                .unwrap();
+                offset += batch.num_rows();
+            }
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let mut reservation = MemoryConsumer::new("build").register(&pool);
+            let mut actual = JoinHashMapU32::with_capacity(num_rows);
+            let peak = build_partitioned(
+                &mut actual,
+                &on,
+                batches.iter().rev(),
+                num_rows,
+                &random_state,
+                null_equality,
+                &mut reservation,
+            )
+            .unwrap();
+            // The peak includes the transient arrays; they are returned.
+            assert_eq!(peak, Some(partitioned_build_bytes(num_rows)));
+            assert_eq!(reservation.size(), 0);
+            assert_eq!(actual.next, expected.next);
+            assert_eq!(actual.len(), expected.len());
+            // Probe with every value and some absent ones.
+            let probe: arrow::array::ArrayRef =
+                Arc::new(UInt64Array::from_iter_values(0..250_000));
+            let mut probe_hashes = vec![0; probe.len()];
+            create_hashes([&probe], &random_state, &mut probe_hashes).unwrap();
+            for limit in [7, 8192] {
+                let a = drain(|o, i, m| {
+                    actual.get_matched_indices_with_limit_offset(
+                        &probe_hashes,
+                        None,
+                        limit,
+                        o,
+                        i,
+                        m,
+                    )
+                });
+                let b = drain(|o, i, m| {
+                    expected.get_matched_indices_with_limit_offset(
+                        &probe_hashes,
+                        None,
+                        limit,
+                        o,
+                        i,
+                        m,
+                    )
+                });
+                assert_eq!(a, b);
+            }
+        }
+    }
+
+    /// Review of JT (leto-mjj.49): the partitioned build with forced 32-bit
+    /// tag collisions and NULL keys, against hashbrown and the row-by-row
+    /// build in the same order.
+    #[test]
+    fn review_tag_collisions_partitioned_build() {
+        let rows = 600_000usize;
+        assert!(JoinHashMapU32::partitions_build(rows));
+        for groups in [3000u64, 100_000] {
+            let (build, probe) = collision_case(rows, groups, 5 + groups);
+            // Two batches; the second has NULL keys (rows that cannot match).
+            let split = 250_000;
+            let valid2 = NullBuffer::from(
+                (0..rows - split).map(|r| r % 9 != 4).collect::<Vec<bool>>(),
+            );
+            let layout = vec![
+                (0, split, None),
+                (split, rows - split, Some(valid2.clone())),
+            ];
+            let mut actual = JoinHashMapU32::with_capacity(rows);
+            actual
+                .update_partitioned(&BuildRows {
+                    hashes: &build,
+                    batches: &layout,
+                })
+                .unwrap();
+            // The row-by-row order: batch 0 from its last row, then batch 1.
+            let mut expected_map = HashTable::with_capacity(rows);
+            let mut expected_next = vec![0u32; rows];
+            let order: Vec<(usize, &u64)> = (0..split)
+                .rev()
+                .chain((split..rows).rev().filter(|r| valid2.is_valid(r - split)))
+                .map(|r| (r, &build[r]))
+                .collect();
+            update_from_iter::<u32>(
+                &mut expected_map,
+                &mut expected_next,
+                Box::new(order.clone().into_iter()),
+                0,
+            );
+            let mut row_by_row = JoinHashMapU32::with_capacity(rows);
+            row_by_row
+                .update_from_iter(Box::new(order.into_iter()), 0)
+                .unwrap();
+            for limit in [5usize, 8192] {
+                let exp = drain(|o, i, m| {
+                    get_matched_indices_with_limit_offset::<u32>(
+                        &expected_map,
+                        &expected_next,
+                        &probe,
+                        None,
+                        limit,
+                        o,
+                        i,
+                        m,
+                    )
+                });
+                let a = drain(|o, i, m| {
+                    actual.get_matched_indices_with_limit_offset(
+                        &probe, None, limit, o, i, m,
+                    )
+                });
+                let r = drain(|o, i, m| {
+                    row_by_row.get_matched_indices_with_limit_offset(
+                        &probe, None, limit, o, i, m,
+                    )
+                });
+                assert_eq!(
+                    filtered(a, &build, &probe),
+                    exp,
+                    "partitioned groups {groups} limit {limit}"
+                );
+                assert_eq!(
+                    filtered(r, &build, &probe),
+                    exp,
+                    "row-by-row groups {groups} limit {limit}"
+                );
+            }
+        }
+    }
+
+    /// Review of JT (leto-mjj.49), M2: a pool that refuses the partitioned
+    /// build's transient arrays leaves the map and the reservation untouched,
+    /// so the caller can build row by row.
+    #[test]
+    fn a_refused_partitioned_build_touches_nothing() {
+        use arrow::array::{RecordBatch, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion_common::NullEquality;
+        use datafusion_common::hash_utils::RandomState;
+        use datafusion_execution::memory_pool::{
+            GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        };
+        use datafusion_physical_expr::expressions::Column;
+        use std::sync::Arc;
+
+        let rows = 300_000_usize;
+        assert!(JoinHashMapU32::partitions_build(rows));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("k", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt64Array::from_iter_values(0..rows as u64))],
+        )
+        .unwrap();
+        let on: Vec<datafusion_physical_expr::PhysicalExprRef> =
+            vec![Arc::new(Column::new("k", 0))];
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(partitioned_build_bytes(rows) - 1));
+        let mut reservation = MemoryConsumer::new("build").register(&pool);
+        let mut map = JoinHashMapU32::with_capacity(rows);
+        let peak = build_partitioned(
+            &mut map,
+            &on,
+            std::iter::once(&batch),
+            rows,
+            &RandomState::with_seed(0),
+            NullEquality::NullEqualsNothing,
+            &mut reservation,
+        )
+        .unwrap();
+        assert_eq!(
+            (peak, map.len(), reservation.size(), pool.reserved()),
+            (None, 0, 0, 0)
+        );
     }
 }

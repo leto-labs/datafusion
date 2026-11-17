@@ -936,3 +936,53 @@ async fn dictionary_shared_by_every_group_is_not_copied_per_group() -> Result<()
     assert!(copies.size() <= rows * (2 * 17 + 4), "{}", copies.size());
     Ok(())
 }
+
+/// Longbow patch (JT), review of leto-mjj.49 (M2): a single-future CollectLeft
+/// build above the partitioned-build size, in a pool that holds the
+/// row-by-row build but not the partitioning's transient arrays, falls back
+/// to the row-by-row build and returns the rows of an unbounded run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_partitioned_build_falls_back_to_the_row_by_row_build() -> Result<()> {
+    use crate::joins::join_hash_map::{PartitionedBuild, partitioned_build_bytes};
+    let rows = 600_000;
+    assert!(JoinHashMapU32::partitions_build(rows));
+    let run = |pool: Arc<dyn MemoryPool>| async move {
+        let left = table("l", rows, 4, 400_000, 0);
+        let right = table("r", 30_000, 3, 500_000, 0);
+        let on = join_on(&left.schema(), &right.schema(), &[0]);
+        let join = HashJoinExec::try_new(
+            Arc::new(CoalescePartitionsExec::new(left)),
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        let batches =
+            common::collect(join.execute(0, context(0, Some(Arc::clone(&pool))))?).await?;
+        let peak = join
+            .metrics()
+            .unwrap()
+            .sum_by_name("build_mem_used")
+            .map_or(0, |value| value.as_usize());
+        let rows = canonical(&join.schema(), &batches)?;
+        drop(join);
+        assert_eq!(pool.reserved(), 0);
+        Ok::<_, DataFusionError>((rows, peak))
+    };
+    let (expected, peak) = run(Arc::new(GreedyMemoryPool::new(usize::MAX))).await?;
+    let transient = partitioned_build_bytes(rows);
+    assert!(peak > transient);
+    let (actual, tight_peak) = run(Arc::new(GreedyMemoryPool::new(peak - transient / 2))).await?;
+    assert!(!expected.is_empty());
+    assert_eq!(actual, expected);
+    // Built row by row: the peak no longer includes the transient arrays.
+    assert!(
+        tight_peak <= peak - transient,
+        "{tight_peak} {peak} {transient}"
+    );
+    Ok(())
+}

@@ -42,7 +42,9 @@ use crate::joins::hash_join::shared_bounds::{
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
-use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
+use crate::joins::join_hash_map::{
+    JoinHashMapU32, JoinHashMapU64, PartitionedBuild, build_partitioned,
+};
 use crate::joins::utils::{
     OnceAsync, OnceFut, asymmetric_join_output_partitioning, reorder_output_after_swap,
     swap_join_projection, update_hash,
@@ -2469,6 +2471,7 @@ async fn collect_left_input(
             // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
             // `u64` indice variant
             // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
+            let mut partitioned = false;
             let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
                 // Longbow patch (JT): the head table of a `u64` map can be
                 // larger than hashbrown's estimate; reserve the larger.
@@ -2484,7 +2487,28 @@ async fn collect_left_input(
                     estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
                 reservation.try_grow(estimated_hashtable_size)?;
                 metrics.build_mem_used.add(estimated_hashtable_size);
-                Box::new(JoinHashMapU32::with_capacity(num_rows))
+                let mut map = JoinHashMapU32::with_capacity(num_rows);
+                // Longbow patch (JT): a table above a few MiB is built
+                // partition by partition, with the same rows, row numbers
+                // and chains as the loop below.
+                // A pool that refuses the partitioning's transient arrays
+                // gets the row-by-row build instead of an error.
+                if JoinHashMapU32::partitions_build(num_rows)
+                    && let Some(peak) = build_partitioned(
+                        &mut map,
+                        &on_left,
+                        batches.iter().rev(),
+                        num_rows,
+                        &random_state,
+                        null_equality,
+                        &mut reservation,
+                    )?
+                {
+                    // The peak with the transient arrays, before they shrank.
+                    metrics.build_mem_used.set_max(peak);
+                    partitioned = true;
+                }
+                Box::new(map)
             };
 
             let mut hashes_buffer = Vec::new();
@@ -2493,7 +2517,7 @@ async fn collect_left_input(
             let batches_iter = batches.iter().rev();
 
             // Updating hashmap starting from the last batch
-            for batch in batches_iter.clone() {
+            for batch in batches_iter.clone().filter(|_| !partitioned) {
                 hashes_buffer.clear();
                 hashes_buffer.resize(batch.num_rows(), 0);
                 update_hash(
