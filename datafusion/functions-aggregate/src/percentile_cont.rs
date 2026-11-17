@@ -25,8 +25,7 @@ use num_traits::AsPrimitive;
 use arrow::array::ArrowNativeTypeOp;
 use arrow::compute::DecimalCast;
 use arrow::datatypes::{
-    ArrowNativeType, Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type,
-    DecimalType,
+    Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type, DecimalType, i256,
 };
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::internal_err;
@@ -56,20 +55,6 @@ use datafusion_functions_aggregate_common::utils::Hashable;
 use datafusion_macros::user_doc;
 
 use crate::utils::PercentileParam;
-
-/// Precision multiplier for linear interpolation calculations.
-///
-/// This value of 1,000,000 was chosen to balance precision with overflow safety:
-/// - Provides 6 decimal places of precision for the fractional component
-/// - Small enough to avoid overflow when multiplied with typical numeric values
-/// - Sufficient precision for most statistical applications
-///
-/// The interpolation formula: `lower + (upper - lower) * fraction`
-/// is computed as: `lower + ((upper - lower) * (fraction * PRECISION)) / PRECISION`
-/// to avoid floating-point operations on integer types while maintaining precision.
-///
-/// Only decimals use it; float interpolation keeps the full fraction.
-const INTERPOLATION_PRECISION: usize = 1_000_000;
 
 create_func!(PercentileCont, percentile_cont_udaf);
 
@@ -519,8 +504,12 @@ where
         if self.all_values.is_empty() {
             return ScalarValue::new_primitive::<T>(None, &self.data_type);
         }
-        let percentile = self.percentile.effective_percentile()?;
-        let value = calculate_percentile::<T, I>(&mut self.all_values, percentile)?;
+        let value = calculate_percentile::<T, I>(
+            &mut self.all_values,
+            self.percentile.get()?,
+            self.percentile.is_desc,
+            &self.data_type,
+        )?;
         ScalarValue::new_primitive::<T>(value, &self.data_type)
     }
 
@@ -784,19 +773,24 @@ where
                         evaluate_result_builder.append_null();
                         continue;
                     }
-                    let percentile = self
-                        .percentile
-                        .apply_order(self.percentile.get_group_value(percentile)?);
-                    let value =
-                        calculate_percentile::<T, I>(values.as_mut_slice(), percentile)?;
+                    let value = calculate_percentile::<T, I>(
+                        values.as_mut_slice(),
+                        self.percentile.get_group_value(percentile)?,
+                        self.percentile.is_desc,
+                        &self.data_type,
+                    )?;
                     evaluate_result_builder.append_option(value);
                 }
             }
             None => {
-                let percentile = self.percentile.effective_percentile()?;
+                let percentile = self.percentile.get()?;
                 for values in &mut emit_group_values {
-                    let value =
-                        calculate_percentile::<T, I>(values.as_mut_slice(), percentile)?;
+                    let value = calculate_percentile::<T, I>(
+                        values.as_mut_slice(),
+                        percentile,
+                        self.percentile.is_desc,
+                        &self.data_type,
+                    )?;
                     evaluate_result_builder.append_option(value);
                 }
             }
@@ -981,8 +975,12 @@ where
         if values.is_empty() {
             return ScalarValue::new_primitive::<T>(None, &self.data_type);
         }
-        let percentile = self.percentile.effective_percentile()?;
-        let value = calculate_percentile::<T, I>(&mut values, percentile)?;
+        let value = calculate_percentile::<T, I>(
+            &mut values,
+            self.percentile.get()?,
+            self.percentile.is_desc,
+            &self.data_type,
+        )?;
         ScalarValue::new_primitive::<T>(value, &self.data_type)
     }
 
@@ -1035,14 +1033,37 @@ where
     }
 }
 
-/// A trait to abstract interpolation logic for percentile calculation
-/// for floats and decimals.
+/// A trait to abstract the rank selection and interpolation of a continuous
+/// percentile for floats and decimals.
 trait PercentileInterpolator<T: ArrowNumericType>: Debug + Sync + Send {
-    fn interpolate(
-        lower: T::Native,
-        upper: T::Native,
-        fraction: f64,
+    /// Returns the continuous percentile of `values`, which holds at least
+    /// two values. `percentile` is the requested fraction in `[0, 1]` before
+    /// the flip for `WITHIN GROUP (ORDER BY ... DESC)`, which `descending`
+    /// requests. `data_type` is the input (and result) type.
+    fn percentile_of(
+        values: &mut [T::Native],
+        percentile: f64,
+        descending: bool,
+        data_type: &DataType,
     ) -> Result<T::Native>;
+}
+
+/// Selects the values at the ascending ranks `lower <= upper`.
+fn select_ranks<T: ArrowPrimitiveType>(
+    values: &mut [T::Native],
+    lower: usize,
+    upper: usize,
+) -> (T::Native, T::Native) {
+    let cmp = |x: &T::Native, y: &T::Native| x.compare(*y);
+    // First, partition at lower to get the lower value
+    let (_, lower_value, _) = values.select_nth_unstable_by(lower, cmp);
+    let lower_value = *lower_value;
+    if lower == upper {
+        return (lower_value, lower_value);
+    }
+    // Then partition at upper to get the upper value
+    let (_, upper_value, _) = values.select_nth_unstable_by(upper, cmp);
+    (lower_value, *upper_value)
 }
 
 #[derive(Debug)]
@@ -1056,11 +1077,43 @@ where
     T::Native: AsPrimitive<f64>,
     f64: AsPrimitive<T::Native>,
 {
-    fn interpolate(
-        lower: T::Native,
-        upper: T::Native,
-        fraction: f64,
+    fn percentile_of(
+        values: &mut [T::Native],
+        percentile: f64,
+        descending: bool,
+        _data_type: &DataType,
     ) -> Result<T::Native> {
+        let cmp = |x: &T::Native, y: &T::Native| x.compare(*y);
+        let percentile = if descending {
+            1.0 - percentile
+        } else {
+            percentile
+        };
+        if percentile == 0.0 {
+            // Get minimum value
+            return Ok(*values
+                .iter()
+                .min_by(|a, b| cmp(a, b))
+                .expect("percentile_of receives at least two values"));
+        }
+        if percentile == 1.0 {
+            // Get maximum value
+            return Ok(*values
+                .iter()
+                .max_by(|a, b| cmp(a, b))
+                .expect("percentile_of receives at least two values"));
+        }
+        // Calculate the index using the formula: p * (n - 1)
+        let index = percentile * ((values.len() - 1) as f64);
+        let lower_index = index.floor() as usize;
+        let upper_index = index.ceil() as usize;
+        let (lower, upper) = select_ranks::<T>(values, lower_index, upper_index);
+        if lower_index == upper_index {
+            // Exact index, return the value at that position
+            return Ok(lower);
+        }
+        let fraction = index - (lower_index as f64);
+
         // Use the full fraction. Quantizing it to six decimal places can
         // move a result by a millionth of the neighbouring-value gap.
         // Widen before arithmetic to retain Float16 overflow safety.
@@ -1079,43 +1132,111 @@ where
     }
 }
 
+/// DuckDB 2.0.0's continuous percentile of decimals.
+///
+/// DuckDB (`QuantileInterpolator` in `quantile_sort_tree.hpp`,
+/// `InterpolateOperator` in `interpolate.hpp` and `arithmetic.cpp`) computes
+/// the binary64 rank `RN = (n - 1) * p` in the requested sort order, reads the
+/// values at `FRN = floor(RN)` and `CRN = ceil(RN)` of that order, returns
+/// the exact value when they coincide, and otherwise interpolates from the
+/// value at FRN (`first`) toward the value at CRN (`second`) with the
+/// binary64 fraction `RN - FRN`. The result keeps the input decimal type.
+/// The arithmetic depends on DuckDB's storage class for the declared
+/// precision (not the Arrow storage width: `DECIMAL(18, 2)` is
+/// `Decimal128(18, 2)` here but int64 in DuckDB):
+///
+/// - Precision <= 18 (int16/32/64): `fma(second - first, fraction, first)`
+///   on the unscaled values as doubles, truncated toward zero. The pinned
+///   DuckDB binary contracts `lo + (hi - lo) * d` to this fused form.
+/// - Precision 19..=38 (HUGEINT): the exact i128 `second - first`, converted
+///   to double by DuckDB's two-limb rule, times the fraction, truncated
+///   toward zero and added to the exact `first`; when the difference
+///   overflows i128, `fma(first, 1 - fraction, second * fraction)` in double,
+///   truncated. A double outside the i128 range is an error.
+/// - Precision > 38 (`Decimal256` only; DuckDB has no such type, so there is
+///   no reference): the HUGEINT rule in 256 bits.
+///
+/// `WITHIN GROUP (ORDER BY ... DESC)` keeps `p` and interpolates in the
+/// descending order, as DuckDB does: precision > 18 then rounds toward the
+/// larger value. Binary64 rounding can carry a precision <= 18 result past
+/// the declared precision (DuckDB's median of two 999999999999999999 values
+/// as DECIMAL(18, 0) is 10^18); the coefficient is returned unchanged and
+/// still fits the storage type.
 #[derive(Debug)]
 struct DecimalInterpolator;
 
-/// Compute a scaled value for interpolation using a formula `trunc(x * num / den)`
-/// where den is a precisely chosen interpolation precision.
-/// The numerical method is separating `q * num + trunc(r * num / den)`
-/// where `q = x / den` and `r = x % den`
-fn scale_by_num<T>(x: T::Native, num: i64) -> Result<T::Native>
-where
-    T: DecimalType,
-    T::Native: DecimalCast,
-{
-    let den = INTERPOLATION_PRECISION as i64;
+fn decimal_overflow() -> datafusion_common::DataFusionError {
+    exec_datafusion_err!("percentile_cont decimal interpolation overflow")
+}
 
-    debug_assert!(num >= 0);
-    debug_assert!(num <= den);
-    debug_assert!(den <= i32::MAX as i64);
+/// DuckDB 2.0.0's `Hugeint::Cast<double>` adds the two 64-bit limbs, which
+/// can round differently from a direct i128 cast near a limb boundary.
+fn hugeint_to_double(value: i128) -> f64 {
+    let lower = value as u64;
+    let upper = (value >> 64) as i64;
+    if upper == -1 {
+        -((u64::MAX - lower) as f64) - 1.0
+    } else {
+        lower as f64 + upper as f64 * 18446744073709551616.0
+    }
+}
 
-    let num_native = T::Native::usize_as(num as usize);
-    let den_native = T::Native::usize_as(den as usize);
+/// DuckDB's `Hugeint::Convert(double)`: truncates toward zero and rejects
+/// non-finite values and both binary64 i128 boundaries. Checked before
+/// Rust's saturating float-to-integer cast could hide an overflow.
+fn hugeint_from_double(value: f64) -> Result<i128> {
+    let bound = 170141183460469231731687303715884105728.0;
+    if !value.is_finite() || value <= -bound || value >= bound {
+        return Err(decimal_overflow());
+    }
+    Ok(value as i128)
+}
 
-    // q and r fit `den` and thus i32 (smallest Decimal32's native type)
-    let q = x.div_wrapping(den_native);
-    let r = x.mod_wrapping(den_native);
-    let r_wide = ArrowNativeType::to_i64(r)
-        .ok_or_else(|| exec_datafusion_err!("Arithmetic overflow in percentile_cont"))?;
+/// Interpolates DuckDB's way for precision <= 38; `narrow` selects the
+/// int16/32/64 rule (precision <= 18).
+fn interpolate_hugeint(
+    first: i128,
+    second: i128,
+    fraction: f64,
+    narrow: bool,
+) -> Result<i128> {
+    if narrow {
+        // The values have at most 18 digits, so `as f64` is DuckDB's
+        // int64-to-double conversion.
+        let lo = first as f64;
+        let hi = second as f64;
+        return hugeint_from_double((hi - lo).mul_add(fraction, lo));
+    }
+    match second.checked_sub(first) {
+        Some(delta) => {
+            let increment = hugeint_from_double(hugeint_to_double(delta) * fraction)?;
+            first.checked_add(increment).ok_or_else(decimal_overflow)
+        }
+        // Opposite DECIMAL(38) extremes overflow the i128 difference.
+        None => hugeint_from_double(
+            hugeint_to_double(first)
+                .mul_add(1.0 - fraction, hugeint_to_double(second) * fraction),
+        ),
+    }
+}
 
-    // `a = q * num` cannot exceed `x` and thus i32
-    let a = q.mul_checked(num_native)?;
-
-    // `r * num` cannot exceed `den^2`, and `r * num / den` cannot exceed `den`, fits i32
-    let b_wide = r_wide.mul_checked(num)?.div_wrapping(den);
-    let b = T::Native::from_decimal(b_wide)
-        .ok_or_else(|| exec_datafusion_err!("Arithmetic overflow in percentile_cont"))?;
-
-    a.add_checked(b)
-        .map_err(|e| exec_datafusion_err!("Arithmetic overflow in percentile_cont: {e}"))
+/// The HUGEINT rule in 256 bits, for `Decimal256` precision > 38 (no DuckDB
+/// reference). `i256::to_f64` rounds to nearest; `i256::from_f64` truncates
+/// toward zero and rejects non-finite and out-of-range values.
+fn interpolate_wide(first: i256, second: i256, fraction: f64) -> Result<i256> {
+    let to_double =
+        |v: i256| num_traits::ToPrimitive::to_f64(&v).ok_or_else(decimal_overflow);
+    match second.checked_sub(first) {
+        Some(delta) => {
+            let increment = i256::from_f64(to_double(delta)? * fraction)
+                .ok_or_else(decimal_overflow)?;
+            first.checked_add(increment).ok_or_else(decimal_overflow)
+        }
+        None => i256::from_f64(
+            to_double(first)?.mul_add(1.0 - fraction, to_double(second)? * fraction),
+        )
+        .ok_or_else(decimal_overflow),
+    }
 }
 
 impl<T> PercentileInterpolator<T> for DecimalInterpolator
@@ -1123,40 +1244,57 @@ where
     T: DecimalType,
     T::Native: DecimalCast,
 {
-    fn interpolate(
-        lower: T::Native,
-        upper: T::Native,
-        fraction: f64,
+    fn percentile_of(
+        values: &mut [T::Native],
+        percentile: f64,
+        descending: bool,
+        data_type: &DataType,
     ) -> Result<T::Native> {
-        debug_assert!((0.0..=1.0).contains(&fraction));
-        debug_assert!(lower <= upper);
-
-        let num = (fraction * INTERPOLATION_PRECISION as f64) as i64;
-        let den = INTERPOLATION_PRECISION as i64;
-
-        // Happy path: `upper - lower` does not overflow
-        // (could be a case for Decimal128 with max precision)
-        if let Ok(delta) = upper.sub_checked(lower) {
-            // Calculate the interpolation weight with the formula, where den is the precision:
-            // `lower + (upper - lower) * num / den`
-            let scaled: T::Native = scale_by_num::<T>(delta, num)?;
-            lower.add_checked(scaled).map_err(|e| {
-                exec_datafusion_err!("Arithmetic overflow in percentile_cont: {e}")
-            })
+        let precision = match data_type {
+            DataType::Decimal32(p, _)
+            | DataType::Decimal64(p, _)
+            | DataType::Decimal128(p, _)
+            | DataType::Decimal256(p, _) => *p,
+            dt => return internal_err!("percentile_cont: {dt} is not a decimal"),
+        };
+        let last = values.len() - 1;
+        // DuckDB's binary64 rank in the requested order; p <= 1 keeps it
+        // within [0, n - 1].
+        let rank = percentile * (last as f64);
+        let floor = rank.floor() as usize;
+        let ceil = rank.ceil() as usize;
+        if ceil > last {
+            return internal_err!("percentile_cont rank {rank} out of range");
+        }
+        // Ascending positions of the values at FRN and CRN in the sort order.
+        let (lower, upper) = if descending {
+            (last - ceil, last - floor)
         } else {
-            // Avoid overflow with the subtraction - split to two additive parts
-            // `a = lower * (precision-num) / precision`
-            // `b = upper * num / precision`
-            // The weights sum to 1, so the result is bounded by max(|lower|, |upper|)
-            // and never overflows, at the cost of a second truncation (2 ULP not 1).
-            let num_a = den.sub_wrapping(num);
-            let a: T::Native = scale_by_num::<T>(lower, num_a)?;
-
-            let b: T::Native = scale_by_num::<T>(upper, num)?;
-
-            a.add_checked(b).map_err(|e| {
-                exec_datafusion_err!("Arithmetic overflow in percentile_cont: {e}")
-            })
+            (floor, ceil)
+        };
+        let (lower_value, upper_value) = select_ranks::<T>(values, lower, upper);
+        if floor == ceil {
+            return Ok(lower_value);
+        }
+        let (first, second) = if descending {
+            (upper_value, lower_value)
+        } else {
+            (lower_value, upper_value)
+        };
+        let fraction = rank - floor as f64;
+        if precision <= 38 {
+            let narrow = |v: T::Native| v.to_i128().ok_or_else(decimal_overflow);
+            let value = interpolate_hugeint(
+                narrow(first)?,
+                narrow(second)?,
+                fraction,
+                precision <= 18,
+            )?;
+            T::Native::from_decimal(value).ok_or_else(decimal_overflow)
+        } else {
+            let wide = |v: T::Native| v.to_i256().ok_or_else(decimal_overflow);
+            let value = interpolate_wide(wide(first)?, wide(second)?, fraction)?;
+            T::Native::from_decimal(value).ok_or_else(decimal_overflow)
         }
     }
 }
@@ -1169,62 +1307,22 @@ where
 /// - If p * (n-1) is an integer, return the value at that position
 /// - Otherwise, interpolate between the two closest values
 ///
+/// `percentile` is the requested fraction before the flip for
+/// `WITHIN GROUP (ORDER BY ... DESC)`, which `descending` requests.
+///
 /// Note: This function takes a mutable slice and sorts it in place, but does not
 /// consume the data. This is important for window frame queries where evaluate()
 /// may be called multiple times on the same accumulator state.
-fn calculate_percentile<T: ArrowPrimitiveType, I: PercentileInterpolator<T>>(
+fn calculate_percentile<T: ArrowNumericType, I: PercentileInterpolator<T>>(
     values: &mut [T::Native],
     percentile: f64,
+    descending: bool,
+    data_type: &DataType,
 ) -> Result<Option<T::Native>> {
-    let cmp = |x: &T::Native, y: &T::Native| x.compare(*y);
-
-    let len = values.len();
-    if len == 0 {
-        Ok(None)
-    } else if len == 1 {
-        Ok(Some(values[0]))
-    } else if percentile == 0.0 {
-        // Get minimum value
-        Ok(Some(
-            *values
-                .iter()
-                .min_by(|a, b| cmp(a, b))
-                .expect("we checked for len > 0 a few lines above"),
-        ))
-    } else if percentile == 1.0 {
-        // Get maximum value
-        Ok(Some(
-            *values
-                .iter()
-                .max_by(|a, b| cmp(a, b))
-                .expect("we checked for len > 0 a few lines above"),
-        ))
-    } else {
-        // Calculate the index using the formula: p * (n - 1)
-        let index = percentile * ((len - 1) as f64);
-        let lower_index = index.floor() as usize;
-        let upper_index = index.ceil() as usize;
-
-        if lower_index == upper_index {
-            // Exact index, return the value at that position
-            let (_, value, _) = values.select_nth_unstable_by(lower_index, cmp);
-            Ok(Some(*value))
-        } else {
-            // Need to interpolate between two values
-            // First, partition at lower_index to get the lower value
-            let (_, lower_value, _) = values.select_nth_unstable_by(lower_index, cmp);
-            let lower_value = *lower_value;
-
-            // Then partition at upper_index to get the upper value
-            let (_, upper_value, _) = values.select_nth_unstable_by(upper_index, cmp);
-            let upper_value = *upper_value;
-
-            let fraction = index - (lower_index as f64);
-
-            let interpolated = I::interpolate(lower_value, upper_value, fraction)?;
-
-            Ok(Some(interpolated))
-        }
+    match values.len() {
+        0 => Ok(None),
+        1 => Ok(Some(values[0])),
+        _ => I::percentile_of(values, percentile, descending, data_type).map(Some),
     }
 }
 
@@ -1232,8 +1330,11 @@ fn calculate_percentile<T: ArrowPrimitiveType, I: PercentileInterpolator<T>>(
 mod tests {
     use super::*;
     use crate::utils::PercentileParamState;
-    use arrow::array::Float64Array;
-    use arrow::datatypes::{Decimal64Type, Decimal128Type, Float16Type, Float64Type};
+    use arrow::array::{Decimal128Array, Float64Array};
+    use arrow::datatypes::{
+        Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type, Float16Type,
+        Float64Type,
+    };
     use half::f16;
 
     fn create_accumulator() -> PercentileContAccumulator<Float64Type, FloatInterpolator> {
@@ -1253,8 +1354,13 @@ mod tests {
         T::Native: AsPrimitive<f64>,
         f64: AsPrimitive<T::Native>,
     {
-        calculate_percentile::<T, FloatInterpolator>(values, percentile)
-            .expect("float interpolation is infallible")
+        calculate_percentile::<T, FloatInterpolator>(
+            values,
+            percentile,
+            false,
+            &T::DATA_TYPE,
+        )
+        .expect("float interpolation is infallible")
     }
 
     #[test]
@@ -1353,10 +1459,14 @@ mod tests {
         // Interpolating between 0 and the max finite f16 value previously overflowed
         // intermediate f16 computations and produced NaN.
         let mut values = vec![f16::from_f32(0.0), f16::from_f32(65504.0)];
-        let result =
-            calculate_percentile::<Float16Type, FloatInterpolator>(&mut values, 0.5)
-                .expect("non-empty input")
-                .expect("non-empty result");
+        let result = calculate_percentile::<Float16Type, FloatInterpolator>(
+            &mut values,
+            0.5,
+            false,
+            &DataType::Float16,
+        )
+        .expect("non-empty input")
+        .expect("non-empty result");
         let result_f = result.to_f32();
         assert!(
             !result_f.is_nan(),
@@ -1367,6 +1477,401 @@ mod tests {
             (result_f - 32752.0).abs() < 1.0,
             "unexpected result {result_f}"
         );
+    }
+
+    fn decimal64_percentile(values: &mut [i64], percentile: f64) -> i64 {
+        calculate_percentile::<Decimal64Type, DecimalInterpolator>(
+            values,
+            percentile,
+            false,
+            &DataType::Decimal64(18, 2),
+        )
+        .expect("evaluate failed")
+        .expect("expected Some value")
+    }
+
+    /// The percentile of unscaled `values` in `data_type`, as i128.
+    fn decimal_percentile<T>(
+        values: &[i128],
+        percentile: f64,
+        descending: bool,
+        data_type: &DataType,
+    ) -> i128
+    where
+        T: DecimalType,
+        T::Native: DecimalCast,
+    {
+        let mut values = values
+            .iter()
+            .map(|&v| T::Native::from_decimal(v).expect("value fits the type"))
+            .collect::<Vec<_>>();
+        calculate_percentile::<T, DecimalInterpolator>(
+            &mut values,
+            percentile,
+            descending,
+            data_type,
+        )
+        .expect("evaluate failed")
+        .expect("expected Some value")
+        .to_i128()
+        .expect("result fits i128")
+    }
+
+    fn decimal256_percentile(
+        values: &[i256],
+        percentile: f64,
+        data_type: &DataType,
+    ) -> i256 {
+        calculate_percentile::<Decimal256Type, DecimalInterpolator>(
+            &mut values.to_vec(),
+            percentile,
+            false,
+            data_type,
+        )
+        .expect("evaluate failed")
+        .expect("expected Some value")
+    }
+
+    fn p128(values: &[i128], percentile: f64, descending: bool, precision: u8) -> i128 {
+        decimal_percentile::<Decimal128Type>(
+            values,
+            percentile,
+            descending,
+            &DataType::Decimal128(precision, 0),
+        )
+    }
+
+    #[test]
+    fn decimal_matches_duckdb_binary64_interpolation() {
+        // Every expectation is a DuckDB 2.0.0 result (unscaled coefficients).
+        // 0, 1000000, ..., 7000000 as DECIMAL(p, 2): p0.9 is 6300000.00 for
+        // precision <= 18 and 6299999.99 for precision 19..=38. A weight
+        // truncated to six decimals gave 6299999.00.
+        let values = (0..8).map(|n| n * 100_000_000).collect::<Vec<i128>>();
+        let narrow = [
+            decimal_percentile::<Decimal32Type>(
+                &values,
+                0.9,
+                false,
+                &DataType::Decimal32(9, 2),
+            ),
+            decimal_percentile::<Decimal64Type>(
+                &values,
+                0.9,
+                false,
+                &DataType::Decimal64(18, 2),
+            ),
+            decimal_percentile::<Decimal128Type>(
+                &values,
+                0.9,
+                false,
+                &DataType::Decimal128(18, 2),
+            ),
+            decimal_percentile::<Decimal256Type>(
+                &values,
+                0.9,
+                false,
+                &DataType::Decimal256(18, 2),
+            ),
+        ];
+        assert_eq!(narrow, [630_000_000; 4]);
+        for data_type in [DataType::Decimal128(19, 2), DataType::Decimal128(38, 2)] {
+            assert_eq!(
+                decimal_percentile::<Decimal128Type>(&values, 0.9, false, &data_type),
+                629_999_999,
+                "{data_type}"
+            );
+        }
+        assert_eq!(
+            decimal_percentile::<Decimal256Type>(
+                &values,
+                0.9,
+                false,
+                &DataType::Decimal256(38, 2)
+            ),
+            629_999_999
+        );
+        // DESC keeps p: percentile_cont(0.1) WITHIN GROUP (ORDER BY x DESC)
+        // is 6300000.00 at DECIMAL(38, 2), unlike p0.9 ascending.
+        assert_eq!(
+            decimal_percentile::<Decimal128Type>(
+                &values,
+                0.1,
+                true,
+                &DataType::Decimal128(38, 2)
+            ),
+            630_000_000
+        );
+        // The pinned binary's fused multiply-add (separate rounding gives
+        // other last digits).
+        assert_eq!(
+            p128(
+                &[-283_110_063_312_371_717, -168_985_206_005_547_813],
+                0.2,
+                false,
+                18
+            ),
+            -260_285_091_851_006_944
+        );
+        assert_eq!(
+            p128(
+                &[
+                    -96_061_439_535_860_669_001_790_758_262_438_174_069,
+                    85_251_732_078_307_683_191_308_606_285_311_392_193
+                ],
+                0.3,
+                false,
+                38
+            ),
+            -41_667_488_051_610_157_332_345_492_003_413_295_104
+        );
+        // DESC of the same narrow pair: p0.8 DESC.
+        assert_eq!(
+            p128(
+                &[-283_110_063_312_371_717, -168_985_206_005_547_813],
+                0.8,
+                true,
+                18
+            ),
+            -260_285_091_851_006_944
+        );
+        // Binary64 rounding can exceed the declared precision.
+        assert_eq!(
+            decimal_percentile::<Decimal64Type>(
+                &[999_999_999_999_999_999; 2],
+                0.5,
+                false,
+                &DataType::Decimal64(18, 0)
+            ),
+            1_000_000_000_000_000_000
+        );
+        assert_eq!(
+            p128(&[9_999_999_999_999_999_999; 2], 0.5, false, 19),
+            9_999_999_999_999_999_999
+        );
+        // Opposite DECIMAL(38, 0) extremes take the weighted fallback.
+        let max = 99_999_999_999_999_999_999_999_999_999_999_999_999i128;
+        assert_eq!(p128(&[-max, max], 0.5, false, 38), 0);
+        assert_eq!(
+            p128(&[-max, max], 0.1, false, 38),
+            -79_999_999_999_999_996_310_101_265_616_969_138_176
+        );
+        assert_eq!(
+            p128(&[-max, max], 0.9, false, 38),
+            79_999_999_999_999_996_310_101_265_616_969_138_176
+        );
+        assert_eq!(p128(&[-max, max], 0.0, false, 38), -max);
+    }
+
+    #[test]
+    fn decimal_rounding_follows_duckdb_width_classes() {
+        // DuckDB 2.0.0 results. Precision <= 18 truncates the interpolated
+        // value toward zero; precision > 18 truncates the offset from the
+        // value at FRN in the sort order.
+        // median(-10, -9) = -9.5
+        assert_eq!(p128(&[-10, -9], 0.5, false, 18), -9);
+        assert_eq!(p128(&[-10, -9], 0.5, false, 38), -10);
+        // ... DESC rounds toward the larger value at precision > 18.
+        assert_eq!(p128(&[-10, -9], 0.5, true, 38), -9);
+        assert_eq!(p128(&[-101, -100], 0.5, false, 19), -101);
+        assert_eq!(p128(&[-101, -100], 0.5, true, 19), -100);
+        // quantile_cont(-1, 2; 0.25) = -0.25
+        assert_eq!(p128(&[-1, 2], 0.25, false, 18), 0);
+        assert_eq!(p128(&[-1, 2], 0.25, false, 38), -1);
+        // percentile_cont(p) WITHIN GROUP (ORDER BY x DESC) of 9, 10.
+        assert_eq!(p128(&[9, 10], 0.25, true, 18), 9);
+        assert_eq!(p128(&[9, 10], 0.25, true, 38), 10);
+        assert_eq!(p128(&[9, 10], 0.5, true, 38), 10);
+        // quantile_cont(-1.0001, -2.0003; 0.37) = -1.630174 (scale 4), and
+        // DESC -1.370174.
+        let values = [-10_001, -20_003];
+        assert_eq!(p128(&values, 0.37, false, 18), -16_302);
+        assert_eq!(p128(&values, 0.37, false, 38), -16_303);
+        assert_eq!(p128(&values, 0.37, true, 18), -13_701);
+        assert_eq!(p128(&values, 0.37, true, 38), -13_701);
+        // The class follows the precision, not the storage width.
+        assert_eq!(
+            decimal_percentile::<Decimal32Type>(
+                &[-10, -9],
+                0.5,
+                false,
+                &DataType::Decimal32(9, 0)
+            ),
+            -9
+        );
+        assert_eq!(
+            decimal_percentile::<Decimal256Type>(
+                &[-10, -9],
+                0.5,
+                false,
+                &DataType::Decimal256(18, 0)
+            ),
+            -9
+        );
+        // Decimal256 precision > 38 keeps the HUGEINT rule (no DuckDB type).
+        assert_eq!(
+            decimal_percentile::<Decimal256Type>(
+                &[-10, -9],
+                0.5,
+                false,
+                &DataType::Decimal256(76, 0)
+            ),
+            -10
+        );
+        // Exact ranks return the exact value.
+        assert_eq!(p128(&[3, -7, 5], 0.0, false, 18), -7);
+        assert_eq!(p128(&[3, -7, 5], 1.0, false, 18), 5);
+        assert_eq!(p128(&[3, -7, 5], 0.0, true, 38), 5);
+        assert_eq!(p128(&[3, -7, 5], 0.5, true, 38), 3);
+    }
+
+    #[test]
+    fn decimal_overflow_is_checked() {
+        let bound = 2f64.powi(127);
+        assert!(hugeint_from_double(bound).is_err());
+        assert!(hugeint_from_double(-bound).is_err());
+        assert!(hugeint_from_double(f64::NAN).is_err());
+        assert!(hugeint_from_double(f64::INFINITY).is_err());
+        assert_eq!(hugeint_from_double(-2.75).unwrap(), -2);
+        // DuckDB's two-limb conversion of -1 and of limb boundaries.
+        assert_eq!(hugeint_to_double(-1), -1.0);
+        assert_eq!(hugeint_to_double(i128::MIN), -bound);
+        assert_eq!(hugeint_to_double(1i128 << 64), 2f64.powi(64));
+        // Native extremes interpolate without an overflow error.
+        assert_eq!(
+            decimal_percentile::<Decimal32Type>(
+                &[i32::MIN.into(), i32::MAX.into()],
+                0.5,
+                false,
+                &DataType::Decimal32(9, 0)
+            ),
+            0
+        );
+        assert_eq!(
+            decimal_percentile::<Decimal64Type>(
+                &[i64::MIN.into(), i64::MAX.into()],
+                0.5,
+                false,
+                &DataType::Decimal64(18, 0)
+            ),
+            0
+        );
+        assert_eq!(p128(&[i128::MIN, i128::MAX], 0.5, false, 38), 0);
+        // Decimal256 precision > 38: 256-bit differences and fallback.
+        let two = i256::from_i128(2);
+        assert_eq!(
+            decimal256_percentile(
+                &[i256::ZERO, two.wrapping_pow(200)],
+                0.5,
+                &DataType::Decimal256(76, 0)
+            ),
+            two.wrapping_pow(199)
+        );
+        assert_eq!(
+            decimal256_percentile(
+                &[i256::MIN, i256::MAX],
+                0.5,
+                &DataType::Decimal256(76, 0)
+            ),
+            i256::ZERO
+        );
+        // Decimal256 values beyond i128 at precision <= 38 are an error.
+        let err = calculate_percentile::<Decimal256Type, DecimalInterpolator>(
+            &mut [i256::MIN, i256::MAX],
+            0.5,
+            false,
+            &DataType::Decimal256(38, 0),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
+    }
+
+    fn decimal_param(percentile: f64, is_desc: bool) -> PercentileParam {
+        PercentileParam {
+            aggregate_fn_name: "PERCENTILE_CONT".to_string(),
+            state: PercentileParamState::Resolved(percentile),
+            is_desc,
+        }
+    }
+
+    #[test]
+    fn decimal_accumulators_match_duckdb() -> Result<()> {
+        // 0, NULL, 1000000.00, ..., 7000000.00 as DECIMAL(18, 2).
+        let data_type = DataType::Decimal128(18, 2);
+        let rows = std::iter::once(Some(0))
+            .chain(std::iter::once(None))
+            .chain((1..8).map(|n| Some(n * 100_000_000)))
+            .collect::<Vec<_>>();
+        let values: ArrayRef = Arc::new(
+            Decimal128Array::from(rows.clone()).with_data_type(data_type.clone()),
+        );
+        let expected = ScalarValue::Decimal128(Some(630_000_000), 18, 2);
+
+        for (percentile, is_desc) in [(0.9, false), (0.1, true)] {
+            let mut acc =
+                PercentileContAccumulator::<Decimal128Type, DecimalInterpolator>::new(
+                    decimal_param(percentile, is_desc),
+                    data_type.clone(),
+                );
+            acc.update_batch(std::slice::from_ref(&values))?;
+            assert_eq!(acc.evaluate()?, expected, "p{percentile} desc={is_desc}");
+        }
+
+        // DISTINCT ignores a duplicate.
+        let duplicated: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(0), Some(700_000_000)])
+                .with_data_type(data_type.clone()),
+        );
+        let mut acc = DistinctPercentileContAccumulator::<
+            Decimal128Type,
+            DecimalInterpolator,
+        >::new(decimal_param(0.9, false), data_type.clone());
+        acc.update_batch(std::slice::from_ref(&values))?;
+        acc.update_batch(std::slice::from_ref(&duplicated))?;
+        assert_eq!(acc.evaluate()?, expected);
+        // A sliding frame: retract 0, add 8000000.00 -> p0.9 = 7300000.00.
+        let added: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![800_000_000]).with_data_type(data_type.clone()),
+        );
+        let retracted: ArrayRef =
+            Arc::new(Decimal128Array::from(vec![0, 0]).with_data_type(data_type.clone()));
+        acc.update_batch(std::slice::from_ref(&added))?;
+        acc.retract_batch(std::slice::from_ref(&retracted))?;
+        assert_eq!(
+            acc.evaluate()?,
+            ScalarValue::Decimal128(Some(730_000_000), 18, 2)
+        );
+
+        let mut acc =
+            PercentileContAccumulator::<Decimal128Type, DecimalInterpolator>::new(
+                decimal_param(0.9, false),
+                data_type.clone(),
+            );
+        acc.update_batch(std::slice::from_ref(&values))?;
+        acc.update_batch(std::slice::from_ref(&added))?;
+        acc.retract_batch(&[Arc::new(
+            Decimal128Array::from(vec![0]).with_data_type(data_type.clone()),
+        )])?;
+        assert_eq!(
+            acc.evaluate()?,
+            ScalarValue::Decimal128(Some(730_000_000), 18, 2)
+        );
+
+        // Grouped: group 1 holds only the NULL row.
+        let mut acc = PercentileContGroupsAccumulator::<
+            Decimal128Type,
+            DecimalInterpolator,
+        >::new(decimal_param(0.9, false), data_type.clone());
+        let groups = rows
+            .iter()
+            .map(|row| usize::from(row.is_none()))
+            .collect::<Vec<_>>();
+        acc.update_batch(std::slice::from_ref(&values), &groups, None, 2)?;
+        let result = acc.evaluate(EmitTo::All)?;
+        let result = result.as_primitive::<Decimal128Type>();
+        assert_eq!(result.value(0), 630_000_000);
+        assert!(result.is_null(1));
+        Ok(())
     }
 
     #[test]
@@ -1383,28 +1888,19 @@ mod tests {
 
         // Test 50th percentile (median)
         // Should return 300.00 (30000)
-        let result =
-            calculate_percentile::<Decimal64Type, DecimalInterpolator>(&mut values, 0.5)
-                .expect("evaluate failed")
-                .expect("expected Some value");
+        let result = decimal64_percentile(&mut values, 0.5);
 
         assert_eq!(result, 30000i64, "50th percentile should be 300.00");
 
         // Test 15th percentile
         // Should return 160.00 (16000)
-        let result =
-            calculate_percentile::<Decimal64Type, DecimalInterpolator>(&mut values, 0.15)
-                .expect("evaluate failed")
-                .expect("expected Some value");
+        let result = decimal64_percentile(&mut values, 0.15);
 
         assert_eq!(result, 16000i64, "15th percentile should be 160.00");
 
         // Test 0th percentile (minimum)
         let mut values = vec![10000i64, 20000i64, 30000i64];
-        let result =
-            calculate_percentile::<Decimal64Type, DecimalInterpolator>(&mut values, 0.0)
-                .expect("evaluate failed")
-                .expect("expected Some value");
+        let result = decimal64_percentile(&mut values, 0.0);
 
         assert_eq!(
             result, 10000i64,
@@ -1413,10 +1909,7 @@ mod tests {
 
         // Test 100th percentile (maximum)
         let mut values = vec![10000i64, 20000i64, 30000i64];
-        let result =
-            calculate_percentile::<Decimal64Type, DecimalInterpolator>(&mut values, 1.0)
-                .expect("evaluate failed")
-                .expect("expected Some value");
+        let result = decimal64_percentile(&mut values, 1.0);
 
         assert_eq!(
             result, 30000i64,
@@ -1440,14 +1933,17 @@ mod tests {
         let result = calculate_percentile::<Decimal128Type, DecimalInterpolator>(
             &mut values,
             0.25,
+            false,
+            &DataType::Decimal128(38, 0),
         )
         .expect("evaluate failed")
         .expect("expected Some value");
 
+        // DuckDB 2.0.0's weighted binary64 fallback for an overflowing i128
+        // difference: fma(lower, 0.75, upper * 0.25) of the double values.
         assert_eq!(
-            result,
-            -boundary / 2,
-            "interpolation should split into two additive parts without overflowing"
+            result, -49_999_999_999_999_998_874_404_911_728_017_014_784,
+            "interpolation should use the weighted fallback without overflowing"
         );
     }
 }

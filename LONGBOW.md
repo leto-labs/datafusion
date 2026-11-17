@@ -311,8 +311,9 @@ read-only accessors for the consumer's scan statistics.
 ## Family QI: continuous percentile interpolation
 
 Purpose: keep the full binary64 rank fraction in `percentile_cont` /
-`quantile_cont` instead of truncating it to six decimal places, and use
-DuckDB's weighted endpoint formula for DOUBLE. Dependent Longbow feature:
+`quantile_cont` instead of truncating it to six decimal places, use
+DuckDB's weighted endpoint formula for DOUBLE, and reproduce DuckDB's
+decimal interpolation. Dependent Longbow feature:
 MARKETDATA-SQL-CORRECTNESS. Audit classification: UPSTREAMABLE.
 
 Upstream 56 moved the interpolation into a `PercentileInterpolator` trait.
@@ -325,11 +326,45 @@ midpoint). Float32 and Float16 keep widened delta arithmetic
 `lower + (upper - lower) * f` with the full fraction, as DuckDB's FLOAT
 overload does; identical infinite FLOAT endpoints therefore give NaN.
 
-Not changed: upstream 56's new `DecimalInterpolator` still quantizes the
-fraction to six decimal places (integer-exact `num / 1_000_000`). The 55.2
-fork coerced decimals to Float64; 56 keeps the decimal type.
+Decimals (amendment, leto-zca.21; the 55.2 counterpart is 37461157): upstream
+56's `DecimalInterpolator` quantized the fraction to six decimal places
+(DECIMAL(18,2) p0.9 of `0..8 * 1e6` gave 6299999.00). The family reproduces
+DuckDB 2.0.0 bit for bit instead. DuckDB computes the binary64 rank
+`RN = (n - 1) * p` in the requested sort order and interpolates from the
+value at `FRN = floor(RN)` (`first`) toward the value at `CRN = ceil(RN)`
+(`second`) with the binary64 fraction `RN - FRN` (`QuantileInterpolator` in
+`quantile_sort_tree.hpp`; `InterpolateOperator` in `interpolate.hpp` and
+`src/function/scalar/operator/arithmetic.cpp`). The result keeps the input
+decimal type, precision and scale. The arithmetic follows DuckDB's storage
+class for the declared precision, not the Arrow storage width:
 
-Regressions (fail on stock 56 with 6_299_999 for 0.9 of `0..8 * 1e6`):
+- precision <= 18 (int16/32/64): `fma(second - first, fraction, first)` on
+  the unscaled values as doubles (the pinned binary contracts
+  `lo + (hi - lo) * d` to an FMA), truncated toward zero;
+- precision 19..=38 (HUGEINT): the exact i128 `second - first`, converted to
+  double by DuckDB's two-limb rule, times the fraction, truncated toward zero
+  and added to the exact `first`. If the difference overflows i128,
+  `fma(first, 1 - fraction, second * fraction)` in double, truncated. A
+  double outside the i128 range is an error ("percentile_cont decimal
+  interpolation overflow"), as is a `Decimal256` value outside i128;
+- precision > 38 (`Decimal256` only): DuckDB has no such type, so there is
+  no reference. The family keeps the HUGEINT rule in 256 bits
+  (`i256::to_f64`, truncating `i256::from_f64`).
+
+`WITHIN GROUP (ORDER BY ... DESC)` keeps `p` and interpolates in the
+descending order, as DuckDB does (precision > 18 then rounds toward the
+larger value); it is not the ascending `1 - p` that floats and the 55.2
+counterpart use. Binary64 rounding can carry a precision <= 18 result past
+the declared precision: the median of two 999999999999999999 values as
+DECIMAL(18,0) is 10^18 in DuckDB and here. The coefficient is returned as
+computed (it fits the storage type) and is not validated against the
+declared precision; 55.2 does the same.
+
+Checked against the pinned DuckDB 2.0.0 on the 55.2 probe sets (100 narrow,
+20 overflow) and 10 DESC probes: 130/130.
+
+Regressions (fail on stock 56 with 6_299_999 for 0.9 of `0..8 * 1e6`; the
+decimal ones fail on the first QI commit 0fee7b30c):
 `scripts/vendored-tests.py datafusion-functions-aggregate -E 'test(percentile_cont::tests)'`.
 
 ## Family RBC: owned boundary prefix on upstream Top-K heaps
