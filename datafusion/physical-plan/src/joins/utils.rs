@@ -2187,6 +2187,89 @@ pub(crate) fn matchable_join_keys(
     }
 }
 
+/// Longbow patch (JT): build rows between a key's prefetch and its compare.
+const KEY_PREFETCH_DISTANCE: usize = 16;
+
+/// Longbow patch (JT): prefetches of the fixed-width build key values of the
+/// candidate pairs of a key comparison. The candidates' build rows are random
+/// in a large build, so each compare is a cache miss; a prefetch
+/// `KEY_PREFETCH_DISTANCE` pairs ahead overlaps them. Only key columns whose
+/// values are above the prefetch size of the join table take part; other
+/// types (strings, nested) compare as before.
+pub(super) struct BuildKeyPrefetch<'a> {
+    /// Value bytes and width of each large fixed-width build key column.
+    columns: Vec<(&'a [u8], usize)>,
+    build_rows: &'a [u64],
+}
+
+impl<'a> BuildKeyPrefetch<'a> {
+    fn new(left_arrays: &'a [ArrayRef], build_rows: &'a [u64]) -> Self {
+        let columns = left_arrays
+            .iter()
+            .filter_map(|array| fixed_width_values(array.as_ref()))
+            .filter(|(bytes, _)| crate::joins::join_hash_map::prefetch_pays(bytes.len()))
+            .collect();
+        Self {
+            columns,
+            build_rows,
+        }
+    }
+
+    /// Prefetches the build keys of the pair `KEY_PREFETCH_DISTANCE` after
+    /// `pair`.
+    #[inline(always)]
+    fn ahead_of(&self, pair: usize) {
+        if self.columns.is_empty() {
+            return;
+        }
+        if let Some(&row) = self.build_rows.get(pair + KEY_PREFETCH_DISTANCE) {
+            for (bytes, width) in &self.columns {
+                crate::joins::join_hash_map::prefetch_read(
+                    bytes,
+                    (row as usize).saturating_mul(*width),
+                );
+            }
+        }
+    }
+}
+
+/// Longbow patch (JT): the value bytes (from the array's first element) and
+/// the width of a primitive array, borrowed from the array.
+fn fixed_width_values(array: &dyn Array) -> Option<(&[u8], usize)> {
+    use arrow::array::AsArray;
+    use arrow::datatypes::*;
+    macro_rules! values {
+        ($t:ty) => {
+            Some((
+                array.as_primitive::<$t>().values().inner().as_slice(),
+                size_of::<<$t as ArrowPrimitiveType>::Native>(),
+            ))
+        };
+    }
+    match array.data_type() {
+        DataType::Int8 => values!(Int8Type),
+        DataType::Int16 => values!(Int16Type),
+        DataType::Int32 => values!(Int32Type),
+        DataType::Int64 => values!(Int64Type),
+        DataType::UInt8 => values!(UInt8Type),
+        DataType::UInt16 => values!(UInt16Type),
+        DataType::UInt32 => values!(UInt32Type),
+        DataType::UInt64 => values!(UInt64Type),
+        DataType::Date32 => values!(Date32Type),
+        DataType::Date64 => values!(Date64Type),
+        DataType::Decimal128(..) => values!(Decimal128Type),
+        DataType::Timestamp(TimeUnit::Second, _) => values!(TimestampSecondType),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            values!(TimestampMillisecondType)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            values!(TimestampMicrosecondType)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => values!(TimestampNanosecondType),
+        _ => None,
+    }
+}
+
 pub(super) fn equal_rows_arr(
     indices_left: &UInt64Array,
     indices_right: &UInt32Array,
@@ -2219,6 +2302,9 @@ pub(super) fn equal_rows_arr(
     // `Ordering` computation of the general `JoinKeyComparator` path. Falls
     // through to the general path for multi-column keys and unspecialized
     // types (e.g. floats, dictionaries, nested).
+    // Longbow patch (JT): prefetch the build keys of the candidate
+    // `KEY_PREFETCH_DISTANCE` pairs ahead when the build keys are large.
+    let keys = BuildKeyPrefetch::new(left_arrays, indices_left.values());
     let single_col_fast_path = if left_arrays.len() == 1 {
         equal_rows_single_col(
             indices_left,
@@ -2226,6 +2312,7 @@ pub(super) fn equal_rows_arr(
             left_arrays[0].as_ref(),
             right_arrays[0].as_ref(),
             null_equality,
+            &keys,
         )
     } else {
         None
@@ -2241,7 +2328,13 @@ pub(super) fn equal_rows_arr(
     let mut left_filtered = Vec::with_capacity(indices_left.len());
     let mut right_filtered = Vec::with_capacity(indices_right.len());
 
-    for (left, right) in indices_left.values().iter().zip(indices_right.values()) {
+    for (pair, (left, right)) in indices_left
+        .values()
+        .iter()
+        .zip(indices_right.values())
+        .enumerate()
+    {
+        keys.ahead_of(pair);
         let left_idx = usize::try_from(*left).map_err(|_| {
             internal_datafusion_err!("Join index {left} can not be represented as usize")
         })?;
@@ -2274,6 +2367,7 @@ fn equal_rows_single_col(
     left: &dyn Array,
     right: &dyn Array,
     null_equality: NullEquality,
+    keys: &BuildKeyPrefetch<'_>,
 ) -> Option<(UInt64Array, UInt32Array)> {
     let null_equals_null = matches!(null_equality, NullEquality::NullEqualsNull);
 
@@ -2285,9 +2379,13 @@ fn equal_rows_single_col(
             let mut left_filtered = Vec::with_capacity(indices_left.len());
             let mut right_filtered = Vec::with_capacity(indices_right.len());
 
-            for (left_idx, right_idx) in
-                indices_left.values().iter().zip(indices_right.values())
+            for (pair, (left_idx, right_idx)) in indices_left
+                .values()
+                .iter()
+                .zip(indices_right.values())
+                .enumerate()
             {
+                keys.ahead_of(pair);
                 let i = *left_idx as usize;
                 let j = *right_idx as usize;
 
@@ -4966,5 +5064,90 @@ mod tests {
             ),
             Inexact(10)
         );
+    }
+
+    /// Longbow patch (JT): key comparisons with build keys above the
+    /// prefetch size (single and two columns, fixed-width, NULLs, unequal
+    /// candidates) keep exactly the equal pairs.
+    #[test]
+    fn equal_rows_with_prefetched_build_keys() -> Result<()> {
+        use arrow::array::{Date32Array, Int32Array, Int64Array};
+        use arrow::compute::kernels::cmp;
+        let rows = 200_000_usize;
+        let build_a: ArrayRef = Arc::new(Int64Array::from_iter(
+            (0..rows as i64).map(|v| (v % 97 != 0).then_some(v * 7)),
+        ));
+        let build_b: ArrayRef = Arc::new(Int32Array::from_iter_values(
+            (0..rows as i32).map(|v| v % 1000),
+        ));
+        let build_c: ArrayRef = Arc::new(Date32Array::from_iter_values(
+            (0..rows as i32).map(|v| v / 3),
+        ));
+        assert!(fixed_width_values(build_a.as_ref()).is_some());
+        // Candidates: a pseudo-random build row for each probe row; probe
+        // keys equal to it for two rows in three.
+        let mut state = 17_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let pairs: Vec<(u64, u32)> = (0..50_000_u32)
+            .map(|probe| (next() % rows as u64, probe))
+            .collect();
+        let probe_a: ArrayRef =
+            Arc::new(Int64Array::from_iter(pairs.iter().map(|(b, p)| {
+                let v = *b as i64;
+                match p % 3 {
+                    0 => Some(v * 7 + 1),
+                    _ => (v % 97 != 0).then_some(v * 7),
+                }
+            })));
+        let probe_b: ArrayRef = Arc::new(Int32Array::from_iter_values(
+            pairs.iter().map(|(b, _)| *b as i32 % 1000),
+        ));
+        let probe_c: ArrayRef = Arc::new(Date32Array::from_iter_values(
+            pairs
+                .iter()
+                .map(|(b, p)| *b as i32 / 3 + i32::from(p % 5 == 0)),
+        ));
+        let left = UInt64Array::from_iter_values(pairs.iter().map(|(b, _)| *b));
+        let right = UInt32Array::from_iter_values(pairs.iter().map(|(_, p)| *p));
+        for (build, probe) in [
+            (vec![Arc::clone(&build_a)], vec![Arc::clone(&probe_a)]),
+            (vec![build_b, build_c], vec![probe_b, probe_c]),
+        ] {
+            let (kept_left, kept_right) = equal_rows_arr(
+                &left,
+                &right,
+                &build,
+                &probe,
+                NullEquality::NullEqualsNothing,
+            )?;
+            let expected: Vec<(u64, u32)> = pairs
+                .iter()
+                .enumerate()
+                .filter(|(index, (b, _))| {
+                    build.iter().zip(&probe).all(|(bc, pc)| {
+                        bc.is_valid(*b as usize)
+                            && pc.is_valid(*index)
+                            && cmp::eq(&bc.slice(*b as usize, 1), &pc.slice(*index, 1))
+                                .unwrap()
+                                .value(0)
+                    })
+                })
+                .map(|(_, pair)| *pair)
+                .collect();
+            let actual: Vec<(u64, u32)> = kept_left
+                .values()
+                .iter()
+                .copied()
+                .zip(kept_right.values().iter().copied())
+                .collect();
+            assert!(!expected.is_empty() && expected.len() < pairs.len());
+            assert_eq!(actual, expected);
+        }
+        Ok(())
     }
 }
