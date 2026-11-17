@@ -873,7 +873,14 @@ where
             let fraction = index - (lower_index as f64);
             let lower_f: f64 = lower_value.as_();
             let upper_f: f64 = upper_value.as_();
-            let interpolated_f = lower_f * (1.0 - fraction) + upper_f * fraction;
+            let interpolated_f = if T::DATA_TYPE == DataType::Float64 {
+                // DuckDB specializes DOUBLE with weighted endpoints. Its FLOAT
+                // overload uses widened delta arithmetic instead (notably,
+                // identical infinite FLOAT endpoints interpolate to NaN).
+                lower_f * (1.0 - fraction) + upper_f * fraction
+            } else {
+                lower_f + (upper_f - lower_f) * fraction
+            };
             Some(interpolated_f.as_())
         }
     }
@@ -909,6 +916,23 @@ mod tests {
             Some(f64::from_bits(1))
         );
         assert_eq!(calculate_percentile::<Float64Type>(&mut [], 0.5), None);
+    }
+
+    #[test]
+    fn float32_keeps_widened_delta_interpolation() {
+        let mut values = [f32::INFINITY; 2];
+        assert!(
+            calculate_percentile::<Float32Type>(&mut values, 0.5)
+                .unwrap()
+                .is_nan()
+        );
+        let mut values = (0u8..8)
+            .map(|n| f32::from(n) * 1_000_000.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calculate_percentile::<Float32Type>(&mut values, 0.9),
+            Some(6_300_000.0)
+        );
     }
 
     #[test]

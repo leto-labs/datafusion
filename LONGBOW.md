@@ -756,3 +756,6 @@ percentile_cont/quantile_cont accumulators. Float16/Float32 inputs still widen
 to binary64 before arithmetic and cast back afterwards. Full-fraction and
 extreme/subnormal regressions accompany the change. DuckDB 2.0.0 uses this
 weighted double formula in src/function/scalar/operator/arithmetic.cpp.
+Float32/Float16 retain widened delta arithmetic with the full fraction; DuckDB
+specializes the weighted formula for DOUBLE, while FLOAT uses delta arithmetic.
+Identical infinite FLOAT endpoints therefore retain their NaN result.
