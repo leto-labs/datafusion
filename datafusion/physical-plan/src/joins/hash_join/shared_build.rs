@@ -881,9 +881,15 @@ impl JoinHashMapType for ShardedJoinHashMap {
         &mut self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
         deleted_offset: usize,
-    ) {
+    ) -> Result<()> {
         for (row, &hash) in iter {
             let row_id = u32::try_from(row + 1).expect("shared build rows fit u32");
+            if row - deleted_offset >= self.next.len() {
+                return Err(internal_datafusion_err!(
+                    "join hash map row {row} is beyond its {} rows",
+                    self.next.len()
+                ));
+            }
             let table = &mut self.shards[shard_of(hash, self.mask)];
             match table.entry(hash, |&(h, _)| h == hash, |&(h, _)| h) {
                 Occupied(mut entry) => {
@@ -897,6 +903,7 @@ impl JoinHashMapType for ShardedJoinHashMap {
                 }
             }
         }
+        Ok(())
     }
 
     fn get_matched_indices<'a>(
