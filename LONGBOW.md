@@ -745,3 +745,14 @@ tests cover reclamation before claim, dictionary pages, oversized slices,
 partial hits and metadata/schema Arc reuse. The prepared-scan regression
 checks narrow decimals, predicates, projections and selections:
 `scripts/vendored-tests.py datafusion-datasource-parquet -E 'test(pq_prepared_scan)'`.
+
+## Family QI: continuous percentile interpolation
+
+Purpose: retain the full binary64 rank fraction and use weighted endpoint
+interpolation instead of truncating the fraction to six decimal places.
+Dependent Longbow feature: MARKETDATA-SQL-CORRECTNESS. Classification: UPSTREAMABLE.
+The shared kernel serves scalar, grouped, DISTINCT and sliding-window
+percentile_cont/quantile_cont accumulators. Float16/Float32 inputs still widen
+to binary64 before arithmetic and cast back afterwards. Full-fraction and
+extreme/subnormal regressions accompany the change. DuckDB 2.0.0 uses this
+weighted double formula in src/function/scalar/operator/arithmetic.cpp.

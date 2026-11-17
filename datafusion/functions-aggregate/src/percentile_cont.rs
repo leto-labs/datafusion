@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Longbow patch QI: retain the full percentile rank fraction and use
+// weighted interpolation for DuckDB-compatible continuous quantiles.
+// Modified by the Longbow authors; see third_party/README.md.
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::mem::{size_of, size_of_val};
@@ -60,21 +63,6 @@ use datafusion_functions_aggregate_common::utils::Hashable;
 use datafusion_macros::user_doc;
 
 use crate::utils::validate_percentile_expr;
-
-/// Precision multiplier for linear interpolation calculations.
-///
-/// This value of 1,000,000 was chosen to balance precision with overflow safety:
-/// - Provides 6 decimal places of precision for the fractional component
-/// - Small enough to avoid overflow when multiplied with typical numeric values
-/// - Sufficient precision for most statistical applications
-///
-/// The interpolation formula: `lower + (upper - lower) * fraction`
-/// is computed as: `lower + ((upper - lower) * (fraction * PRECISION)) / PRECISION`
-/// to avoid floating-point operations on integer types while maintaining precision.
-///
-/// The interpolation arithmetic is performed in f64 and then cast back to the
-/// native type to avoid overflowing Float16 intermediates.
-const INTERPOLATION_PRECISION: f64 = 1_000_000.0;
 
 create_func!(PercentileCont, percentile_cont_udaf);
 
@@ -878,19 +866,14 @@ where
             let (_, upper_value, _) = values.select_nth_unstable_by(upper_index, cmp);
             let upper_value = *upper_value;
 
-            // Linear interpolation.
-            // We compute a quantized interpolation weight using `INTERPOLATION_PRECISION` because:
-            // 1. Both values come from the input data, so (upper - lower) is bounded by the value range
-            // 2. fraction is between 0 and 1; quantizing it provides stable, predictable results
-            // 3. The result is guaranteed to be between lower_value and upper_value (modulo cast rounding)
-            // 4. Arithmetic is performed in f64 and cast back to avoid overflowing Float16 intermediates
+            // Use the full fraction. Quantizing to six decimal places can
+            // move a result by a millionth of the neighbouring-value gap.
+            // Weighted endpoints also avoid overflow in (upper - lower).
+            // Widen before arithmetic to retain Float16 overflow safety.
             let fraction = index - (lower_index as f64);
-            let scaled = (fraction * INTERPOLATION_PRECISION) as usize;
-            let weight = scaled as f64 / INTERPOLATION_PRECISION;
-
             let lower_f: f64 = lower_value.as_();
             let upper_f: f64 = upper_value.as_();
-            let interpolated_f = lower_f + (upper_f - lower_f) * weight;
+            let interpolated_f = lower_f * (1.0 - fraction) + upper_f * fraction;
             Some(interpolated_f.as_())
         }
     }
@@ -901,6 +884,32 @@ mod tests {
     use super::*;
     use arrow::array::Float64Array;
     use half::f16;
+
+    #[test]
+    fn interpolation_retains_full_fraction_and_weighted_endpoints() {
+        let mut values = (0..8)
+            .map(|n| f64::from(n) * 1_000_000.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calculate_percentile::<Float64Type>(&mut values, 0.9),
+            Some(6_300_000.0)
+        );
+        let mut values = [-f64::MAX, f64::MAX];
+        assert_eq!(
+            calculate_percentile::<Float64Type>(&mut values, 0.5),
+            Some(0.0)
+        );
+        let mut values = [f64::from_bits(1); 2];
+        assert_eq!(
+            calculate_percentile::<Float64Type>(&mut values, 0.5),
+            Some(0.0)
+        );
+        assert_eq!(
+            calculate_percentile::<Float64Type>(&mut values, 0.0),
+            Some(f64::from_bits(1))
+        );
+        assert_eq!(calculate_percentile::<Float64Type>(&mut [], 0.5), None);
+    }
 
     #[test]
     fn retract_batch_errors_on_untracked_value() {
