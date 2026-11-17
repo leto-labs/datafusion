@@ -331,3 +331,18 @@ fork coerced decimals to Float64; 56 keeps the decimal type.
 
 Regressions (fail on stock 56 with 6_299_999 for 0.9 of `0..8 * 1e6`):
 `scripts/vendored-tests.py datafusion-functions-aggregate -E 'test(percentile_cont::tests)'`.
+
+## Family RBC: owned boundary prefix on upstream Top-K heaps
+
+Purpose: keep an owned 15-byte prefix of the current worst encoded key in
+upstream 56's `PartitionHeap` (shared by ROW_NUMBER and RANK in
+`PartitionedTopKExec`), refresh it after insertions and replacements, and
+compare candidate keys against it first; equal truncated prefixes fall back to
+the full root key, so decisions match full byte ordering
+(`topk::order_prefix::tests::prefix_decisions_match_full_encoded_order`).
+Dependent Longbow feature: WINDOW-TOPK. Classification: UPSTREAMABLE.
+Kept by the task 3.6 screen (leto-zca.23): H2O group-by SF100 q8,
+rbc/stock 0.762 (pull, n=8, 0.724-0.815) and 0.777 (native, n=6); TPC-DS SF10
+rank/row_number queries unchanged (0.994, 1.003). The companion family CR was
+dropped: on upstream's `PartitionSlot` layout it regressed q8 to 1.62.
+
