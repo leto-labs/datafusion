@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -663,7 +665,7 @@ fn correlated_row_state(
         let mut map = new_join_hashmap(null_rows, reservation, metrics)?;
         let mut hashes_buffer = vec![0; null_rows];
         create_hashes(&scope_values, random_state, &mut hashes_buffer)?;
-        map.update_from_iter(Box::new(hashes_buffer.iter().enumerate().rev()), 0);
+        map.update_from_iter(Box::new(hashes_buffer.iter().enumerate().rev()), 0)?;
         Some(map)
     };
     Ok((
@@ -1774,7 +1776,8 @@ mod tests {
                     .map(|row| hash(self.build_keys[*row as usize]))
                     .collect();
                 scope_map
-                    .update_from_iter(Box::new(build_hashes.iter().enumerate().rev()), 0);
+                    .update_from_iter(Box::new(build_hashes.iter().enumerate().rev()), 0)
+                    .unwrap();
                 let probe_hashes: Vec<u64> =
                     self.probe_keys.iter().map(|key| hash(*key)).collect();
                 pairs.scope_matches(

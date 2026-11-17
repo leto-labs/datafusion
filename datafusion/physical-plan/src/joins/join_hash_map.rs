@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -12,6 +14,7 @@ use std::ops::Sub;
 use arrow::array::BooleanArray;
 use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::datatypes::ArrowNativeType;
+use datafusion_common::{Result, internal_datafusion_err};
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry::{Occupied, Vacant};
 
@@ -118,11 +121,14 @@ pub enum ProbeOffset {
 pub trait JoinHashMapType: Send + Sync {
     fn extend_zero(&mut self, len: usize);
 
+    /// Longbow patch (JT): fallible. `JoinHashMapU32` and `JoinHashMapU64`
+    /// have one chain entry per row and return an error instead of panicking
+    /// when given a row beyond it.
     fn update_from_iter<'a>(
         &mut self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
         deleted_offset: usize,
-    );
+    ) -> Result<()>;
 
     fn get_matched_indices<'a>(
         &self,
@@ -192,9 +198,10 @@ impl JoinHashMapType for JoinHashMapU32 {
         &mut self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
         deleted_offset: usize,
-    ) {
+    ) -> Result<()> {
         self.chained |=
-            update_from_iter::<u32>(&mut self.map, &mut self.next, iter, deleted_offset);
+            update_within_rows::<u32>(&mut self.map, &mut self.next, iter, deleted_offset)?;
+        Ok(())
     }
 
     fn get_matched_indices<'a>(
@@ -278,9 +285,10 @@ impl JoinHashMapType for JoinHashMapU64 {
         &mut self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
         deleted_offset: usize,
-    ) {
+    ) -> Result<()> {
         self.chained |=
-            update_from_iter::<u64>(&mut self.map, &mut self.next, iter, deleted_offset);
+            update_within_rows::<u64>(&mut self.map, &mut self.next, iter, deleted_offset)?;
+        Ok(())
     }
 
     fn get_matched_indices<'a>(
@@ -366,6 +374,50 @@ where
         }
     }
     chained
+}
+
+/// Longbow patch (JT): [`update_from_iter`] for a map whose chain array has
+/// one entry for each of its rows. A row at or beyond the end of `next`
+/// would be written out of bounds, or read out of bounds by a later probe's
+/// chain walk, so it ends the update with an error. The rows before it are
+/// inserted.
+fn update_within_rows<'a, T>(
+    map: &mut HashTable<(u64, T)>,
+    next: &mut [T],
+    iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
+    deleted_offset: usize,
+) -> Result<bool>
+where
+    T: Copy + TryFrom<usize> + PartialOrd,
+    <T as TryFrom<usize>>::Error: Debug,
+{
+    let mut chained = false;
+    let row_bound = next.len() + deleted_offset;
+    for (row, &hash_value) in iter {
+        if row >= row_bound {
+            return Err(internal_datafusion_err!(
+                "join hash map row {row} is beyond its {row_bound} rows"
+            ));
+        }
+        let entry = map.entry(
+            hash_value,
+            |&(hash, _)| hash_value == hash,
+            |&(hash, _)| hash,
+        );
+        match entry {
+            Occupied(mut occupied_entry) => {
+                let (_, index) = occupied_entry.get_mut();
+                let prev_index = *index;
+                *index = T::try_from(row + 1).unwrap();
+                next[row - deleted_offset] = prev_index;
+                chained = true;
+            }
+            Vacant(vacant_entry) => {
+                vacant_entry.insert((hash_value, T::try_from(row + 1).unwrap()));
+            }
+        }
+    }
+    Ok(chained)
 }
 
 pub fn get_matched_indices<'a, T>(
@@ -539,7 +591,9 @@ mod tests {
     #[test]
     fn test_contain_hashes() {
         let mut hash_map = JoinHashMapU32::with_capacity(10);
-        hash_map.update_from_iter(Box::new([10u64, 20u64, 30u64].iter().enumerate()), 0);
+        hash_map
+            .update_from_iter(Box::new([10u64, 20u64, 30u64].iter().enumerate()), 0)
+            .unwrap();
 
         let probe_hashes = vec![10, 11, 20, 21, 30, 31];
         let array = hash_map.contain_hashes(&probe_hashes);
@@ -558,7 +612,9 @@ mod tests {
     #[test]
     fn test_get_matched_indices_skips_invalid_keys() {
         let mut hash_map = JoinHashMapU32::with_capacity(3);
-        hash_map.update_from_iter(Box::new([10u64, 20u64, 30u64].iter().enumerate()), 0);
+        hash_map
+            .update_from_iter(Box::new([10u64, 20u64, 30u64].iter().enumerate()), 0)
+            .unwrap();
 
         let probe_hashes = vec![10, 20, 30];
         // The probe row for hash 20 has a NULL key and must not match.
@@ -584,10 +640,12 @@ mod tests {
     fn test_get_matched_indices_skips_invalid_keys_with_duplicates() {
         // Duplicate build keys chain multiple rows under one hash value.
         let mut hash_map = JoinHashMapU32::with_capacity(4);
-        hash_map.update_from_iter(
-            Box::new([10u64, 20u64, 10u64, 20u64].iter().enumerate()),
-            0,
-        );
+        hash_map
+            .update_from_iter(
+                Box::new([10u64, 20u64, 10u64, 20u64].iter().enumerate()),
+                0,
+            )
+            .unwrap();
 
         let probe_hashes = vec![10, 20];
         // The probe row for hash 10 has a NULL key: none of the build rows in
@@ -618,10 +676,12 @@ mod tests {
         // single row, so the probe takes the unique-key fast path.
         let build_hashes = [10u64, 99, 20, 30];
         let mut hash_map = JoinHashMapU32::with_capacity(build_hashes.len());
-        hash_map.update_from_iter(
-            Box::new(build_hashes.iter().enumerate().filter(|(row, _)| *row != 1)),
-            0,
-        );
+        hash_map
+            .update_from_iter(
+                Box::new(build_hashes.iter().enumerate().filter(|(row, _)| *row != 1)),
+                0,
+            )
+            .unwrap();
 
         // Probe row 1 has no match.
         let probe_hashes = vec![10, 40, 20, 30];
@@ -660,8 +720,12 @@ mod tests {
         // Rows 0 and 1 share a hash value; a later update without a chain must
         // not re-enable the unique-key fast path.
         let mut hash_map = JoinHashMapU32::with_capacity(3);
-        hash_map.update_from_iter(Box::new([10u64, 10u64].iter().enumerate()), 0);
-        hash_map.update_from_iter(Box::new([(2, &20u64)].into_iter()), 0);
+        hash_map
+            .update_from_iter(Box::new([10u64, 10u64].iter().enumerate()), 0)
+            .unwrap();
+        hash_map
+            .update_from_iter(Box::new([(2, &20u64)].into_iter()), 0)
+            .unwrap();
 
         let mut input_indices = vec![];
         let mut match_indices = vec![];
@@ -690,8 +754,12 @@ mod tests {
     /// the second creates the chain. Probing with `limit = 1` must resume
     /// through the chain and return each build row exactly once.
     fn assert_chain_created_by_later_update(mut hash_map: impl JoinHashMapType) {
-        hash_map.update_from_iter(Box::new([(0, &10u64)].into_iter()), 0);
-        hash_map.update_from_iter(Box::new([(2, &10u64)].into_iter()), 0);
+        hash_map
+            .update_from_iter(Box::new([(0, &10u64)].into_iter()), 0)
+            .unwrap();
+        hash_map
+            .update_from_iter(Box::new([(2, &10u64)].into_iter()), 0)
+            .unwrap();
 
         let mut input_indices = vec![];
         let mut match_indices = vec![];
@@ -716,5 +784,54 @@ mod tests {
 
         matched.sort_unstable();
         assert_eq!(matched, vec![0, 2]);
+    }
+
+    /// Longbow patch (JT): rows beyond the chain array, with repeated or
+    /// distinct keys, end `update_hash` with an error and no panic.
+    #[test]
+    fn rows_beyond_the_map_return_an_error() {
+        use crate::joins::utils::update_hash;
+        use arrow::array::{RecordBatch, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion_common::NullEquality;
+        use datafusion_common::hash_utils::RandomState;
+        use datafusion_physical_expr::expressions::Column;
+        use std::sync::Arc;
+
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("k", DataType::UInt64, false)]));
+        let on: Vec<datafusion_physical_expr::PhysicalExprRef> =
+            vec![Arc::new(Column::new("k", 0))];
+        for keys in [vec![1_u64, 2, 1, 2, 1, 2], vec![10, 11, 12, 13, 14, 15]] {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(UInt64Array::from(keys))],
+            )
+            .unwrap();
+            let maps: [Box<dyn JoinHashMapType>; 2] = [
+                Box::new(JoinHashMapU32::with_capacity(4)),
+                Box::new(JoinHashMapU64::with_capacity(4)),
+            ];
+            for mut map in maps {
+                let mut hashes = vec![0; batch.num_rows()];
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        update_hash(
+                            &on,
+                            &batch,
+                            &mut *map,
+                            0,
+                            &RandomState::with_seed(0),
+                            &mut hashes,
+                            0,
+                            true,
+                            NullEquality::NullEqualsNothing,
+                        )
+                    }))
+                    .expect("no panic");
+                let error = result.expect_err("rows beyond the map").to_string();
+                assert!(error.contains("beyond its 4 rows"), "{error}");
+            }
+        }
     }
 }

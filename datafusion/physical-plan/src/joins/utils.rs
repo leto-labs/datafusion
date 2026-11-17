@@ -2350,9 +2350,9 @@ pub fn update_hash(
         .map(|(i, val)| (i + offset, val));
 
     if fifo_hashmap {
-        hash_map.update_from_iter(Box::new(hash_values_iter.rev()), deleted_offset);
+        hash_map.update_from_iter(Box::new(hash_values_iter.rev()), deleted_offset)?;
     } else {
-        hash_map.update_from_iter(Box::new(hash_values_iter), deleted_offset);
+        hash_map.update_from_iter(Box::new(hash_values_iter), deleted_offset)?;
     }
 
     Ok(())

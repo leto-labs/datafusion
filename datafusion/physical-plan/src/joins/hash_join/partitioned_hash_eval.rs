@@ -1256,7 +1256,8 @@ mod tests {
         let mut hashes = vec![0; keys.len()];
         create_hashes([keys], random_state.random_state(), &mut hashes)?;
         let mut map = JoinHashMapU32::with_capacity(keys.len());
-        map.update_from_iter(Box::new(hashes.iter().enumerate()), 0);
+        map.update_from_iter(Box::new(hashes.iter().enumerate()), 0)
+            .unwrap();
         Ok(Arc::new(Map::HashMap(Box::new(map))))
     }
 
