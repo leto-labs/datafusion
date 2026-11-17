@@ -775,6 +775,20 @@ addition overflow return errors instead of saturating. As in DuckDB, rounding
 at p18 can exceed the declared precision while fitting the physical integer.
 Exact ranks and singleton values retain their exact coefficients.
 
+QI's DESC path retains the original binary64 percentile and computes the rank
+in the requested order, interpolating from the larger coefficient toward the
+smaller one. Ascending at `1-p` changes both rank rounding and the exact starting
+endpoint, which is observable when the wide-decimal increment truncates toward
+zero. This follows the DataFusion 56 QI implementation at `0c3fddef`; floating
+inputs retain their existing ascending-at-`1-p` rule. Scalar, grouped, DISTINCT,
+partial-state merge and sliding-window decimal paths share this rule. Native
+regressions include DuckDB 2.0.0 DESC probes, exact ranks, FMA and difference
+overflow. Longbow's `tests/sql/marketdata_decimal_quantile_desc.slt` preserves the
+56 fixture's exact DuckDB expectations with Decimal256 columns represented as
+Decimal128 (all values fit precision 38); no records are dropped. On the 55.2
+parent `37461157`, six of its 17 records fail in every engine mode. Decimal256
+support remains outside this 55.2 correction. Local lane: `leto-mkr.15`.
+
 Source: `opensrc path duckdb/duckdb@v2.0.0`, particularly
 `extension/core_functions/aggregate/holistic/quantile.cpp`,
 `extension/core_functions/include/core_functions/aggregate/quantile_sort_tree.hpp`,
