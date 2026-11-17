@@ -7,6 +7,8 @@
 //! TopK: Combination of Sort / LIMIT
 
 mod memory;
+mod order_prefix;
+use order_prefix::OrderPrefix;
 
 use arrow::{
     array::{Array, AsArray},
@@ -1656,16 +1658,22 @@ impl Ord for PartitionSlot {
 /// eviction performs no allocation and no teardown.
 ///
 /// There is one of these per *distinct partition key*, so every field is
-/// multiplied by the partition count. Hence it is nothing but the heap, 24
-/// bytes: the batches live in the operator's one shared [`RecordBatchStore`],
-/// and `k` is a single constant for the whole operator, so it is passed to the
-/// methods that need it rather than stored per partition.
+/// multiplied by the partition count. Batches live in the operator's one
+/// shared [`RecordBatchStore`], and `k` is passed to the methods that need it.
+/// An owned boundary prefix avoids following the heap root's key allocation
+/// for most rejected rows.
 #[derive(Debug, Default)]
 struct PartitionHeap {
     inner: BinaryHeap<PartitionSlot>,
+    /// The worst key's owned prefix, used only when the heap is full.
+    worst_prefix: OrderPrefix,
 }
 
 impl PartitionHeap {
+    fn refresh_prefix(&mut self) {
+        self.worst_prefix = OrderPrefix::new(self.worst_key().unwrap_or_default());
+    }
+
     /// True if `key` belongs in the top-`k`: the heap is not yet full, or
     /// `key` beats the worst retained row.
     fn qualifies(&self, k: usize, key: &[u8]) -> bool {
@@ -1675,12 +1683,16 @@ impl PartitionHeap {
     /// How `key` compares with the worst retained row, or `None` while the
     /// heap holds fewer than `k` rows and so admits anything.
     ///
-    /// The worst retained row is the root, so this is one comparison. `RANK`
-    /// needs all three outcomes, since `Equal` is a tie at the boundary;
+    /// Compare the owned prefix first, then the full root key when equal
+    /// truncated prefixes need the remaining bytes. `RANK` needs all three
+    /// outcomes, since `Equal` is a tie at the boundary;
     /// `ROW_NUMBER` only needs [`Self::qualifies`].
     fn classify(&self, k: usize, key: &[u8]) -> Option<Ordering> {
         if self.inner.len() < k {
             return None;
+        }
+        if let Some(order) = self.worst_prefix.compare(key) {
+            return Some(order);
         }
         self.inner.peek().map(|worst| key.cmp(worst.key.as_slice()))
     }
@@ -1726,6 +1738,7 @@ impl PartitionHeap {
             let grown = worst.key.capacity() - before;
             let evicted = std::mem::replace(&mut worst.at, at);
             drop(worst);
+            self.refresh_prefix();
             (Some(evicted), grown)
         } else {
             let slot = PartitionSlot {
@@ -1735,6 +1748,7 @@ impl PartitionHeap {
             let key_bytes = slot.key.capacity();
             let inner_before = self.inner.capacity();
             self.inner.push(slot);
+            self.refresh_prefix();
             let grown = key_bytes
                 + (self.inner.capacity() - inner_before) * size_of::<PartitionSlot>();
             (None, grown)
@@ -1761,6 +1775,7 @@ impl PartitionHeap {
         std::mem::swap(&mut worst.key, evicted_key);
         let evicted = std::mem::replace(&mut worst.at, at);
         drop(worst);
+        self.refresh_prefix();
         (evicted, grown)
     }
 
