@@ -29,7 +29,10 @@ use arrow::array::{
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::{
     array::{Array, ArrayRef, AsArray},
-    datatypes::{DataType, Field, FieldRef, Float16Type, Float32Type, Float64Type},
+    datatypes::{
+        DataType, Decimal32Type, Decimal64Type, Decimal128Type, Field, FieldRef,
+        Float16Type, Float32Type, Float64Type,
+    },
 };
 
 use num_traits::AsPrimitive;
@@ -49,7 +52,7 @@ use datafusion_common::{
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Coercion, Documentation, Expr, Signature,
-    TypeSignatureClass, Volatility,
+    TypeSignature, TypeSignatureClass, Volatility,
 };
 use datafusion_expr::{EmitTo, GroupsAccumulator};
 use datafusion_expr::{
@@ -131,18 +134,28 @@ impl Default for PercentileCont {
 impl PercentileCont {
     pub fn new() -> Self {
         Self {
-            signature: Signature::coercible(
+            signature: Signature::one_of(
                 vec![
-                    Coercion::new_implicit(
-                        TypeSignatureClass::Float,
-                        vec![TypeSignatureClass::Numeric],
-                        NativeType::Float64,
-                    ),
-                    Coercion::new_implicit(
-                        TypeSignatureClass::Native(logical_float64()),
-                        vec![TypeSignatureClass::Numeric],
-                        NativeType::Float64,
-                    ),
+                    TypeSignature::Coercible(vec![
+                        Coercion::new_exact(TypeSignatureClass::Decimal),
+                        Coercion::new_implicit(
+                            TypeSignatureClass::Native(logical_float64()),
+                            vec![TypeSignatureClass::Numeric],
+                            NativeType::Float64,
+                        ),
+                    ]),
+                    TypeSignature::Coercible(vec![
+                        Coercion::new_implicit(
+                            TypeSignatureClass::Float,
+                            vec![TypeSignatureClass::Numeric],
+                            NativeType::Float64,
+                        ),
+                        Coercion::new_implicit(
+                            TypeSignatureClass::Native(logical_float64()),
+                            vec![TypeSignatureClass::Numeric],
+                            NativeType::Float64,
+                        ),
+                    ]),
                 ],
                 Volatility::Immutable,
             )
@@ -222,6 +235,18 @@ impl AggregateUDFImpl for PercentileCont {
                 DataType::Float64 => Ok(Box::new(DistinctPercentileContAccumulator::<
                     Float64Type,
                 >::new(percentile))),
+                DataType::Decimal32(_, _) => Ok(Box::new(
+                    DistinctPercentileContAccumulator::<Decimal32Type>::new(percentile)
+                        .with_data_type(input_dt.clone()),
+                )),
+                DataType::Decimal64(_, _) => Ok(Box::new(
+                    DistinctPercentileContAccumulator::<Decimal64Type>::new(percentile)
+                        .with_data_type(input_dt.clone()),
+                )),
+                DataType::Decimal128(_, _) => Ok(Box::new(
+                    DistinctPercentileContAccumulator::<Decimal128Type>::new(percentile)
+                        .with_data_type(input_dt.clone()),
+                )),
                 dt => internal_err!("Unsupported datatype for percentile cont: {dt}"),
             }
         } else {
@@ -234,6 +259,18 @@ impl AggregateUDFImpl for PercentileCont {
                 )),
                 DataType::Float64 => Ok(Box::new(
                     PercentileContAccumulator::<Float64Type>::new(percentile),
+                )),
+                DataType::Decimal32(_, _) => Ok(Box::new(
+                    PercentileContAccumulator::<Decimal32Type>::new(percentile)
+                        .with_data_type(input_dt.clone()),
+                )),
+                DataType::Decimal64(_, _) => Ok(Box::new(
+                    PercentileContAccumulator::<Decimal64Type>::new(percentile)
+                        .with_data_type(input_dt.clone()),
+                )),
+                DataType::Decimal128(_, _) => Ok(Box::new(
+                    PercentileContAccumulator::<Decimal128Type>::new(percentile)
+                        .with_data_type(input_dt.clone()),
                 )),
                 dt => internal_err!("Unsupported datatype for percentile cont: {dt}"),
             }
@@ -261,6 +298,18 @@ impl AggregateUDFImpl for PercentileCont {
             DataType::Float64 => Ok(Box::new(PercentileContGroupsAccumulator::<
                 Float64Type,
             >::new(percentile))),
+            DataType::Decimal32(_, _) => Ok(Box::new(
+                PercentileContGroupsAccumulator::<Decimal32Type>::new(percentile)
+                    .with_data_type(input_dt.clone()),
+            )),
+            DataType::Decimal64(_, _) => Ok(Box::new(
+                PercentileContGroupsAccumulator::<Decimal64Type>::new(percentile)
+                    .with_data_type(input_dt.clone()),
+            )),
+            DataType::Decimal128(_, _) => Ok(Box::new(
+                PercentileContGroupsAccumulator::<Decimal128Type>::new(percentile)
+                    .with_data_type(input_dt.clone()),
+            )),
             dt => internal_err!("Unsupported datatype for percentile cont: {dt}"),
         }
     }
@@ -368,6 +417,7 @@ fn simplify_percentile_cont_aggregate(
 struct PercentileContAccumulator<T: ArrowNumericType + Debug> {
     all_values: Vec<T::Native>,
     percentile: f64,
+    data_type: DataType,
 }
 
 impl<T: ArrowNumericType + Debug> PercentileContAccumulator<T> {
@@ -375,14 +425,20 @@ impl<T: ArrowNumericType + Debug> PercentileContAccumulator<T> {
         Self {
             all_values: vec![],
             percentile,
+            data_type: T::DATA_TYPE,
         }
+    }
+
+    fn with_data_type(mut self, data_type: DataType) -> Self {
+        self.data_type = data_type;
+        self
     }
 }
 
 impl<T> Accumulator for PercentileContAccumulator<T>
 where
     T: ArrowNumericType + Debug,
-    T::Native: Copy + AsPrimitive<f64>,
+    T::Native: Copy + AsPrimitive<f64> + num_traits::ToPrimitive + num_traits::NumCast,
     f64: AsPrimitive<T::Native>,
 {
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
@@ -396,11 +452,12 @@ where
         let values_array = PrimitiveArray::<T>::new(
             ScalarBuffer::from(std::mem::take(&mut self.all_values)),
             None,
-        );
+        )
+        .with_data_type(self.data_type.clone());
 
         // Build the result list array
         let list_array = ListArray::new(
-            Arc::new(Field::new_list_field(T::DATA_TYPE, true)),
+            Arc::new(Field::new_list_field(self.data_type.clone(), true)),
             offsets,
             Arc::new(values_array),
             None,
@@ -428,13 +485,19 @@ where
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
         let array = states[0].as_list::<i32>();
-        self.update_batch(&[array.value(0)])?;
+        for values in array.iter().flatten() {
+            self.update_batch(&[values])?;
+        }
         Ok(())
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        let value = calculate_percentile::<T>(&mut self.all_values, self.percentile);
-        ScalarValue::new_primitive::<T>(value, &T::DATA_TYPE)
+        let value = calculate_typed_percentile::<T>(
+            &mut self.all_values,
+            self.percentile,
+            &self.data_type,
+        )?;
+        ScalarValue::new_primitive::<T>(value, &self.data_type)
     }
 
     fn size(&self) -> usize {
@@ -502,6 +565,7 @@ where
 struct PercentileContGroupsAccumulator<T: ArrowNumericType + Send> {
     group_values: Vec<Vec<T::Native>>,
     percentile: f64,
+    data_type: DataType,
 }
 
 impl<T: ArrowNumericType + Send> PercentileContGroupsAccumulator<T> {
@@ -509,14 +573,20 @@ impl<T: ArrowNumericType + Send> PercentileContGroupsAccumulator<T> {
         Self {
             group_values: vec![],
             percentile,
+            data_type: T::DATA_TYPE,
         }
+    }
+
+    fn with_data_type(mut self, data_type: DataType) -> Self {
+        self.data_type = data_type;
+        self
     }
 }
 
 impl<T> GroupsAccumulator for PercentileContGroupsAccumulator<T>
 where
     T: ArrowNumericType + Send,
-    T::Native: Copy + AsPrimitive<f64>,
+    T::Native: Copy + AsPrimitive<f64> + num_traits::ToPrimitive + num_traits::NumCast,
     f64: AsPrimitive<T::Native>,
 {
     fn update_batch(
@@ -590,11 +660,12 @@ where
         let flatten_group_values =
             emit_group_values.into_iter().flatten().collect::<Vec<_>>();
         let group_values_array =
-            PrimitiveArray::<T>::new(ScalarBuffer::from(flatten_group_values), None);
+            PrimitiveArray::<T>::new(ScalarBuffer::from(flatten_group_values), None)
+                .with_data_type(self.data_type.clone());
 
         // Build the result list array
         let result_list_array = ListArray::new(
-            Arc::new(Field::new_list_field(T::DATA_TYPE, true)),
+            Arc::new(Field::new_list_field(self.data_type.clone(), true)),
             offsets,
             Arc::new(group_values_array),
             None,
@@ -609,9 +680,14 @@ where
 
         // Calculate percentile for each group
         let mut evaluate_result_builder =
-            PrimitiveBuilder::<T>::with_capacity(emit_group_values.len());
+            PrimitiveBuilder::<T>::with_capacity(emit_group_values.len())
+                .with_data_type(self.data_type.clone());
         for values in &mut emit_group_values {
-            let value = calculate_percentile::<T>(values.as_mut_slice(), self.percentile);
+            let value = calculate_typed_percentile::<T>(
+                values.as_mut_slice(),
+                self.percentile,
+                &self.data_type,
+            )?;
             evaluate_result_builder.append_option(value);
         }
 
@@ -635,7 +711,8 @@ where
         // to null.
 
         // Reuse values buffer in `input_array` to build `values` in `ListArray`
-        let values = PrimitiveArray::<T>::new(input_array.values().clone(), None);
+        let values = PrimitiveArray::<T>::new(input_array.values().clone(), None)
+            .with_data_type(self.data_type.clone());
 
         // `offsets` in `ListArray`, each row as a list element
         let offset_end = i32::try_from(input_array.len()).map_err(|e| {
@@ -656,7 +733,7 @@ where
         let nulls = filtered_null_mask(opt_filter, input_array);
 
         let converted_list_array = ListArray::new(
-            Arc::new(Field::new_list_field(T::DATA_TYPE, true)),
+            Arc::new(Field::new_list_field(self.data_type.clone(), true)),
             offsets,
             Arc::new(values),
             nulls,
@@ -690,6 +767,7 @@ struct DistinctPercentileContAccumulator<T: ArrowNumericType> {
     /// SipHash, which is considerably slower for this hot path.
     counts: HashMap<Hashable<T::Native>, usize, RandomState>,
     percentile: f64,
+    data_type: DataType,
 }
 
 impl<T: ArrowNumericType + Debug> DistinctPercentileContAccumulator<T> {
@@ -697,14 +775,20 @@ impl<T: ArrowNumericType + Debug> DistinctPercentileContAccumulator<T> {
         Self {
             counts: HashMap::default(),
             percentile,
+            data_type: T::DATA_TYPE,
         }
+    }
+
+    fn with_data_type(mut self, data_type: DataType) -> Self {
+        self.data_type = data_type;
+        self
     }
 }
 
 impl<T> Accumulator for DistinctPercentileContAccumulator<T>
 where
     T: ArrowNumericType + Debug,
-    T::Native: Copy + AsPrimitive<f64>,
+    T::Native: Copy + AsPrimitive<f64> + num_traits::ToPrimitive + num_traits::NumCast,
     f64: AsPrimitive<T::Native>,
 {
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
@@ -714,7 +798,7 @@ where
         // cross-partition merges only need the distinct key set.
         let arr = Arc::new(
             PrimitiveArray::<T>::from_iter_values(self.counts.keys().map(|v| v.0))
-                .with_data_type(T::DATA_TYPE),
+                .with_data_type(self.data_type.clone()),
         );
         Ok(vec![
             SingleRowListArrayBuilder::new(arr).build_list_scalar(),
@@ -751,8 +835,12 @@ where
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
         let mut values: Vec<T::Native> = self.counts.keys().map(|v| v.0).collect();
-        let value = calculate_percentile::<T>(&mut values, self.percentile);
-        ScalarValue::new_primitive::<T>(value, &T::DATA_TYPE)
+        let value = calculate_typed_percentile::<T>(
+            &mut values,
+            self.percentile,
+            &self.data_type,
+        )?;
+        ScalarValue::new_primitive::<T>(value, &self.data_type)
     }
 
     fn size(&self) -> usize {
@@ -802,6 +890,103 @@ where
     fn supports_retract_batch(&self) -> bool {
         true
     }
+}
+
+/// DuckDB 2.0.0's HUGEINT-to-DOUBLE conversion adds the two 64-bit limbs.
+/// A direct Rust i128 cast can round differently near a limb boundary.
+fn duckdb_decimal_to_double(value: i128) -> f64 {
+    let lower = value as u64;
+    let upper = (value >> 64) as i64;
+    if upper == -1 {
+        -((u64::MAX - lower) as f64) - 1.0
+    } else {
+        lower as f64 + upper as f64 * 18446744073709551616.0
+    }
+}
+
+fn decimal_from_double(value: f64) -> Result<i128> {
+    // DuckDB Hugeint::Convert rejects both boundary doubles. Check before
+    // Rust's saturating float-to-integer cast could hide an overflow.
+    let bound = 170141183460469231731687303715884105728.0;
+    if !value.is_finite() || value <= -bound || value >= bound {
+        return Err(exec_datafusion_err!(
+            "percentile_cont decimal interpolation overflow"
+        ));
+    }
+    Ok(value as i128)
+}
+
+fn interpolate_decimal(
+    lower: i128,
+    upper: i128,
+    fraction: f64,
+    precision: u8,
+) -> Result<i128> {
+    if precision <= 18 {
+        // DuckDB INT16/32/64: truncate the final unscaled double toward zero.
+        let lo = lower as f64;
+        let hi = upper as f64;
+        // The pinned DuckDB binary contracts this expression to an FMA.
+        decimal_from_double((hi - lo).mul_add(fraction, lo))
+    } else if let Some(delta) = upper.checked_sub(lower) {
+        // DuckDB HUGEINT: truncate the increment, then add the exact lower
+        // endpoint. This intentionally differs for negative half units.
+        let increment = decimal_from_double(duckdb_decimal_to_double(delta) * fraction)?;
+        lower.checked_add(increment).ok_or_else(|| {
+            exec_datafusion_err!("percentile_cont decimal interpolation overflow")
+        })
+    } else {
+        // Opposite DECIMAL(38) extremes can overflow the i128 difference.
+        decimal_from_double(
+            duckdb_decimal_to_double(lower)
+                .mul_add(1.0 - fraction, duckdb_decimal_to_double(upper) * fraction),
+        )
+    }
+}
+
+fn calculate_typed_percentile<T: ArrowNumericType>(
+    values: &mut [T::Native],
+    percentile: f64,
+    data_type: &DataType,
+) -> Result<Option<T::Native>>
+where
+    T::Native: Copy + AsPrimitive<f64> + num_traits::ToPrimitive + num_traits::NumCast,
+    f64: AsPrimitive<T::Native>,
+{
+    let precision = match data_type {
+        DataType::Decimal32(p, _)
+        | DataType::Decimal64(p, _)
+        | DataType::Decimal128(p, _) => *p,
+        _ => return Ok(calculate_percentile::<T>(values, percentile)),
+    };
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let index = percentile * ((values.len() - 1) as f64);
+    let lower_index = index.floor() as usize;
+    let upper_index = index.ceil() as usize;
+    let cmp = |x: &T::Native, y: &T::Native| x.compare(*y);
+    let lower = *values.select_nth_unstable_by(lower_index, cmp).1;
+    if lower_index == upper_index {
+        return Ok(Some(lower));
+    }
+    let upper = *values.select_nth_unstable_by(upper_index, cmp).1;
+    let as_i128 = |v: T::Native| {
+        num_traits::ToPrimitive::to_i128(&v).ok_or_else(|| {
+            exec_datafusion_err!("percentile_cont decimal conversion overflow")
+        })
+    };
+    let value = interpolate_decimal(
+        as_i128(lower)?,
+        as_i128(upper)?,
+        index - lower_index as f64,
+        precision,
+    )?;
+    <T::Native as num_traits::NumCast>::from(value)
+        .map(Some)
+        .ok_or_else(|| {
+            exec_datafusion_err!("percentile_cont decimal conversion overflow")
+        })
 }
 
 /// Calculate the percentile value for a given set of values.
@@ -890,7 +1075,259 @@ where
 mod tests {
     use super::*;
     use arrow::array::Float64Array;
+    use arrow::datatypes::ArrowPrimitiveType;
     use half::f16;
+
+    #[test]
+    fn decimal_percentile_preserves_negative_lower_endpoint() {
+        use arrow::datatypes::Decimal128Type;
+        // DuckDB's >=19-digit path truncates the increment, then adds it to
+        // the exact lower endpoint. Casting the final double truncates wrongly.
+        let mut acc = PercentileContAccumulator::<Decimal128Type>::new(0.5);
+        acc.all_values = vec![-101, -100];
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            ScalarValue::new_primitive::<Decimal128Type>(
+                Some(-101),
+                &Decimal128Type::DATA_TYPE
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn decimal_percentile_signature_preserves_logical_type() {
+        use datafusion_expr::type_coercion::functions::fields_with_aggregate_udf;
+        for dt in [
+            DataType::Decimal32(4, 2),
+            DataType::Decimal64(18, 3),
+            DataType::Decimal128(38, 10),
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Null,
+        ] {
+            let fields = [
+                Arc::new(Field::new("x", dt.clone(), true)),
+                Arc::new(Field::new("p", DataType::Float64, false)),
+            ];
+            let coerced =
+                fields_with_aggregate_udf(&fields, percentile_cont_udaf().as_ref())
+                    .unwrap();
+            assert_eq!(coerced[0].data_type(), &dt);
+            let result = PercentileCont::new()
+                .return_type(&[dt.clone(), DataType::Float64])
+                .unwrap();
+            assert_eq!(result, if dt.is_null() { DataType::Float64 } else { dt });
+        }
+    }
+
+    #[test]
+    fn decimal_percentile_precision_scale_rounding_and_nulls() {
+        // Raw coefficients, not decimal-as-double values. Each expected result
+        // is pinned against DuckDB 2.0.0's decimal physical-width dispatch.
+        for (precision, scale, expected) in [
+            (4, 2, -100),
+            (9, 3, -100),
+            (18, 2, -100),
+            (19, 2, -101),
+            (38, 10, -101),
+        ] {
+            let dt = DataType::Decimal128(precision, scale);
+            let mut acc = PercentileContAccumulator::<Decimal128Type>::new(0.5)
+                .with_data_type(dt.clone());
+            let values: ArrayRef = Arc::new(
+                PrimitiveArray::<Decimal128Type>::from(vec![
+                    Some(-101),
+                    None,
+                    Some(-100),
+                ])
+                .with_data_type(dt.clone()),
+            );
+            acc.update_batch(&[values]).unwrap();
+            assert_eq!(
+                acc.evaluate().unwrap(),
+                ScalarValue::Decimal128(Some(expected), precision, scale)
+            );
+            acc.all_values = vec![100, 101];
+            assert_eq!(
+                acc.evaluate().unwrap(),
+                ScalarValue::Decimal128(Some(100), precision, scale)
+            );
+            acc.all_values.clear();
+            assert_eq!(
+                acc.evaluate().unwrap(),
+                ScalarValue::Decimal128(None, precision, scale)
+            );
+        }
+        // Narrow Arrow storage must follow logical precision, just like i128.
+        let mut small = PercentileContAccumulator::<Decimal32Type>::new(0.5)
+            .with_data_type(DataType::Decimal32(4, 2));
+        small.all_values = vec![-101, -100];
+        assert_eq!(
+            small.evaluate().unwrap(),
+            ScalarValue::Decimal32(Some(-100), 4, 2)
+        );
+        let mut narrow = PercentileContAccumulator::<Decimal64Type>::new(0.5)
+            .with_data_type(DataType::Decimal64(18, 2));
+        narrow.all_values = vec![-101, -100];
+        assert_eq!(
+            narrow.evaluate().unwrap(),
+            ScalarValue::Decimal64(Some(-100), 18, 2)
+        );
+    }
+
+    #[test]
+    fn decimal_percentile_full_fraction_extremes_and_overflow() {
+        let values = (0..8)
+            .map(|n| i128::from(n) * 100_000_000)
+            .collect::<Vec<_>>();
+        for (precision, expected) in
+            [(18, 630_000_000), (19, 629_999_999), (38, 629_999_999)]
+        {
+            let mut acc = PercentileContAccumulator::<Decimal128Type>::new(0.9)
+                .with_data_type(DataType::Decimal128(precision, 2));
+            acc.all_values = values.clone();
+            assert_eq!(
+                acc.evaluate().unwrap(),
+                ScalarValue::Decimal128(Some(expected), precision, 2)
+            );
+        }
+        // Pinned DuckDB contracts these expressions to FMA; separate multiply
+        // and add differ by 32 units for this INT64 case and by an ulp for i128.
+        assert_eq!(
+            interpolate_decimal(
+                -283_110_063_312_371_717,
+                -168_985_206_005_547_813,
+                0.2,
+                18
+            )
+            .unwrap(),
+            -260_285_091_851_006_944
+        );
+        assert_eq!(
+            interpolate_decimal(
+                -96_061_439_535_860_669_001_790_758_262_438_174_069,
+                85_251_732_078_307_683_191_308_606_285_311_392_193,
+                0.3,
+                38
+            )
+            .unwrap(),
+            -41_667_488_051_610_157_332_345_492_003_413_295_104
+        );
+        let max = 10_i128.pow(38) - 1;
+        let dt = DataType::Decimal128(38, 0);
+        for (p, expected) in [
+            (0.0, -max),
+            (0.1, -79_999_999_999_999_996_310_101_265_616_969_138_176),
+            (0.5, 0),
+            (0.9, 79_999_999_999_999_996_310_101_265_616_969_138_176),
+            (1.0, max),
+        ] {
+            assert_eq!(
+                calculate_typed_percentile::<Decimal128Type>(&mut [-max, max], p, &dt)
+                    .unwrap(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            calculate_typed_percentile::<Decimal128Type>(&mut [max, max], 0.5, &dt)
+                .unwrap(),
+            Some(max)
+        );
+        // DuckDB's INT64 arithmetic can exceed the declared decimal precision
+        // after binary64 rounding, while staying within the physical type.
+        assert_eq!(
+            interpolate_decimal(
+                999_999_999_999_999_999,
+                999_999_999_999_999_999,
+                0.5,
+                18
+            )
+            .unwrap(),
+            1_000_000_000_000_000_000
+        );
+        assert!(decimal_from_double(f64::INFINITY).is_err());
+        assert!(decimal_from_double(i128::MAX as f64).is_err());
+        assert!(decimal_from_double(i128::MIN as f64).is_err());
+        assert!(interpolate_decimal(i128::MAX - 1, i128::MAX, 1.0, 38).is_ok());
+    }
+
+    #[test]
+    fn decimal_percentile_partial_states_and_retraction() {
+        let dt = DataType::Decimal128(19, 2);
+        let mut first = PercentileContAccumulator::<Decimal128Type>::new(0.5)
+            .with_data_type(dt.clone());
+        first.all_values = vec![-101];
+        let mut second = PercentileContAccumulator::<Decimal128Type>::new(0.5)
+            .with_data_type(dt.clone());
+        second.all_values = vec![-100];
+        let states = vec![
+            first.state().unwrap().remove(0),
+            second.state().unwrap().remove(0),
+        ];
+        let states = ScalarValue::iter_to_array(states).unwrap();
+        let mut merged = PercentileContAccumulator::<Decimal128Type>::new(0.5)
+            .with_data_type(dt.clone());
+        merged.merge_batch(&[states]).unwrap();
+        assert_eq!(
+            merged.evaluate().unwrap(),
+            ScalarValue::Decimal128(Some(-101), 19, 2)
+        );
+        let retract: ArrayRef = Arc::new(
+            PrimitiveArray::<Decimal128Type>::from(vec![Some(-101), None])
+                .with_data_type(dt),
+        );
+        merged.retract_batch(&[retract]).unwrap();
+        assert_eq!(
+            merged.evaluate().unwrap(),
+            ScalarValue::Decimal128(Some(-100), 19, 2)
+        );
+    }
+
+    #[test]
+    fn decimal_percentile_group_state_and_distinct() {
+        let dt = DataType::Decimal128(18, 2);
+        let values: ArrayRef = Arc::new(
+            PrimitiveArray::<Decimal128Type>::from(vec![Some(-101), Some(-100), None])
+                .with_data_type(dt.clone()),
+        );
+        let mut groups = PercentileContGroupsAccumulator::<Decimal128Type>::new(0.5)
+            .with_data_type(dt.clone());
+        groups
+            .update_batch(&[Arc::clone(&values)], &[0, 0, 1], None, 2)
+            .unwrap();
+        let states = groups.state(EmitTo::All).unwrap();
+        assert_eq!(states[0].as_list::<i32>().value_type(), dt);
+        groups.merge_batch(&states, &[0, 1], 2).unwrap();
+        let results = groups.evaluate(EmitTo::All).unwrap();
+        assert_eq!(results.data_type(), &dt);
+        assert_eq!(
+            results
+                .as_primitive::<Decimal128Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(-100), None]
+        );
+        let converted = groups
+            .convert_to_state(&[Arc::clone(&values)], None)
+            .unwrap();
+        assert_eq!(converted[0].as_list::<i32>().value_type(), dt);
+        let mut distinct = DistinctPercentileContAccumulator::<Decimal128Type>::new(0.5)
+            .with_data_type(dt.clone());
+        distinct.update_batch(&[Arc::clone(&values)]).unwrap();
+        distinct.update_batch(&[Arc::clone(&values)]).unwrap();
+        distinct.retract_batch(&[values]).unwrap();
+        let states = distinct.state().unwrap();
+        let mut merged = DistinctPercentileContAccumulator::<Decimal128Type>::new(0.5)
+            .with_data_type(dt);
+        merged
+            .merge_batch(&[ScalarValue::iter_to_array(states).unwrap()])
+            .unwrap();
+        assert_eq!(
+            merged.evaluate().unwrap(),
+            ScalarValue::Decimal128(Some(-100), 18, 2)
+        );
+    }
 
     #[test]
     fn interpolation_retains_full_fraction_and_weighted_endpoints() {

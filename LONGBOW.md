@@ -759,3 +759,31 @@ weighted double formula in src/function/scalar/operator/arithmetic.cpp.
 Float32/Float16 retain widened delta arithmetic with the full fraction; DuckDB
 specializes the weighted formula for DOUBLE, while FLOAT uses delta arithmetic.
 Identical infinite FLOAT endpoints therefore retain their NaN result.
+
+QI also preserves DECIMAL precision, scale and coefficients instead of coercing
+inputs to DOUBLE. Decimal32/64/128 scalar, grouped, DISTINCT and sliding states
+retain their input metadata, including after partial-state merge. Scalar merge
+consumes every list row. DuckDB 2.0.0 selects its decimal arithmetic by logical
+precision: up to 18 digits it truncates the final unscaled DOUBLE toward zero;
+19–38 digits use an exact i128 difference and lower endpoint, truncating the
+DOUBLE-scaled increment before addition. Thus negative half units can differ by
+precision, and p0.9 over 0..7M is 6300000.00 at p18 but 6299999.99 at p19/38.
+The wider path reproduces DuckDB's two-limb HUGEINT-to-DOUBLE conversion. An
+unrepresentable i128 difference uses weighted DOUBLE endpoints. Explicit fused
+multiply-add matches the pinned binary for the narrow and overflow paths; conversion and
+addition overflow return errors instead of saturating. As in DuckDB, rounding
+at p18 can exceed the declared precision while fitting the physical integer.
+Exact ranks and singleton values retain their exact coefficients.
+
+Source: `opensrc path duckdb/duckdb@v2.0.0`, particularly
+`extension/core_functions/aggregate/holistic/quantile.cpp`,
+`extension/core_functions/include/core_functions/aggregate/quantile_sort_tree.hpp`,
+`src/include/duckdb/common/operator/interpolate.hpp`,
+`src/function/scalar/operator/arithmetic.cpp` and `src/common/types/hugeint.cpp`.
+The pinned `duckdb-v2.0.0/duckdb` confirms scale, truncation, negative half units
+and extreme endpoints. Decimal256 remains unsupported (DuckDB has no decimal
+precision above 38). Native tests cover logical precision independently of
+Arrow storage width, NULLs, half units, exact ranks, overflowing differences,
+metadata through partial/grouped/DISTINCT state and window retraction. Run
+`python scripts/vendored-tests.py datafusion-functions-aggregate -E 'test(percentile)'`
+in Longbow; exact SQL regressions are in `tests/sql/marketdata_decimal_quantile.slt`.
