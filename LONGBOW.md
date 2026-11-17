@@ -531,3 +531,18 @@ partition sees every relaxed mark before any thread join.
 
 Evidence: Longbow lane `leto-mjj.65`,
 `docs/research/idle-cores-2-20261118.md`, section 6.
+
+## Family JT: prefetching join table and partitioned build
+
+Dependent Longbow feature: JOIN-TABLE (scale-up task 5.2 V5). Five commits,
+each with its own purpose; the DataFusion 56 port carries them one by one.
+
+### JT 1: fallible `update_from_iter`
+
+Purpose: a row beyond a map's chain array becomes an error instead of an
+out-of-bounds panic in a worker. Classification: UPSTREAMABLE.
+`JoinHashMapType::update_from_iter` returns `Result<()>`. `JoinHashMapU32`,
+`JoinHashMapU64` and the shared build's sharded map refuse a row at or
+beyond `next.len() + deleted_offset` (rows before it are inserted);
+`update_hash` and the pruning map propagate the result. Every production
+caller sizes the map to its rows, so no query changes.

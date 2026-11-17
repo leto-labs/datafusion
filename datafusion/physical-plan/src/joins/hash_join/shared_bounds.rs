@@ -1162,7 +1162,7 @@ impl SharedBuildAccumulator {
         let mut hashes = vec![0; rows];
         create_hashes(columns, HASH_JOIN_SEED.random_state(), &mut hashes)?;
         let mut map = JoinHashMapU32::with_capacity(hashes.len());
-        map.update_from_iter(Box::new(hashes.iter().enumerate()), 0);
+        map.update_from_iter(Box::new(hashes.iter().enumerate()), 0)?;
         Ok(Arc::new(Map::HashMap(Box::new(map))))
     }
 
@@ -1603,7 +1603,8 @@ mod tests {
         let mut hashes = vec![0; keys.len()];
         create_hashes([&keys], HASH_JOIN_SEED.random_state(), &mut hashes).unwrap();
         let mut map = JoinHashMapU32::with_capacity(keys.len());
-        map.update_from_iter(Box::new(hashes.iter().enumerate()), 0);
+        map.update_from_iter(Box::new(hashes.iter().enumerate()), 0)
+            .unwrap();
         PushdownStrategy::Map(Arc::new(Map::HashMap(Box::new(map))), None, None)
     }
 

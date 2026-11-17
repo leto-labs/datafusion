@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -51,9 +53,10 @@ impl JoinHashMapType for PruningJoinHashMap {
         &mut self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
         deleted_offset: usize,
-    ) {
+    ) -> Result<()> {
         let slice: &mut [u64] = self.next.make_contiguous();
         update_from_iter::<u64>(&mut self.map, slice, iter, deleted_offset);
+        Ok(())
     }
 
     fn get_matched_indices<'a>(
