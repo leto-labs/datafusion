@@ -20,6 +20,7 @@ with the fork's generator (`datafusion/proto-models/regen.sh`) after a change.
 | `PartitionedFile` | `optional string e_tag` | 900 | D |
 | `PartitionedFile` | `optional string version` | 901 | D |
 | `FileScanExecConf` | `uint32 virtual_column_count` | 902 | RP |
+| `AsOfJoinExecNode` | `bool partitioned` | 900 | AP |
 
 Fields that upstream now owns and that the 55.2 fork had assigned differently
 (family FC, dropped): `FileScanExecConf.preserve_order = 17`,
@@ -423,3 +424,58 @@ Regressions: `scripts/vendored-tests.py datafusion-physical-plan -E
 test(lookups_expose_partition_build_keys_and_memory) |
 test(lookup_exposes_build_keys_and_memory_while_the_join_holds_them) |
 test(prepared)'`.
+
+## Family AJ: DuckDB's ASOF join forms
+
+Purpose: plan DuckDB's `ASOF [INNER | LEFT [OUTER]] JOIN r ON ... | USING
+(...)` to upstream's `LogicalPlan::AsOfJoin`, as the market-data suite's
+KX SQL writes it (ADR 0054, decision 1). Dependent Longbow feature:
+MARKETDATA-ASOF (MD1 T10-T12, B02; KX 62, 63, 79-84). Classification:
+UPSTREAMABLE (the token pass is temporary; the production belongs in
+sqlparser).
+
+- `datafusion-sql` `asof_tokens::rewrite_duckdb_asof`, run by
+  `DFParserBuilder::build` and public for callers that parse with sqlparser
+  directly: after `ASOF [INNER | LEFT [OUTER]] JOIN <relation>` followed by
+  `ON` or `USING`, it removes the join kind and inserts
+  `MATCH_CONDITION (__datafusion_asof_inner | __datafusion_asof_left)`. The
+  relation's extent comes from `Parser::parse_table_factor`; an unaliased table
+  gets its last name part as alias. Nested ASOF joins are rewritten from the
+  last to the first. Snowflake's form and other SQL are unchanged.
+- `datafusion-sql` `relation/asof`: a marked match condition plans DuckDB's
+  meaning. `ON`: exactly one `<`, `<=`, `>`, `>=` conjunct between the sides,
+  in either operand order, normalized to `left op right`; the other conjuncts
+  are equalities. `USING (k..., t)`: equality on all but the last column and
+  `left.t >= right.t` on the last. Inner: a constant marker column on the
+  right input, `marker IS NOT NULL` above the join, then a projection that
+  removes it.
+- `datafusion-expr`: `AsOfJoin::ordered_using` (`with_ordered_using`, kept by
+  every rebuild). `using_columns` binds the last `USING` column too, and `*`
+  keeps the left value of each `USING` column of such a join.
+- `datafusion-proto`: the logical encoder refuses `ordered_using`.
+
+Regressions: `scripts/vendored-tests.py datafusion-sql asof_tokens`; Longbow
+`tests/sql/asof_join.slt` (DuckDB 2.0.0 rows).
+
+## Family AP: partitioned mode of `AsOfJoinExec`
+
+Purpose: an ASOF join with an equality key streams both inputs instead of
+collecting the right one (ADR 0054, decision 2). Dependent Longbow feature:
+MARKETDATA-ASOF (`longbow-plan` `AsOfPartitioned`). Classification:
+UPSTREAMABLE (upstream's module documentation names repartitioning both inputs
+as future work).
+
+- `AsOfJoinMode { Broadcast, Partitioned }` and `with_mode`; `Partitioned`
+  requires an equality key, requires co-partitioned `KeyPartitioned` inputs,
+  keeps the left partitioning and merges partition *i* of each side without a
+  reservation. Rebuilds keep the mode. Display adds `mode=Partitioned` only for
+  that mode. Accessors `left`, `right`, `on`, `match_condition`, `projection`,
+  `mode`.
+- Protobuf `AsOfJoinExecNode.partitioned = 900`; prost and pbjson regenerated.
+  The generator's include path does not match the moved proto directory; it
+  was run with a `PROTOC` wrapper that adds `-I.`.
+- The tie rule of both modes: the last eligible right row in the right input's
+  order (`>=` and `>`), across batch boundaries.
+
+Regressions: `scripts/vendored-tests.py datafusion-physical-plan asof`;
+`scripts/vendored-tests.py datafusion-proto --test proto_integration asof`.
