@@ -439,19 +439,23 @@ sqlparser).
   directly: after `ASOF [INNER | LEFT [OUTER]] JOIN <relation>` followed by
   `ON` or `USING`, it removes the join kind and inserts
   `MATCH_CONDITION (__datafusion_asof_inner | __datafusion_asof_left)`. The
-  relation's extent comes from `Parser::parse_table_factor`; an unaliased table
-  gets its last name part as alias. Nested ASOF joins are rewritten from the
-  last to the first. Snowflake's form and other SQL are unchanged.
+  relation's extent comes from `Parser::parse_table_factor`; `MATCH_CONDITION`
+  is reserved for implicit aliases, so an unaliased table keeps its qualifier.
+  `ASOF` is an operator only in join position (not after `AS`, `FROM`, `JOIN`,
+  `,` or `(`). Nested ASOF joins are rewritten from the last to the first.
+  Snowflake's form and other SQL are unchanged.
 - `datafusion-sql` `relation/asof`: a marked match condition plans DuckDB's
   meaning. `ON`: exactly one `<`, `<=`, `>`, `>=` conjunct between the sides,
   in either operand order, normalized to `left op right`; the other conjuncts
   are equalities. `USING (k..., t)`: equality on all but the last column and
-  `left.t >= right.t` on the last. Inner: a constant marker column on the
-  right input, `marker IS NOT NULL` above the join, then a projection that
-  removes it.
+  `left.t >= right.t` on the last, resolved through each input's `USING`
+  bindings (chained joins). Inner: a constant marker column, under a name that
+  neither input has, on the right input after the constraint binds;
+  `marker IS NOT NULL` above the join, then a projection that removes it.
 - `datafusion-expr`: `AsOfJoin::ordered_using` (`with_ordered_using`, kept by
-  every rebuild). `using_columns` binds the last `USING` column too, and `*`
-  keeps the left value of each `USING` column of such a join.
+  every rebuild). `using_columns` binds the last `USING` column too, merged into
+  the binding of its left column, and `*` keeps the left value of each `USING`
+  column of such a join in the visible FROM tree (not below a subquery alias).
 - `datafusion-proto`: the logical encoder refuses `ordered_using`.
 
 Regressions: `scripts/vendored-tests.py datafusion-sql asof_tokens`; Longbow
@@ -476,6 +480,9 @@ as future work).
   was run with a `PROTOC` wrapper that adds `-I.`.
 - The tie rule of both modes: the last eligible right row in the right input's
   order (`>=` and `>`), across batch boundaries.
+- Both modes: the pending output rows of a side reference at most 32 distinct
+  input batches before a flush; equality keys with a floating-point leaf are
+  rejected.
 
 Regressions: `scripts/vendored-tests.py datafusion-physical-plan asof`;
 `scripts/vendored-tests.py datafusion-proto --test proto_integration asof`.
