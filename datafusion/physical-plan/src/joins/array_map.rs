@@ -305,6 +305,39 @@ impl ArrayMap {
     where
         T::Native: Copy + AsPrimitive<u64>,
     {
+        // Longbow patch (JT): one loop per prefetch mode, so that a direct
+        // array below the prefetch size runs the loop without the prefetch.
+        if self.prefetches() {
+            self.lookup_with::<T, true>(
+                array,
+                limit,
+                current_offset,
+                probe_indices,
+                build_indices,
+            )
+        } else {
+            self.lookup_with::<T, false>(
+                array,
+                limit,
+                current_offset,
+                probe_indices,
+                build_indices,
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn lookup_with<T: ArrowNumericType, const PREFETCH: bool>(
+        &self,
+        array: &ArrayRef,
+        limit: usize,
+        current_offset: ProbeOffset,
+        probe_indices: &mut Vec<u32>,
+        build_indices: &mut Vec<u64>,
+    ) -> Result<Option<ProbeOffset>>
+    where
+        T::Native: Copy + AsPrimitive<u64>,
+    {
         probe_indices.clear();
         build_indices.clear();
 
@@ -312,12 +345,8 @@ impl ArrayMap {
 
         let have_null = arr.null_count() > 0;
 
-        // Longbow patch (JT): prefetch the slot of the row this far ahead.
-        let ahead = if self.prefetches() {
-            PREFETCH_DISTANCE
-        } else {
-            usize::MAX
-        };
+        // Longbow patch (JT): with `PREFETCH`, prefetch the slot of the row
+        // `PREFETCH_DISTANCE` rows ahead.
         let values = arr.values();
         if self.next.is_empty() {
             debug_assert!(
@@ -332,7 +361,8 @@ impl ArrayMap {
                 if build_indices.len() == limit {
                     return Ok(Some(AtRow { row: prob_idx }));
                 }
-                if let Some(value) = values.get(prob_idx.saturating_add(ahead)) {
+                if PREFETCH && let Some(value) = values.get(prob_idx + PREFETCH_DISTANCE)
+                {
                     self.prefetch(value.as_());
                 }
 
@@ -379,7 +409,9 @@ impl ArrayMap {
                 if remaining_output == 0 {
                     return Ok(Some(AtRow { row: prob_side_idx }));
                 }
-                if let Some(value) = values.get(prob_side_idx.saturating_add(ahead)) {
+                if PREFETCH
+                    && let Some(value) = values.get(prob_side_idx + PREFETCH_DISTANCE)
+                {
                     self.prefetch(value.as_());
                 }
 
