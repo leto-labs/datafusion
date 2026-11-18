@@ -8,6 +8,9 @@ records its purpose, dependent Longbow feature and audit classification.
 `third_party/README.md` in the consuming Longbow repository holds the
 inventory.
 
+The join visited bitmap (family VB, leto-mjj.68) is pending integration and
+qualification.
+
 ## Reserved protobuf tags
 
 Every protobuf field that a fork family adds uses a tag of 900 or more, so a
@@ -397,6 +400,16 @@ Kept by the task 3.6 screen (leto-zca.23): H2O group-by SF100 q8,
 rbc/stock 0.762 (pull, n=8, 0.724-0.815) and 0.777 (native, n=6); TPC-DS SF10
 rank/row_number queries unchanged (0.994, 1.003). The companion family CR was
 dropped: on upstream's `PartitionSlot` layout it regressed q8 to 1.62.
+
+## Family CG: native skip probe on the chained grouping-sets root
+
+The chained root is a single-set Partial aggregate. It uses the native
+skip probe when its input reduces poorly. Skipped rows still carry
+mergeable aggregate state for derived levels and the final consumer.
+Expanding grouping sets follow the upstream probe guard. The chained-root
+metric `chained_root_skipped_rows` and the regression
+`chained_grouping_sets_root_skip_probe_follows_reduction` cover low-reduction
+and reducing roots (leto-zca.31).
 
 ## Family PRS: partial-reduce aggregation over grouping sets
 
