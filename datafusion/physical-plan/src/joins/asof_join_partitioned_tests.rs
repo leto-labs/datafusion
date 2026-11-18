@@ -317,3 +317,98 @@ async fn ties_take_the_last_right_row_in_input_order() -> Result<()> {
     }
     Ok(())
 }
+
+/// An equality key with a floating-point leaf is rejected like a float key:
+/// the sort order and the comparator disagree on signed zero.
+#[test]
+fn equality_keys_with_floating_leaves_are_rejected() -> Result<()> {
+    use datafusion_physical_expr::expressions::CastExpr;
+    let (left, right) = inputs();
+    let exec = join(left, right, Operator::GtEq, AsOfJoinMode::Broadcast)?;
+    let dictionary =
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Float64));
+    let key = |index| -> Arc<
+        dyn datafusion_physical_expr_common::physical_expr::PhysicalExpr,
+    > {
+        Arc::new(CastExpr::new(
+            Arc::new(PhysicalColumn::new("ts", index)),
+            dictionary.clone(),
+            None,
+        ))
+    };
+    let error = AsOfJoinExec::try_new(
+        Arc::clone(exec.left()),
+        Arc::clone(exec.right()),
+        vec![(key(1), key(1))],
+        exec.match_condition().clone(),
+        None,
+    )
+    .expect_err("a dictionary of floats must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("do not support floating-point type"),
+        "{error}"
+    );
+    Ok(())
+}
+
+/// One match in each of many wide right batches: the stream flushes before
+/// its pending rows pin more than `MAX_PENDING_SOURCES` batches of a side.
+#[tokio::test]
+async fn sparse_matches_flush_before_pinning_many_input_batches() -> Result<()> {
+    let (l, r) = (schema("id"), schema("price"));
+    let keys = 200;
+    let width = 1024;
+    let right: Vec<RecordBatch> = (0..keys)
+        .map(|k| {
+            let key = format!("k{k:04}");
+            batch(
+                &r,
+                vec![Some(key.as_str()); width],
+                (0..width as i64).map(Some).collect(),
+                vec![k as i32; width],
+            )
+        })
+        .collect();
+    let left_keys: Vec<String> = (0..keys).map(|k| format!("k{k:04}")).collect();
+    let left = vec![batch(
+        &l,
+        left_keys.iter().map(|k| Some(k.as_str())).collect(),
+        vec![Some(0); keys],
+        (0..keys as i32).collect(),
+    )];
+    for mode in [AsOfJoinMode::Broadcast, AsOfJoinMode::Partitioned] {
+        let exec = join(
+            vec![left.clone()],
+            vec![right.clone()],
+            Operator::GtEq,
+            mode,
+        )?;
+        let batches = collect(exec as _, context(8192)).await?;
+        assert!(
+            batches.iter().all(|b| b.num_rows() <= MAX_PENDING_SOURCES),
+            "{mode:?}: {:?}",
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>()
+        );
+        let prices: Vec<_> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(3)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+            })
+            .collect();
+        assert_eq!(
+            prices,
+            (0..keys as i32).map(Some).collect::<Vec<_>>(),
+            "{mode:?}"
+        );
+    }
+    Ok(())
+}

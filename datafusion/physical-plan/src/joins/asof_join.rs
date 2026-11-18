@@ -1099,6 +1099,10 @@ impl AsOfJoinMetrics {
     }
 }
 
+/// The most distinct input batches that the pending rows of one side may
+/// reference before the stream flushes an output batch (Longbow family AP).
+const MAX_PENDING_SOURCES: usize = 32;
+
 /// Row references accumulated for the next output batch.
 ///
 /// For right output, `None` represents NULL padding for an unmatched left row.
@@ -1410,7 +1414,13 @@ impl AsOfJoinStream {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<RecordBatch>>> {
         loop {
-            if self.pending_left.len() >= self.batch_size {
+            // Longbow family AP: pending row references keep whole input
+            // batches alive, outside any reservation. A sparse match over wide
+            // batches flushes before it pins more than a few of them.
+            if self.pending_left.len() >= self.batch_size
+                || self.pending_left.sources.len() >= MAX_PENDING_SOURCES
+                || self.pending_right.sources.len() >= MAX_PENDING_SOURCES
+            {
                 return Poll::Ready(Some(self.flush()));
             }
             if !ready!(
@@ -1598,7 +1608,9 @@ fn validate_asof_join(
                 "AsOfJoinExec equality expressions have unsupported hash type {left_type}"
             );
         }
-        if left_type.is_floating() {
+        // Longbow family AP: also a float inside a dictionary, struct, list or
+        // other nested key, whose order and equality disagree for signed zero.
+        if datafusion_common::float_semantics::has_float_leaf(&left_type) {
             return plan_err!(
                 "AsOfJoinExec equality expressions do not support floating-point type {left_type}"
             );
