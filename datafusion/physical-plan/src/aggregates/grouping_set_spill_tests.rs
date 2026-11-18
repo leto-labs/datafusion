@@ -257,12 +257,17 @@ impl MemoryPool for NoSpillLending {
     }
 }
 
+#[rstest::rstest]
+#[case::table_only(1)]
+#[case::merge_and_table(2)]
 #[tokio::test]
-async fn final_rollup_replay_table_can_use_the_unspillable_budget() -> Result<()> {
+async fn final_rollup_replays_without_new_spill_lending(
+    #[case] runs: usize,
+) -> Result<()> {
     let unbounded = context(false);
     let partial = fixture(true, AggregateMode::Partial)?;
     let batch = stock(&partial, &unbounded).await?.remove(0);
-    let agg = final_aggregate(&partial, vec![batch.clone()])?;
+    let agg = final_aggregate(&partial, vec![batch.clone(); runs])?;
     let expected = stock(&agg, &unbounded).await?;
     let pool: Arc<dyn MemoryPool> =
         Arc::new(NoSpillLending(GreedyMemoryPool::new(128 * 1024)));
@@ -285,12 +290,22 @@ async fn final_rollup_replay_table_can_use_the_unspillable_budget() -> Result<()
         &batch.schema(),
         SpillMetrics::new(&agg.metrics, 0),
     )?;
-    // A single sorted run requires no spillable merge buffers. Its clustered
-    // replay table must still fit after peers occupy the entire lending cap.
-    spill.sort_and_spill(Some(batch))?;
-    let merge = MemoryConsumer::new("FinalHashAggregateStream[0]")
+    let mut merge = MemoryConsumer::new("FinalHashAggregateStream[0]")
         .with_can_spill(true)
         .register(&pool);
+    if runs > 1 {
+        // Model hash table memory granted before siblings fill the lending cap.
+        merge.grow(64 * 1024);
+    }
+    for _ in 0..runs {
+        spill.sort_and_spill(Some(batch.clone()))?;
+    }
+    if runs > 1 {
+        // The table is now gone. The merge may spend its retained grant but
+        // cannot get a new spillable allocation.
+        spill.retain_merge_workspace(&mut merge);
+        merge.free();
+    }
     let actual = spill
         .into_replay_stream(
             &BaselineMetrics::new(&agg.metrics, 0),

@@ -809,6 +809,9 @@ impl FinalHashAggregateStream {
                     let result = hash_table
                         .take_state_batch()
                         .and_then(|batch| spill_context.sort_and_spill(batch));
+                    if result.is_ok() {
+                        spill_context.retain_merge_workspace(&mut self.reservation);
+                    }
 
                     // Spilling shrinks the aggregate table and releases its accumulated
                     // memory. Update the reservation accordingly.
@@ -848,6 +851,7 @@ impl FinalHashAggregateStream {
         hash_table
             .take_state_batch()
             .and_then(|batch| spill_context.sort_and_spill(batch))?;
+        spill_context.retain_merge_workspace(&mut self.reservation);
 
         // Construct the ordered input used to merge all spill files.
         let mut output_stream =
