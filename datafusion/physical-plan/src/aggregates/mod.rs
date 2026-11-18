@@ -221,6 +221,8 @@ mod grouping_set_spill_tests;
 mod hash_stream;
 mod optimizations;
 pub mod order;
+#[cfg(test)]
+mod partial_reduce_sets_tests;
 mod partial_reduce_stream;
 mod single_stream;
 mod skip_partial;
@@ -1379,10 +1381,19 @@ impl AggregateExec {
             )?));
         }
 
-        // Grouping sets are expanded by the raw-input stages, so the stages
-        // consuming partial state must receive the expanded keys as a plain
-        // group by (see `PhysicalGroupBy::as_final`).
+        // Grouping sets are expanded by the raw-input stages, so the final
+        // stages must receive the expanded keys as a plain group by (see
+        // `PhysicalGroupBy::as_final`).
+        //
+        // Longbow family PRS: a partial-reduce aggregate over grouping sets
+        // expands each state row into every set and merges it, as a raw-input
+        // stage expands each raw row (`aggregate_batch_inner` evaluates and
+        // merges every set). Its input holds ungrouped keys and a placeholder
+        // where a state input carries the grouping id. Empty-set rows are
+        // synthesized only from raw input (`init_empty_grouping_sets`), so the
+        // caller owns the grand total of an empty input.
         if self.mode.input_mode() == AggregateInputMode::Partial
+            && self.mode != PartialReduce
             && !self.group_by().is_single()
         {
             return internal_err!(

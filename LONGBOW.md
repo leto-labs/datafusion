@@ -381,6 +381,25 @@ rbc/stock 0.762 (pull, n=8, 0.724-0.815) and 0.777 (native, n=6); TPC-DS SF10
 rank/row_number queries unchanged (0.994, 1.003). The companion family CR was
 dropped: on upstream's `PartitionSlot` layout it regressed q8 to 1.62.
 
+## Family PRS: partial-reduce aggregation over grouping sets
+
+Purpose: let a `PartialReduce` aggregate whose group by holds grouping sets
+run on the default (migrated) aggregate streams. It expands each partial-state
+row into every grouping set and merges it, as the raw-input stage expands each
+raw row; the hash table already evaluates and merges every set
+(`aggregate_batch_inner`), so the change only narrows the execution guard to
+the final stages, which still need `PhysicalGroupBy::as_final`. The input holds
+ungrouped keys and a placeholder column where a state input carries the
+grouping id. Empty-set rows come only from raw input
+(`init_empty_grouping_sets`), so the caller supplies the grand total of an
+empty input. Upstream 56 rejects the plan at execution ("Grouping sets must be
+expanded before PartialReduce aggregation"); the 55.2 legacy stream accepted
+it. Dependent Longbow feature: EAGER-AGGREGATION (`add-eager-aggregation`:
+grouping sets merge their states in a `PartialReduce` aggregate). Audit
+classification: UPSTREAMABLE. Tests:
+`aggregates::partial_reduce_sets_tests` (ROLLUP and CUBE against the stock
+two-phase plan, empty input, early emission under memory pressure).
+
 ## Family E: build keys and memory consumer of hash-join membership lookups
 
 Purpose: let Longbow replace a kept hash-join residual's `HashTableLookupExpr`
