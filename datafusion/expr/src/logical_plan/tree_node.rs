@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -146,6 +148,7 @@ impl TreeNode for LogicalPlan {
                 on,
                 match_condition,
                 join_constraint,
+                ordered_using,
                 schema,
             }) => (left, right).map_elements(f)?.update_data(|(left, right)| {
                 LogicalPlan::AsOfJoin(AsOfJoin {
@@ -154,6 +157,7 @@ impl TreeNode for LogicalPlan {
                     on,
                     match_condition,
                     join_constraint,
+                    ordered_using,
                     schema,
                 })
             }),
@@ -674,6 +678,7 @@ impl LogicalPlan {
                 on,
                 match_condition,
                 join_constraint,
+                ordered_using,
                 schema,
             }) => (on, (match_condition.left, match_condition.right))
                 .map_elements(f)?
@@ -688,6 +693,7 @@ impl LogicalPlan {
                             right: right_match,
                         }),
                         join_constraint,
+                        ordered_using,
                         schema,
                     })
                 }),

@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -1825,8 +1827,16 @@ impl AsLogicalPlan for LogicalPlanNode {
                 on,
                 match_condition,
                 join_constraint,
+                ordered_using,
                 ..
             }) => {
+                if *ordered_using {
+                    // Longbow family AJ: DuckDB's ordered USING column has no
+                    // protobuf field; Longbow ships physical plans only.
+                    return Err(proto_error(
+                        "ASOF JOIN USING with an ordered last column has no protobuf encoding",
+                    ));
+                }
                 let left = LogicalPlanNode::try_from_logical_plan(
                     left.as_ref(),
                     extension_codec,
