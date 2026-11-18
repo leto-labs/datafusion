@@ -49,6 +49,18 @@ with the planned footer's offsets. Without a validator the reads are
 upstream's plain range reads. A custom `ParquetFileReaderFactory` owns its
 own checks.
 
+## Family FD: final aggregate spill replay accounting
+
+Purpose: give the fully clustered replay table of an unordered hash
+aggregate a distinct reservation. Dependent Longbow feature:
+CORE-SPILL-STORAGE. Audit classification: UPSTREAMABLE.
+
+The hash table writes sorted partial states to disk. Its spill-run merge
+can adjust its buffering and continues to borrow from the spillable budget.
+The replay table keeps the current key and accumulator state until it can
+emit the result. This table has no spill path. Its own reservation charges
+that working set to the worker's unspillable budget.
+
 ## Family I: bounded static expression preparation cache
 
 Purpose: reuse the simplified form of an unchanged, fully static scan
