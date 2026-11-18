@@ -26,12 +26,11 @@ use crate::expr::reject_window_functions;
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_common::{Column, DFSchema, HashMap, Result, plan_err};
 use datafusion_expr::utils::{conjunction, split_conjunction_owned};
-use datafusion_expr::{
-    BinaryExpr, Expr, LogicalPlan, LogicalPlanBuilder, Operator, col, lit,
-};
+use datafusion_expr::{BinaryExpr, Expr, LogicalPlan, LogicalPlanBuilder, Operator, lit};
 use sqlparser::ast::{Expr as SQLExpr, JoinConstraint, ObjectName};
 
-/// The constant column that marks a matched right row of an inner ASOF join.
+/// The prefix of the constant column that marks a matched right row of an
+/// inner ASOF join; a numeric suffix makes it unique among the inputs' names.
 const MATCHED: &str = "__datafusion_asof_matched";
 
 /// The DuckDB join kind that a match condition marks, if it is a marker.
@@ -63,17 +62,31 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         constraint: JoinConstraint,
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
-        let right = if inner {
+        // The constraint binds against the inputs as written; the marker of an
+        // inner join is added to the right input afterwards, under a name that
+        // neither input has.
+        let marker = inner.then(|| {
+            let taken = |name: &str| {
+                left.schema().has_column_with_unqualified_name(name)
+                    || right.schema().has_column_with_unqualified_name(name)
+            };
+            (0..)
+                .map(|n| format!("{MATCHED}_{n}"))
+                .find(|name| !taken(name))
+                .expect("an unused marker name")
+        });
+        let with_marker = |right: LogicalPlan| -> Result<LogicalPlan> {
+            let Some(marker) = &marker else {
+                return Ok(right);
+            };
             let mut exprs: Vec<Expr> = right
                 .schema()
                 .columns()
                 .into_iter()
                 .map(Expr::Column)
                 .collect();
-            exprs.push(lit(true).alias(MATCHED));
-            LogicalPlanBuilder::from(right).project(exprs)?.build()?
-        } else {
-            right
+            exprs.push(lit(true).alias(marker));
+            LogicalPlanBuilder::from(right).project(exprs)?.build()
         };
         let plan = match constraint {
             JoinConstraint::On(sql_on) => {
@@ -118,7 +131,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let match_condition =
                     Expr::BinaryExpr(BinaryExpr::new(Box::new(a), op, Box::new(b)));
                 LogicalPlanBuilder::from(left)
-                    .asof_join_on(right, conjunction(equal), match_condition)?
+                    .asof_join_on(
+                        with_marker(right)?,
+                        conjunction(equal),
+                        match_condition,
+                    )?
                     .build()?
             }
             JoinConstraint::Using(object_names) => {
@@ -139,15 +156,20 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let Some(last) = names.pop() else {
                     return plan_err!("ASOF JOIN USING requires at least one column");
                 };
-                let side = |schema: &DFSchema| -> Result<Expr> {
-                    let (qualifier, field) =
-                        schema.qualified_field_with_unqualified_name(&last)?;
-                    Ok(Expr::Column(Column::from((qualifier, field))))
+                // An input that is itself a USING join binds the name to its
+                // first column (a chain of ASOF joins USING the same column).
+                let side = |plan: &LogicalPlan| -> Result<Expr> {
+                    let column = Column::from_name(last.clone())
+                        .normalize_with_schemas_and_ambiguity_check(
+                            &[&[plan.schema()]],
+                            &plan.using_columns()?,
+                        )?;
+                    Ok(Expr::Column(column))
                 };
-                let match_condition = side(left.schema())?.gt_eq(side(right.schema())?);
+                let match_condition = side(&left)?.gt_eq(side(&right)?);
                 let keys = names.into_iter().map(Column::from_name).collect();
                 let LogicalPlan::AsOfJoin(join) = LogicalPlanBuilder::from(left)
-                    .asof_join_using(right, keys, match_condition)?
+                    .asof_join_using(with_marker(right)?, keys, match_condition)?
                     .build()?
                 else {
                     unreachable!("the builder returns the ASOF join");
@@ -161,18 +183,19 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 return plan_err!("NATURAL ASOF JOIN is not supported");
             }
         };
-        if !inner {
+        let Some(marker) = marker else {
             return Ok(plan);
-        }
+        };
+        let marker = Column::new_unqualified(marker);
         let columns: Vec<Expr> = plan
             .schema()
             .columns()
             .into_iter()
-            .filter(|c| !(c.relation.is_none() && c.name == MATCHED))
+            .filter(|c| *c != marker)
             .map(Expr::Column)
             .collect();
         LogicalPlanBuilder::from(plan)
-            .filter(col(MATCHED).is_not_null())?
+            .filter(Expr::Column(marker).is_not_null())?
             .project(columns)?
             .build()
     }

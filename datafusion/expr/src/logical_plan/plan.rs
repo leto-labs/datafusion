@@ -566,6 +566,9 @@ impl LogicalPlan {
     /// returns all `Using` join columns in a logical plan
     pub fn using_columns(&self) -> Result<Vec<HashSet<Column>>, DataFusionError> {
         let mut using_columns: Vec<HashSet<Column>> = vec![];
+        // Longbow family AJ: the (left, right) match columns of DuckDB's
+        // ordered USING column, in the order the walk finds them.
+        let mut ordered: Vec<(Column, Column)> = vec![];
 
         self.apply_with_subqueries(|plan| {
             let on = match plan {
@@ -592,7 +595,7 @@ impl LogicalPlan {
                     match_condition.right.get_as_join_column(),
                 )
             {
-                using_columns.push(HashSet::from([l.to_owned(), r.to_owned()]));
+                ordered.push((l.to_owned(), r.to_owned()));
             }
             if let Some(on) = on {
                 // The join keys in using-join must be columns.
@@ -618,6 +621,19 @@ impl LogicalPlan {
             }
             Ok(TreeNodeRecursion::Continue)
         })?;
+
+        // An ordered USING column joins the binding of its left column, so that
+        // a chain `a ASOF JOIN b USING (t) ASOF JOIN c USING (t)` binds a.t, b.t
+        // and c.t together. The walk meets outer joins first; inner ones bind
+        // first.
+        for (l, r) in ordered.into_iter().rev() {
+            match using_columns.iter_mut().find(|set| set.contains(&l)) {
+                Some(set) => {
+                    set.insert(r);
+                }
+                None => using_columns.push(HashSet::from([l, r])),
+            }
+        }
 
         Ok(using_columns)
     }
