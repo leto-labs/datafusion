@@ -21,14 +21,16 @@
 //! `MATCH_CONDITION (<marker>)`, where the marker is an identifier that names
 //! the join kind ([`ASOF_INNER_MARKER`], [`ASOF_LEFT_MARKER`]). The SQL planner
 //! recognizes the marker and derives the ordered comparison and the equality
-//! keys from the constraint, with the schemas of both sides in hand. A
-//! relation without an alias gets its own last name part as an alias, so the
-//! parser does not read `MATCH_CONDITION` as the alias.
+//! keys from the constraint, with the schemas of both sides in hand.
+//! `MATCH_CONDITION` is reserved for table aliases, so a relation without an
+//! alias keeps its qualifier.
 //!
+//! `ASOF` starts an operator only in join position: after a relation, never
+//! after `AS` (an alias named `asof`) or where a relation starts (`FROM`,
+//! `JOIN`, `,`, `(`: a table or CTE named `asof`).
 //! The pass needs no schema and leaves every other token unchanged. It is
 //! removed when `sqlparser` parses DuckDB's form.
 
-use sqlparser::ast::TableFactor;
 use sqlparser::dialect::Dialect;
 use sqlparser::dialect::keywords::Keyword;
 use sqlparser::parser::Parser;
@@ -73,7 +75,21 @@ pub fn rewrite_duckdb_asof(
     tokens
 }
 
+/// The index of the last token before `before` that is not whitespace.
+fn previous_significant(tokens: &[TokenWithSpan], before: usize) -> Option<usize> {
+    (0..before).rev().find(|&i| !is_blank(&tokens[i].token))
+}
+
 fn rewrite_one(dialect: &dyn Dialect, tokens: &mut Vec<TokenWithSpan>, start: usize) {
+    if previous_significant(tokens, start).is_none_or(|i| {
+        let token = &tokens[i].token;
+        [Keyword::AS, Keyword::FROM, Keyword::JOIN]
+            .into_iter()
+            .any(|k| is_keyword(token, k))
+            || matches!(token, Token::Comma | Token::LParen)
+    }) {
+        return;
+    }
     let Some(mut next) = significant(tokens, start + 1) else {
         return;
     };
@@ -104,9 +120,9 @@ fn rewrite_one(dialect: &dyn Dialect, tokens: &mut Vec<TokenWithSpan>, start: us
     let relation_start = next + 1;
     let mut parser = Parser::new(dialect)
         .with_tokens_with_locations(tokens[relation_start..].to_vec());
-    let Ok(relation) = parser.parse_table_factor() else {
+    if parser.parse_table_factor().is_err() {
         return;
-    };
+    }
     let relation_end = relation_start + parser.index();
     let Some(constraint) = significant(tokens, relation_end) else {
         return;
@@ -120,16 +136,6 @@ fn rewrite_one(dialect: &dyn Dialect, tokens: &mut Vec<TokenWithSpan>, start: us
     let span = tokens[constraint].span;
     let mut insert = Vec::new();
     let mut push = |token: Token| insert.push(TokenWithSpan::new(token, span));
-    if let TableFactor::Table {
-        name, alias: None, ..
-    } = &relation
-        && let Some(last) = name.0.last().and_then(|part| part.as_ident())
-    {
-        push(Token::make_keyword("AS"));
-        push(Token::Whitespace(Whitespace::Space));
-        push(Token::make_word(&last.value, last.quote_style));
-        push(Token::Whitespace(Whitespace::Space));
-    }
     push(Token::make_keyword("MATCH_CONDITION"));
     push(Token::Whitespace(Whitespace::Space));
     push(Token::LParen);
@@ -170,7 +176,7 @@ mod tests {
     fn left_on_and_using() {
         assert_eq!(
             rewrite("SELECT * FROM l ASOF LEFT JOIN r ON l.k = r.k AND l.t >= r.t"),
-            "SELECT * FROM l ASOF JOIN r AS r MATCH_CONDITION (__datafusion_asof_left) ON l.k = r.k AND l.t >= r.t"
+            "SELECT * FROM l ASOF JOIN r MATCH_CONDITION (__datafusion_asof_left) ON l.k = r.k AND l.t >= r.t"
         );
         assert_eq!(
             rewrite(
@@ -181,14 +187,14 @@ mod tests {
     }
 
     #[test]
-    fn inner_forms_and_unaliased_tables() {
+    fn inner_forms_and_unaliased_tables_keep_their_qualifiers() {
         assert_eq!(
             rewrite("FROM l ASOF JOIN s.timeBuckets ON l.t >= timeBuckets.bound"),
-            "FROM l ASOF JOIN s.timeBuckets AS timeBuckets MATCH_CONDITION (__datafusion_asof_inner) ON l.t >= timeBuckets.bound"
+            "FROM l ASOF JOIN s.timeBuckets MATCH_CONDITION (__datafusion_asof_inner) ON l.t >= timeBuckets.bound"
         );
         assert_eq!(
             rewrite(r#"FROM l ASOF INNER JOIN "R" USING (t)"#),
-            r#"FROM l ASOF JOIN "R" AS "R" MATCH_CONDITION (__datafusion_asof_inner) USING (t)"#
+            r#"FROM l ASOF JOIN "R" MATCH_CONDITION (__datafusion_asof_inner) USING (t)"#
         );
     }
 
@@ -198,7 +204,7 @@ mod tests {
             rewrite(
                 "FROM a ASOF LEFT JOIN (SELECT * FROM b ASOF JOIN c ON b.t > c.t) x ON a.t >= x.t"
             ),
-            "FROM a ASOF JOIN (SELECT * FROM b ASOF JOIN c AS c MATCH_CONDITION (__datafusion_asof_inner) ON b.t > c.t) x MATCH_CONDITION (__datafusion_asof_left) ON a.t >= x.t"
+            "FROM a ASOF JOIN (SELECT * FROM b ASOF JOIN c MATCH_CONDITION (__datafusion_asof_inner) ON b.t > c.t) x MATCH_CONDITION (__datafusion_asof_left) ON a.t >= x.t"
         );
     }
 
@@ -210,6 +216,11 @@ mod tests {
             "SELECT 'ASOF LEFT JOIN r ON' FROM t",
             "SELECT * FROM l ASOF LEFT JOIN r",
             "SELECT * FROM l LEFT JOIN r ON l.k = r.k",
+            // An alias, a table and a CTE named asof.
+            "SELECT asof.t FROM l AS asof JOIN r ON asof.t = r.t",
+            "SELECT * FROM asof JOIN r ON asof.t = r.t",
+            "WITH asof AS (SELECT 1 AS t) SELECT * FROM r, asof JOIN s ON asof.t = s.t",
+            "SELECT * FROM (asof JOIN r ON asof.t = r.t)",
         ] {
             assert_eq!(
                 rewrite(sql),
