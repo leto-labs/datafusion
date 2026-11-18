@@ -30,7 +30,9 @@ use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
 use crate::joins::hash_join::visited::VisitedBitmap;
-use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
+use crate::joins::join_hash_map::{
+    JoinHashMapU32, JoinHashMapU64, PartitionedBuild, build_partitioned,
+};
 use crate::joins::key_range_bitmap::KeyRangeBitmap;
 use crate::joins::probe_completion::{Completion, ProbeCompletion};
 use crate::joins::utils::{
@@ -3009,12 +3011,31 @@ fn is_perfect_hash_join_candidate(
     Ok(ArrayMap::is_supported_type(&data_type))
 }
 
+/// Longbow patch (JT): the `u32` map of [`new_join_hashmap`], with the same
+/// reservation, for the partitioned build of `collect_left_input`.
+fn new_join_hashmap_u32(
+    num_rows: usize,
+    reservation: &mut MemoryReservation,
+    metrics: &BuildProbeJoinMetrics,
+) -> Result<JoinHashMapU32> {
+    let fixed_size_u32 = size_of::<JoinHashMapU32>();
+    let estimated_hashtable_size =
+        estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?
+            // Each build row also owns an index in the duplicate-key chain.
+            .checked_add(num_rows * size_of::<u32>())
+            .ok_or_else(|| {
+                datafusion_common::exec_datafusion_err!("Hash join table size overflow")
+            })?;
+    reservation.try_grow(estimated_hashtable_size)?;
+    metrics.build_mem_used.add(estimated_hashtable_size);
+    Ok(JoinHashMapU32::with_capacity(num_rows))
+}
+
 pub(super) fn new_join_hashmap(
     num_rows: usize,
     reservation: &mut MemoryReservation,
     metrics: &BuildProbeJoinMetrics,
 ) -> Result<Box<dyn JoinHashMapType>> {
-    let fixed_size_u32 = size_of::<JoinHashMapU32>();
     let fixed_size_u64 = size_of::<JoinHashMapU64>();
 
     if num_rows > u32::MAX as usize {
@@ -3034,18 +3055,11 @@ pub(super) fn new_join_hashmap(
         metrics.build_mem_used.add(estimated_hashtable_size);
         Ok(Box::new(JoinHashMapU64::with_capacity(num_rows)))
     } else {
-        let estimated_hashtable_size =
-            estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?
-                // Each build row also owns an index in the duplicate-key chain.
-                .checked_add(num_rows * size_of::<u32>())
-                .ok_or_else(|| {
-                    datafusion_common::exec_datafusion_err!(
-                        "Hash join table size overflow"
-                    )
-                })?;
-        reservation.try_grow(estimated_hashtable_size)?;
-        metrics.build_mem_used.add(estimated_hashtable_size);
-        Ok(Box::new(JoinHashMapU32::with_capacity(num_rows)))
+        Ok(Box::new(new_join_hashmap_u32(
+            num_rows,
+            reservation,
+            metrics,
+        )?))
     }
 }
 
@@ -3320,6 +3334,9 @@ fn build_in_memory(
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
 
     let compact = matches!(path, BuildPath::Compacted);
+    // Longbow patch (JT): the reservation's size while a partitioned build
+    // held its transient arrays.
+    let mut partitioned_peak = None;
     let (join_hash_map, batch, left_values) = if let BuildPath::Prebuilt(hashmap) = path {
         // Longbow family H: `batches` holds the consolidated batch of the
         // parallel build, whose rows the sharded map indexes.
@@ -3354,10 +3371,34 @@ fn build_in_memory(
         // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
         // `u64` indice variant
         // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
-        let mut hashmap = new_join_hashmap(num_rows, &mut reservation, metrics)?;
+        // Longbow patch (JT): a `u32` table above a few MiB is built
+        // partition by partition, with the same rows, row numbers and chains
+        // as the loop below. A pool that refuses the partitioning's transient
+        // arrays gets the row-by-row build instead of an error.
+        let mut partitioned = false;
+        let mut hashmap: Box<dyn JoinHashMapType> = if num_rows <= u32::MAX as usize
+            && JoinHashMapU32::partitions_build(num_rows)
+        {
+            let mut map = new_join_hashmap_u32(num_rows, &mut reservation, metrics)?;
+            if let Some(peak) = build_partitioned(
+                &mut map,
+                on_left,
+                batches,
+                num_rows,
+                random_state,
+                null_equality,
+                &mut reservation,
+            )? {
+                partitioned_peak = Some(peak);
+                partitioned = true;
+            }
+            Box::new(map)
+        } else {
+            new_join_hashmap(num_rows, &mut reservation, metrics)?
+        };
 
         let scratch_reservation = reservation.new_empty();
-        if prepared {
+        if prepared && !partitioned {
             scratch_reservation.try_grow(prepared::prepared_scratch_bytes(
                 max_batch_rows,
                 on_left.len(),
@@ -3371,7 +3412,7 @@ fn build_in_memory(
         // Update the hashmap starting from the last batch, so rows with smaller
         // indices end up on top of the chains. Each batch is indexed at its
         // position in the forward concatenation below.
-        for batch in batches.iter().rev() {
+        for batch in batches.iter().rev().filter(|_| !partitioned) {
             offset -= batch.num_rows();
             hashes_buffer.clear();
             hashes_buffer.resize(batch.num_rows(), 0);
@@ -3544,6 +3585,13 @@ fn build_in_memory(
             copy_bytes,
             retained,
         )?;
+    }
+
+    // Longbow patch (JT): the build's peak includes the partitioning's
+    // transient arrays when they outgrew everything charged after them (the
+    // concatenation copy, keys and bitmaps above).
+    if let Some(peak) = partitioned_peak {
+        metrics.build_mem_used.set_max(peak);
     }
 
     let data = JoinLeftData {
