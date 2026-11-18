@@ -592,3 +592,50 @@ mod tests {
 
 #[cfg(test)]
 mod range_tests;
+
+#[cfg(test)]
+mod indexed_tests {
+    use super::*;
+    use arrow::array::{UInt32Array, record_batch};
+    use arrow::compute::take_record_batch;
+
+    #[test]
+    fn indexed_coalescing_respects_fetch_and_finish() -> Result<()> {
+        let batch = record_batch!(("i", Int32, [0, 1, 2, 3, 4, 5, 6, 7]))?.slice(1, 6);
+        for target in [2, 3, 4, 8, 16] {
+            for fetch in [None, Some(0), Some(2), Some(5), Some(10), Some(24)] {
+                let mut expected =
+                    LimitedBatchCoalescer::new(batch.schema(), target, fetch);
+                let mut actual =
+                    LimitedBatchCoalescer::new(batch.schema(), target, fetch);
+                let mut staging = BatchCoalescer::new(batch.schema(), 2);
+                for rows in [&[0, 5][..], &[3, 2, 1, 0, 0], &[], &[4, 1, 0]] {
+                    let taken =
+                        take_record_batch(&batch, &UInt32Array::from(rows.to_vec()))?;
+                    let staged = staging.gather_batch_with_u32_indices(&batch, rows)?;
+                    assert_eq!(
+                        actual.push_batch_range(&staged, 0, staged.num_rows())?,
+                        expected.push_batch(taken)?
+                    );
+                    while let Some(batch) = expected.next_completed_batch() {
+                        assert_eq!(actual.next_completed_batch(), Some(batch));
+                    }
+                    assert!(actual.next_completed_batch().is_none());
+                }
+                actual.finish()?;
+                expected.finish()?;
+                while let Some(batch) = expected.next_completed_batch() {
+                    assert_eq!(actual.next_completed_batch(), Some(batch));
+                }
+                assert!(actual.next_completed_batch().is_none());
+                let staged = staging.gather_batch_with_u32_indices(&batch, &[1])?;
+                assert!(
+                    actual
+                        .push_batch_range(&staged, 0, staged.num_rows())
+                        .is_err()
+                );
+            }
+        }
+        Ok(())
+    }
+}

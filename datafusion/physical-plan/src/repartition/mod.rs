@@ -37,7 +37,7 @@ use crate::{
 };
 
 use arrow::array::{PrimitiveArray, RecordBatch, RecordBatchOptions, UInt64Array};
-use arrow::compute::take_arrays;
+use arrow::compute::{BatchCoalescer, take_arrays};
 use arrow::datatypes::{DataType, Schema, SchemaRef, UInt32Type};
 use arrow_schema::SortOptions;
 use datafusion_common::ScalarValue;
@@ -219,27 +219,32 @@ impl OutputChannel {
         }
     }
 
-    fn coalesce_range(
+    /// Coalesce and send one output partition's selection. Returns true
+    /// when the receiver has closed.
+    async fn send_partition(
         &mut self,
-        batch: &RecordBatch,
-        start: usize,
-        len: usize,
-        out: &mut Vec<RecordBatch>,
-    ) -> Result<()> {
-        match &self.shared_coalescer {
-            Some(shared) => shared.push_range_and_drain(batch, start, len, out),
-            None => {
-                out.push(batch.slice(start, len));
-                Ok(())
+        rows: RoutedRows<'_>,
+        ready: &mut Vec<RecordBatch>,
+    ) -> Result<bool> {
+        match rows {
+            RoutedRows::Batch(batch) => self.coalesce(batch, ready)?,
+            RoutedRows::Indices(batch, indices, staging) => self
+                .shared_coalescer
+                .as_ref()
+                .expect("indexed routing requires a shared coalescer")
+                .push_indices_and_drain(batch, indices, staging, ready)?,
+        }
+        for batch in ready.drain(..) {
+            if self.send(batch).await.is_err() {
+                return Ok(true);
             }
         }
+        Ok(false)
     }
 
     /// Send a single batch through the channel for `partition`, applying
     /// the memory reservation / spill-writer fallback. Removes the channel
     /// from `self.inner` if the receiver has hung up.
-    ///
-    /// Used after [`OutputChannel::coalesce_range`] for performance purposes.
     async fn send(&mut self, batch: RecordBatch) -> Result<(), SendError<MaybeBatch>> {
         let payload = match self.reservation.try_reserve(&batch) {
             Ok(ticket) => Ok(RepartitionBatch::Memory(ReservedBatch::new(ticket))),
@@ -308,7 +313,20 @@ impl SharedCoalescer {
         Ok(())
     }
 
-    /// Append a borrowed range and drain completed batches under one lock.
+    /// Gather in the input task before locking the shared output.
+    fn push_indices_and_drain(
+        &self,
+        batch: &RecordBatch,
+        indices: &[u32],
+        staging: &mut BatchCoalescer,
+        out: &mut Vec<RecordBatch>,
+    ) -> Result<()> {
+        let staged = staging.gather_batch_with_u32_indices(batch, indices)?;
+        // Keep ownership of the staging batch outside the lock so dropping
+        // its temporary buffers never extends the shared critical section.
+        self.push_range_and_drain(&staged, 0, staged.num_rows(), out)
+    }
+
     fn push_range_and_drain(
         &self,
         batch: &RecordBatch,
@@ -692,6 +710,16 @@ fn private_schema(schema: &SchemaRef) -> SchemaRef {
 struct PartitionedBatch {
     batch: RecordBatch,
     ranges: Vec<(usize, usize, usize)>,
+}
+
+enum BatchRouting<'a> {
+    Whole(usize),
+    Indices(&'a [Vec<u32>]),
+}
+
+enum RoutedRows<'a> {
+    Batch(RecordBatch),
+    Indices(&'a RecordBatch, &'a [u32], &'a mut BatchCoalescer),
 }
 
 /// A utility that can be used to partition batches based on [`Partitioning`]
@@ -1317,20 +1345,37 @@ impl BatchPartitioner {
         }))
     }
 
-    // Internal consumers can coalesce borrowed ranges without making tiny batches.
     fn partition_batch(&mut self, batch: RecordBatch) -> Result<PartitionedBatch> {
-        match &mut self.state {
+        match Self::route_batch(&mut self.state, &self.timer, &batch)? {
+            BatchRouting::Whole(partition) => {
+                let len = batch.num_rows();
+                Ok(PartitionedBatch {
+                    batch,
+                    ranges: vec![(partition, 0, len)],
+                })
+            }
+            BatchRouting::Indices(indices) => Self::partition_grouped_take(
+                &batch,
+                indices,
+                &self.timer,
+                &mut self.schema,
+            ),
+        }
+    }
+
+    fn route_batch<'a>(
+        state: &'a mut BatchPartitionerState,
+        repartition_time: &metrics::Time,
+        batch: &RecordBatch,
+    ) -> Result<BatchRouting<'a>> {
+        match state {
             BatchPartitionerState::RoundRobin {
                 num_partitions,
                 next_idx,
             } => {
                 let idx = *next_idx;
                 *next_idx = (*next_idx + 1) % *num_partitions;
-                let len = batch.num_rows();
-                Ok(PartitionedBatch {
-                    batch,
-                    ranges: vec![(idx, 0, len)],
-                })
+                Ok(BatchRouting::Whole(idx))
             }
             BatchPartitionerState::Hash {
                 exprs,
@@ -1338,72 +1383,40 @@ impl BatchPartitioner {
                 hash_buffer,
                 indices,
             } => {
-                // Tracking time required for distributing indexes across output partitions
-                let timer = self.timer.timer();
-
-                let arrays = evaluate_expressions_to_arrays(exprs.as_slice(), &batch)?;
-
+                let _timer = repartition_time.timer();
+                let arrays = evaluate_expressions_to_arrays(exprs.as_slice(), batch)?;
                 hash_buffer.clear();
                 hash_buffer.resize(batch.num_rows(), 0);
-
                 create_hashes(
                     &arrays,
                     REPARTITION_RANDOM_STATE.random_state(),
                     hash_buffer,
                 )?;
-
                 for v in indices.iter_mut() {
                     v.clear();
                 }
-
                 partition_reducer.partition_indices(hash_buffer, indices);
-
-                // Finished building index-arrays for output partitions
-                timer.done();
-
-                Self::partition_grouped_take(
-                    &batch,
-                    indices,
-                    &self.timer,
-                    &mut self.schema,
-                )
+                Ok(BatchRouting::Indices(indices))
             }
             BatchPartitionerState::Range {
                 ordering,
                 router,
                 indices,
             } => {
-                // Tracking time required for distributing indexes across output partitions
-                let timer = self.timer.timer();
+                let _timer = repartition_time.timer();
                 if router.num_split_points() == 0 {
-                    timer.done();
-                    let len = batch.num_rows();
-                    Ok(PartitionedBatch {
-                        batch,
-                        ranges: vec![(0, 0, len)],
-                    })
-                } else {
-                    let arrays = evaluate_expressions_to_arrays(
-                        ordering.iter().map(|e| &e.expr),
-                        &batch,
-                    )?;
-
-                    for v in indices.iter_mut() {
-                        v.clear();
-                    }
-
-                    router.route_indices(&arrays, indices)?;
-
-                    // Finished building index-arrays for output partitions
-                    timer.done();
-
-                    Self::partition_grouped_take(
-                        &batch,
-                        indices,
-                        &self.timer,
-                        &mut self.schema,
-                    )
+                    return Ok(BatchRouting::Whole(0));
                 }
+
+                let arrays = evaluate_expressions_to_arrays(
+                    ordering.iter().map(|e| &e.expr),
+                    batch,
+                )?;
+                for v in indices.iter_mut() {
+                    v.clear();
+                }
+                router.route_indices(&arrays, indices)?;
+                Ok(BatchRouting::Indices(indices))
             }
         }
     }
@@ -1435,14 +1448,14 @@ impl BatchPartitioner {
     /// `partition 0 = slice(0, 2)` and `partition 2 = slice(2, 3)`.
     fn partition_grouped_take(
         batch: &RecordBatch,
-        indices: &mut [Vec<u32>],
+        indices: &[Vec<u32>],
         timer: &metrics::Time,
         schema: &mut Option<(SchemaRef, SchemaRef)>,
     ) -> Result<PartitionedBatch> {
         let mut partition_ranges = Vec::with_capacity(indices.len());
         let mut reordered_indices = Vec::with_capacity(batch.num_rows());
 
-        for (partition, p_indices) in indices.iter_mut().enumerate() {
+        for (partition, p_indices) in indices.iter().enumerate() {
             if p_indices.is_empty() {
                 continue;
             }
@@ -1450,7 +1463,6 @@ impl BatchPartitioner {
             let start = reordered_indices.len();
             reordered_indices.extend_from_slice(p_indices);
             partition_ranges.push((partition, start, p_indices.len()));
-            p_indices.clear();
         }
 
         if reordered_indices.is_empty() {
@@ -2355,6 +2367,23 @@ impl RepartitionExec {
         }
     }
 
+    async fn send_to_partition(
+        output_channels: &mut HashMap<usize, OutputChannel>,
+        partition: usize,
+        rows: RoutedRows<'_>,
+        ready: &mut Vec<RecordBatch>,
+        send_time: &metrics::Time,
+    ) -> Result<()> {
+        let _timer = send_time.timer();
+        if let Some(output) = output_channels.get_mut(&partition)
+            && output.send_partition(rows, ready).await?
+        {
+            // The receiver may stop early, e.g. when reaching a LIMIT.
+            output_channels.remove(&partition);
+        }
+        Ok(())
+    }
+
     /// Pulls data from the specified input plan, feeding it to the
     /// output partitions based on the desired partitioning
     ///
@@ -2387,9 +2416,16 @@ impl RepartitionExec {
             )?,
         };
 
+        // Every output channel for this input uses the same coalescing policy.
+        let coalescing = output_channels
+            .values()
+            .next()
+            .is_some_and(|output| output.shared_coalescer.is_some());
+
         // While there are still outputs to send to, keep pulling inputs
         let mut batches_until_yield = partitioner.num_partitions();
         let mut coalesced = Vec::new();
+        let mut staging = None;
         while !output_channels.is_empty() {
             // fetch the next batch
             let timer = metrics.fetch_time.timer();
@@ -2407,35 +2443,70 @@ impl RepartitionExec {
                 continue;
             }
 
-            let PartitionedBatch { batch, ranges } =
-                partitioner.partition_batch(batch)?;
-            let whole =
-                ranges.len() == 1 && ranges[0].1 == 0 && ranges[0].2 == batch.num_rows();
-            let mut batch = Some(batch);
-            for (partition, start, len) in ranges {
-                let timer = metrics.send_time.timer();
-                // if there is still a receiver, send to it
-                if let Some(output_channel) = output_channels.get_mut(&partition) {
-                    if whole {
-                        output_channel.coalesce(batch.take().unwrap(), &mut coalesced)?;
-                    } else {
-                        output_channel.coalesce_range(
-                            batch.as_ref().unwrap(),
-                            start,
-                            len,
+            if !coalescing {
+                for result in partitioner.partition_iter(batch)? {
+                    let (partition, batch) = result?;
+                    Self::send_to_partition(
+                        &mut output_channels,
+                        partition,
+                        RoutedRows::Batch(batch),
+                        &mut coalesced,
+                        &metrics.send_time,
+                    )
+                    .await?;
+                }
+            } else {
+                match BatchPartitioner::route_batch(
+                    &mut partitioner.state,
+                    &partitioner.timer,
+                    &batch,
+                )? {
+                    BatchRouting::Whole(partition) => {
+                        Self::send_to_partition(
+                            &mut output_channels,
+                            partition,
+                            RoutedRows::Batch(batch),
                             &mut coalesced,
-                        )?;
+                            &metrics.send_time,
+                        )
+                        .await?;
                     }
-                    for batch in coalesced.drain(..) {
-                        if output_channel.send(batch).await.is_err() {
-                            // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
-                            // so ignore this channel from now on.
-                            output_channels.remove(&partition);
-                            break;
+                    BatchRouting::Indices(partitions) => {
+                        let num_rows = batch.num_rows();
+                        for (partition, indices) in partitions.iter().enumerate() {
+                            if indices.len() == num_rows {
+                                Self::send_to_partition(
+                                    &mut output_channels,
+                                    partition,
+                                    RoutedRows::Batch(batch),
+                                    &mut coalesced,
+                                    &metrics.send_time,
+                                )
+                                .await?;
+                                break;
+                            }
+                            if !indices.is_empty() {
+                                Self::send_to_partition(
+                                    &mut output_channels,
+                                    partition,
+                                    RoutedRows::Indices(
+                                        &batch,
+                                        indices,
+                                        staging.get_or_insert_with(|| {
+                                            BatchCoalescer::new(
+                                                private_schema(batch.schema_ref()),
+                                                num_rows.div_ceil(partitions.len()),
+                                            )
+                                        }),
+                                    ),
+                                    &mut coalesced,
+                                    &metrics.send_time,
+                                )
+                                .await?;
+                            }
                         }
                     }
                 }
-                timer.done();
             }
 
             // If the input stream is endless, we may spin forever and
