@@ -122,8 +122,9 @@ pub trait JoinHashMapType: Send + Sync {
     fn extend_zero(&mut self, len: usize);
 
     /// Longbow patch (JT): fallible. `JoinHashMapU32` and `JoinHashMapU64`
-    /// have one chain entry per row and return an error instead of panicking
-    /// when given a row beyond it.
+    /// have one chain entry per row and a fixed number of slots; they return
+    /// an error instead of panicking when given a row beyond the chain array
+    /// or more distinct hashes than their slots hold.
     fn update_from_iter<'a>(
         &mut self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
@@ -160,9 +161,13 @@ pub trait JoinHashMapType: Send + Sync {
     fn len(&self) -> usize;
 }
 
+// Longbow patch (JT): the `u32` and `u64` maps keep their chain encoding
+// (`next`, row + 1, 0 ends a chain) but store the chain heads in a
+// [`HeadTable`] instead of a `hashbrown::HashTable`, so that the build and
+// the probe can prefetch the slot of a row several rows ahead.
 pub struct JoinHashMapU32 {
     // Stores hash value to last row index
-    map: HashTable<(u64, u32)>,
+    table: HeadTable<u32>,
     // Stores indices in chained list data structure
     next: Vec<u32>,
     // Whether any hash value maps to more than one row
@@ -170,16 +175,22 @@ pub struct JoinHashMapU32 {
 }
 
 impl JoinHashMapU32 {
+    /// Longbow patch (JT): a map with the heads of `map`, as `map.find`
+    /// returns them: tests build maps whose table holds one hash twice.
     #[cfg(test)]
     pub(crate) fn new(map: HashTable<(u64, u32)>, next: Vec<u32>) -> Self {
         let chained = map.len() != next.len();
-        Self { map, next, chained }
+        Self {
+            table: HeadTable::from_hashbrown(&map),
+            next,
+            chained,
+        }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            map: HashTable::with_capacity(cap),
-            next: vec![0; cap],
+            table: HeadTable::with_capacity(cap),
+            next: zeroed_with_huge_pages(cap),
             chained: false,
         }
     }
@@ -199,9 +210,17 @@ impl JoinHashMapType for JoinHashMapU32 {
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
         deleted_offset: usize,
     ) -> Result<()> {
-        self.chained |=
-            update_within_rows::<u32>(&mut self.map, &mut self.next, iter, deleted_offset)?;
-        Ok(())
+        let next = &mut self.next;
+        let chained = &mut self.chained;
+        let row_bound = next.len() + deleted_offset;
+        self.table.insert_all(
+            iter.map(|(row, hash)| (row, *hash)),
+            row_bound,
+            |row, prev| {
+                next[row - deleted_offset] = prev;
+                *chained = true;
+            },
+        )
     }
 
     fn get_matched_indices<'a>(
@@ -209,7 +228,7 @@ impl JoinHashMapType for JoinHashMapU32 {
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
         deleted_offset: Option<usize>,
     ) -> (Vec<u32>, Vec<u64>) {
-        get_matched_indices::<u32>(&self.map, &self.next, iter, deleted_offset)
+        heads_matched_indices(&self.table, &self.next, iter, deleted_offset)
     }
 
     fn get_matched_indices_with_limit_offset(
@@ -221,8 +240,8 @@ impl JoinHashMapType for JoinHashMapU32 {
         input_indices: &mut Vec<u32>,
         match_indices: &mut Vec<u64>,
     ) -> Option<ProbeOffset> {
-        get_matched_indices_with_limit_offset::<u32>(
-            &self.map,
+        heads_matched_indices_with_limit_offset(
+            &self.table,
             &self.next,
             !self.chained,
             hash_values,
@@ -235,21 +254,21 @@ impl JoinHashMapType for JoinHashMapU32 {
     }
 
     fn contain_hashes(&self, hash_values: &[u64]) -> BooleanArray {
-        contain_hashes(&self.map, hash_values)
+        heads_contain_hashes(&self.table, hash_values)
     }
 
     fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.table.len() == 0
     }
 
     fn len(&self) -> usize {
-        self.map.len()
+        self.table.len()
     }
 }
 
 pub struct JoinHashMapU64 {
     // Stores hash value to last row index
-    map: HashTable<(u64, u64)>,
+    table: HeadTable<u64>,
     // Stores indices in chained list data structure
     next: Vec<u64>,
     // Whether any hash value maps to more than one row
@@ -257,18 +276,29 @@ pub struct JoinHashMapU64 {
 }
 
 impl JoinHashMapU64 {
+    /// Longbow patch (JT): see [`JoinHashMapU32::new`].
     #[cfg(test)]
     pub(crate) fn new(map: HashTable<(u64, u64)>, next: Vec<u64>) -> Self {
         let chained = map.len() != next.len();
-        Self { map, next, chained }
+        Self {
+            table: HeadTable::from_hashbrown(&map),
+            next,
+            chained,
+        }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            map: HashTable::with_capacity(cap),
-            next: vec![0; cap],
+            table: HeadTable::with_capacity(cap),
+            next: zeroed_with_huge_pages(cap),
             chained: false,
         }
+    }
+
+    /// Longbow patch (JT): bytes of the head table of a map made for `cap`
+    /// rows (the chain array is not included, as in `estimate_memory_size`).
+    pub fn table_bytes(cap: usize) -> usize {
+        HeadTable::<u64>::bytes_for(cap)
     }
 }
 
@@ -286,9 +316,17 @@ impl JoinHashMapType for JoinHashMapU64 {
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
         deleted_offset: usize,
     ) -> Result<()> {
-        self.chained |=
-            update_within_rows::<u64>(&mut self.map, &mut self.next, iter, deleted_offset)?;
-        Ok(())
+        let next = &mut self.next;
+        let chained = &mut self.chained;
+        let row_bound = next.len() + deleted_offset;
+        self.table.insert_all(
+            iter.map(|(row, hash)| (row, *hash)),
+            row_bound,
+            |row, prev| {
+                next[row - deleted_offset] = prev;
+                *chained = true;
+            },
+        )
     }
 
     fn get_matched_indices<'a>(
@@ -296,7 +334,7 @@ impl JoinHashMapType for JoinHashMapU64 {
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
         deleted_offset: Option<usize>,
     ) -> (Vec<u32>, Vec<u64>) {
-        get_matched_indices::<u64>(&self.map, &self.next, iter, deleted_offset)
+        heads_matched_indices(&self.table, &self.next, iter, deleted_offset)
     }
 
     fn get_matched_indices_with_limit_offset(
@@ -308,8 +346,8 @@ impl JoinHashMapType for JoinHashMapU64 {
         input_indices: &mut Vec<u32>,
         match_indices: &mut Vec<u64>,
     ) -> Option<ProbeOffset> {
-        get_matched_indices_with_limit_offset::<u64>(
-            &self.map,
+        heads_matched_indices_with_limit_offset(
+            &self.table,
             &self.next,
             !self.chained,
             hash_values,
@@ -322,15 +360,15 @@ impl JoinHashMapType for JoinHashMapU64 {
     }
 
     fn contain_hashes(&self, hash_values: &[u64]) -> BooleanArray {
-        contain_hashes(&self.map, hash_values)
+        heads_contain_hashes(&self.table, hash_values)
     }
 
     fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.table.len() == 0
     }
 
     fn len(&self) -> usize {
-        self.map.len()
+        self.table.len()
     }
 }
 
@@ -374,50 +412,6 @@ where
         }
     }
     chained
-}
-
-/// Longbow patch (JT): [`update_from_iter`] for a map whose chain array has
-/// one entry for each of its rows. A row at or beyond the end of `next`
-/// would be written out of bounds, or read out of bounds by a later probe's
-/// chain walk, so it ends the update with an error. The rows before it are
-/// inserted.
-fn update_within_rows<'a, T>(
-    map: &mut HashTable<(u64, T)>,
-    next: &mut [T],
-    iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
-    deleted_offset: usize,
-) -> Result<bool>
-where
-    T: Copy + TryFrom<usize> + PartialOrd,
-    <T as TryFrom<usize>>::Error: Debug,
-{
-    let mut chained = false;
-    let row_bound = next.len() + deleted_offset;
-    for (row, &hash_value) in iter {
-        if row >= row_bound {
-            return Err(internal_datafusion_err!(
-                "join hash map row {row} is beyond its {row_bound} rows"
-            ));
-        }
-        let entry = map.entry(
-            hash_value,
-            |&(hash, _)| hash_value == hash,
-            |&(hash, _)| hash,
-        );
-        match entry {
-            Occupied(mut occupied_entry) => {
-                let (_, index) = occupied_entry.get_mut();
-                let prev_index = *index;
-                *index = T::try_from(row + 1).unwrap();
-                next[row - deleted_offset] = prev_index;
-                chained = true;
-            }
-            Vacant(vacant_entry) => {
-                vacant_entry.insert((hash_value, T::try_from(row + 1).unwrap()));
-            }
-        }
-    }
-    Ok(chained)
 }
 
 pub fn get_matched_indices<'a, T>(
@@ -582,6 +576,708 @@ pub fn contain_hashes<T>(map: &HashTable<(u64, T)>, hash_values: &[u64]) -> Bool
         map.find(hash, |(h, _)| hash == *h).is_some()
     });
     BooleanArray::new(buffer, None)
+}
+
+// ---------------------------------------------------------------------------
+// Longbow patch (JT): the chain-head table of `JoinHashMapU32`,
+// `JoinHashMapU64` and the shared build's shards.
+//
+// One power-of-two array of slots with linear probing at a load factor of at
+// most one half. A `u32` slot is one 64-bit word: the low 32 bits of the
+// row's hash above the chain head (row + 1, 0 = empty). A `u64` slot is two
+// words: the whole hash, then the head. The slot of a hash is the top bits
+// of `hash * MUL`, so every hash bit moves the slot, including the bits that
+// pick a shard of the shared build.
+//
+// A `u32` table compares 32 hash bits, so two different hashes with the same
+// low 32 bits that probe the same slots share one chain. That only adds
+// candidates: every caller compares the keys of the candidate rows
+// (`equal_rows_arr`) or uses the answer as a filter that may pass rows that
+// do not match (`contain_hashes`). With 2^32 tags and runs of one or two
+// slots, it happens for about one probe in 2^31.
+//
+// Adversarial keys: a chain is walked row by row, so keys that share one
+// chain make a probe cost linear in their rows (quadratic over a probe of
+// them). With hashbrown, crafting such keys meant colliding all 64 hash bits;
+// a `u32` table needs only the low 32 bits and the slot, about 2^32 work per
+// key. Longbow is single-tenant (no untrusted query author shares a worker),
+// so this is recorded, not mitigated.
+//
+// Memory: `slots = max(2, next_power_of_two(2 * capacity))`, 8 bytes each for
+// `u32` (at most `16 * next_power_of_two(capacity)` bytes, below the 17 bytes
+// for each of hashbrown's `next_power_of_two(capacity * 8 / 7)` buckets that
+// `estimate_memory_size::<(u32, u64)>` reserves) and 16 for `u64` (up to 1.9
+// times that estimate, so the `u64` build reserves the larger of the two:
+// [`JoinHashMapU64::table_bytes`]).
+//
+// Above `PREFETCH_BYTES` the probe prefetches the slot of the row
+// `PREFETCH_DISTANCE` rows ahead, and the build keeps that many rows in
+// flight, so their cache misses overlap instead of following each other.
+// With `LONGBOW_JOIN_TABLE_HUGE_PAGES=on` (off by default), the slots and the
+// chain from `HUGE_PAGE_BYTES` on ask the kernel for 2 MiB pages
+// (`MADV_HUGEPAGE`; the host's THP mode is `madvise`) before they are first
+// written, which removes most of the TLB misses of a random probe. It is off
+// by default because the advice outlives the table: the allocator reuses the
+// freed range for other operators, and their faults there allocate huge pages
+// with synchronous compaction in the query thread (THP defrag `madvise`).
+// Measured on worker-01 (TPC-H SF100, 48 threads, same code with and without
+// the advice): TPC-H Q9 pull 17% faster with it, q10 pull 27% slower in a
+// suite process (it advises nothing itself), suite sums about 3% faster.
+// ---------------------------------------------------------------------------
+
+/// The multiplier of the slot position (2^64 / golden ratio, odd).
+const SLOT_MUL: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Tables above this size prefetch (Zen 4 L2 is 1 MiB per core).
+const PREFETCH_BYTES: usize = 512 << 10;
+
+/// Whether a table of `bytes` is large enough for prefetches to pay.
+pub(crate) fn prefetch_pays(bytes: usize) -> bool {
+    bytes > PREFETCH_BYTES
+}
+
+/// Rows between a slot's prefetch and its use. 16 misses in flight cover
+/// one DRAM latency (about 110 ns) at about 7 ns per row.
+const PREFETCH_DISTANCE: usize = 16;
+
+/// Arrays from this size are advised to use transparent huge pages, when the
+/// advice is on ([`huge_page_advice`]).
+const HUGE_PAGE_BYTES: usize = 4 << 20;
+
+/// The environment variable that turns the huge-page advice on: `on`, `1` or
+/// `true`. Read once per process.
+pub const HUGE_PAGES_ENV: &str = "LONGBOW_JOIN_TABLE_HUGE_PAGES";
+
+/// Whether a value of [`HUGE_PAGES_ENV`] turns the advice on.
+fn huge_pages_requested(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("on" | "1" | "true"))
+}
+
+/// Whether join tables ask for 2 MiB pages: off unless [`HUGE_PAGES_ENV`]
+/// asks for them.
+pub fn huge_page_advice() -> bool {
+    static ADVICE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ADVICE.get_or_init(|| {
+        huge_pages_requested(std::env::var(HUGE_PAGES_ENV).ok().as_deref())
+    })
+}
+
+/// The width of the heads of a [`HeadTable`].
+pub(crate) trait HeadWord: Copy + Send + Sync + 'static {
+    /// 64-bit words per slot.
+    const WORDS: usize;
+    /// The hash bits that a slot stores.
+    fn tag(hash: u64) -> u64;
+    /// The tag and the head of a slot; head 0 is an empty slot.
+    fn read(words: &[u64], slot: usize) -> (u64, u64);
+    fn write(words: &mut [u64], slot: usize, tag: u64, head: u64);
+    /// Converts a head (row + 1) of this width.
+    fn of_head(head: u64) -> Self;
+    fn head_of(row: usize) -> u64;
+}
+
+impl HeadWord for u32 {
+    const WORDS: usize = 1;
+
+    #[inline(always)]
+    fn tag(hash: u64) -> u64 {
+        hash & 0xFFFF_FFFF
+    }
+
+    #[inline(always)]
+    fn read(words: &[u64], slot: usize) -> (u64, u64) {
+        let word = words[slot];
+        (word >> 32, word & 0xFFFF_FFFF)
+    }
+
+    #[inline(always)]
+    fn write(words: &mut [u64], slot: usize, tag: u64, head: u64) {
+        words[slot] = (tag << 32) | head;
+    }
+
+    #[inline(always)]
+    fn of_head(head: u64) -> Self {
+        head as u32
+    }
+
+    #[inline(always)]
+    fn head_of(row: usize) -> u64 {
+        // As `T::try_from(row + 1).unwrap()` before: a `u32` map has fewer
+        // than `u32::MAX` rows.
+        u64::from(u32::try_from(row + 1).expect("u32 join map row"))
+    }
+}
+
+impl HeadWord for u64 {
+    const WORDS: usize = 2;
+
+    #[inline(always)]
+    fn tag(hash: u64) -> u64 {
+        hash
+    }
+
+    #[inline(always)]
+    fn read(words: &[u64], slot: usize) -> (u64, u64) {
+        (words[2 * slot], words[2 * slot + 1])
+    }
+
+    #[inline(always)]
+    fn write(words: &mut [u64], slot: usize, tag: u64, head: u64) {
+        words[2 * slot] = tag;
+        words[2 * slot + 1] = head;
+    }
+
+    #[inline(always)]
+    fn of_head(head: u64) -> Self {
+        head
+    }
+
+    #[inline(always)]
+    fn head_of(row: usize) -> u64 {
+        row as u64 + 1
+    }
+}
+
+/// An insert into a [`HeadTable`] without room for another hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableFull;
+
+/// Chain heads by hash: the first row (+ 1) of each distinct hash.
+pub(crate) struct HeadTable<T: HeadWord> {
+    words: Vec<u64>,
+    /// The rows that the table was made for.
+    capacity: usize,
+    /// `64 - log2(slots)`.
+    shift: u32,
+    mask: usize,
+    len: usize,
+    prefetch: bool,
+    _width: std::marker::PhantomData<T>,
+}
+
+impl<T: HeadWord> HeadTable<T> {
+    fn slots_for(capacity: usize) -> usize {
+        capacity
+            .saturating_mul(2)
+            .max(2)
+            .checked_next_power_of_two()
+            .expect("join table capacity")
+    }
+
+    /// Bytes of the slots of a table made for `capacity` rows.
+    pub(crate) fn bytes_for(capacity: usize) -> usize {
+        Self::slots_for(capacity) * T::WORDS * size_of::<u64>()
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        let slots = Self::slots_for(capacity);
+        let words = zeroed_with_huge_pages(slots * T::WORDS);
+        Self {
+            prefetch: prefetch_pays(words.len() * size_of::<u64>()),
+            words,
+            capacity,
+            shift: 64 - slots.trailing_zeros(),
+            mask: slots - 1,
+            len: 0,
+            _width: std::marker::PhantomData,
+        }
+    }
+
+    /// Distinct hashes (up to tag collisions of a `u32` table).
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Bytes of the slots.
+    pub(crate) fn bytes(&self) -> usize {
+        self.words.len() * size_of::<u64>()
+    }
+
+    /// Whether the table is large enough for prefetches to pay.
+    #[inline(always)]
+    pub(crate) fn prefetches(&self) -> bool {
+        self.prefetch
+    }
+
+    #[inline(always)]
+    fn position(&self, hash: u64) -> usize {
+        (hash.wrapping_mul(SLOT_MUL) >> self.shift) as usize
+    }
+
+    /// Hints the cache to load the first slot of `hash`.
+    #[inline(always)]
+    pub(crate) fn prefetch(&self, hash: u64) {
+        prefetch_read(&self.words, self.position(hash) * T::WORDS);
+    }
+
+    /// The chain head of `hash`, or 0.
+    #[inline(always)]
+    pub(crate) fn head(&self, hash: u64) -> u64 {
+        let tag = T::tag(hash);
+        let mut slot = self.position(hash);
+        loop {
+            let (stored, head) = T::read(&self.words, slot);
+            if head == 0 {
+                return 0;
+            }
+            if stored == tag {
+                return head;
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
+    /// Makes `head` the chain head of `hash`; returns the head it replaces,
+    /// or 0 when `hash` is new.
+    ///
+    /// A `u32` slot does not keep the whole hash, so the table cannot be
+    /// rehashed into more slots. It takes up to twice the capacity that it
+    /// was made for (every caller inserts at most that capacity); beyond
+    /// that, when only one empty slot is left (it ends every probe), the
+    /// insert fails with [`TableFull`] and changes nothing.
+    #[inline(always)]
+    pub(crate) fn insert(&mut self, hash: u64, head: u64) -> Result<u64, TableFull> {
+        let tag = T::tag(hash);
+        let mut slot = self.position(hash);
+        loop {
+            let (stored, previous) = T::read(&self.words, slot);
+            if previous == 0 {
+                if self.len >= self.mask {
+                    return Err(TableFull);
+                }
+                T::write(&mut self.words, slot, tag, head);
+                self.len += 1;
+                return Ok(0);
+            }
+            if stored == tag {
+                T::write(&mut self.words, slot, tag, head);
+                return Ok(previous);
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
+    /// The error of an insert into a full table.
+    #[cold]
+    pub(crate) fn full_error(&self) -> datafusion_common::DataFusionError {
+        internal_datafusion_err!(
+            "join hash table full: {} distinct hashes in {} slots, made for {} rows",
+            self.len,
+            self.mask + 1,
+            self.capacity
+        )
+    }
+
+    /// Inserts rows in iteration order, each with its hash. `previous` gets
+    /// each row that already had a chain head, and that head: the caller
+    /// links the row to it. Keeps `PREFETCH_DISTANCE` rows in flight. Fails
+    /// when the table is full or a row is not below `row_bound` (the end of
+    /// the caller's chain array, which every head must index); the rows
+    /// before the failing one are inserted.
+    pub(crate) fn insert_all<I, F>(
+        &mut self,
+        rows: I,
+        row_bound: usize,
+        mut previous: F,
+    ) -> Result<()>
+    where
+        I: Iterator<Item = (usize, u64)>,
+        F: FnMut(usize, T),
+    {
+        let mut add = |table: &mut Self, row: usize, hash: u64| -> Result<()> {
+            if row >= row_bound {
+                return Err(internal_datafusion_err!(
+                    "join hash map row {row} is beyond its {row_bound} rows"
+                ));
+            }
+            match table.insert(hash, T::head_of(row)) {
+                Ok(0) => Ok(()),
+                Ok(head) => {
+                    previous(row, T::of_head(head));
+                    Ok(())
+                }
+                Err(TableFull) => Err(table.full_error()),
+            }
+        };
+        if !self.prefetch {
+            for (row, hash) in rows {
+                add(self, row, hash)?;
+            }
+            return Ok(());
+        }
+        let mut ring = [(0_usize, 0_u64); PREFETCH_DISTANCE];
+        let mut pending = 0;
+        let mut at = 0;
+        for (row, hash) in rows {
+            self.prefetch(hash);
+            if pending == PREFETCH_DISTANCE {
+                let (old_row, old_hash) = ring[at];
+                add(self, old_row, old_hash)?;
+            } else {
+                pending += 1;
+            }
+            ring[at] = (row, hash);
+            at = (at + 1) % PREFETCH_DISTANCE;
+        }
+        // The oldest pending row is at `at` once the ring is full, else at 0.
+        let first = if pending == PREFETCH_DISTANCE { at } else { 0 };
+        for index in 0..pending {
+            let (row, hash) = ring[(first + index) % PREFETCH_DISTANCE];
+            add(self, row, hash)?;
+        }
+        Ok(())
+    }
+
+    /// A table with the heads that `map.find` returns for its hashes. Its
+    /// length is the map's: tests build maps that hold one hash twice, and
+    /// a probe takes the chain path whenever the length is below the rows.
+    #[cfg(test)]
+    pub(crate) fn from_hashbrown<V>(map: &HashTable<(u64, V)>) -> Self
+    where
+        V: Copy + Into<u64>,
+    {
+        let mut table = Self::with_capacity(map.len());
+        for (hash, _) in map.iter() {
+            if table.head(*hash) == 0 {
+                let (_, head) = map.find(*hash, |(h, _)| h == hash).expect("own entry");
+                table.insert(*hash, (*head).into()).expect("map fits");
+            }
+        }
+        table.len = map.len();
+        table
+    }
+}
+
+/// Longbow patch (JT): chain heads by hash, for the probe functions below.
+pub(crate) trait HeadLookup {
+    /// The chain head (row + 1) of `hash`, or 0.
+    fn head(&self, hash: u64) -> u64;
+    /// Hints the cache to load what [`Self::head`] reads first.
+    fn prefetch(&self, hash: u64);
+    /// Whether the table is large enough for prefetches to pay.
+    fn prefetches(&self) -> bool;
+}
+
+impl<T: HeadWord> HeadLookup for HeadTable<T> {
+    #[inline(always)]
+    fn head(&self, hash: u64) -> u64 {
+        HeadTable::head(self, hash)
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, hash: u64) {
+        HeadTable::prefetch(self, hash)
+    }
+
+    #[inline(always)]
+    fn prefetches(&self) -> bool {
+        HeadTable::prefetches(self)
+    }
+}
+
+/// Longbow patch (JT): [`get_matched_indices`] over a [`HeadLookup`].
+pub(crate) fn heads_matched_indices<'a, L, T>(
+    table: &L,
+    next: &[T],
+    iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
+    deleted_offset: Option<usize>,
+) -> (Vec<u32>, Vec<u64>)
+where
+    L: HeadLookup,
+    T: Copy + Into<u64>,
+{
+    let mut input_indices = vec![];
+    let mut match_indices = vec![];
+    let offset = deleted_offset.unwrap_or(0) as u64;
+    for (row_idx, &hash) in iter {
+        let head = table.head(hash);
+        if head == 0 {
+            continue;
+        }
+        let mut row = head - 1;
+        loop {
+            // A pruned chain ends below the offset.
+            if row < offset {
+                break;
+            }
+            let index = row - offset;
+            match_indices.push(index);
+            input_indices.push(row_idx as u32);
+            let next_row: u64 = next[index as usize].into();
+            if next_row == 0 {
+                break;
+            }
+            row = next_row - 1;
+        }
+    }
+    (input_indices, match_indices)
+}
+
+/// Longbow patch (JT): [`get_matched_indices_with_limit_offset`] over a
+/// [`HeadLookup`], with the same offsets and results. `unique` is true when
+/// every row has its own head, so no chain needs to be followed. A large
+/// table prefetches the slot of the row `PREFETCH_DISTANCE` rows ahead.
+///
+/// `unique` must be `true` only if every hash value maps to a single row
+/// (the `chained` flag of the maps, not `len == next.len()`: rows left out
+/// for NULL keys own a chain slot but no head).
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn heads_matched_indices_with_limit_offset<L, T>(
+    table: &L,
+    next_chain: &[T],
+    unique: bool,
+    hash_values: &[u64],
+    valid_keys: Option<&NullBuffer>,
+    limit: usize,
+    offset: ProbeOffset,
+    input_indices: &mut Vec<u32>,
+    match_indices: &mut Vec<u64>,
+) -> Option<ProbeOffset>
+where
+    L: HeadLookup,
+    T: Copy + TryFrom<usize> + PartialOrd + Into<u64> + Sub<Output = T>,
+    <T as TryFrom<usize>>::Error: Debug,
+    T: ArrowNativeType,
+{
+    if table.prefetches() {
+        matched_heads::<L, T, true>(
+            table,
+            next_chain,
+            unique,
+            hash_values,
+            valid_keys,
+            limit,
+            offset,
+            input_indices,
+            match_indices,
+        )
+    } else {
+        matched_heads::<L, T, false>(
+            table,
+            next_chain,
+            unique,
+            hash_values,
+            valid_keys,
+            limit,
+            offset,
+            input_indices,
+            match_indices,
+        )
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+#[inline(always)]
+fn matched_heads<L, T, const PREFETCH: bool>(
+    table: &L,
+    next_chain: &[T],
+    unique: bool,
+    hash_values: &[u64],
+    valid_keys: Option<&NullBuffer>,
+    limit: usize,
+    offset: ProbeOffset,
+    input_indices: &mut Vec<u32>,
+    match_indices: &mut Vec<u64>,
+) -> Option<ProbeOffset>
+where
+    L: HeadLookup,
+    T: Copy + TryFrom<usize> + PartialOrd + Into<u64> + Sub<Output = T>,
+    <T as TryFrom<usize>>::Error: Debug,
+    T: ArrowNativeType,
+{
+    input_indices.clear();
+    match_indices.clear();
+    let len = hash_values.len();
+    // Prefetches the rows from `from` to the distance ahead of it.
+    let warm = |from: usize, end: usize| {
+        if PREFETCH {
+            for &hash in &hash_values[from.min(end)..(from + PREFETCH_DISTANCE).min(end)]
+            {
+                table.prefetch(hash);
+            }
+        }
+    };
+
+    // Every hash has a single row: no chain to follow.
+    if unique {
+        debug_assert!(
+            matches!(offset, AtRow { .. }),
+            "unique keys cannot have mid-chain"
+        );
+        let (AtRow { row: start } | MidChain { row: start, .. }) = offset;
+        let end = (start + limit).min(len);
+        warm(start, end);
+        for row in start..end {
+            if PREFETCH && row + PREFETCH_DISTANCE < end {
+                table.prefetch(hash_values[row + PREFETCH_DISTANCE]);
+            }
+            // NULL keys cannot match any build row
+            if valid_keys.is_some_and(|valid| valid.is_null(row)) {
+                continue;
+            }
+            let head = table.head(hash_values[row]);
+            if head != 0 {
+                input_indices.push(row as u32);
+                match_indices.push(head - 1);
+            }
+        }
+        return if end == len {
+            None
+        } else {
+            Some(AtRow { row: end })
+        };
+    }
+
+    let mut remaining_output = limit;
+
+    // Calculate initial `hash_values` index before iterating
+    let to_skip = match offset {
+        // `AtRow` indicates that `idx` processing hasn't been started
+        AtRow { row: idx } => idx,
+        // Otherwise, process remaining `idx` matches by traversing `next_chain`,
+        // to start with the next index
+        MidChain {
+            row: idx,
+            next: next_idx,
+        } => {
+            let next_idx: T = T::usize_as(next_idx as usize);
+            let is_last = idx == len - 1;
+            if let Some(next_offset) = traverse_chain(
+                next_chain,
+                idx,
+                next_idx,
+                &mut remaining_output,
+                input_indices,
+                match_indices,
+                is_last,
+            ) {
+                return Some(next_offset);
+            }
+            idx + 1
+        }
+    };
+
+    warm(to_skip, len);
+    for row_idx in to_skip..len {
+        if PREFETCH && row_idx + PREFETCH_DISTANCE < len {
+            table.prefetch(hash_values[row_idx + PREFETCH_DISTANCE]);
+        }
+        // NULL keys cannot match any build row
+        if valid_keys.is_some_and(|valid| valid.is_null(row_idx)) {
+            continue;
+        }
+        let head = table.head(hash_values[row_idx]);
+        if head != 0 {
+            let is_last = row_idx == len - 1;
+            if let Some(next_offset) = traverse_chain(
+                next_chain,
+                row_idx,
+                T::usize_as(head as usize),
+                &mut remaining_output,
+                input_indices,
+                match_indices,
+                is_last,
+            ) {
+                return Some(next_offset);
+            }
+        }
+    }
+    None
+}
+
+/// Longbow patch (JT): [`contain_hashes`] over a [`HeadLookup`].
+pub(crate) fn heads_contain_hashes<L: HeadLookup>(
+    table: &L,
+    hash_values: &[u64],
+) -> BooleanArray {
+    let prefetch = table.prefetches();
+    let len = hash_values.len();
+    if prefetch {
+        for &hash in &hash_values[..PREFETCH_DISTANCE.min(len)] {
+            table.prefetch(hash);
+        }
+    }
+    let buffer = BooleanBuffer::collect_bool(len, |i| {
+        if prefetch && i + PREFETCH_DISTANCE < len {
+            table.prefetch(hash_values[i + PREFETCH_DISTANCE]);
+        }
+        table.head(hash_values[i]) != 0
+    });
+    BooleanArray::new(buffer, None)
+}
+
+/// Longbow patch (JT): hints the CPU to load `slice[index]` into all cache
+/// levels. Does nothing when `index` is out of bounds or the target has no
+/// prefetch instruction here.
+#[inline(always)]
+pub fn prefetch_read<T>(slice: &[T], index: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(element) = slice.get(index) {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        // SAFETY: `element` is a reference into `slice`, so the address is
+        // inside a live allocation. A prefetch neither faults nor changes
+        // memory or registers; it only hints the cache.
+        unsafe { _mm_prefetch::<_MM_HINT_T0>((element as *const T).cast::<i8>()) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (slice, index);
+    }
+}
+
+/// Longbow patch (JT): `vec![0; len]`, whose pages are advised to be 2 MiB
+/// transparent huge pages from `HUGE_PAGE_BYTES` on when the advice is on
+/// ([`huge_page_advice`], off by default). The advice applies to
+/// pages that are first touched after it: memory that the allocator takes
+/// fresh from the kernel and has not written yet. Memory that the allocator
+/// reuses is already backed by pages (it zeroes them for this allocation), so
+/// the advice changes nothing there until the kernel collapses them. The
+/// advice stays on the address range after the vector is freed, and the
+/// allocator may hand the range to other allocations.
+pub(crate) fn zeroed_with_huge_pages<T: Copy + Default + ArrowNativeType>(
+    len: usize,
+) -> Vec<T> {
+    let values = vec![T::default(); len];
+    advise_huge_pages(&values);
+    values
+}
+
+/// Longbow patch (JT): `madvise(MADV_HUGEPAGE)` on the 2 MiB-aligned part of
+/// `values`, from `HUGE_PAGE_BYTES` on and only when [`huge_page_advice`] is
+/// on. Errors are ignored: the advice is a hint, and a kernel without
+/// transparent huge pages refuses it.
+fn advise_huge_pages<T>(values: &[T]) {
+    if size_of_val(values) >= HUGE_PAGE_BYTES && huge_page_advice() {
+        madvise_huge_pages(values);
+    }
+}
+
+/// `madvise(MADV_HUGEPAGE)` on the 2 MiB-aligned part of `values`, whatever
+/// [`huge_page_advice`] says (the gate is [`advise_huge_pages`]).
+fn madvise_huge_pages<T>(values: &[T]) {
+    #[cfg(target_os = "linux")]
+    {
+        const HUGE_PAGE: usize = 2 << 20;
+        let bytes = size_of_val(values);
+        let start = values.as_ptr() as usize;
+        let first = start.next_multiple_of(HUGE_PAGE);
+        let last = (start + bytes) & !(HUGE_PAGE - 1);
+        if last > first {
+            // SAFETY: `first..last` lies inside the allocation of `values`,
+            // which this function borrows. `MADV_HUGEPAGE` only sets a flag
+            // on the mapping: it changes no contents and no permission, and
+            // the allocation stays valid whatever the call returns.
+            unsafe {
+                libc::madvise(
+                    first as *mut libc::c_void,
+                    last - first,
+                    libc::MADV_HUGEPAGE,
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = values;
 }
 
 #[cfg(test)]
@@ -786,10 +1482,191 @@ mod tests {
         assert_eq!(matched, vec![0, 2]);
     }
 
-    /// Longbow patch (JT): rows beyond the chain array, with repeated or
-    /// distinct keys, end `update_hash` with an error and no panic.
+    // Longbow patch (JT): the head table against the hashbrown map that it
+    // replaces, through the generic functions that still serve hashbrown.
+
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// The hashbrown reference: the map and chain of the code before JT.
+    fn reference(hashes: &[u64]) -> (HashTable<(u64, u32)>, Vec<u32>, bool) {
+        let mut map = HashTable::with_capacity(hashes.len());
+        let mut next = vec![0_u32; hashes.len()];
+        // As `update_hash` with `fifo_hashmap`: rows in reverse.
+        let chained = update_from_iter::<u32>(
+            &mut map,
+            &mut next,
+            Box::new(hashes.iter().enumerate().rev()),
+            0,
+        );
+        (map, next, chained)
+    }
+
+    /// Every (probe, build) pair of a probe batch, resumed at `limit`.
+    fn drain(
+        probe: impl Fn(ProbeOffset, &mut Vec<u32>, &mut Vec<u64>) -> Option<ProbeOffset>,
+    ) -> Vec<(u32, u64)> {
+        let (mut input, mut matched, mut pairs) = (vec![], vec![], vec![]);
+        let mut offset = AtRow { row: 0 };
+        loop {
+            let next = probe(offset, &mut input, &mut matched);
+            pairs.extend(input.iter().copied().zip(matched.iter().copied()));
+            match next {
+                Some(resume) => offset = resume,
+                None => return pairs,
+            }
+        }
+    }
+
+    fn compare_with_reference(build: &[u64], probe: &[u64], valid: Option<&NullBuffer>) {
+        let (map, next, chained) = reference(build);
+        let mut table = JoinHashMapU32::with_capacity(build.len());
+        table
+            .update_from_iter(Box::new(build.iter().enumerate().rev()), 0)
+            .unwrap();
+        assert_eq!(table.len(), map.len());
+        assert_eq!(table.chained, chained);
+        let limits: &[usize] = if build.len() <= 1000 {
+            &[1, 2, 3, 7, 64, 8192]
+        } else {
+            &[7, 8192]
+        };
+        for &limit in limits {
+            let expected = drain(|offset, input, matched| {
+                get_matched_indices_with_limit_offset::<u32>(
+                    &map, &next, !chained, probe, valid, limit, offset, input, matched,
+                )
+            });
+            let actual = drain(|offset, input, matched| {
+                table.get_matched_indices_with_limit_offset(
+                    probe, valid, limit, offset, input, matched,
+                )
+            });
+            assert_eq!(actual, expected, "limit {limit}");
+        }
+        let iter = || Box::new(probe.iter().enumerate());
+        assert_eq!(
+            table.get_matched_indices(iter(), None),
+            get_matched_indices::<u32>(&map, &next, iter(), None)
+        );
+        assert_eq!(table.contain_hashes(probe), contain_hashes(&map, probe));
+    }
+
     #[test]
-    fn rows_beyond_the_map_return_an_error() {
+    fn head_table_matches_hashbrown_with_duplicates_and_null_keys() {
+        let mut state = 7;
+        // Small: no prefetch. Large: the table is above `PREFETCH_BYTES`.
+        for (rows, keys) in [
+            (100, 30),
+            (1000, 1000),
+            (200_000, 50_000),
+            (100_000, 100_000),
+        ] {
+            let domain: Vec<u64> = (0..keys).map(|_| splitmix(&mut state)).collect();
+            let build: Vec<u64> = (0..rows)
+                .map(|_| domain[(splitmix(&mut state) % keys as u64) as usize])
+                .collect();
+            // Half the probes hit, half miss.
+            let probe: Vec<u64> = (0..rows)
+                .map(|row| {
+                    if row % 2 == 0 {
+                        domain[(splitmix(&mut state) % keys as u64) as usize]
+                    } else {
+                        splitmix(&mut state)
+                    }
+                })
+                .collect();
+            let valid = NullBuffer::from(
+                (0..rows).map(|row| row % 5 != 3).collect::<Vec<bool>>(),
+            );
+            compare_with_reference(&build, &probe, None);
+            compare_with_reference(&build, &probe, Some(&valid));
+        }
+        let table = JoinHashMapU32::with_capacity(200_000);
+        assert!(table.table.prefetches());
+        assert!(!JoinHashMapU32::with_capacity(1000).table.prefetches());
+    }
+
+    #[test]
+    fn head_table_with_one_hash_for_every_row() {
+        // `force_hash_collisions`: every row in one chain.
+        let build = vec![42_u64; 1000];
+        compare_with_reference(&build, &[42, 1, 42], None);
+    }
+
+    #[test]
+    fn a_u32_head_table_merges_only_hashes_with_equal_low_bits() {
+        // Two hashes with equal low 32 bits share one chain in a `u32`
+        // table: the probe of either gets the rows of both, which the key
+        // comparison then drops. Other hashes stay apart.
+        let (a, b) = (0x1234_5678_9ABC_DEF0_u64, 0x8765_4321_9ABC_DEF0_u64);
+        let mut table = HeadTable::<u32>::with_capacity(4);
+        table.insert(a, 1).unwrap();
+        let other = table.insert(b, 2).unwrap();
+        // `b` lands in the same probe run only if its slot is reached; the
+        // table then reports `a`'s head as the head it replaces.
+        if other != 0 {
+            assert_eq!((other, table.head(a), table.len()), (1, 2, 1));
+        } else {
+            assert_eq!((table.head(a), table.head(b), table.len()), (1, 2, 2));
+        }
+        // A `u64` table compares whole hashes.
+        let mut wide = HeadTable::<u64>::with_capacity(4);
+        assert_eq!((wide.insert(a, 1), wide.insert(b, 2)), (Ok(0), Ok(0)));
+        assert_eq!((wide.head(a), wide.head(b), wide.len()), (1, 2, 2));
+    }
+
+    #[test]
+    fn a_u64_map_matches_the_u32_map() {
+        let mut state = 11;
+        let build: Vec<u64> = (0..5000).map(|_| splitmix(&mut state) % 1777).collect();
+        let probe: Vec<u64> = (0..5000).map(|_| splitmix(&mut state) % 2000).collect();
+        let mut narrow = JoinHashMapU32::with_capacity(build.len());
+        let mut wide = JoinHashMapU64::with_capacity(build.len());
+        narrow
+            .update_from_iter(Box::new(build.iter().enumerate().rev()), 0)
+            .unwrap();
+        wide.update_from_iter(Box::new(build.iter().enumerate().rev()), 0)
+            .unwrap();
+        for limit in [1, 5, 8192] {
+            let a = drain(|o, i, m| {
+                narrow.get_matched_indices_with_limit_offset(&probe, None, limit, o, i, m)
+            });
+            let b = drain(|o, i, m| {
+                wide.get_matched_indices_with_limit_offset(&probe, None, limit, o, i, m)
+            });
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn a_head_table_takes_twice_its_capacity_and_then_refuses() {
+        let mut table = HeadTable::<u64>::with_capacity(4);
+        // Eight slots: seven distinct hashes fit, one slot stays empty.
+        for hash in 0..7 {
+            assert_eq!(table.insert(hash, hash + 1), Ok(0));
+        }
+        for hash in 0..7 {
+            assert_eq!(table.head(hash), hash + 1);
+        }
+        assert_eq!(table.head(100), 0);
+        // An existing hash still takes a new head; a new one is refused and
+        // changes nothing.
+        assert_eq!(table.insert(3, 50), Ok(4));
+        assert_eq!(table.insert(7, 8), Err(TableFull));
+        assert_eq!((table.len(), table.head(7), table.head(3)), (7, 0, 50));
+    }
+
+    /// An overfilled map returns an error through `update_hash`, the build
+    /// path of `HashJoinExec`, for both widths and with and without
+    /// prefetching; it does not panic.
+    #[test]
+    fn an_overfilled_map_returns_an_error() {
         use crate::joins::utils::update_hash;
         use arrow::array::{RecordBatch, UInt64Array};
         use arrow::datatypes::{DataType, Field, Schema};
@@ -802,15 +1679,15 @@ mod tests {
             Arc::new(Schema::new(vec![Field::new("k", DataType::UInt64, false)]));
         let on: Vec<datafusion_physical_expr::PhysicalExprRef> =
             vec![Arc::new(Column::new("k", 0))];
-        for keys in [vec![1_u64, 2, 1, 2, 1, 2], vec![10, 11, 12, 13, 14, 15]] {
+        for (capacity, rows) in [(4_usize, 100_u64), (40_000, 200_000)] {
             let batch = RecordBatch::try_new(
                 Arc::clone(&schema),
-                vec![Arc::new(UInt64Array::from(keys))],
+                vec![Arc::new(UInt64Array::from_iter_values(0..rows))],
             )
             .unwrap();
             let maps: [Box<dyn JoinHashMapType>; 2] = [
-                Box::new(JoinHashMapU32::with_capacity(4)),
-                Box::new(JoinHashMapU64::with_capacity(4)),
+                Box::new(JoinHashMapU32::with_capacity(capacity)),
+                Box::new(JoinHashMapU64::with_capacity(capacity)),
             ];
             for mut map in maps {
                 let mut hashes = vec![0; batch.num_rows()];
@@ -829,9 +1706,255 @@ mod tests {
                         )
                     }))
                     .expect("no panic");
-                let error = result.expect_err("rows beyond the map").to_string();
-                assert!(error.contains("beyond its 4 rows"), "{error}");
+                // The chain array bounds the rows before the slots run out.
+                let error = result.expect_err("overfilled map").to_string();
+                assert!(
+                    error.contains(&format!("beyond its {capacity} rows")),
+                    "{error}"
+                );
             }
+        }
+        // Repeated keys and rows beyond the chain array: an error, also when
+        // the table still has room (review of JT, finding 2).
+        for keys in [vec![1_u64, 2, 1, 2, 1, 2], vec![10, 11, 12, 13, 14, 15]] {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(UInt64Array::from(keys))],
+            )
+            .unwrap();
+            let mut map = JoinHashMapU32::with_capacity(4);
+            let mut hashes = vec![0; batch.num_rows()];
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                update_hash(
+                    &on,
+                    &batch,
+                    &mut map,
+                    0,
+                    &RandomState::with_seed(0),
+                    &mut hashes,
+                    0,
+                    true,
+                    NullEquality::NullEqualsNothing,
+                )
+            }))
+            .expect("no panic");
+            let error = result.expect_err("rows beyond the map").to_string();
+            assert!(error.contains("beyond its 4 rows"), "{error}");
+        }
+        // Within its rows, a map with twice the slots takes them all.
+        let mut map = JoinHashMapU32::with_capacity(7);
+        let hashes: Vec<u64> = (0..7).collect();
+        map.update_from_iter(Box::new(hashes.iter().enumerate()), 0)
+            .unwrap();
+        assert_eq!(map.len(), 7);
+        // A `u64` map reserves its real table size.
+        assert!(
+            JoinHashMapU64::table_bytes(5) >= HeadTable::<u64>::with_capacity(5).bytes()
+        );
+    }
+
+    #[test]
+    fn prefetch_read_ignores_out_of_bounds_indices() {
+        let values = [1_u64, 2, 3];
+        prefetch_read(&values, 1);
+        prefetch_read(&values, 3);
+        prefetch_read::<u64>(&[], 0);
+    }
+
+    #[test]
+    fn huge_page_advice_keeps_contents() {
+        // The advice itself, whatever the switch says.
+        let mut advised: Vec<u64> = vec![0; 1 << 20];
+        advised[12345] = 7;
+        madvise_huge_pages(&advised);
+        assert_eq!((advised[12345], advised.iter().sum::<u64>()), (7, 7));
+        let values: Vec<u64> = zeroed_with_huge_pages(1 << 20);
+        assert!(values.iter().all(|value| *value == 0));
+        let table = HeadTable::<u32>::with_capacity(1 << 20);
+        assert_eq!(table.bytes(), (2 << 20) * size_of::<u64>());
+    }
+
+    // Review of JT (leto-mjj.49): the unique path with prefetch, forced
+    // 32-bit tag collisions and a partial insert before an error.
+
+    /// Exact (probe, build) pairs of the hashbrown reference, which compares
+    /// whole hashes.
+    fn reference_pairs(
+        build: &[u64],
+        probe: &[u64],
+        valid: Option<&NullBuffer>,
+        limit: usize,
+    ) -> Vec<(u32, u64)> {
+        let (map, next, chained) = reference(build);
+        drain(|offset, input, matched| {
+            get_matched_indices_with_limit_offset::<u32>(
+                &map, &next, !chained, probe, valid, limit, offset, input, matched,
+            )
+        })
+    }
+
+    /// The key comparison of the join, with the keys equal to the hashes.
+    fn filtered(pairs: Vec<(u32, u64)>, build: &[u64], probe: &[u64]) -> Vec<(u32, u64)> {
+        pairs
+            .into_iter()
+            .filter(|(p, b)| build[*b as usize] == probe[*p as usize])
+            .collect()
+    }
+
+    #[test]
+    fn review_unique_path_with_prefetch_matches_hashbrown() {
+        let mut state = 99;
+        let rows = 100_000;
+        let build: Vec<u64> = (0..rows).map(|_| splitmix(&mut state)).collect();
+        let probe: Vec<u64> = (0..rows)
+            .map(|r| {
+                if r % 3 == 0 {
+                    splitmix(&mut state)
+                } else {
+                    build[(splitmix(&mut state) % rows as u64) as usize]
+                }
+            })
+            .collect();
+        let valid =
+            NullBuffer::from((0..rows).map(|r| r % 7 != 2).collect::<Vec<bool>>());
+        let mut table = JoinHashMapU32::with_capacity(rows);
+        table
+            .update_from_iter(Box::new(build.iter().enumerate().rev()), 0)
+            .unwrap();
+        assert!(table.table.prefetches());
+        assert_eq!(table.len(), rows);
+        assert!(!table.chained, "unique path must be taken");
+        for v in [None, Some(&valid)] {
+            for limit in [1usize, 7, 16, 17, 8192] {
+                let actual = drain(|o, i, m| {
+                    table.get_matched_indices_with_limit_offset(&probe, v, limit, o, i, m)
+                });
+                assert_eq!(
+                    actual,
+                    reference_pairs(&build, &probe, v, limit),
+                    "limit {limit}"
+                );
+            }
+        }
+    }
+
+    /// Many hashes share their low 32 bits, so a `u32` table merges chains.
+    fn collision_case(rows: usize, groups: u64, seed: u64) -> (Vec<u64>, Vec<u64>) {
+        let mut state = seed;
+        // `groups` distinct low halves, random high halves; about rows / 4 keys.
+        let keys: Vec<u64> = (0..rows / 4)
+            .map(|_| {
+                ((splitmix(&mut state) >> 32) << 32) | (splitmix(&mut state) % groups)
+            })
+            .collect();
+        let build: Vec<u64> = (0..rows)
+            .map(|_| keys[(splitmix(&mut state) % keys.len() as u64) as usize])
+            .collect();
+        let probe: Vec<u64> = (0..rows / 2)
+            .map(|r| {
+                if r % 2 == 0 {
+                    keys[(splitmix(&mut state) % keys.len() as u64) as usize]
+                } else {
+                    ((splitmix(&mut state) >> 32) << 32) | (splitmix(&mut state) % groups)
+                }
+            })
+            .collect();
+        (build, probe)
+    }
+
+    #[test]
+    fn review_tag_collisions_row_by_row_u32_and_u64() {
+        for (rows, groups) in [(400usize, 3u64), (20_000, 50), (300_000, 1000)] {
+            let (build, probe) = collision_case(rows, groups, rows as u64);
+            let valid = NullBuffer::from(
+                (0..probe.len()).map(|r| r % 5 != 1).collect::<Vec<bool>>(),
+            );
+            let mut narrow = JoinHashMapU32::with_capacity(rows);
+            narrow
+                .update_from_iter(Box::new(build.iter().enumerate().rev()), 0)
+                .unwrap();
+            let mut wide = JoinHashMapU64::with_capacity(rows);
+            wide.update_from_iter(Box::new(build.iter().enumerate().rev()), 0)
+                .unwrap();
+            for v in [None, Some(&valid)] {
+                for limit in [1usize, 3, 64, 8192] {
+                    let expected = reference_pairs(&build, &probe, v, limit);
+                    let a = drain(|o, i, m| {
+                        narrow.get_matched_indices_with_limit_offset(
+                            &probe, v, limit, o, i, m,
+                        )
+                    });
+                    assert!(a.len() >= expected.len());
+                    assert_eq!(
+                        filtered(a, &build, &probe),
+                        expected,
+                        "u32 rows {rows} limit {limit}"
+                    );
+                    let b = drain(|o, i, m| {
+                        wide.get_matched_indices_with_limit_offset(
+                            &probe, v, limit, o, i, m,
+                        )
+                    });
+                    assert_eq!(b, expected, "u64 rows {rows} limit {limit}");
+                }
+            }
+            // contain_hashes: a superset of exact membership.
+            let exact = contain_hashes(&reference(&build).0, &probe);
+            let got = narrow.contain_hashes(&probe);
+            for i in 0..probe.len() {
+                if exact.value(i) {
+                    assert!(got.value(i));
+                }
+            }
+            // get_matched_indices, without a limit.
+            let iter = || Box::new(probe.iter().enumerate());
+            let (pi, bi) = narrow.get_matched_indices(iter(), None);
+            let (reference_map, reference_next, _) = reference(&build);
+            let (ri, rb) =
+                get_matched_indices::<u32>(&reference_map, &reference_next, iter(), None);
+            let got: Vec<(u32, u64)> =
+                filtered(pi.into_iter().zip(bi).collect(), &build, &probe);
+            assert_eq!(got, ri.into_iter().zip(rb).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn review_insert_all_error_after_partial_insert_with_prefetch() {
+        // A prefetching table made for 40,000 rows; rows beyond them are an
+        // error, and the rows before the failing one stay inserted.
+        let mut map = JoinHashMapU32::with_capacity(40_000);
+        assert!(map.table.prefetches());
+        let hashes: Vec<u64> = (0..50_000u64)
+            .map(|h| h.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        let err = map
+            .update_from_iter(Box::new(hashes.iter().enumerate()), 0)
+            .unwrap_err();
+        assert!(err.to_string().contains("beyond its 40000 rows"), "{err}");
+        assert_eq!(map.len(), 40_000);
+        for (row, h) in hashes.iter().enumerate().take(40_000) {
+            assert_eq!(map.table.head(*h), row as u64 + 1);
+        }
+    }
+
+    #[test]
+    fn huge_page_advice_is_off_unless_requested() {
+        for value in [
+            None,
+            Some(""),
+            Some("off"),
+            Some("0"),
+            Some("false"),
+            Some("yes"),
+        ] {
+            assert!(!huge_pages_requested(value), "{value:?}");
+        }
+        for value in [Some("on"), Some("1"), Some("true"), Some(" on ")] {
+            assert!(huge_pages_requested(value), "{value:?}");
+        }
+        // The test process does not set the variable.
+        if std::env::var(HUGE_PAGES_ENV).is_err() {
+            assert!(!huge_page_advice());
         }
     }
 }

@@ -546,3 +546,36 @@ out-of-bounds panic in a worker. Classification: UPSTREAMABLE.
 beyond `next.len() + deleted_offset` (rows before it are inserted);
 `update_hash` and the pruning map propagate the result. Every production
 caller sizes the map to its rows, so no query changes.
+
+
+### JT 2: chain-head table with prefetch and 2 MiB pages
+
+Purpose: take the probe and build off dependent cache and TLB misses.
+Classification: UPSTREAMABLE. The chain heads of `JoinHashMapU32`,
+`JoinHashMapU64` and the shards live in `HeadTable`: one power-of-two slot
+array with linear probing at load at most one half. A `u32` slot is one word
+(the low 32 hash bits over row + 1); a `u64` slot is two (hash, row + 1). The
+slot is the top bits of `hash * golden`. The chain encoding is unchanged.
+Two hashes with equal low 32 bits in one probe run share a chain; every
+consumer compares keys or uses the answer as a filter that may pass extra
+rows (measured at SF100: no extra candidate on TPC-H Q9 or TPC-DS q78).
+Crafted keys that share one chain are cheaper to make with 32-bit tags (about
+2^32 work per key instead of a 64-bit collision) and make a probe of them
+quadratic; Longbow is single-tenant, so this is recorded, not mitigated.
+Tables above 512 KiB prefetch the slot 16 probe rows ahead and keep 16 build
+rows in flight in order (one `_mm_prefetch` with a SAFETY comment). On other
+targets, aarch64 (Graviton) included, the prefetch is a no-op; Graviton is
+unmeasured. With `LONGBOW_JOIN_TABLE_HUGE_PAGES=on` (off by default), arrays
+from 4 MiB on get `MADV_HUGEPAGE` on their 2 MiB-aligned interior. It is off
+by default because the advice outlives a freed table: the allocator reuses
+the range for other operators, and their faults there allocate huge pages
+with synchronous compaction (worker-01, TPC-H SF100, the same code with and
+without it: Q9 pull 17% faster, q10 pull 27% slower in a suite process,
+suite sums about 3% faster). A table takes up to twice its capacity and then refuses a new hash
+with an error. A `u64` map reserves the larger of hashbrown's estimate and
+its table (`collect_left_input`). The hashbrown functions stay for the
+pruning map. Tests compare the table with the hashbrown reference
+(duplicates, NULL keys, every resume limit, both widths, both prefetch modes)
+and overfill it. On 56 the maps keep upstream's `chained` flag (set by any
+insert that finds a head): rows left out for NULL keys keep the unique-key
+path, and the head-table probe resumes with `ProbeOffset`.
