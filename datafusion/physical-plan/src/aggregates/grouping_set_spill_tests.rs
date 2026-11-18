@@ -7,11 +7,14 @@
 //! Stock grouping-set spill replay must retain the grouping ID as a key.
 
 use super::*;
+use crate::metrics::{BaselineMetrics, SpillMetrics};
 use crate::test::TestMemoryExec;
 use arrow::array::{Int32Array, Int64Array};
 use datafusion_common::test_util::batches_to_sort_string;
 use datafusion_execution::config::SessionConfig;
-use datafusion_execution::memory_pool::FairSpillPool;
+use datafusion_execution::memory_pool::{
+    FairSpillPool, GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation,
+};
 use datafusion_execution::runtime_env::RuntimeEnvBuilder;
 use datafusion_functions_aggregate::{average::avg_udaf, count::count_udaf};
 use datafusion_physical_expr::aggregate::AggregateExprBuilder;
@@ -217,6 +220,91 @@ async fn compare(rollup: bool, mode: AggregateMode) -> Result<()> {
         "leaked reservation"
     );
     assert_eq!(unbounded.memory_pool().reserved(), 0, "leaked reservation");
+    Ok(())
+}
+
+#[derive(Debug)]
+struct NoSpillLending(GreedyMemoryPool);
+
+impl std::fmt::Display for NoSpillLending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no spill lending")
+    }
+}
+
+impl MemoryPool for NoSpillLending {
+    fn name(&self) -> &str {
+        "no spill lending"
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, size: usize) {
+        self.0.grow(reservation, size);
+    }
+
+    fn try_grow(&self, reservation: &MemoryReservation, size: usize) -> Result<()> {
+        if reservation.consumer().can_spill() {
+            return datafusion_common::resources_err!("spill lending exhausted");
+        }
+        self.0.try_grow(reservation, size)
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, size: usize) {
+        self.0.shrink(reservation, size);
+    }
+
+    fn reserved(&self) -> usize {
+        self.0.reserved()
+    }
+}
+
+#[tokio::test]
+async fn final_rollup_replay_table_can_use_the_unspillable_budget() -> Result<()> {
+    let unbounded = context(false);
+    let partial = fixture(true, AggregateMode::Partial)?;
+    let batch = stock(&partial, &unbounded).await?.remove(0);
+    let agg = final_aggregate(&partial, vec![batch.clone()])?;
+    let expected = stock(&agg, &unbounded).await?;
+    let pool: Arc<dyn MemoryPool> =
+        Arc::new(NoSpillLending(GreedyMemoryPool::new(128 * 1024)));
+    let ctx = Arc::new(
+        TaskContext::default()
+            .with_session_config(SessionConfig::new().with_batch_size(64))
+            .with_runtime(
+                RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::clone(&pool))
+                    .build_arc()?,
+            ),
+    );
+    let mut spill = spill::AggregateSpill::try_new(
+        "FinalHashAggregateSpill",
+        &agg,
+        &ctx,
+        0,
+        64,
+        &GroupClusteringMode::None,
+        &batch.schema(),
+        SpillMetrics::new(&agg.metrics, 0),
+    )?;
+    // A single sorted run requires no spillable merge buffers. Its clustered
+    // replay table must still fit after peers occupy the entire lending cap.
+    spill.sort_and_spill(Some(batch))?;
+    let merge = MemoryConsumer::new("FinalHashAggregateStream[0]")
+        .with_can_spill(true)
+        .register(&pool);
+    let actual = spill
+        .into_replay_stream(
+            &BaselineMetrics::new(&agg.metrics, 0),
+            aggregate_hash_table::ClusteredAggregateTableMetrics::new(&agg, 0),
+            merge,
+        )?
+        .try_collect::<Vec<_>>()
+        .await?;
+    assert_eq!(
+        batches_to_sort_string(&actual),
+        batches_to_sort_string(&expected)
+    );
+    assert_eq!(pool.reserved(), 0);
+    assert_eq!(ctx.runtime_env().disk_manager.used_disk_space(), 0);
     Ok(())
 }
 
