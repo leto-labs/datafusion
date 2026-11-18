@@ -16,7 +16,7 @@ use super::*;
 use crate::attempt_tasks::AttemptTasks;
 use crate::coalesce_partitions::CoalescePartitionsExec;
 use crate::common;
-use crate::joins::join_hash_map::{JoinHashMapU32, ProbeOffset};
+use crate::joins::join_hash_map::{HeadTable, JoinHashMapU32, ProbeOffset};
 use crate::test::TestMemoryExec;
 use arrow::array::{AsArray, Int32Array, StringViewArray};
 use arrow::datatypes::Field;
@@ -486,12 +486,21 @@ async fn sharded_map_resumes_like_the_native_map() -> Result<()> {
 
 #[test]
 fn sharded_map_requires_a_power_of_two_shard_count() {
-    let shards = vec![hashbrown::HashTable::new(); 2];
-    assert!(ShardedJoinHashMap::new(shards, vec![], false).is_empty());
-    let result = std::panic::catch_unwind(|| {
-        ShardedJoinHashMap::new(vec![hashbrown::HashTable::new(); 3], vec![], false)
-    });
+    let tables = |count: usize| (0..count).map(|_| HeadTable::with_capacity(0)).collect();
+    assert!(ShardedJoinHashMap::new(tables(2), vec![], false).is_empty());
+    let result =
+        std::panic::catch_unwind(|| ShardedJoinHashMap::new(tables(3), vec![], false));
     assert!(result.is_err());
+    // Longbow patch (JT): a shard without room returns an error, no panic.
+    let mut map = ShardedJoinHashMap::new(tables(2), vec![0; 64], false);
+    let hashes: Vec<u64> = (0..64).map(|row| row << 40).collect();
+    let error = map
+        .update_from_iter(Box::new(hashes.iter().enumerate()), 0)
+        .expect_err("two-slot shards hold one hash each");
+    assert!(
+        error.to_string().contains("join hash table full"),
+        "{error}"
+    );
 }
 
 /// The build's input fits; its tables do not. The join reports resource

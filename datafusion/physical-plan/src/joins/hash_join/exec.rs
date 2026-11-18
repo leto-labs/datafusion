@@ -3018,8 +3018,11 @@ pub(super) fn new_join_hashmap(
     let fixed_size_u64 = size_of::<JoinHashMapU64>();
 
     if num_rows > u32::MAX as usize {
+        // Longbow patch (JT): the head table of a `u64` map can be larger
+        // than hashbrown's estimate; reserve the larger.
         let estimated_hashtable_size =
             estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?
+                .max(JoinHashMapU64::table_bytes(num_rows) + fixed_size_u64)
                 // Each build row also owns an index in the duplicate-key chain.
                 .checked_add(num_rows * size_of::<u64>())
                 .ok_or_else(|| {
