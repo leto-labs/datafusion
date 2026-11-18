@@ -61,6 +61,11 @@ The replay table keeps the current key and accumulator state until it can
 emit the result. This table has no spill path. Its own reservation charges
 that working set to the worker's unspillable budget.
 
+Once the hash table spills, it preserves part of its existing grant as
+workspace for spill-run reads and merging. The table can use the same bytes
+between spills. The merge releases idle workspace when it starts streaming
+the last pass. The original spillable consumer owns the grant throughout.
+
 ## Family I: bounded static expression preparation cache
 
 Purpose: reuse the simplified form of an unchanged, fully static scan
