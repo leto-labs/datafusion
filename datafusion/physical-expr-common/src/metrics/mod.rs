@@ -28,7 +28,7 @@ use std::{
 // public exports
 
 pub use baseline::{BaselineMetrics, RecordOutput, SpillMetrics, SplitMetrics};
-pub use builder::MetricBuilder;
+pub use builder::{MetricBatch, MetricBuilder, MetricSink};
 pub use custom::CustomMetricValue;
 pub use elapsed_compute::{ElapsedComputeFuture, ElapsedComputeFutureExt};
 pub use expression::ExpressionEvaluatorMetrics;

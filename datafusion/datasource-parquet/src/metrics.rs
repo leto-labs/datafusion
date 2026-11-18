@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use datafusion_physical_plan::metrics::{
-    Count, ExecutionPlanMetricsSet, Gauge, Label, MetricBuilder, MetricCategory,
-    MetricType, PruningMetrics, RatioMergeStrategy, RatioMetrics, Time,
+    Count, ExecutionPlanMetricsSet, Gauge, Label, MetricBatch, MetricBuilder,
+    MetricCategory, MetricType, PruningMetrics, RatioMergeStrategy, RatioMetrics, Time,
 };
 
 /// Stores metrics about the parquet execution for a particular parquet file.
@@ -185,10 +185,11 @@ impl ParquetFileMetrics {
         filename: &str,
         metrics: &ExecutionPlanMetricsSet,
     ) -> Self {
-        // Share the filename label across all per-file metrics to avoid
-        // allocating the same filename string for each metric.
+        // Build outside the shared registry lock. All partitions of a scan
+        // register here, often concurrently as they open their next files.
+        let batch = MetricBatch::with_capacity(19);
         let filename_label = Label::new("filename", Arc::<str>::from(filename));
-        let builder = MetricBuilder::new(metrics).with_label(filename_label);
+        let builder = MetricBuilder::for_sink(&batch).with_label(filename_label);
 
         // -----------------------
         // 'summary' level metrics
@@ -223,7 +224,7 @@ impl ParquetFileMetrics {
             .with_type(MetricType::Summary)
             .subset_time("metadata_load_time", partition);
 
-        let files_ranges_pruned_statistics = MetricBuilder::new(metrics)
+        let files_ranges_pruned_statistics = MetricBuilder::for_sink(&batch)
             .with_type(MetricType::Summary)
             .pruning_metrics("files_ranges_pruned_statistics", partition);
 
@@ -277,13 +278,15 @@ impl ParquetFileMetrics {
             .gauge("predicate_cache_inner_records", partition);
 
         let predicate_cache_records = builder
+            .clone()
             .with_category(MetricCategory::Rows)
             .gauge("predicate_cache_records", partition);
 
-        let row_groups_pruned_dynamic_filter = MetricBuilder::new(metrics)
-            .with_new_label("filename", filename.to_string())
+        let row_groups_pruned_dynamic_filter = builder
             .with_type(MetricType::Summary)
             .counter("row_groups_pruned_dynamic_filter", partition);
+
+        batch.register(metrics);
 
         Self {
             files_ranges_pruned_statistics,

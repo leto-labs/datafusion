@@ -40,6 +40,10 @@ impl Registry {
         self.metrics.push(metric);
     }
 
+    pub(super) fn register_batch(&mut self, metrics: Vec<Arc<Metric>>) {
+        self.metrics.extend(metrics);
+    }
+
     /// Select metrics whose partition ID equals `partition`. `end` is an exclusive
     /// position in the full registration vector, including other partitions and
     /// global metrics. It fixes the membership of the requesting snapshot.
@@ -297,6 +301,42 @@ mod tests {
         let index = &registry.index;
         assert_eq!(index.indexed, 3);
         assert_eq!(index.positions[&0], vec![0, 1]);
+    }
+
+    #[test]
+    fn batch_preserves_order_partitions_and_live_values_across_snapshots() {
+        use crate::metrics::{MetricBatch, MetricBuilder};
+
+        let registry = ExecutionPlanMetricsSet::new();
+        registry.register(metric(None));
+        let before = registry.clone_inner();
+
+        let batch = MetricBatch::with_capacity(3);
+        let builder = MetricBuilder::for_sink(&batch);
+        let first = builder.clone().counter("files", 2);
+        let second = builder.clone().counter("files", 1);
+        let third = builder.counter("files", 2);
+        first.add(7);
+        assert_eq!(registry.clone_inner().iter().count(), 1);
+        batch.register(&registry);
+        let after = registry.clone_inner();
+        assert_eq!(
+            after.iter().map(|m| m.partition()).collect::<Vec<_>>(),
+            [None, Some(2), Some(1), Some(2)]
+        );
+        assert_eq!(before.for_partition(2).iter().count(), 0);
+
+        second.add(11);
+        third.add(13);
+        assert_eq!(after.sum_by_name("files").unwrap().as_usize(), 31);
+        assert_eq!(
+            after
+                .for_partition(2)
+                .sum_by_name("files")
+                .unwrap()
+                .as_usize(),
+            20
+        );
     }
 
     #[test]

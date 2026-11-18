@@ -4,7 +4,7 @@
 
 //! Builder for creating arbitrary metrics
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, cell::RefCell, sync::Arc};
 
 use crate::metrics::{
     MetricCategory, MetricType,
@@ -15,6 +15,50 @@ use super::{
     Count, ExecutionPlanMetricsSet, Gauge, Label, LabelValue, Metric, MetricValue, Time,
     Timestamp,
 };
+
+/// Destination for a metric constructed by a [`MetricBuilder`].
+pub trait MetricSink {
+    /// Record a metric in this destination.
+    fn record_metric(&self, metric: Arc<Metric>);
+}
+
+impl MetricSink for ExecutionPlanMetricsSet {
+    fn record_metric(&self, metric: Arc<Metric>) {
+        self.register(metric);
+    }
+}
+
+/// Builds a group of metrics locally, then publishes them under one plan lock.
+///
+/// The batch is local to the caller. Metric handles built from it can be
+/// updated before and after publication.
+#[derive(Debug)]
+pub struct MetricBatch {
+    metrics: RefCell<Vec<Arc<Metric>>>,
+}
+
+impl MetricBatch {
+    /// Create a batch with room for `capacity` metrics.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            metrics: RefCell::new(Vec::with_capacity(capacity)),
+        }
+    }
+
+    /// Publish all metrics in registration order as one batch.
+    pub fn register(self, destination: &ExecutionPlanMetricsSet) {
+        destination
+            .inner
+            .lock()
+            .register_batch(self.metrics.into_inner());
+    }
+}
+
+impl MetricSink for MetricBatch {
+    fn record_metric(&self, metric: Arc<Metric>) {
+        self.metrics.borrow_mut().push(metric);
+    }
+}
 
 /// Structure for constructing metrics, counters, timers, etc.
 ///
@@ -36,10 +80,9 @@ use super::{
 ///     .with_new_label("filename", "my_awesome_file.parquet")
 ///     .counter("num_bytes", partition);
 /// ```
-#[derive(Clone)]
-pub struct MetricBuilder<'a> {
-    /// Location that the metric created by this builder will be added do
-    metrics: &'a ExecutionPlanMetricsSet,
+pub struct MetricBuilder<'a, S = ExecutionPlanMetricsSet> {
+    /// Destination for the metric created by this builder.
+    metrics: &'a S,
 
     /// optional partition number
     partition: Option<usize>,
@@ -56,12 +99,28 @@ pub struct MetricBuilder<'a> {
     metric_category: Option<MetricCategory>,
 }
 
+impl<S> Clone for MetricBuilder<'_, S> {
+    fn clone(&self) -> Self {
+        Self {
+            metrics: self.metrics,
+            partition: self.partition,
+            labels: self.labels.clone(),
+            metric_type: self.metric_type,
+            metric_category: self.metric_category,
+        }
+    }
+}
+
 impl<'a> MetricBuilder<'a> {
-    /// Create a new `MetricBuilder` that will register the result of `build()` with the `metrics`
-    ///
-    /// `self.metric_type` controls when such metric is displayed. See comments in
-    /// [`MetricType`] for details.
+    /// Create a builder that registers each metric directly with the plan.
     pub fn new(metrics: &'a ExecutionPlanMetricsSet) -> Self {
+        Self::for_sink(metrics)
+    }
+}
+
+impl<'a, S: MetricSink> MetricBuilder<'a, S> {
+    /// Create a builder that records each metric in `metrics`.
+    pub fn for_sink(metrics: &'a S) -> Self {
         Self {
             metrics,
             partition: None,
@@ -125,7 +184,7 @@ impl<'a> MetricBuilder<'a> {
         if let Some(category) = metric_category {
             metric = metric.with_category(category);
         }
-        metrics.register(Arc::new(metric));
+        metrics.record_metric(Arc::new(metric));
     }
 
     /// Consume self and create a new counter for recording output rows
