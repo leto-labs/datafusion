@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -398,6 +400,7 @@ fn get_exprs_except_skipped(
 fn exclude_using_columns(plan: &LogicalPlan) -> Result<HashSet<Column>> {
     let output_columns: HashSet<_> = plan.schema().columns().iter().cloned().collect();
     let mut excluded = HashSet::new();
+    let asof_right = ordered_asof_right_columns(plan)?;
     for cols in plan.using_columns()? {
         // `using_columns()` returns join columns from both sides regardless of
         // the join type. For semi/anti joins, only one side's columns appear in
@@ -410,8 +413,12 @@ fn exclude_using_columns(plan: &LogicalPlan) -> Result<HashSet<Column>> {
             .collect();
 
         // Sort so we keep the same qualified column, regardless of HashSet
-        // iteration order.
-        cols.sort();
+        // iteration order. Longbow family AJ: the right columns of DuckDB's
+        // ASOF `USING` sort last, so `*` keeps the left value, which every
+        // left row has.
+        cols.sort_by(|a, b| {
+            (asof_right.contains(a), a).cmp(&(asof_right.contains(b), b))
+        });
 
         // Keep only one column per name from the columns set, adding any
         // duplicates to the excluded set.
@@ -425,6 +432,27 @@ fn exclude_using_columns(plan: &LogicalPlan) -> Result<HashSet<Column>> {
         }
     }
     Ok(excluded)
+}
+
+/// Longbow family AJ: the right `USING` columns of every ASOF join in DuckDB's
+/// `USING (k, ..., t)` form ([`crate::logical_plan::AsOfJoin::ordered_using`]).
+fn ordered_asof_right_columns(plan: &LogicalPlan) -> Result<HashSet<Column>> {
+    let mut columns = HashSet::new();
+    plan.apply_with_subqueries(|plan| {
+        if let LogicalPlan::AsOfJoin(join) = plan
+            && join.ordered_using
+        {
+            columns.extend(
+                join.on
+                    .iter()
+                    .map(|(_, right)| right)
+                    .chain([&join.match_condition.right])
+                    .filter_map(|right| right.get_as_join_column().cloned()),
+            );
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(columns)
 }
 
 /// Resolves an `Expr::Wildcard` to a collection of `Expr::Column`'s.

@@ -581,6 +581,19 @@ impl LogicalPlan {
                 }) => Some(on),
                 _ => None,
             };
+            // Longbow family AJ: DuckDB's last USING column is bound too.
+            if let LogicalPlan::AsOfJoin(AsOfJoin {
+                ordered_using: true,
+                match_condition,
+                ..
+            }) = plan
+                && let (Some(l), Some(r)) = (
+                    match_condition.left.get_as_join_column(),
+                    match_condition.right.get_as_join_column(),
+                )
+            {
+                using_columns.push(HashSet::from([l.to_owned(), r.to_owned()]));
+            }
             if let Some(on) = on {
                 // The join keys in using-join must be columns.
                 let columns = on.iter().try_fold(
@@ -788,20 +801,24 @@ impl LogicalPlan {
                 on,
                 match_condition,
                 join_constraint,
+                ordered_using,
                 schema: _,
-            }) => Ok(LogicalPlan::AsOfJoin(AsOfJoin::try_new(
-                left,
-                right,
-                on.into_iter()
-                    .map(|(left, right)| (left.unalias(), right.unalias()))
-                    .collect(),
-                AsOfMatch {
-                    left: match_condition.left.unalias(),
-                    op: match_condition.op,
-                    right: match_condition.right.unalias(),
-                },
-                join_constraint,
-            )?)),
+            }) => Ok(LogicalPlan::AsOfJoin(
+                AsOfJoin::try_new(
+                    left,
+                    right,
+                    on.into_iter()
+                        .map(|(left, right)| (left.unalias(), right.unalias()))
+                        .collect(),
+                    AsOfMatch {
+                        left: match_condition.left.unalias(),
+                        op: match_condition.op,
+                        right: match_condition.right.unalias(),
+                    },
+                    join_constraint,
+                )?
+                .with_ordered_using(ordered_using)?,
+            )),
             LogicalPlan::Subquery(_) => Ok(self),
             LogicalPlan::SubqueryAlias(SubqueryAlias {
                 input,
@@ -1115,6 +1132,7 @@ impl LogicalPlan {
                 on,
                 match_condition,
                 join_constraint,
+                ordered_using,
                 ..
             }) => {
                 let (left, right) = self.only_two_inputs(inputs)?;
@@ -1138,17 +1156,20 @@ impl LogicalPlan {
                 let match_right =
                     iter.next().expect("expression count checked").unalias();
 
-                Ok(LogicalPlan::AsOfJoin(AsOfJoin::try_new(
-                    Arc::new(left),
-                    Arc::new(right),
-                    new_on,
-                    AsOfMatch {
-                        left: match_left,
-                        op: match_condition.op,
-                        right: match_right,
-                    },
-                    *join_constraint,
-                )?))
+                Ok(LogicalPlan::AsOfJoin(
+                    AsOfJoin::try_new(
+                        Arc::new(left),
+                        Arc::new(right),
+                        new_on,
+                        AsOfMatch {
+                            left: match_left,
+                            op: match_condition.op,
+                            right: match_right,
+                        },
+                        *join_constraint,
+                    )?
+                    .with_ordered_using(*ordered_using)?,
+                ))
             }
             LogicalPlan::Subquery(Subquery {
                 outer_ref_columns,
@@ -4725,6 +4746,12 @@ pub struct AsOfJoin {
     pub match_condition: Box<AsOfMatch>,
     /// Whether equality keys came from `ON` or `USING`.
     pub join_constraint: JoinConstraint,
+    /// Longbow family AJ: the match condition came from the last column of
+    /// DuckDB's `USING (k, ..., t)`. Then [`LogicalPlan::using_columns`] binds
+    /// both sides of the match like a `USING` column (an unqualified `t` and
+    /// `*` show it once, with the left value). Snowflake's `MATCH_CONDITION`
+    /// leaves it `false`.
+    pub ordered_using: bool,
     /// Output schema.
     pub schema: DFSchemaRef,
 }
@@ -4808,8 +4835,26 @@ impl AsOfJoin {
             on,
             match_condition: Box::new(match_condition),
             join_constraint,
+            ordered_using: false,
             schema: Arc::new(schema),
         })
+    }
+
+    /// Marks the match condition as the last `USING` column (see
+    /// [`Self::ordered_using`]). Requires `USING` and a match between two
+    /// columns.
+    pub fn with_ordered_using(mut self, ordered_using: bool) -> Result<Self> {
+        if ordered_using
+            && (self.join_constraint != JoinConstraint::Using
+                || self.match_condition.left.get_as_join_column().is_none()
+                || self.match_condition.right.get_as_join_column().is_none())
+        {
+            return plan_err!(
+                "An ordered ASOF USING column must be a column of each side"
+            );
+        }
+        self.ordered_using = ordered_using;
+        Ok(self)
     }
 
     fn validate_side(expr: &Expr, schema: &DFSchema, name: &str) -> Result<()> {
@@ -4838,6 +4883,7 @@ impl PartialOrd for AsOfJoin {
             &self.on,
             &self.match_condition,
             &self.join_constraint,
+            &self.ordered_using,
         )
             .partial_cmp(&(
                 &other.left,
@@ -4845,6 +4891,7 @@ impl PartialOrd for AsOfJoin {
                 &other.on,
                 &other.match_condition,
                 &other.join_constraint,
+                &other.ordered_using,
             ))
             .filter(|cmp| *cmp != Ordering::Equal || self == other)
     }
