@@ -442,3 +442,25 @@ Regressions: `scripts/vendored-tests.py datafusion-physical-plan -E
 test(lookups_expose_partition_build_keys_and_memory) |
 test(lookup_exposes_build_keys_and_memory_while_the_join_holds_them) |
 test(prepared)'`.
+
+## Family PX: executor-supplied task spawner (prototype, not merged)
+
+Prototype of lane `leto-rle.58` on branch `leto-rle.58`; it is not part of
+`longbow-56.0`, and the Longbow engine does not use it unless
+`LONGBOW_ISLAND_ON_POOL=1` is set.
+
+`datafusion-common-runtime` gets `spawner`: a thread-local `TaskSpawner` that
+the thread polling an operator can install for the length of a poll.
+`SpawnedTask::spawn` and `JoinSet::spawn` hand their future to it. The Tokio
+task that the caller holds only waits for the result, so join, abort on drop
+and the attempt scope of family A keep their meaning: an abort closes the
+result channel, and the redirected future ends at its next poll. With no
+spawner installed nothing changes. `spawn_blocking`, `spawn_on` and the local
+variants are not redirected.
+
+Dependent Longbow feature: ENGINE-CONVERGENCE (ADR 0066 draft: DataFusion
+streams and their tasks on the morsel compute pool). Audit classification:
+LONGBOW-ONLY.
+
+Regressions: `scripts/vendored-tests.py datafusion-common-runtime` (three
+tests in `spawner::tests`).

@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -53,7 +55,11 @@ impl<T: 'static> JoinSet<T> {
         F: Send + 'static,
         T: Send,
     {
-        self.inner.spawn(trace_future(task))
+        // Longbow family PX (prototype): see `crate::spawner`.
+        match crate::spawner::redirect(task) {
+            Ok(waiting) => self.inner.spawn(waiting),
+            Err(task) => self.inner.spawn(trace_future(task)),
+        }
     }
 
     /// [JoinSet::spawn_on](tokio::task::JoinSet::spawn_on) - Spawn a task on a provided runtime.

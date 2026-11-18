@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -30,6 +32,16 @@ impl<R: 'static> SpawnedTask<R> {
         T: Send + 'static,
         R: Send,
     {
+        // Longbow family PX (prototype): a spawner installed by the polling
+        // thread runs the task; the Tokio task only waits for its result.
+        let task = match crate::spawner::redirect(task) {
+            Ok(waiting) => {
+                #[expect(clippy::disallowed_methods)]
+                let inner = tokio::task::spawn(waiting);
+                return Self { inner };
+            }
+            Err(task) => task,
+        };
         // Ok to use spawn here as SpawnedTask handles aborting/cancelling the task on Drop
         #[expect(clippy::disallowed_methods)]
         let inner = tokio::task::spawn(trace_future(task));
