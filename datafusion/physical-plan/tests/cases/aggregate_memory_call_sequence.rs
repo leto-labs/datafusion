@@ -493,8 +493,8 @@ fn clustered_partial_input_long_run() -> Vec<Vec<(i64, i64)>> {
 // Final, Single (GroupClusteringMode::None): spill or fail
 // ---------------------------------------------------------------------------
 
-/// Final and Single: two spills, then the merge and the replay stream run as
-/// siblings of the stream's reservation (same consumer name).
+/// Final and Single: two spills, then the run merge keeps the original
+/// spillable consumer and the replay table uses its own reservation.
 #[tokio::test]
 async fn spills_twice_then_replays() -> Result<()> {
     let _bound = hide_byte_counts().bind_to_scope();
@@ -518,34 +518,36 @@ async fn spills_twice_then_replays() -> Result<()> {
     FinalHashAggregateStream[0] try_grow [bytes] -> refused
     FinalHashAggregateStream[0] shrink [bytes]
     FinalHashAggregateStream[0] shrink [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] register can_spill=false
+    AggregateSpillReplayTable[0] try_grow [bytes]
     FinalHashAggregateStream[0] try_grow [bytes]
     FinalHashAggregateStream[0] try_grow [bytes] -> refused
     FinalHashAggregateStream[0] shrink [bytes]
     FinalHashAggregateStream[0] try_grow [bytes]
     FinalHashAggregateStream[0] try_grow [bytes]
     FinalHashAggregateStream[0] shrink [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] shrink [bytes]
+    AggregateSpillReplayTable[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] shrink [bytes]
+    AggregateSpillReplayTable[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] shrink [bytes]
+    AggregateSpillReplayTable[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] shrink [bytes]
+    AggregateSpillReplayTable[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] shrink [bytes]
+    AggregateSpillReplayTable[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] try_grow [bytes]
+    AggregateSpillReplayTable[0] shrink [bytes]
     FinalHashAggregateStream[0] shrink [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
-    FinalHashAggregateStream[0] shrink [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
-    FinalHashAggregateStream[0] shrink [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
-    FinalHashAggregateStream[0] shrink [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
-    FinalHashAggregateStream[0] shrink [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
-    FinalHashAggregateStream[0] shrink [bytes]
-    FinalHashAggregateStream[0] shrink [bytes]
-    FinalHashAggregateStream[0] shrink [bytes]
-    FinalHashAggregateStream[0] shrink [bytes]
+    AggregateSpillReplayTable[0] shrink [bytes]
+    AggregateSpillReplayTable[0] shrink [bytes]
+    AggregateSpillReplayTable[0] unregister
     FinalHashAggregateStream[0] unregister
     => Ok(768 rows in 7 batches)
     ");

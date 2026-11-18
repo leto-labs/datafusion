@@ -12,7 +12,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, internal_err};
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_expr::PhysicalSortExpr;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -123,6 +123,9 @@ pub(super) struct AggregateSpill {
     min_spill_batch_rows: usize,
     /// Describes this stream's spill requests, and prefixes its internal errors.
     label: &'static str,
+    /// Unordered hash streams hand their spills to a distinct clustered
+    /// replay table with no further spill path.
+    separate_replay_table: bool,
 }
 
 impl AggregateSpill {
@@ -166,6 +169,8 @@ impl AggregateSpill {
                 return internal_err!("{label}: cannot replay aggregate mode {mode:?}");
             }
         };
+        let separate_replay_table =
+            matches!(group_clustering_mode, GroupClusteringMode::None);
 
         let num_group_columns = group_schema.fields().len();
         let contiguous_indices: &[usize] = match group_clustering_mode {
@@ -208,6 +213,7 @@ impl AggregateSpill {
             spills: vec![],
             min_spill_batch_rows: batch_size,
             label,
+            separate_replay_table,
         })
     }
 
@@ -293,13 +299,23 @@ impl AggregateSpill {
             spills,
             min_spill_batch_rows,
             label: _,
+            separate_replay_table,
         } = self;
 
         let spill_schema = Arc::clone(spill_manager.schema());
-        // The merge and replay table are two components of the same aggregate
-        // operator. Keep them under one consumer registration so a fair memory
-        // pool does not divide this operator's quota between its own phases.
+        // Merging runs can reduce read-ahead and fan-in, or split a run. Its
+        // buffers remain charged to the caller's spillable consumer.
         let merge_reservation = reservation.new_empty();
+        // Once an unordered hash aggregate has spilled, its fully
+        // clustered replay can emit completed keys but must keep the current
+        // key until the merge reaches its boundary. This new table cannot
+        // spill. Charge it independently of the spillable run merge.
+        let replay_reservation = if separate_replay_table {
+            MemoryConsumer::new(format!("AggregateSpillReplayTable[{partition}]"))
+                .register(context.memory_pool())
+        } else {
+            reservation
+        };
         let merged = StreamingMergeBuilder::new()
             .with_schema(spill_schema)
             .with_spill_manager(spill_manager)
@@ -330,7 +346,7 @@ impl AggregateSpill {
             baseline_metrics.clone(),
             metrics,
             None,
-            reservation,
+            replay_reservation,
         )?;
         Ok(replay.into_stream())
     }
