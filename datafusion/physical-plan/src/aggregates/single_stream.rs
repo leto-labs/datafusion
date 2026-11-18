@@ -100,8 +100,8 @@ use crate::stream::{ObservedStream, RecordBatchStreamAdapter};
 /// cross the threshold. The downstream limit operator enforces the exact result
 /// size.
 pub(crate) struct SingleHashAggregateStream {
-    /// Covers group keys, accumulators, and spill sorting; replay reuses it
-    /// through a sibling reservation.
+    /// Covers group keys, accumulators, and spill sorting. Spill-run merging
+    /// reuses its grant.
     reservation: MemoryReservation,
     context: SingleHashAggregateContext,
     stage: ExecutionStage,
@@ -262,7 +262,7 @@ impl SingleHashAggregateStream {
     /// 9. End.
     pub(crate) fn into_stream(self) -> SendableRecordBatchStream {
         let Self {
-            reservation,
+            mut reservation,
             context,
             stage,
         } = self;
@@ -273,7 +273,7 @@ impl SingleHashAggregateStream {
             while let Some(current_stage) = stage {
                 stage = match current_stage {
                     ExecutionStage::Aggregating(aggregating) => {
-                        aggregating.handle_stage(&context, &reservation).await?
+                        aggregating.handle_stage(&context, &mut reservation).await?
                     }
                     ExecutionStage::Outputting(outputting) => {
                         outputting
@@ -330,7 +330,7 @@ impl Aggregating {
     async fn handle_stage(
         mut self,
         context: &SingleHashAggregateContext,
-        reservation: &MemoryReservation,
+        reservation: &mut MemoryReservation,
     ) -> Result<Option<ExecutionStage>> {
         debug_assert!(self.hash_table.is_building());
         let elapsed_compute = context.baseline_metrics.elapsed_compute();
@@ -353,6 +353,7 @@ impl Aggregating {
                         "Single hash aggregate ran out of memory with no aggregated groups"
                     );
                     spill_context.sort_and_spill(self.hash_table.take_state_batch()?)?;
+                    spill_context.retain_merge_workspace(reservation);
                     reservation
                         .try_resize(self.hash_table.memory_size())
                         .map_err(|e| {
@@ -383,6 +384,7 @@ impl Aggregating {
             hash_table
                 .take_state_batch()
                 .and_then(|batch| spill_context.sort_and_spill(batch))?;
+            spill_context.retain_merge_workspace(reservation);
 
             // Construct the replay stream: an ordered final aggregate stream
             // over the sort-preserving merge of all spill runs.

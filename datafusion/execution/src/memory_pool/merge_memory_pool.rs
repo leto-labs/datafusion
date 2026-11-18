@@ -132,12 +132,24 @@ impl MergeMemoryPool {
     /// allocation policy applies to the combined usage of all children and loans.
     pub fn new(parent: Arc<dyn MemoryPool>, consumer: MemoryConsumer) -> Self {
         let reservation = consumer.register(&parent);
+        Self::with_parent(parent, reservation)
+    }
+
+    /// Reuses an existing reservation as idle workspace without returning it
+    /// to the parent pool. The original consumer remains registered.
+    pub fn from_reservation(reservation: MemoryReservation) -> Self {
+        let parent = Arc::clone(&reservation.registration.pool);
+        Self::with_parent(parent, reservation)
+    }
+
+    fn with_parent(parent: Arc<dyn MemoryPool>, reservation: MemoryReservation) -> Self {
+        let retained = reservation.size();
         Self {
             parent,
             state: Mutex::new(MergeMemoryState {
                 reservation,
                 used: 0,
-                retained: 0,
+                retained,
             }),
         }
     }

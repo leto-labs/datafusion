@@ -12,7 +12,9 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, internal_err};
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::memory_pool::{
+    MemoryConsumer, MemoryPool, MemoryReservation, MergeMemoryPool,
+};
 use datafusion_physical_expr::PhysicalSortExpr;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -126,6 +128,10 @@ pub(super) struct AggregateSpill {
     /// Unordered hash streams hand their spills to a distinct clustered
     /// replay table with no further spill path.
     separate_replay_table: bool,
+    /// Part of the hash table's grant that remains available to read and
+    /// merge spill runs after the table is released.
+    merge_workspace: Option<Arc<MergeMemoryPool>>,
+    largest_spill_batch: usize,
 }
 
 impl AggregateSpill {
@@ -214,6 +220,8 @@ impl AggregateSpill {
             min_spill_batch_rows: batch_size,
             label,
             separate_replay_table,
+            merge_workspace: None,
+            largest_spill_batch: 0,
         })
     }
 
@@ -259,9 +267,30 @@ impl AggregateSpill {
             file,
             max_record_batch_memory,
         });
+        self.largest_spill_batch = self.largest_spill_batch.max(max_record_batch_memory);
         self.min_spill_batch_rows = self.min_spill_batch_rows.min(max_batch_rows);
 
         Ok(())
+    }
+
+    /// Keep a bounded portion of an unordered hash table's existing grant
+    /// after each spill. The table can reuse the bytes while ingesting input,
+    /// and they remain granted when it hands the runs over to the merge.
+    pub(super) fn retain_merge_workspace(&mut self, reservation: &mut MemoryReservation) {
+        let workspace = self.merge_workspace.get_or_insert_with(|| {
+            let size = reservation.size();
+            let workspace =
+                Arc::new(MergeMemoryPool::from_reservation(reservation.take()));
+            let pool: Arc<dyn MemoryPool> = Arc::clone(&workspace) as _;
+            *reservation = MemoryConsumer::new("AggregateSpillWorkspace").register(&pool);
+            // The parent already holds this grant.
+            reservation.grow(size);
+            workspace
+        });
+        // Budget for two input runs without read-ahead. Each input needs the
+        // batch and encoded keys, and admission checks for equal replay headroom.
+        let needed = self.largest_spill_batch.saturating_mul(8);
+        workspace.retain(needed.min(workspace.reserved()));
     }
 
     /// Writes already evaluated output batches to one spill file and returns a
@@ -300,6 +329,8 @@ impl AggregateSpill {
             min_spill_batch_rows,
             label: _,
             separate_replay_table,
+            merge_workspace,
+            largest_spill_batch: _,
         } = self;
 
         let spill_schema = Arc::clone(spill_manager.schema());
@@ -316,7 +347,7 @@ impl AggregateSpill {
         } else {
             reservation
         };
-        let merged = StreamingMergeBuilder::new()
+        let mut merge = StreamingMergeBuilder::new()
             .with_schema(spill_schema)
             .with_spill_manager(spill_manager)
             .with_sorted_spill_files(spills)
@@ -326,8 +357,11 @@ impl AggregateSpill {
             .with_max_batch_bytes(Some(SPILL_BATCH_TARGET_BYTES))
             .with_reservation(merge_reservation)
             .with_replay_headroom()
-            .with_intermediate_merge_sizing(Some(min_spill_batch_rows))
-            .build()?;
+            .with_intermediate_merge_sizing(Some(min_spill_batch_rows));
+        if let Some(workspace) = merge_workspace {
+            merge = merge.with_merge_pool(workspace);
+        }
+        let merged = merge.build()?;
         // A merged batch references the whole data buffers of the spilled
         // batches its rows come from, and can hold all their dictionary
         // values. Replay keeps the list states of a group, such as those of

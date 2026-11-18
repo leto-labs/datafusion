@@ -514,19 +514,14 @@ async fn spills_twice_then_replays() -> Result<()> {
     FinalHashAggregateStream[0] try_grow [bytes]
     FinalHashAggregateStream[0] try_grow [bytes]
     FinalHashAggregateStream[0] try_grow [bytes] -> refused
-    FinalHashAggregateStream[0] shrink [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
     FinalHashAggregateStream[0] try_grow [bytes] -> refused
-    FinalHashAggregateStream[0] shrink [bytes]
-    FinalHashAggregateStream[0] shrink [bytes]
     AggregateSpillReplayTable[0] register can_spill=false
     AggregateSpillReplayTable[0] try_grow [bytes]
     FinalHashAggregateStream[0] try_grow [bytes]
     FinalHashAggregateStream[0] try_grow [bytes] -> refused
     FinalHashAggregateStream[0] shrink [bytes]
     FinalHashAggregateStream[0] try_grow [bytes]
-    FinalHashAggregateStream[0] try_grow [bytes]
+    FinalHashAggregateStream[0] shrink [bytes]
     FinalHashAggregateStream[0] shrink [bytes]
     AggregateSpillReplayTable[0] try_grow [bytes]
     AggregateSpillReplayTable[0] try_grow [bytes]
