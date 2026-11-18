@@ -305,6 +305,39 @@ impl ArrayMap {
     where
         T::Native: Copy + AsPrimitive<u64>,
     {
+        // Longbow patch (JT): one loop per prefetch mode, so that a direct
+        // array below the prefetch size runs the loop without the prefetch.
+        if self.prefetches() {
+            self.lookup_with::<T, true>(
+                array,
+                limit,
+                current_offset,
+                probe_indices,
+                build_indices,
+            )
+        } else {
+            self.lookup_with::<T, false>(
+                array,
+                limit,
+                current_offset,
+                probe_indices,
+                build_indices,
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn lookup_with<T: ArrowNumericType, const PREFETCH: bool>(
+        &self,
+        array: &ArrayRef,
+        limit: usize,
+        current_offset: ProbeOffset,
+        probe_indices: &mut Vec<u32>,
+        build_indices: &mut Vec<u64>,
+    ) -> Result<Option<ProbeOffset>>
+    where
+        T::Native: Copy + AsPrimitive<u64>,
+    {
         probe_indices.clear();
         build_indices.clear();
 
@@ -312,12 +345,8 @@ impl ArrayMap {
 
         let have_null = arr.null_count() > 0;
 
-        // Longbow patch (JT): prefetch the slot of the row this far ahead.
-        let ahead = if self.prefetches() {
-            PREFETCH_DISTANCE
-        } else {
-            usize::MAX
-        };
+        // Longbow patch (JT): with `PREFETCH`, prefetch the slot of the row
+        // `PREFETCH_DISTANCE` rows ahead.
         let values = arr.values();
         if self.next.is_empty() {
             debug_assert!(
@@ -332,7 +361,8 @@ impl ArrayMap {
                 if build_indices.len() == limit {
                     return Ok(Some(AtRow { row: prob_idx }));
                 }
-                if let Some(value) = values.get(prob_idx.saturating_add(ahead)) {
+                if PREFETCH && let Some(value) = values.get(prob_idx + PREFETCH_DISTANCE)
+                {
                     self.prefetch(value.as_());
                 }
 
@@ -379,7 +409,9 @@ impl ArrayMap {
                 if remaining_output == 0 {
                     return Ok(Some(AtRow { row: prob_side_idx }));
                 }
-                if let Some(value) = values.get(prob_side_idx.saturating_add(ahead)) {
+                if PREFETCH
+                    && let Some(value) = values.get(prob_side_idx + PREFETCH_DISTANCE)
+                {
                     self.prefetch(value.as_());
                 }
 
@@ -678,6 +710,69 @@ mod tests {
                 }
             }
             assert_eq!(pairs, expected, "duplicates {duplicates}");
+        }
+        Ok(())
+    }
+
+    /// Review S4 (leto-mjj.61): the prefetching and the plain loops of
+    /// `lookup_with` give the same pairs and resume offsets on the same map
+    /// and input, unique and chained, at probe lengths and limits around the
+    /// prefetch distance, with resumes through `AtRow` and `MidChain`.
+    #[test]
+    fn prefetch_modes_give_equal_lookups() -> Result<()> {
+        use arrow::datatypes::Int64Type;
+        for duplicates in [1_usize, 3] {
+            let build: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                (0..20_i64).flat_map(|key| std::iter::repeat_n(key * 2, duplicates)),
+            ));
+            let map = ArrayMap::try_new(&build, 0, 38)?;
+            assert_eq!(map.next.is_empty(), duplicates == 1);
+            for len in [15_i64, 16, 17, 33] {
+                let probe: ArrayRef = Arc::new(Int64Array::from_iter(
+                    (0..len).map(|k| (k % 7 != 6).then_some((k * 5) % 45 - 3)),
+                ));
+                for limit in [1_usize, 15, 16, 17] {
+                    let run = |prefetch: bool| -> Result<Vec<_>> {
+                        let (mut probes, mut builds, mut steps) =
+                            (vec![], vec![], vec![]);
+                        let mut offset = AtRow { row: 0 };
+                        loop {
+                            let next = if prefetch {
+                                map.lookup_with::<Int64Type, true>(
+                                    &probe,
+                                    limit,
+                                    offset,
+                                    &mut probes,
+                                    &mut builds,
+                                )?
+                            } else {
+                                map.lookup_with::<Int64Type, false>(
+                                    &probe,
+                                    limit,
+                                    offset,
+                                    &mut probes,
+                                    &mut builds,
+                                )?
+                            };
+                            steps.push((probes.clone(), builds.clone(), next));
+                            match next {
+                                Some(resume) => offset = resume,
+                                None => return Ok(steps),
+                            }
+                        }
+                    };
+                    let (a, b) = (run(true)?, run(false)?);
+                    assert_eq!(a, b, "duplicates {duplicates} len {len} limit {limit}");
+                    if duplicates > 1 && limit == 1 {
+                        assert!(
+                            a.iter().any(|(_, _, next)| matches!(
+                                next,
+                                Some(MidChain { .. })
+                            ))
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }

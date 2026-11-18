@@ -657,3 +657,19 @@ one base page; a refused mapping (test hook) falls back to a zeroed heap
 array; dropped tables (after a full and after a failed build) leave no
 advised mapping; an `ArrayMap` of 4.8 MB is mapped; the switch's values.
 
+### JT 7: one probe loop per prefetch mode
+
+Purpose: keep the probe of small tables at its pre-JT cost. Classification:
+UPSTREAMABLE. Parts 4 and 5 checked per probe row (or candidate pair) whether
+to prefetch. On TPC-DS SF100 q14 (worker-01, 48 threads, pull), whose probe is
+almost all `ArrayMap` lookups into small arrays, that check cost 12-18% of the
+probe (14.4-14.7 to 16.4-17.3 CPU-s per execution) at every prefetch threshold
+from 512 KiB to 16 MiB, while raising the threshold made TPC-H Q9 and TPC-DS
+q78 slower (Q9 probe 44 / 48 / 70 ns per row at 512 KiB / 8 MiB / 16 MiB;
+q78 30 / 32 / 34). The `ArrayMap` probe and both key-comparison loops now
+choose their loop once per call, monomorphized on the prefetch decision, as
+the head-table probe already did, and so does `heads_contain_hashes`; the
+512 KiB threshold stays. Tests: both loops of the `ArrayMap` probe, the
+head-table probe, `heads_contain_hashes` and the key comparison (prefetch
+forced on and off by a test hook) give equal pairs and resume offsets on the
+same input, at probe lengths 15, 16, 17 and 33 and limits 1, 15, 16 and 17.

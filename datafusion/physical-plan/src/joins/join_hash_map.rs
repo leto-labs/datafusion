@@ -1408,20 +1408,32 @@ where
     None
 }
 
-/// Longbow patch (JT): [`contain_hashes`] over a [`HeadLookup`].
+/// Longbow patch (JT): [`contain_hashes`] over a [`HeadLookup`], with one
+/// loop per prefetch mode.
 pub(crate) fn heads_contain_hashes<L: HeadLookup>(
     table: &L,
     hash_values: &[u64],
 ) -> BooleanArray {
-    let prefetch = table.prefetches();
+    if table.prefetches() {
+        contained_heads::<L, true>(table, hash_values)
+    } else {
+        contained_heads::<L, false>(table, hash_values)
+    }
+}
+
+#[inline(always)]
+fn contained_heads<L: HeadLookup, const PREFETCH: bool>(
+    table: &L,
+    hash_values: &[u64],
+) -> BooleanArray {
     let len = hash_values.len();
-    if prefetch {
+    if PREFETCH {
         for &hash in &hash_values[..PREFETCH_DISTANCE.min(len)] {
             table.prefetch(hash);
         }
     }
     let buffer = BooleanBuffer::collect_bool(len, |i| {
-        if prefetch && i + PREFETCH_DISTANCE < len {
+        if PREFETCH && i + PREFETCH_DISTANCE < len {
             table.prefetch(hash_values[i + PREFETCH_DISTANCE]);
         }
         table.head(hash_values[i]) != 0
@@ -2766,5 +2778,85 @@ mod tests {
             (peak, map.len(), reservation.size(), pool.reserved()),
             (None, 0, 0, 0)
         );
+    }
+
+    /// Review S4 (leto-mjj.61): the prefetching and the plain probe loops
+    /// give the same pairs and resume offsets on the same input, unique and
+    /// chained, at probe lengths around the prefetch distance and limits
+    /// around it, with resumes through `AtRow` and `MidChain`.
+    #[test]
+    fn prefetch_modes_give_equal_probes() {
+        let mut state = 21;
+        for (keys, duplicates) in [(40_u64, 1_usize), (12, 3)] {
+            let build: Vec<u64> = (0..keys)
+                .flat_map(|k| {
+                    std::iter::repeat_n(k.wrapping_mul(0x9E37_79B9), duplicates)
+                })
+                .collect();
+            let mut map = JoinHashMapU32::with_capacity(build.len());
+            map.update_from_iter(Box::new(build.iter().enumerate().rev()), 0)
+                .unwrap();
+            assert_eq!(map.chained, duplicates > 1);
+            for len in [15_usize, 16, 17, 33] {
+                let probe: Vec<u64> = (0..len)
+                    .map(|_| {
+                        let r = splitmix(&mut state);
+                        if r % 4 == 0 {
+                            r
+                        } else {
+                            build[(r % build.len() as u64) as usize]
+                        }
+                    })
+                    .collect();
+                let valid =
+                    NullBuffer::from((0..len).map(|r| r % 6 != 5).collect::<Vec<bool>>());
+                for v in [None, Some(&valid)] {
+                    for limit in [1_usize, 15, 16, 17] {
+                        let run = |prefetch: bool| {
+                            let (mut input, mut matched) = (vec![], vec![]);
+                            let mut offset = AtRow { row: 0 };
+                            let mut steps = vec![];
+                            loop {
+                                let next = if prefetch {
+                                    matched_heads::<_, u32, true>(
+                                        &map.table,
+                                        &map.next,
+                                        !map.chained,
+                                        &probe,
+                                        v,
+                                        limit,
+                                        offset,
+                                        &mut input,
+                                        &mut matched,
+                                    )
+                                } else {
+                                    matched_heads::<_, u32, false>(
+                                        &map.table,
+                                        &map.next,
+                                        !map.chained,
+                                        &probe,
+                                        v,
+                                        limit,
+                                        offset,
+                                        &mut input,
+                                        &mut matched,
+                                    )
+                                };
+                                steps.push((input.clone(), matched.clone(), next));
+                                match next {
+                                    Some(resume) => offset = resume,
+                                    None => return steps,
+                                }
+                            }
+                        };
+                        assert_eq!(run(true), run(false), "len {len} limit {limit}");
+                    }
+                }
+                assert_eq!(
+                    contained_heads::<_, true>(&map.table, &probe),
+                    contained_heads::<_, false>(&map.table, &probe)
+                );
+            }
+        }
     }
 }

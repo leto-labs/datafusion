@@ -2400,10 +2400,18 @@ pub(super) struct BuildKeyPrefetch<'a> {
 
 impl<'a> BuildKeyPrefetch<'a> {
     fn new(left_arrays: &'a [ArrayRef], build_rows: &'a [u64]) -> Self {
+        #[cfg(test)]
+        let forced = FORCE_KEY_PREFETCH.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let forced: Option<bool> = None;
         let columns = left_arrays
             .iter()
             .filter_map(|array| fixed_width_values(array.as_ref()))
-            .filter(|(bytes, _)| crate::joins::join_hash_map::prefetch_pays(bytes.len()))
+            .filter(|(bytes, _)| {
+                forced.unwrap_or_else(|| {
+                    crate::joins::join_hash_map::prefetch_pays(bytes.len())
+                })
+            })
             .collect();
         Self {
             columns,
@@ -2411,13 +2419,17 @@ impl<'a> BuildKeyPrefetch<'a> {
         }
     }
 
+    /// Whether any build key column is large enough to prefetch. The
+    /// comparison loops take one loop without [`Self::ahead_of`] when not.
+    #[inline(always)]
+    fn active(&self) -> bool {
+        !self.columns.is_empty()
+    }
+
     /// Prefetches the build keys of the pair `KEY_PREFETCH_DISTANCE` after
     /// `pair`.
     #[inline(always)]
     fn ahead_of(&self, pair: usize) {
-        if self.columns.is_empty() {
-            return;
-        }
         if let Some(&row) = self.build_rows.get(pair + KEY_PREFETCH_DISTANCE) {
             for (bytes, width) in &self.columns {
                 crate::joins::join_hash_map::prefetch_read(
@@ -2427,6 +2439,14 @@ impl<'a> BuildKeyPrefetch<'a> {
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: `Some(true)` makes every fixed-width build key column
+    /// prefetch, `Some(false)` none, whatever their size.
+    static FORCE_KEY_PREFETCH: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Longbow patch (JT): the value bytes (from the array's first element) and
@@ -2591,22 +2611,36 @@ fn equal_rows_arr_impl(
     let mut left_filtered = Vec::with_capacity(indices_left.len());
     let mut right_filtered = Vec::with_capacity(indices_right.len());
 
-    for (pair, (left, right)) in indices_left
-        .values()
-        .iter()
-        .zip(indices_right.values())
-        .enumerate()
-    {
-        keys.ahead_of(pair);
-        let left_idx = usize::try_from(*left).map_err(|_| {
-            internal_datafusion_err!("Join index {left} can not be represented as usize")
-        })?;
-        let right_idx = *right as usize;
+    // Longbow patch (JT): one loop per prefetch mode (see `BuildKeyPrefetch`).
+    macro_rules! compare_pairs {
+        ($prefetch:expr) => {
+            for (pair, (left, right)) in indices_left
+                .values()
+                .iter()
+                .zip(indices_right.values())
+                .enumerate()
+            {
+                if $prefetch {
+                    keys.ahead_of(pair);
+                }
+                let left_idx = usize::try_from(*left).map_err(|_| {
+                    internal_datafusion_err!(
+                        "Join index {left} can not be represented as usize"
+                    )
+                })?;
+                let right_idx = *right as usize;
 
-        if comparator.is_equal(left_idx, right_idx) {
-            left_filtered.push(*left);
-            right_filtered.push(*right);
-        }
+                if comparator.is_equal(left_idx, right_idx) {
+                    left_filtered.push(*left);
+                    right_filtered.push(*right);
+                }
+            }
+        };
+    }
+    if keys.active() {
+        compare_pairs!(true);
+    } else {
+        compare_pairs!(false);
     }
 
     Ok((left_filtered.into(), right_filtered.into()))
@@ -2642,26 +2676,39 @@ fn equal_rows_single_col(
             let mut left_filtered = Vec::with_capacity(indices_left.len());
             let mut right_filtered = Vec::with_capacity(indices_right.len());
 
-            for (pair, (left_idx, right_idx)) in indices_left
-                .values()
-                .iter()
-                .zip(indices_right.values())
-                .enumerate()
-            {
-                keys.ahead_of(pair);
-                let i = *left_idx as usize;
-                let j = *right_idx as usize;
+            // Longbow patch (JT): one loop per prefetch mode (see
+            // `BuildKeyPrefetch`).
+            macro_rules! compare_pairs {
+                ($prefetch:expr) => {
+                    for (pair, (left_idx, right_idx)) in indices_left
+                        .values()
+                        .iter()
+                        .zip(indices_right.values())
+                        .enumerate()
+                    {
+                        if $prefetch {
+                            keys.ahead_of(pair);
+                        }
+                        let i = *left_idx as usize;
+                        let j = *right_idx as usize;
 
-                let is_equal = match (l.is_null(i), r.is_null(j)) {
-                    (false, false) => l.value(i) == r.value(j),
-                    (true, true) => null_equals_null,
-                    _ => false,
+                        let is_equal = match (l.is_null(i), r.is_null(j)) {
+                            (false, false) => l.value(i) == r.value(j),
+                            (true, true) => null_equals_null,
+                            _ => false,
+                        };
+
+                        if is_equal {
+                            left_filtered.push(*left_idx);
+                            right_filtered.push(*right_idx);
+                        }
+                    }
                 };
-
-                if is_equal {
-                    left_filtered.push(*left_idx);
-                    right_filtered.push(*right_idx);
-                }
+            }
+            if keys.active() {
+                compare_pairs!(true);
+            } else {
+                compare_pairs!(false);
             }
 
             return Some((left_filtered.into(), right_filtered.into()));
@@ -5993,6 +6040,67 @@ mod tests {
                 .collect();
             assert!(!expected.is_empty() && expected.len() < pairs.len());
             assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    /// Review S4 (leto-mjj.61): the key comparison keeps the same pairs in
+    /// the same order with the build-key prefetch forced on and forced off,
+    /// on the single-column fast path and the comparator loop, for probe
+    /// lengths around the prefetch distance.
+    #[test]
+    fn key_prefetch_modes_give_equal_pairs() -> Result<()> {
+        use arrow::array::{Float64Array, Int32Array, Int64Array};
+        let build_a: ArrayRef = Arc::new(Int64Array::from_iter(
+            (0..64_i64).map(|v| (v % 9 != 0).then_some(v % 20)),
+        ));
+        let build_b: ArrayRef =
+            Arc::new(Int32Array::from_iter_values((0..64_i32).map(|v| v % 3)));
+        let build_f: ArrayRef = Arc::new(Float64Array::from_iter_values(
+            (0..64).map(|v| (v % 4) as f64),
+        ));
+        for len in [15_u32, 16, 17, 33] {
+            let left =
+                UInt64Array::from_iter_values((0..len).map(|p| (p as u64 * 7) % 64));
+            let right = UInt32Array::from_iter_values(0..len);
+            let probe = |build: &ArrayRef| -> ArrayRef {
+                let indices = UInt64Array::from_iter_values((0..len).map(|p| {
+                    if p % 3 == 0 {
+                        (p as u64 * 7 + 1) % 64
+                    } else {
+                        (p as u64 * 7) % 64
+                    }
+                }));
+                take(build.as_ref(), &indices, None).unwrap()
+            };
+            for build in [
+                vec![Arc::clone(&build_a)],
+                vec![Arc::clone(&build_a), Arc::clone(&build_b)],
+                vec![Arc::clone(&build_f), Arc::clone(&build_b)],
+            ] {
+                let probes: Vec<ArrayRef> = build.iter().map(probe).collect();
+                let run = |forced: bool| {
+                    FORCE_KEY_PREFETCH.with(|f| f.set(Some(forced)));
+                    let out = equal_rows_arr(
+                        &left,
+                        &right,
+                        &build,
+                        &probes,
+                        NullEquality::NullEqualsNothing,
+                        &mut None,
+                    );
+                    FORCE_KEY_PREFETCH.with(|f| f.set(None));
+                    out
+                };
+                let (on, off) = (run(true)?, run(false)?);
+                assert_eq!(on, off, "len {len} columns {}", build.len());
+                assert!(!on.0.is_empty() && on.0.len() < len as usize);
+                FORCE_KEY_PREFETCH.with(|f| f.set(Some(true)));
+                assert!(BuildKeyPrefetch::new(&build, left.values()).active());
+                FORCE_KEY_PREFETCH.with(|f| f.set(Some(false)));
+                assert!(!BuildKeyPrefetch::new(&build, left.values()).active());
+                FORCE_KEY_PREFETCH.with(|f| f.set(None));
+            }
         }
         Ok(())
     }
