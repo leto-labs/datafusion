@@ -490,3 +490,23 @@ pruning map. Tests compare the table with the hashbrown reference
 and overfill it. On 56 the maps keep upstream's `chained` flag (set by any
 insert that finds a head): rows left out for NULL keys keep the unique-key
 path, and the head-table probe resumes with `ProbeOffset`.
+
+### JT 3: partitioned build above 4 MiB
+
+Purpose: build a table larger than the caches with inserts that hit L2.
+Classification: UPSTREAMABLE. `build_in_memory` (hash_join/exec.rs) builds a
+`u32` map above 4 MiB with `build_partitioned`: every row's hash, then a
+stable counting sort of (hash, row) into partitions of at most 256 KiB of
+slots, then the inserts partition by partition. Rows, row numbers, NULL
+handling and chains equal the row-by-row loop (rows at their position in the
+forward concatenation, batches inserted from the last, each from its last
+row). The transient 20 bytes per row are reserved beside the build's other
+charges and returned before the concatenation copy is charged;
+`build_mem_used` records the peak with them when it is the larger. A pool
+that refuses them gets the row-by-row build, not an error: CollectLeft cannot
+spill, and a build that fits without partitioning must not fail. Prepared
+builds (`PreparedHashJoinBuild`) take the same path and skip the per-batch
+scratch when partitioned. Tests: the two builds against each other and
+against hashbrown with forced 32-bit tag collisions and NULL keys; a refused
+reservation touches nothing; a one-batch CollectLeft join whose pool refuses
+the transient arrays returns the rows of an unbounded run.
