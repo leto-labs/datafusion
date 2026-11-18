@@ -1,5 +1,3 @@
-// Modified by the Longbow authors; see third_party/README.md.
-
 impl serde::Serialize for AggLimit {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -1698,6 +1696,9 @@ impl serde::Serialize for AsOfJoinExecNode {
         if !self.projection.is_empty() {
             len += 1;
         }
+        if self.partitioned {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.AsOfJoinExecNode", len)?;
         if let Some(v) = self.left.as_ref() {
             struct_ser.serialize_field("left", v)?;
@@ -1722,6 +1723,9 @@ impl serde::Serialize for AsOfJoinExecNode {
         if !self.projection.is_empty() {
             struct_ser.serialize_field("projection", &self.projection)?;
         }
+        if self.partitioned {
+            struct_ser.serialize_field("partitioned", &self.partitioned)?;
+        }
         struct_ser.end()
     }
 }
@@ -1742,6 +1746,7 @@ impl<'de> serde::Deserialize<'de> for AsOfJoinExecNode {
             "match_operator",
             "matchOperator",
             "projection",
+            "partitioned",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -1753,6 +1758,7 @@ impl<'de> serde::Deserialize<'de> for AsOfJoinExecNode {
             RightMatchExpr,
             MatchOperator,
             Projection,
+            Partitioned,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -1781,6 +1787,7 @@ impl<'de> serde::Deserialize<'de> for AsOfJoinExecNode {
                             "rightMatchExpr" | "right_match_expr" => Ok(GeneratedField::RightMatchExpr),
                             "matchOperator" | "match_operator" => Ok(GeneratedField::MatchOperator),
                             "projection" => Ok(GeneratedField::Projection),
+                            "partitioned" => Ok(GeneratedField::Partitioned),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -1807,6 +1814,7 @@ impl<'de> serde::Deserialize<'de> for AsOfJoinExecNode {
                 let mut right_match_expr__ = None;
                 let mut match_operator__ = None;
                 let mut projection__ = None;
+                let mut partitioned__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Left => {
@@ -1854,6 +1862,12 @@ impl<'de> serde::Deserialize<'de> for AsOfJoinExecNode {
                                     .into_iter().map(|x| x.0).collect())
                             ;
                         }
+                        GeneratedField::Partitioned => {
+                            if partitioned__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partitioned"));
+                            }
+                            partitioned__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(AsOfJoinExecNode {
@@ -1864,6 +1878,7 @@ impl<'de> serde::Deserialize<'de> for AsOfJoinExecNode {
                     right_match_expr: right_match_expr__,
                     match_operator: match_operator__.unwrap_or_default(),
                     projection: projection__.unwrap_or_default(),
+                    partitioned: partitioned__.unwrap_or_default(),
                 })
             }
         }
