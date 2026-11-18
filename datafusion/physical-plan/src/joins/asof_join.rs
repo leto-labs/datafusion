@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -43,7 +45,16 @@
 //! candidate, while the collected right batches are immutable and shared.
 //! The key state-machine entry point is [`AsOfJoinStream::poll_next_impl`].
 //!
-//! This mode preserves probe-side parallelism when there are no equality keys
+//! Longbow family AP adds [`AsOfJoinMode::Partitioned`]: both inputs are
+//! partitioned on the equality keys with the same partition count, and left
+//! partition *i* merges with right partition *i* as it streams. No side is
+//! collected, so the operator holds one batch of each input and the candidate
+//! row; its memory does not grow with either input. The tie rule of both
+//! modes: among right rows with equal keys and equal match value, the last in
+//! the right input's order is the match for `>=` and `>` (the candidate is
+//! replaced by each later eligible row).
+//!
+//! The broadcast mode preserves probe-side parallelism when there are no equality keys
 //! or when equality keys have low cardinality or skew. It retains the complete
 //! right input in the memory pool and may scan it once per left partition.
 //! Alternative strategies, including broadcasting the other side or
@@ -125,7 +136,20 @@ impl AsOfMatchExpr {
     }
 }
 
-/// A broadcast sort-merge ASOF join that emits one row for every left row.
+/// How an [`AsOfJoinExec`] distributes its right input (Longbow family AP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AsOfJoinMode {
+    /// Upstream's mode: one right partition, collected under a reservation and
+    /// shared by every left partition. Any left distribution.
+    #[default]
+    Broadcast,
+    /// Both inputs key-partitioned on the equality keys with the same
+    /// partition count; partition *i* of each side streams into partition *i*.
+    /// Requires at least one equality key.
+    Partitioned,
+}
+
+/// A sort-merge ASOF join that emits one row for every left row.
 #[derive(Debug)]
 pub struct AsOfJoinExec {
     left: Arc<dyn ExecutionPlan>,
@@ -145,6 +169,8 @@ pub struct AsOfJoinExec {
     right_ordering: LexOrdering,
     /// Shared collection future that materializes the right input only once.
     right_fut: OnceAsync<BroadcastRightInput>,
+    /// Distribution of the right input (Longbow family AP).
+    mode: AsOfJoinMode,
     cache: Arc<PlanProperties>,
 }
 
@@ -234,20 +260,81 @@ impl AsOfJoinExec {
             left_ordering,
             right_ordering,
             right_fut: Default::default(),
+            mode: AsOfJoinMode::Broadcast,
             cache,
         })
+    }
+
+    /// The left input.
+    pub fn left(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.left
+    }
+
+    /// The right input.
+    pub fn right(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.right
+    }
+
+    /// The equality keys, as pairs of left and right expressions.
+    pub fn on(&self) -> &JoinOn {
+        &self.on
+    }
+
+    /// The ordered comparison.
+    pub fn match_condition(&self) -> &AsOfMatchExpr {
+        &self.match_condition
+    }
+
+    /// The indices of the output columns in the left-then-right join schema.
+    pub fn projection(&self) -> Option<&[usize]> {
+        self.projection.as_deref()
+    }
+
+    /// The distribution of the right input (Longbow family AP).
+    pub fn mode(&self) -> AsOfJoinMode {
+        self.mode
+    }
+
+    /// The same join in `mode`. [`AsOfJoinMode::Partitioned`] requires at
+    /// least one equality key.
+    pub fn with_mode(&self, mode: AsOfJoinMode) -> Result<Self> {
+        if mode == AsOfJoinMode::Partitioned && self.on.is_empty() {
+            return plan_err!("A partitioned ASOF join requires an equality key");
+        }
+        let mut join = Self::try_new(
+            Arc::clone(&self.left),
+            Arc::clone(&self.right),
+            self.on.clone(),
+            self.match_condition.clone(),
+            self.projection.as_deref().map(<[usize]>::to_vec),
+        )?;
+        join.mode = mode;
+        Ok(join)
     }
 
     /// Returns this join emitting only the columns in `projection`, in that order.
     /// The indices address the join's own schema, before any projection.
     pub fn with_projection(&self, projection: Option<Vec<usize>>) -> Result<Self> {
-        Self::try_new(
+        let mut join = Self::try_new(
             Arc::clone(&self.left),
             Arc::clone(&self.right),
             self.on.clone(),
             self.match_condition.clone(),
             projection,
-        )
+        )?;
+        join.mode = self.mode;
+        Ok(join)
+    }
+
+    /// The input side and index of every output column, after the projection.
+    fn output_column_indices(&self) -> Vec<ColumnIndex> {
+        match self.projection.as_ref() {
+            Some(projection) => projection
+                .iter()
+                .map(|index| self.column_indices[*index].clone())
+                .collect(),
+            None => self.column_indices.clone(),
+        }
     }
 
     fn compute_properties(
@@ -333,18 +420,28 @@ impl DisplayAs for AsOfJoinExec {
                 )
             })
             .unwrap_or_default();
+        // Upstream's broadcast mode keeps upstream's text.
+        let mode = match self.mode {
+            AsOfJoinMode::Broadcast => "",
+            AsOfJoinMode::Partitioned => ", mode=Partitioned",
+        };
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 f,
-                "{}: on=[{}], match=[{}]{}",
+                "{}: on=[{}], match=[{}]{}{}",
                 Self::static_name(),
                 on,
                 match_condition,
-                projection
+                projection,
+                mode
             ),
             DisplayFormatType::TreeRender => {
                 writeln!(f, "on={on}")?;
-                writeln!(f, "match={match_condition}")
+                writeln!(f, "match={match_condition}")?;
+                if self.mode == AsOfJoinMode::Partitioned {
+                    writeln!(f, "mode=Partitioned")?;
+                }
+                Ok(())
             }
         }
     }
@@ -364,6 +461,17 @@ impl ExecutionPlan for AsOfJoinExec {
     }
 
     fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        if self.mode == AsOfJoinMode::Partitioned {
+            let (left, right) = self
+                .on
+                .iter()
+                .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
+                .unzip();
+            return InputDistributionRequirements::co_partitioned(vec![
+                Distribution::KeyPartitioned(left),
+                Distribution::KeyPartitioned(right),
+            ]);
+        }
         // Every left partition scans the complete broadcast right input, so
         // equality keys do not require the inputs to be co-partitioned.
         // `UnspecifiedDistribution` imposes no layout requirement; because this
@@ -434,15 +542,20 @@ impl ExecutionPlan for AsOfJoinExec {
                 left_ordering: self.left_ordering.clone(),
                 right_ordering: self.right_ordering.clone(),
                 right_fut: Default::default(),
+                mode: self.mode,
                 cache: Arc::clone(&self.cache),
             })),
-            ChildrenPropertiesMode::Recompute => Ok(Arc::new(Self::try_new(
-                left,
-                right,
-                self.on.clone(),
-                self.match_condition.clone(),
-                self.projection.as_deref().map(<[usize]>::to_vec),
-            )?)),
+            ChildrenPropertiesMode::Recompute => {
+                let mut join = Self::try_new(
+                    left,
+                    right,
+                    self.on.clone(),
+                    self.match_condition.clone(),
+                    self.projection.as_deref().map(<[usize]>::to_vec),
+                )?;
+                join.mode = self.mode;
+                Ok(Arc::new(join))
+            }
         }
     }
 
@@ -472,13 +585,45 @@ impl ExecutionPlan for AsOfJoinExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let right_partitions = self.right.output_partitioning().partition_count();
-        assert_eq_or_internal_err!(
-            right_partitions,
-            1,
-            "AsOfJoinExec requires one right partition, found {right_partitions}"
-        );
+        if self.mode == AsOfJoinMode::Partitioned {
+            let left_partitions = self.left.output_partitioning().partition_count();
+            assert_eq_or_internal_err!(
+                right_partitions,
+                left_partitions,
+                "A partitioned AsOfJoinExec requires equal partition counts, found {left_partitions} and {right_partitions}"
+            );
+        } else {
+            assert_eq_or_internal_err!(
+                right_partitions,
+                1,
+                "AsOfJoinExec requires one right partition, found {right_partitions}"
+            );
+        }
         let left_stream = self.left.execute(partition, Arc::clone(&context))?;
         let metrics = AsOfJoinMetrics::new(partition, &self.metrics);
+        if self.mode == AsOfJoinMode::Partitioned {
+            let right_stream = self.right.execute(partition, Arc::clone(&context))?;
+            let (left_keys, right_keys) = self.on.iter().cloned().unzip();
+            let stream = AsOfJoinStream::new(
+                self.schema(),
+                InputCursor::new(
+                    left_stream,
+                    left_keys,
+                    Arc::clone(&self.match_condition.left),
+                ),
+                InputCursor::new(
+                    right_stream,
+                    right_keys,
+                    Arc::clone(&self.match_condition.right),
+                ),
+                self.match_condition.op,
+                self.output_column_indices(),
+                context.session_config().batch_size(),
+                metrics,
+                None,
+            );
+            return Ok(Box::pin(stream));
+        }
         let build_metrics = metrics.clone();
         let right_fut = self.right_fut.try_once(|| {
             let right_stream = self.right.execute(0, Arc::clone(&context))?;
@@ -496,13 +641,7 @@ impl ExecutionPlan for AsOfJoinExec {
         let left_match = Arc::clone(&self.match_condition.left);
         let right_match = Arc::clone(&self.match_condition.right);
         let match_op = self.match_condition.op;
-        let column_indices = match self.projection.as_ref() {
-            Some(projection) => projection
-                .iter()
-                .map(|index| self.column_indices[*index].clone())
-                .collect(),
-            None => self.column_indices.clone(),
-        };
+        let column_indices = self.output_column_indices();
         let batch_size = context.session_config().batch_size();
         let stream = stream::once(async move {
             let mut right_fut = right_fut;
@@ -516,7 +655,7 @@ impl ExecutionPlan for AsOfJoinExec {
                 column_indices,
                 batch_size,
                 metrics,
-                right_input,
+                Some(right_input),
             );
             Ok::<SendableRecordBatchStream, datafusion_common::DataFusionError>(Box::pin(
                 stream,
@@ -596,6 +735,7 @@ impl ExecutionPlan for AsOfJoinExec {
             right_ordering: _,
             // right input collected at execution time, not part of the plan
             right_fut: _,
+            mode,
             // recomputed by `try_new` on decode
             cache: _,
         } = self;
@@ -643,6 +783,7 @@ impl ExecutionPlan for AsOfJoinExec {
                                 projection.iter().map(|index| *index as u32).collect()
                             }
                         },
+                        partitioned: *mode == AsOfJoinMode::Partitioned,
                     },
                 )),
             ),
@@ -674,6 +815,7 @@ impl AsOfJoinExec {
             right_match_expr,
             match_operator,
             projection,
+            partitioned,
         } = &**asof_join;
 
         let left = ctx.decode_required_child(left.as_deref(), "AsOfJoinExec", "left")?;
@@ -735,13 +877,17 @@ impl AsOfJoinExec {
             indices => Some(indices.iter().map(|index| *index as usize).collect()),
         };
 
-        Ok(Arc::new(Self::try_new(
+        let join = Self::try_new(
             left,
             right,
             on,
             AsOfMatchExpr::new(left_match, op, right_match),
             projection,
-        )?))
+        )?;
+        if *partitioned {
+            return Ok(Arc::new(join.with_mode(AsOfJoinMode::Partitioned)?));
+        }
+        Ok(Arc::new(join))
     }
 }
 
@@ -1063,7 +1209,7 @@ struct AsOfJoinStream {
     /// Independent cursor over the shared, ordered right input.
     right: InputCursor,
     /// Retains the shared right batches and their memory reservation.
-    _right_input: Arc<BroadcastRightInput>,
+    _right_input: Option<Arc<BroadcastRightInput>>,
     /// Validated ordered match operator.
     op: Operator,
     /// Projected output columns and their input sides.
@@ -1101,7 +1247,7 @@ impl AsOfJoinStream {
         column_indices: Vec<ColumnIndex>,
         batch_size: usize,
         metrics: AsOfJoinMetrics,
-        right_input: Arc<BroadcastRightInput>,
+        right_input: Option<Arc<BroadcastRightInput>>,
     ) -> Self {
         let group_sort_options = vec![
             SortOptions {
@@ -2171,3 +2317,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "asof_join_partitioned_tests.rs"]
+mod partitioned_tests;

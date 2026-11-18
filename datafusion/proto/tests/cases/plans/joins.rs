@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -16,8 +18,8 @@ use datafusion::physical_plan::expressions::{
 };
 use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion::physical_plan::joins::{
-    AsOfJoinExec, AsOfMatchExpr, HashJoinExec, NestedLoopJoinExec, PartitionMode,
-    PiecewiseMergeJoinExec, SortMergeJoinExec, StreamJoinPartitionMode,
+    AsOfJoinExec, AsOfJoinMode, AsOfMatchExpr, HashJoinExec, NestedLoopJoinExec,
+    PartitionMode, PiecewiseMergeJoinExec, SortMergeJoinExec, StreamJoinPartitionMode,
     SymmetricHashJoinExec,
 };
 use datafusion::prelude::SessionContext;
@@ -94,19 +96,25 @@ fn roundtrip_asof_join() -> Result<()> {
         Arc::new(Column::new("symbol", 0)) as _,
     )];
 
-    for projection in [None, Some(vec![]), Some(vec![0, 5])] {
-        for op in [Operator::Lt, Operator::LtEq, Operator::Gt, Operator::GtEq] {
-            roundtrip_test(Arc::new(AsOfJoinExec::try_new(
-                Arc::new(EmptyExec::new(Arc::clone(&left_schema))),
-                Arc::new(EmptyExec::new(Arc::clone(&right_schema))),
-                on.clone(),
-                AsOfMatchExpr::new(
-                    Arc::new(Column::new("ts", 1)),
-                    op,
-                    Arc::new(Column::new("ts", 1)),
-                ),
-                projection.clone(),
-            )?))?;
+    // Longbow family AP: both modes round-trip.
+    for mode in [AsOfJoinMode::Broadcast, AsOfJoinMode::Partitioned] {
+        for projection in [None, Some(vec![]), Some(vec![0, 5])] {
+            for op in [Operator::Lt, Operator::LtEq, Operator::Gt, Operator::GtEq] {
+                roundtrip_test(Arc::new(
+                    AsOfJoinExec::try_new(
+                        Arc::new(EmptyExec::new(Arc::clone(&left_schema))),
+                        Arc::new(EmptyExec::new(Arc::clone(&right_schema))),
+                        on.clone(),
+                        AsOfMatchExpr::new(
+                            Arc::new(Column::new("ts", 1)),
+                            op,
+                            Arc::new(Column::new("ts", 1)),
+                        ),
+                        projection.clone(),
+                    )?
+                    .with_mode(mode)?,
+                ))?;
+            }
         }
     }
     Ok(())
