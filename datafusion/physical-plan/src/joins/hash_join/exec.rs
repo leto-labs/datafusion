@@ -29,6 +29,7 @@ use crate::joins::hash_join::shared_bounds::{
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
+use crate::joins::hash_join::visited::VisitedBitmap;
 use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
 use crate::joins::key_range_bitmap::KeyRangeBitmap;
 use crate::joins::probe_completion::{Completion, ProbeCompletion};
@@ -36,7 +37,7 @@ use crate::joins::utils::{
     OnceAsync, OnceFut, asymmetric_join_output_partitioning, emits_unmatched_left_rows,
     is_existence_join, reorder_output_after_swap, swap_join_projection, update_hash,
 };
-use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
+use crate::joins::{JoinOn, JoinOnRef, PartitionMode};
 use crate::metrics::{Count, MetricBuilder, MetricCategory};
 use crate::projection::{
     EmbeddedProjection, JoinData, ProjectionExec, try_embed_projection,
@@ -61,7 +62,7 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
+use arrow::array::{Array, ArrayRef};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -93,7 +94,6 @@ use datafusion_common::hash_utils::RandomState;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::TryStreamExt;
-use parking_lot::Mutex;
 
 use super::partitioned_hash_eval::SeededRandomState;
 
@@ -222,7 +222,7 @@ pub(super) struct JoinLeftData {
     /// The `NOT IN` state of a null-aware join, see [`NotInBuild`].
     not_in: Option<NotInBuild>,
     /// Shared bitmap for visited left indices within this consuming join.
-    visited_indices_bitmap: SharedBitmapBuilder,
+    visited_indices_bitmap: VisitedBitmap,
     /// Tracks the final probe partition and what every partition observed.
     /// See [`ProbeCompletion`] for the completion invariant.
     probe_completion: ProbeCompletion,
@@ -271,7 +271,7 @@ impl JoinLeftData {
     }
 
     /// returns a reference to the visited indices bitmap
-    pub(super) fn visited_indices_bitmap(&self) -> &SharedBitmapBuilder {
+    pub(super) fn visited_indices_bitmap(&self) -> &VisitedBitmap {
         &self.visited_indices_bitmap
     }
 
@@ -3432,21 +3432,18 @@ fn build_in_memory(
     reservation.try_grow(keys_size)?;
     metrics.build_mem_used.add(keys_size);
 
-    let allocate_bitmap = || -> Result<BooleanBufferBuilder> {
-        let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
+    let allocate_bitmap = || -> Result<VisitedBitmap> {
+        let bitmap_size = VisitedBitmap::size_bytes(num_rows);
         reservation.try_grow(bitmap_size)?;
         metrics.build_mem_used.add(bitmap_size);
-
-        let mut bitmap = BooleanBufferBuilder::new(batch.num_rows());
-        bitmap.append_n(num_rows, false);
-        Ok(bitmap)
+        Ok(VisitedBitmap::new(num_rows))
     };
 
-    // Reserve additional memory for visited indices bitmap and create shared builder
+    // Reserve the visited bitmap before allocating it.
     let visited_indices_bitmap = if with_visited_indices_bitmap {
         allocate_bitmap()?
     } else {
-        BooleanBufferBuilder::new(0)
+        VisitedBitmap::empty()
     };
 
     let not_in = not_in
@@ -3556,7 +3553,7 @@ fn build_in_memory(
             reservation,
         }),
         not_in,
-        visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
+        visited_indices_bitmap,
         probe_completion: ProbeCompletion::new(probe_threads_count),
     };
 
@@ -9346,6 +9343,69 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn left_anti_final_pass_observes_all_probe_partitions() -> Result<()> {
+        const PARTITIONS: i32 = 48;
+        const BUILD_ROWS: i32 = 4099;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let batch = |keys: Vec<i32>| {
+            let column = Arc::new(Int32Array::from(keys)) as ArrayRef;
+            RecordBatch::try_new(Arc::clone(&schema), vec![column])
+        };
+        let left = TestMemoryExec::try_new_exec(
+            &[vec![batch((0..BUILD_ROWS).collect())?]],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let right_partitions: Vec<_> = (0..PARTITIONS)
+            .map(|partition| {
+                // Each partition has unique matches as well as shared matches.
+                let keys = (0..BUILD_ROWS)
+                    .filter(|row| {
+                        row % 2 == 0
+                            && (row / 2 % PARTITIONS == partition || row % 64 == 0)
+                    })
+                    .collect();
+                batch(keys).map(|batch| vec![batch])
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        let right =
+            TestMemoryExec::try_new_exec(&right_partitions, Arc::clone(&schema), None)?;
+        let key =
+            Arc::new(Column::new_with_schema("k", &schema)?) as Arc<dyn PhysicalExpr>;
+        let join = HashJoinExecBuilder::new(
+            left,
+            right,
+            vec![(Arc::clone(&key), key)],
+            JoinType::LeftAnti,
+        )
+        .with_partition_mode(PartitionMode::CollectLeft)
+        .build()?;
+
+        let outputs =
+            crate::collect_partitioned(Arc::new(join), prepare_task_ctx(128, false))
+                .await?;
+        assert_eq!(
+            outputs.iter().filter(|batches| !batches.is_empty()).count(),
+            1
+        );
+        let actual: Vec<_> = outputs
+            .iter()
+            .flatten()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(actual, (1..BUILD_ROWS).step_by(2).collect::<Vec<_>>());
+        Ok(())
     }
 
     /// Drains the probe partitions of `join` one after another in the given

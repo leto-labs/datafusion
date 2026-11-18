@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -362,6 +364,39 @@ mod loom_tests {
                 },
                 "the summary lost a fact one of the partitions recorded"
             );
+        });
+    }
+
+    /// The completion counter publishes relaxed bitmap writes to the final pass.
+    /// That pass runs before thread joins can independently publish the marks.
+    #[test]
+    fn the_last_partition_observes_all_visited_bits() {
+        use loom::sync::atomic::AtomicU64;
+
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(2);
+        model.check(|| {
+            let state = Arc::new((ProbeCompletion::new(3), AtomicU64::new(0)));
+
+            let finish = |(completion, visited): &(ProbeCompletion, AtomicU64), bit| {
+                if visited.load(Ordering::Relaxed) & bit == 0 {
+                    visited.fetch_or(bit, Ordering::Relaxed);
+                }
+                if let Completion::Emit(_) = completion.report_completed() {
+                    assert_eq!(visited.load(Ordering::Relaxed), 0b111);
+                }
+            };
+
+            let probes: Vec<_> = (0..2)
+                .map(|partition| {
+                    let state = Arc::clone(&state);
+                    loom::thread::spawn(move || finish(&state, 1 << partition))
+                })
+                .collect();
+            finish(&state, 0b100);
+            for probe in probes {
+                probe.join().unwrap();
+            }
         });
     }
 
