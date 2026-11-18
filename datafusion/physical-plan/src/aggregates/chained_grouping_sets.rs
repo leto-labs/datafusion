@@ -6,8 +6,8 @@
 
 //! Partition-local grouping-set state reuse. Only maximal requested sets read
 //! raw rows. Each other set merges the smallest containing computed set. Native
-//! partial states remain mergeable across bounded and memory-pressure flushes;
-//! coarser merges use upstream pressure emission and may emit duplicate states.
+//! partial states remain mergeable across bounded, skipped and memory-pressure
+//! flushes; coarser merges use upstream pressure emission and may emit duplicate states.
 //! AVG retains its sum/count state through the entire chain. Floating SUM/AVG
 //! can reassociate addition relative to evaluating each set independently.
 //!
@@ -399,18 +399,26 @@ impl State {
         // merges any duplicate fine states while computing the coarser keys.
         // Open the actual caller partition exactly once. Derived levels only
         // read the retained sources that this call produces.
-        // `new_single` above is an internal root representation, not a
-        // reason to re-enable the skip probe upstream disables for grouping
-        // sets. G's bounded flush policy and native pressure emission still apply.
+        // A single root keeps the native skip probe. Upstream disables it for
+        // expanding grouping sets only; this root is one ordinary set whose
+        // states every derived level and the final consumer merge anyway, so a
+        // low-reduction root (TPC-DS q67) converts raw rows to states instead
+        // of hashing them. G's bounded flush and pressure emission still apply.
         let stream =
             super::PartialHashAggregateStream::new(&raw, &self.context, self.partition)?
-                .without_skip_aggregation_probe()
                 .into_stream();
         let (source, rows) = self.store(&raw, stream).await?;
         self.roots_empty = rows == 0;
         MetricBuilder::new(&self.original.metrics)
             .counter("chained_root_state_rows", self.partition)
             .add(rows);
+        let skipped = raw
+            .metrics()
+            .and_then(|metrics| metrics.sum_by_name("skipped_aggregation_rows"))
+            .map_or(0, |count| count.as_usize());
+        MetricBuilder::new(&self.original.metrics)
+            .counter("chained_root_skipped_rows", self.partition)
+            .add(skipped);
         for i in 0..self.levels.len() {
             if self.levels[i].parent.is_some() {
                 continue;

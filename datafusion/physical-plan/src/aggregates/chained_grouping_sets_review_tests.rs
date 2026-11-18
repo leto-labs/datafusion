@@ -836,45 +836,87 @@ async fn chained_grouping_sets_unknown_limit_without_disk_uses_native_partial()
     Ok(())
 }
 
+/// Default-ratio probe that decides after the first batch.
+fn probe_context(groups: usize) -> Arc<TaskContext> {
+    let mut config = SessionConfig::new().with_batch_size(BASE.batch);
+    config
+        .options_mut()
+        .execution
+        .skip_partial_aggregation_probe_rows_threshold = 1;
+    if groups > 0 {
+        config = bounded_partial::test_option::with_groups(config, groups);
+    }
+    Arc::new(TaskContext::default().with_session_config(config))
+}
+
+fn metric(agg: &AggregateExec, name: &str) -> usize {
+    agg.metrics()
+        .unwrap()
+        .sum_by_name(name)
+        .map_or(0, |count| count.as_usize())
+}
+
+/// The CG root is one ordinary group-by over the finest requested set. Its
+/// states are merged again by every derived level and by the final consumer,
+/// so the native skip probe applies to it like any single-set partial
+/// (DataFusion 55.2 behavior; TPC-DS q67 hashed 53 M near-unique rows on 56
+/// without it). Strongly reducing roots keep their native reduction.
 #[tokio::test]
-async fn chained_grouping_sets_root_disables_skip_probe() -> Result<()> {
-    let input = data(91, 4096, 1, 256);
+async fn chained_grouping_sets_root_skip_probe_follows_reduction() -> Result<()> {
     let masks = shapes().remove(0).1;
-    let ctx = context(Ctx { skip: true, ..BASE });
-    // A grouping-set root through the native path never enables the probe.
+    // Low reduction: (v, x, s) is near-unique, so the root converts raw rows.
+    let unique = data(4242, 4096, 1, 256);
+    let ctx = probe_context(0);
+    let agg = build(&unique, 3, masks.clone(), AggregateMode::Partial)?;
+    let output = collect(agg.execute(0, Arc::clone(&ctx))?).await?;
+    assert!(metric(&agg, "chained_grouping_sets") > 0, "CG must admit");
+    let skipped = metric(&agg, "chained_root_skipped_rows");
+    assert!(
+        skipped > 4096 / 2,
+        "a low-reduction CG root must skip partial aggregation: {skipped}"
+    );
+    assert_eq!(ctx.memory_pool().reserved(), 0);
+    let native = build(&unique, 3, masks.clone(), AggregateMode::Partial)?;
+    let unbounded = context(BASE);
+    let expected = collect(stock_stream(&native, &unbounded, 0)?).await?;
+    assert_eq!(
+        batches_to_sort_string(&finish(&agg, output, &unbounded).await?),
+        batches_to_sort_string(&finish(&native, expected, &unbounded).await?)
+    );
+
+    // Strong reduction: the probe never fires and the root stays complete.
+    let input = data(91, 4096, 1, 256);
     let root = build(&input, 0, vec![vec![false; 3]], AggregateMode::Partial)?;
-    let root_rows: usize = collect(stock_stream(&root, &ctx, 0)?)
+    let root_rows: usize = collect(stock_stream(&root, &probe_context(0), 0)?)
         .await?
         .iter()
         .map(RecordBatch::num_rows)
         .sum();
     assert!(root_rows < 4096 / 4, "fixture must reduce strongly");
     for groups in [0, 4] {
-        let ctx = context(Ctx {
-            groups,
-            skip: true,
-            ..BASE
-        });
+        let ctx = probe_context(groups);
         let agg = build(&input, 0, masks.clone(), AggregateMode::Partial)?;
-        let _output = collect(agg.execute(0, Arc::clone(&ctx))?).await?;
-        let retained = agg
-            .metrics()
-            .unwrap()
-            .sum_by_name("chained_root_state_rows")
-            .unwrap()
-            .as_usize();
+        let output = collect(agg.execute(0, Arc::clone(&ctx))?).await?;
+        let retained = metric(&agg, "chained_root_state_rows");
         if groups == 0 {
+            assert_eq!(metric(&agg, "chained_root_skipped_rows"), 0);
             assert_eq!(
                 retained, root_rows,
-                "the CG root must keep native grouping-set reduction"
+                "a reducing CG root must keep native grouping-set reduction"
             );
         } else {
             assert!(
-                retained > root_rows && retained < 4096,
-                "G must flush early without skip conversion: {retained}, native root {root_rows}"
+                retained > root_rows && retained <= 4096,
+                "G must flush early: {retained}, native root {root_rows}"
             );
         }
         assert_eq!(ctx.memory_pool().reserved(), 0);
+        let native = build(&input, 0, masks.clone(), AggregateMode::Partial)?;
+        let expected = collect(stock_stream(&native, &unbounded, 0)?).await?;
+        assert_eq!(
+            batches_to_sort_string(&finish(&agg, output, &unbounded).await?),
+            batches_to_sort_string(&finish(&native, expected, &unbounded).await?)
+        );
     }
     Ok(())
 }

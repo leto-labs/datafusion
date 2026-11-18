@@ -43,8 +43,8 @@ type Row = (Option<i32>, Option<i32>, Option<i32>, Option<i64>);
 
 fn context(memory: Option<usize>) -> Arc<TaskContext> {
     let mut config = SessionConfig::new().with_batch_size(7);
-    // Aggressive probe settings must not enable skipping in CG's internal
-    // single-root representation; grouping sets keep their native reduction.
+    // Force the finest native partial (CG's single root) to exercise its skip
+    // path; derived levels and the final consumer merge the unreduced states.
     config
         .options_mut()
         .execution

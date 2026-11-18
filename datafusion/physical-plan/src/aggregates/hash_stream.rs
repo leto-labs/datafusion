@@ -300,14 +300,6 @@ impl PartialHashAggregateStream {
         })
     }
 
-    /// CG derives coarser sets from these roots. Keep the same no-skip
-    /// policy as upstream grouping sets even when the root is represented
-    /// as a single ordinary group-by to avoid repeated raw evaluation.
-    pub(super) fn without_skip_aggregation_probe(mut self) -> Self {
-        self.skip_aggregation_probe = None;
-        self
-    }
-
     pub(crate) fn into_stream(self) -> SendableRecordBatchStream {
         let schema = Arc::clone(&self.schema);
 
