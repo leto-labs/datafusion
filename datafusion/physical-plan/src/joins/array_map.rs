@@ -95,7 +95,7 @@ const PREFETCH_DISTANCE: usize = 16;
 #[derive(Debug)]
 pub struct ArrayMap {
     // data[probSideVal-offset] -> valIdxInBuildSide + 1; 0 for absent
-    data: Vec<u32>,
+    data: crate::joins::join_hash_map::ZeroedArray<u32>,
     // min val in buildSide
     offset: u64,
     // next[buildSideIdx] -> next matching valIdxInBuildSide + 1; 0 for end of chain.
@@ -173,8 +173,7 @@ impl ArrayMap {
         let size = (range + 1) as usize;
 
         // Longbow patch (JT): 2 MiB pages for a large direct array.
-        let mut data: Vec<u32> =
-            crate::joins::join_hash_map::zeroed_with_huge_pages(size);
+        let mut data = crate::joins::join_hash_map::zeroed_with_huge_pages::<u32>(size);
         let mut next: Vec<u32> = vec![];
         let mut num_of_distinct_key = 0;
 
@@ -236,7 +235,7 @@ impl ArrayMap {
 
     /// Returns the memory usage of this [`ArrayMap`] in bytes.
     pub fn size(&self) -> usize {
-        self.data.capacity() * size_of::<u32>() + self.next.capacity() * size_of::<u32>()
+        self.data.len() * size_of::<u32>() + self.next.capacity() * size_of::<u32>()
     }
 
     pub fn get_matched_indices_with_limit_offset(
@@ -638,13 +637,20 @@ mod tests {
     fn test_array_map_large_enough_to_prefetch() -> Result<()> {
         for duplicates in [1_i64, 3] {
             let build: ArrayRef = Arc::new(Int64Array::from_iter_values(
-                (0..300_000_i64)
+                (0..400_000_i64)
                     .flat_map(|key| std::iter::repeat_n(key * 3, duplicates as usize)),
             ));
-            let map = ArrayMap::try_new(&build, 0, 900_000)?;
+            // A direct array of 1.2 M slots (4.8 MB): above the prefetch size
+            // and, with the advice on, in its own mapping (review S4,
+            // leto-mjj.61).
+            let map = ArrayMap::try_new(&build, 0, 1_200_000)?;
             assert!(map.prefetches());
+            assert_eq!(
+                map.data.is_mapped(),
+                crate::joins::join_hash_map::huge_page_advice()
+            );
             let probe: ArrayRef = Arc::new(Int64Array::from_iter(
-                (-5..1_000_000_i64).map(|key| (key % 11 != 0).then_some(key)),
+                (-5..1_300_000_i64).map(|key| (key % 11 != 0).then_some(key)),
             ));
             let mut pairs = vec![];
             let (mut offset, mut probes, mut builds) = (AtRow { row: 0 }, vec![], vec![]);
@@ -663,8 +669,8 @@ mod tests {
                 }
             }
             let mut expected = vec![];
-            for (row, key) in (-5..1_000_000_i64).enumerate() {
-                if key % 11 != 0 && key >= 0 && key % 3 == 0 && key < 900_000 {
+            for (row, key) in (-5..1_300_000_i64).enumerate() {
+                if key % 11 != 0 && key >= 0 && key % 3 == 0 && key < 1_200_000 {
                     let first = (key / 3 * duplicates) as u64;
                     expected.extend(
                         (first..first + duplicates as u64).map(|b| (row as u32, b)),

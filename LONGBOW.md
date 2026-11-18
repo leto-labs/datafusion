@@ -620,3 +620,40 @@ for key columns above 512 KiB (a no-op on aarch64, unmeasured); strings and
 other types compare as before.
 The test compares single- and two-column keys above that size, with NULLs
 and unequal candidates, against a direct comparison.
+
+### JT 6: own mappings for advised tables; the advice on by default
+
+Purpose: make the 2 MiB-page advice of parts 2 and 4 safe to leave on.
+Classification: UPSTREAMABLE. The advice of mjj.16 went on allocator memory
+and outlived the table: the allocator reused the range for other operators,
+whose faults there allocated huge pages with synchronous compaction (TPC-H
+SF100 on worker-01: q10 pull 27% slower in a suite process, which advises
+nothing itself). Now an array of a head table, a chain or an `ArrayMap` from
+4 MiB on gets its own anonymous mapping (`ZeroedArray`), 2 MiB aligned and
+advised `MADV_HUGEPAGE`, and is unmapped when dropped, so the advice ends
+with the table. The mapping is exactly the array's bytes rounded up to
+base pages (the alignment slack and the tail are unmapped again), so a 2 MiB
+region that the array fills only in part gets base pages: the resident bytes
+stay below the charged bytes plus one base page. Smaller arrays, other
+targets, a refused mapping or a refused advice use a `Vec`, as do kernels
+whose THP mode is `never` or that have no THP. The advice is on unless
+`LONGBOW_JOIN_TABLE_HUGE_PAGES` is `off`, `0`, `false`, `no` or `disabled`
+(any case; another value warns and leaves it on). `ZeroedValue` is an
+`unsafe trait`: its zero bit pattern must be a valid value.
+
+Host dependency: with the advice on, the first touch of an advised table can
+compact memory synchronously in the query thread. How often depends on the
+host's THP `defrag` setting (`madvise`, the kernel default, compacts for
+advised mappings) and on free contiguous memory. On worker-01 (160 GiB
+partition) the TPC-H SF100 suite showed 1,265-1,802 compaction stalls and
+12,228 THP faults per process, with no regression; a host with a tight
+memory limit or fragmented memory can see more. Watch `compact_stall` in
+`/proc/vmstat` when it matters.
+
+Tests: a mapped array is zeroed, writable, 2 MiB aligned, in an `hg` mapping
+of exactly its pages, and unmapped on drop; a fully written mapped array of
+4 MiB + 4 B (and + 64 KiB, and 6 MiB) is resident for at most its bytes plus
+one base page; a refused mapping (test hook) falls back to a zeroed heap
+array; dropped tables (after a full and after a failed build) leave no
+advised mapping; an `ArrayMap` of 4.8 MB is mapped; the switch's values.
+

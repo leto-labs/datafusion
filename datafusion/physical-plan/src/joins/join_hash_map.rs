@@ -169,7 +169,7 @@ pub struct JoinHashMapU32 {
     // Stores hash value to last row index
     table: HeadTable<u32>,
     // Stores indices in chained list data structure
-    next: Vec<u32>,
+    next: ZeroedArray<u32>,
     // Whether any hash value maps to more than one row
     chained: bool,
 }
@@ -182,7 +182,7 @@ impl JoinHashMapU32 {
         let chained = map.len() != next.len();
         Self {
             table: HeadTable::from_hashbrown(&map),
-            next,
+            next: next.into(),
             chained,
         }
     }
@@ -270,7 +270,7 @@ pub struct JoinHashMapU64 {
     // Stores hash value to last row index
     table: HeadTable<u64>,
     // Stores indices in chained list data structure
-    next: Vec<u64>,
+    next: ZeroedArray<u64>,
     // Whether any hash value maps to more than one row
     chained: bool,
 }
@@ -282,7 +282,7 @@ impl JoinHashMapU64 {
         let chained = map.len() != next.len();
         Self {
             table: HeadTable::from_hashbrown(&map),
-            next,
+            next: next.into(),
             chained,
         }
     }
@@ -613,16 +613,16 @@ pub fn contain_hashes<T>(map: &HashTable<(u64, T)>, hash_values: &[u64]) -> Bool
 // Above `PREFETCH_BYTES` the probe prefetches the slot of the row
 // `PREFETCH_DISTANCE` rows ahead, and the build keeps that many rows in
 // flight, so their cache misses overlap instead of following each other.
-// With `LONGBOW_JOIN_TABLE_HUGE_PAGES=on` (off by default), the slots and the
-// chain from `HUGE_PAGE_BYTES` on ask the kernel for 2 MiB pages
-// (`MADV_HUGEPAGE`; the host's THP mode is `madvise`) before they are first
-// written, which removes most of the TLB misses of a random probe. It is off
-// by default because the advice outlives the table: the allocator reuses the
-// freed range for other operators, and their faults there allocate huge pages
-// with synchronous compaction in the query thread (THP defrag `madvise`).
-// Measured on worker-01 (TPC-H SF100, 48 threads, same code with and without
-// the advice): TPC-H Q9 pull 17% faster with it, q10 pull 27% slower in a
-// suite process (it advises nothing itself), suite sums about 3% faster.
+// The slots and the chain from `HUGE_PAGE_BYTES` on ask the kernel for 2 MiB
+// pages (`MADV_HUGEPAGE`; the host's THP mode is `madvise`), which removes
+// most of the TLB misses of a random probe; `LONGBOW_JOIN_TABLE_HUGE_PAGES=off`
+// turns that off. Such an array has its own anonymous mapping
+// ([`ZeroedArray`]), unmapped when the table is dropped, so the advice ends
+// with the table. Advice on allocator memory outlived the table: the
+// allocator reused the freed range for other operators, and their faults
+// there allocated huge pages with synchronous compaction in the query thread
+// (THP defrag `madvise`; TPC-H SF100 on worker-01, 48 threads: q10 pull 27%
+// slower in a suite process, while Q9 pull was 17% faster).
 // ---------------------------------------------------------------------------
 
 /// The multiplier of the slot position (2^64 / golden ratio, odd).
@@ -640,25 +640,60 @@ pub(crate) fn prefetch_pays(bytes: usize) -> bool {
 /// one DRAM latency (about 110 ns) at about 7 ns per row.
 const PREFETCH_DISTANCE: usize = 16;
 
-/// Arrays from this size are advised to use transparent huge pages, when the
-/// advice is on ([`huge_page_advice`]).
+/// Arrays from this size get their own mapping advised to use transparent
+/// huge pages, when the advice is on ([`huge_page_advice`]).
 const HUGE_PAGE_BYTES: usize = 4 << 20;
 
-/// The environment variable that turns the huge-page advice on: `on`, `1` or
-/// `true`. Read once per process.
+/// The environment variable that turns the huge-page advice off: `off`,
+/// `0`, `false`, `no` or `disabled`, in any case. Read once per process.
 pub const HUGE_PAGES_ENV: &str = "LONGBOW_JOIN_TABLE_HUGE_PAGES";
 
-/// Whether a value of [`HUGE_PAGES_ENV`] turns the advice on.
+/// Whether a value of [`HUGE_PAGES_ENV`] leaves the advice on: unset, empty,
+/// `on`, `1`, `true`, `yes` or `enabled` (any case) leave it on; `off`, `0`,
+/// `false`, `no` or `disabled` turn it off. Any other value leaves it on and
+/// logs a warning.
 fn huge_pages_requested(value: Option<&str>) -> bool {
-    matches!(value.map(str::trim), Some("on" | "1" | "true"))
+    let Some(value) = value.map(str::trim) else {
+        return true;
+    };
+    let is = |words: &[&str]| words.iter().any(|w| value.eq_ignore_ascii_case(w));
+    if is(&["off", "0", "false", "no", "disabled"]) {
+        false
+    } else if value.is_empty() || is(&["on", "1", "true", "yes", "enabled"]) {
+        true
+    } else {
+        log::warn!(
+            "{HUGE_PAGES_ENV}={value:?} is not recognized; the 2 MiB-page advice \
+             stays on (use off, 0, false, no or disabled to turn it off)"
+        );
+        true
+    }
 }
 
-/// Whether join tables ask for 2 MiB pages: off unless [`HUGE_PAGES_ENV`]
-/// asks for them.
+/// Whether the kernel can give an advised mapping huge pages: transparent
+/// huge pages exist and are not `never` (`enabled` reads `[always]` or
+/// `[madvise]`).
+fn transparent_huge_pages_available(enabled: Option<&str>) -> bool {
+    enabled.is_some_and(|mode| !mode.contains("[never]"))
+}
+
+/// Whether join tables ask for 2 MiB pages: on unless [`HUGE_PAGES_ENV`]
+/// turns them off, and only where the kernel has transparent huge pages
+/// that are not `never`. Read once per process.
+///
+/// With the advice on, the first touch of an advised table can compact
+/// memory synchronously in the query thread; how often depends on the host's
+/// THP `defrag` setting and free contiguous memory (`madvise`, the default,
+/// compacts for advised mappings).
 pub fn huge_page_advice() -> bool {
     static ADVICE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ADVICE.get_or_init(|| {
         huge_pages_requested(std::env::var(HUGE_PAGES_ENV).ok().as_deref())
+            && transparent_huge_pages_available(
+                std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+                    .ok()
+                    .as_deref(),
+            )
     })
 }
 
@@ -744,7 +779,7 @@ pub(crate) struct TableFull;
 
 /// Chain heads by hash: the first row (+ 1) of each distinct hash.
 pub(crate) struct HeadTable<T: HeadWord> {
-    words: Vec<u64>,
+    words: ZeroedArray<u64>,
     /// The rows that the table was made for.
     capacity: usize,
     /// `64 - log2(slots)`.
@@ -1413,59 +1448,223 @@ pub fn prefetch_read<T>(slice: &[T], index: usize) {
     }
 }
 
-/// Longbow patch (JT): `vec![0; len]`, whose pages are advised to be 2 MiB
-/// transparent huge pages from `HUGE_PAGE_BYTES` on when the advice is on
-/// ([`huge_page_advice`], off by default). The advice applies to
-/// pages that are first touched after it: memory that the allocator takes
-/// fresh from the kernel and has not written yet. Memory that the allocator
-/// reuses is already backed by pages (it zeroes them for this allocation), so
-/// the advice changes nothing there until the kernel collapses them. The
-/// advice stays on the address range after the vector is freed, and the
-/// allocator may hand the range to other allocations.
-pub(crate) fn zeroed_with_huge_pages<T: Copy + Default + ArrowNativeType>(
-    len: usize,
-) -> Vec<T> {
-    let values = vec![T::default(); len];
-    advise_huge_pages(&values);
-    values
-}
-
-/// Longbow patch (JT): `madvise(MADV_HUGEPAGE)` on the 2 MiB-aligned part of
-/// `values`, from `HUGE_PAGE_BYTES` on and only when [`huge_page_advice`] is
-/// on. Errors are ignored: the advice is a hint, and a kernel without
-/// transparent huge pages refuses it.
-fn advise_huge_pages<T>(values: &[T]) {
-    if size_of_val(values) >= HUGE_PAGE_BYTES && huge_page_advice() {
-        madvise_huge_pages(values);
-    }
-}
-
-/// `madvise(MADV_HUGEPAGE)` on the 2 MiB-aligned part of `values`, whatever
-/// [`huge_page_advice`] says (the gate is [`advise_huge_pages`]).
-fn madvise_huge_pages<T>(values: &[T]) {
-    #[cfg(target_os = "linux")]
+/// Longbow patch (JT): a zeroed array of `len` values, with its own
+/// 2 MiB-page mapping from `HUGE_PAGE_BYTES` on when the advice is on
+/// ([`huge_page_advice`]); otherwise `vec![0; len]`.
+pub(crate) fn zeroed_with_huge_pages<T: ZeroedValue>(len: usize) -> ZeroedArray<T> {
+    if len.saturating_mul(size_of::<T>()) >= HUGE_PAGE_BYTES
+        && huge_page_advice()
+        && let Some(mapped) = ZeroedArray::mapped(len)
     {
-        const HUGE_PAGE: usize = 2 << 20;
-        let bytes = size_of_val(values);
-        let start = values.as_ptr() as usize;
-        let first = start.next_multiple_of(HUGE_PAGE);
-        let last = (start + bytes) & !(HUGE_PAGE - 1);
-        if last > first {
-            // SAFETY: `first..last` lies inside the allocation of `values`,
-            // which this function borrows. `MADV_HUGEPAGE` only sets a flag
-            // on the mapping: it changes no contents and no permission, and
-            // the allocation stays valid whatever the call returns.
-            unsafe {
-                libc::madvise(
-                    first as *mut libc::c_void,
-                    last - first,
-                    libc::MADV_HUGEPAGE,
-                );
-            }
+        return mapped;
+    }
+    vec![T::default(); len].into()
+}
+
+/// Longbow patch (JT): the values a [`ZeroedArray`] holds.
+///
+/// # Safety
+///
+/// The all-zero bit pattern must be a valid value of the type (and equal to
+/// its `Default`): a mapped [`ZeroedArray`] hands out fresh anonymous pages,
+/// which read as zero, as initialized values.
+pub unsafe trait ZeroedValue: Copy + Default + Send + Sync + 'static {}
+// SAFETY: every bit pattern, zero included, is a valid `u32`, and zero is
+// its default.
+unsafe impl ZeroedValue for u32 {}
+// SAFETY: as for `u32`.
+unsafe impl ZeroedValue for u64 {}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the next [`ZeroedArray::mapped`] on this thread fails as
+    /// a refused `mmap` would.
+    static REFUSE_NEXT_MAPPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Longbow patch (JT): a fixed-length array of a join table: a `Vec`, or
+/// its own anonymous mapping, 2 MiB aligned and advised `MADV_HUGEPAGE`,
+/// which is unmapped when the array is dropped. The advice therefore ends
+/// with the table and never reaches memory that the allocator later hands to
+/// other operators (advice on allocator memory did: their faults there
+/// allocated huge pages with synchronous compaction).
+pub struct ZeroedArray<T: ZeroedValue> {
+    /// The first value: into `owner`'s buffer, which never moves.
+    ptr: std::ptr::NonNull<T>,
+    len: usize,
+    owner: ArrayOwner<T>,
+}
+
+enum ArrayOwner<T> {
+    /// The values; held only to own (and free) them.
+    Heap { _values: Vec<T> },
+    /// The whole mapping (the values, rounded up to whole base pages),
+    /// unmapped on drop.
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
+    Mapped {
+        base: std::ptr::NonNull<u8>,
+        bytes: usize,
+    },
+}
+
+// SAFETY: a `ZeroedArray<T>` owns its values exactly as a `Vec<T>` does (the
+// pointer is into a buffer that only this array reaches), so it may move to
+// and be shared between threads under the same bounds.
+unsafe impl<T: ZeroedValue> Send for ZeroedArray<T> {}
+// SAFETY: see `Send`; shared access gives only `&[T]`.
+unsafe impl<T: ZeroedValue> Sync for ZeroedArray<T> {}
+
+impl<T: ZeroedValue> From<Vec<T>> for ZeroedArray<T> {
+    fn from(mut values: Vec<T>) -> Self {
+        let ptr = std::ptr::NonNull::new(values.as_mut_ptr()).expect("Vec pointer");
+        Self {
+            ptr,
+            len: values.len(),
+            owner: ArrayOwner::Heap { _values: values },
         }
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = values;
+}
+
+impl<T: ZeroedValue> ZeroedArray<T> {
+    /// `len` zeroed values in their own anonymous mapping, 2 MiB aligned and
+    /// advised `MADV_HUGEPAGE`, whatever [`huge_page_advice`] says (the gate
+    /// is [`zeroed_with_huge_pages`]). `None` when the kernel refuses the
+    /// mapping or the advice, or the target has none of these calls; the
+    /// caller then uses a `Vec`.
+    ///
+    /// The mapping is exactly the values rounded up to whole base pages: the
+    /// alignment slack before them and the address space after them are
+    /// unmapped again. A 2 MiB region that the values fill only in part is
+    /// therefore not wholly inside the mapping, so the kernel backs it with
+    /// base pages, and the resident bytes stay below the values' bytes plus
+    /// one base page (the charge of the callers is the values' bytes).
+    pub(crate) fn mapped(len: usize) -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            const HUGE_PAGE: usize = 2 << 20;
+            #[cfg(test)]
+            if REFUSE_NEXT_MAPPING.with(|refuse| refuse.replace(false)) {
+                return None;
+            }
+            // SAFETY: `sysconf` only reads a system constant.
+            let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+                .ok()
+                .filter(|page| page.is_power_of_two() && *page <= HUGE_PAGE)?;
+            let bytes = len.checked_mul(size_of::<T>())?.max(1);
+            let used = bytes.checked_next_multiple_of(page)?;
+            // One more huge page, so that an aligned start leaves room for
+            // every value.
+            let map_bytes = bytes
+                .checked_next_multiple_of(HUGE_PAGE)?
+                .checked_add(HUGE_PAGE)?;
+            // SAFETY: a new private anonymous mapping at an address of the
+            // kernel's choice; no existing memory is touched. Its pages read
+            // as zero until written.
+            let base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    map_bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if base == libc::MAP_FAILED {
+                return None;
+            }
+            let base = base.cast::<u8>();
+            // `base` is page aligned, so `offset` and `used` are whole pages
+            // and `offset < HUGE_PAGE`.
+            let offset = (base as usize).next_multiple_of(HUGE_PAGE) - base as usize;
+            let tail = map_bytes - offset - used;
+            // SAFETY: `base..base + map_bytes` is the mapping made above, and
+            // `offset + used + tail == map_bytes`, so `start..start + used`
+            // and the head and tail ranges unmapped below lie inside it and
+            // are page aligned. Nothing else refers to the mapping yet.
+            // `MADV_HUGEPAGE` only sets a flag on the kept range: it changes
+            // no contents and no permission.
+            let start = unsafe {
+                let start = base.add(offset);
+                let trimmed = (offset == 0 || libc::munmap(base.cast(), offset) == 0)
+                    && (tail == 0 || libc::munmap(start.add(used).cast(), tail) == 0);
+                if !trimmed {
+                    // Unmap whatever is left of the mapping, then use a `Vec`.
+                    libc::munmap(base.cast(), map_bytes);
+                    return None;
+                }
+                if libc::madvise(start.cast(), used, libc::MADV_HUGEPAGE) != 0 {
+                    // No huge pages for this mapping: a `Vec` reuses the
+                    // allocator's pages instead.
+                    libc::munmap(start.cast(), used);
+                    return None;
+                }
+                start
+            };
+            // A 2 MiB-aligned address is non-null and aligned for `T`.
+            let start = std::ptr::NonNull::new(start).expect("mapping address");
+            Some(Self {
+                ptr: start.cast::<T>(),
+                len,
+                owner: ArrayOwner::Mapped {
+                    base: start,
+                    bytes: used,
+                },
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = len;
+            None
+        }
+    }
+
+    /// Whether the values live in their own mapping.
+    pub(crate) fn is_mapped(&self) -> bool {
+        matches!(self.owner, ArrayOwner::Mapped { .. })
+    }
+}
+
+impl<T: ZeroedValue> Drop for ZeroedArray<T> {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let ArrayOwner::Mapped { base, bytes } = self.owner {
+            // SAFETY: the mapping is this array's alone, and nothing borrows
+            // it once the array is dropped. Unmapping also ends its advice.
+            let unmapped = unsafe { libc::munmap(base.as_ptr().cast(), bytes) };
+            debug_assert_eq!(unmapped, 0, "munmap of a join table mapping");
+        }
+    }
+}
+
+impl<T: ZeroedValue> std::ops::Deref for ZeroedArray<T> {
+    type Target = [T];
+
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        // SAFETY: `ptr` points to `len` initialized values owned by `owner`,
+        // which lives as long as `self`: a `Vec`'s values, or a mapping's
+        // pages, which are zero until written and are valid values because
+        // of `ZeroedValue`'s contract.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl<T: ZeroedValue> std::ops::DerefMut for ZeroedArray<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: as `deref`; `&mut self` makes this the only borrow.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl<T: ZeroedValue + Debug> Debug for ZeroedArray<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("ZeroedArray")
+            .field("len", &self.len)
+            .field("mapped", &self.is_mapped())
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -1951,15 +2150,179 @@ mod tests {
 
     #[test]
     fn huge_page_advice_keeps_contents() {
-        // The advice itself, whatever the switch says.
-        let mut advised: Vec<u64> = vec![0; 1 << 20];
-        advised[12345] = 7;
-        madvise_huge_pages(&advised);
-        assert_eq!((advised[12345], advised.iter().sum::<u64>()), (7, 7));
-        let values: Vec<u64> = zeroed_with_huge_pages(1 << 20);
+        let values: ZeroedArray<u64> = zeroed_with_huge_pages(1 << 20);
+        assert_eq!(values.len(), 1 << 20);
         assert!(values.iter().all(|value| *value == 0));
         let table = HeadTable::<u32>::with_capacity(1 << 20);
         assert_eq!(table.bytes(), (2 << 20) * size_of::<u64>());
+        // Small arrays stay on the heap.
+        assert!(!zeroed_with_huge_pages::<u32>(1000).is_mapped());
+    }
+
+    /// The mappings of this process: (start, end, VmFlags, Rss in bytes).
+    #[cfg(target_os = "linux")]
+    fn mappings() -> Vec<(usize, usize, String, usize)> {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut out: Vec<(usize, usize, String, usize)> = vec![];
+        for line in smaps.lines() {
+            let range = line.split(' ').next().unwrap_or_default();
+            let bounds = range.split_once('-').and_then(|(low, high)| {
+                Some((
+                    usize::from_str_radix(low, 16).ok()?,
+                    usize::from_str_radix(high, 16).ok()?,
+                ))
+            });
+            if let Some((low, high)) = bounds {
+                out.push((low, high, String::new(), 0));
+            } else if let Some(last) = out.last_mut() {
+                if let Some(flags) = line.strip_prefix("VmFlags:") {
+                    last.2 = flags.trim().to_string();
+                } else if let Some(rss) = line.strip_prefix("Rss:") {
+                    let kb: usize =
+                        rss.trim().trim_end_matches("kB").trim().parse().unwrap();
+                    last.3 = kb * 1024;
+                }
+            }
+        }
+        out
+    }
+
+    /// Advised (`hg`) mappings of this process: (start, end).
+    #[cfg(target_os = "linux")]
+    fn advised_mappings() -> Vec<(usize, usize)> {
+        mappings()
+            .into_iter()
+            .filter(|(_, _, flags, _)| flags.split_whitespace().any(|f| f == "hg"))
+            .map(|(low, high, _, _)| (low, high))
+            .collect()
+    }
+
+    /// Review of the advice lifecycle (leto-mjj.61): a mapped array is
+    /// zeroed, writable and 2 MiB aligned, lives in an advised mapping of
+    /// exactly its bytes rounded up to base pages, and is unmapped when
+    /// dropped, so its advice cannot reach other memory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_mapped_array_is_unmapped_on_drop() {
+        let len = (9 << 20) / size_of::<u32>() + 3;
+        let Some(mut values) = ZeroedArray::<u32>::mapped(len) else {
+            // A kernel without transparent huge pages refuses the advice.
+            assert!(!transparent_huge_pages_available(
+                std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+                    .ok()
+                    .as_deref()
+            ));
+            return;
+        };
+        assert!(values.is_mapped());
+        assert_eq!(values.len(), len);
+        assert_eq!(values.as_ptr() as usize % (2 << 20), 0);
+        assert!(values.iter().all(|value| *value == 0));
+        values[0] = 1;
+        values[len - 1] = 2;
+        assert_eq!((values[0], values[len / 2], values[len - 1]), (1, 0, 2));
+        let start = values.as_ptr() as usize;
+        let end = start + (len * size_of::<u32>()).next_multiple_of(4096);
+        // Exactly one advised mapping, of exactly the values' pages.
+        assert!(
+            advised_mappings().contains(&(start, end)),
+            "{:?}",
+            advised_mappings()
+        );
+        drop(values);
+        assert!(!advised_mappings().contains(&(start, end)));
+        // A heap array keeps its values as a `Vec` would.
+        let heap: ZeroedArray<u64> = vec![5_u64; 10].into();
+        assert!(!heap.is_mapped());
+        assert_eq!(&*heap, &[5; 10]);
+    }
+
+    /// Review S1 (leto-mjj.61): a fully written mapped array is resident for
+    /// at most its bytes plus one base page, which is what its callers
+    /// charge (plus less than a page): the 2 MiB region that it fills only in
+    /// part is not backed by a whole huge page.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_mapped_array_is_resident_for_at_most_its_bytes() {
+        for bytes in [(4 << 20) + 4, (4 << 20) + (64 << 10), 6 << 20] {
+            let len = bytes / size_of::<u32>();
+            let Some(mut values) = ZeroedArray::<u32>::mapped(len) else {
+                // Only a kernel without usable transparent huge pages
+                // refuses the advice.
+                assert!(!transparent_huge_pages_available(
+                    std::fs::read_to_string(
+                        "/sys/kernel/mm/transparent_hugepage/enabled"
+                    )
+                    .ok()
+                    .as_deref()
+                ));
+                return;
+            };
+            values.iter_mut().for_each(|value| *value = 7);
+            let start = values.as_ptr() as usize;
+            let (_, _, _, rss) = mappings()
+                .into_iter()
+                .find(|(low, high, _, _)| *low <= start && start < *high)
+                .expect("the array's mapping");
+            let charged = len * size_of::<u32>();
+            assert!(
+                rss <= charged + 4096,
+                "{bytes}: rss {rss} charged {charged}"
+            );
+        }
+    }
+
+    /// Review S4 (leto-mjj.61): a refused mapping falls back to a zeroed,
+    /// writable heap array of the full length.
+    #[test]
+    fn a_refused_mapping_falls_back_to_the_heap() {
+        REFUSE_NEXT_MAPPING.with(|refuse| refuse.set(true));
+        let len = (5 << 20) / size_of::<u64>();
+        let mut values: ZeroedArray<u64> = zeroed_with_huge_pages(len);
+        assert!(!values.is_mapped());
+        assert_eq!(values.len(), len);
+        assert!(values.iter().all(|value| *value == 0));
+        values[len - 1] = 9;
+        assert_eq!(values[len - 1], 9);
+        // The hook is spent: the next array is mapped where the advice is on.
+        let next: ZeroedArray<u64> = zeroed_with_huge_pages(len);
+        assert_eq!(next.is_mapped(), huge_page_advice());
+    }
+
+    /// Review S4 (leto-mjj.61): tables dropped after a full build, after a
+    /// failed build and from a partitioned build leave no advised mapping.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropped_tables_leave_no_advised_mapping() {
+        let before = advised_mappings();
+        let rows = 1 << 20;
+        let hashes: Vec<u64> = (0..rows as u64)
+            .map(|h| h.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        {
+            let mut map = JoinHashMapU32::with_capacity(rows);
+            map.update_from_iter(Box::new(hashes.iter().enumerate()), 0)
+                .unwrap();
+            let mut wide = JoinHashMapU64::with_capacity(rows);
+            wide.update_from_iter(Box::new(hashes.iter().enumerate()), 0)
+                .unwrap();
+            if huge_page_advice() {
+                assert!(advised_mappings().len() > before.len());
+            }
+        }
+        {
+            // Rows beyond the map: the build fails, the map is dropped.
+            let mut map = JoinHashMapU32::with_capacity(rows / 2);
+            assert!(
+                map.update_from_iter(Box::new(hashes.iter().enumerate()), 0)
+                    .is_err()
+            );
+        }
+        let after = advised_mappings();
+        assert!(
+            after.iter().all(|range| before.contains(range)),
+            "{before:?} -> {after:?}"
+        );
     }
 
     // Review of JT (leto-mjj.49): the unique path with prefetch, forced
@@ -2126,24 +2489,46 @@ mod tests {
     }
 
     #[test]
-    fn huge_page_advice_is_off_unless_requested() {
+    fn huge_page_advice_is_on_unless_turned_off() {
+        for value in [
+            "off", "0", "false", " off ", "OFF", "Off", "no", "NO", "disabled",
+            "Disabled",
+        ] {
+            assert!(!huge_pages_requested(Some(value)), "{value:?}");
+        }
         for value in [
             None,
             Some(""),
-            Some("off"),
-            Some("0"),
-            Some("false"),
+            Some("on"),
+            Some("ON"),
+            Some("1"),
+            Some("true"),
             Some("yes"),
+            Some("enabled"),
+            // Unrecognized: stays on, with a warning.
+            Some("maybe"),
         ] {
-            assert!(!huge_pages_requested(value), "{value:?}");
-        }
-        for value in [Some("on"), Some("1"), Some("true"), Some(" on ")] {
             assert!(huge_pages_requested(value), "{value:?}");
         }
-        // The test process does not set the variable.
-        if std::env::var(HUGE_PAGES_ENV).is_err() {
-            assert!(!huge_page_advice());
-        }
+        assert!(transparent_huge_pages_available(Some(
+            "always [madvise] never\n"
+        )));
+        assert!(transparent_huge_pages_available(Some(
+            "[always] madvise never\n"
+        )));
+        assert!(!transparent_huge_pages_available(Some(
+            "always madvise [never]\n"
+        )));
+        assert!(!transparent_huge_pages_available(None));
+        // The process's setting: on unless the variable turns it off or the
+        // kernel has no usable transparent huge pages.
+        let thp =
+            std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").ok();
+        assert_eq!(
+            huge_page_advice(),
+            huge_pages_requested(std::env::var(HUGE_PAGES_ENV).ok().as_deref())
+                && transparent_huge_pages_available(thp.as_deref())
+        );
     }
 
     /// The partitioned build gives the maps of the row-by-row build of
@@ -2222,7 +2607,7 @@ mod tests {
             // The peak includes the transient arrays; they are returned.
             assert_eq!(peak, Some(partitioned_build_bytes(num_rows)));
             assert_eq!(reservation.size(), 0);
-            assert_eq!(actual.next, expected.next);
+            assert_eq!(*actual.next, *expected.next);
             assert_eq!(actual.len(), expected.len());
             assert_eq!(actual.chained, expected.chained);
             // Probe with every value and some absent ones.
