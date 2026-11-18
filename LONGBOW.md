@@ -520,3 +520,14 @@ Graviton is unmeasured), and with `LONGBOW_JOIN_TABLE_HUGE_PAGES=on` the
 array is advised to use 2 MiB pages. The
 test covers unique and duplicate keys, misses, out-of-range keys and NULLs
 above the prefetch size.
+
+### JT 5: prefetched build keys in the key comparison
+
+Purpose: overlap the misses of the key comparison, which reads the build key
+of each candidate pair at a random build row. Classification: UPSTREAMABLE.
+`equal_rows_arr` (single-column fast path and multi-column comparator)
+prefetches the fixed-width build key values of the candidate 16 pairs ahead
+for key columns above 512 KiB (a no-op on aarch64, unmeasured); strings and
+other types compare as before.
+The test compares single- and two-column keys above that size, with NULLs
+and unequal candidates, against a direct comparison.
