@@ -1867,6 +1867,8 @@ message AsOfJoinExecNode {
   PhysicalExprNode right_match_expr = 5;
   AsOfMatchOperator match_operator = 6;
   repeated uint32 projection = 7;
+  // Longbow family AP: AsOfJoinMode::Partitioned (both sides key-partitioned).
+  bool partitioned = 900;
 }
 
 message AsyncFuncExecNode {
