@@ -666,6 +666,11 @@ impl PhysicalExpr for BinaryExpr {
             | Operator::ILikeMatch
             | Operator::NotLikeMatch
             | Operator::NotILikeMatch => {
+                if let Some(result) =
+                    super::short_string::compare_inline_scalar(self.op, &lhs, &rhs)
+                {
+                    return Ok(result);
+                }
                 return apply_cmp(self.op, &lhs, &rhs);
             }
             _ => {}

@@ -430,6 +430,28 @@ classification: UPSTREAMABLE. Tests:
 `aggregates::partial_reduce_sets_tests` (ROLLUP and CUBE against the stock
 two-phase plan, empty input, early emission under memory pressure).
 
+## Family SVC: inline string-view constant comparison
+
+Purpose: evaluate `column = 'constant'` and `<>` on a `Utf8View` column against
+a non-NULL constant of 5 to 12 bytes by comparing each 16-byte view, as two
+64-bit words, with the constant's inline view (length plus zero-padded
+bytes); no payload is read, also when the array owns data buffers for longer
+strings (`expressions/short_string.rs`, called first from
+`BinaryExpr::evaluate`). Arrow 60.1 compares whole views only when neither
+side owns a data buffer, and its scalar fast path stops at four bytes, so
+Parquet-decoded columns compared with 5 to 12 byte constants take its per-row
+length and prefix branches. Constants of at most four bytes keep Arrow's
+low-word path, which is faster than this kernel (0.26 vs 0.54 ns/row).
+TPC-DS q59 and q2 evaluate seven `d_day_name = '<weekday>'` conditions per row
+(leto-zca.34: 1.6-2.1 vs 0.53 ns/row in a kernel benchmark; q59's aggregate
+arguments 7.8 s on stock 56 vs 4.0 s on 55.2). The task 3.6 screen
+(leto-zca.23) dropped the earlier full-width port on TPC-H SF30, whose
+constants are at most four bytes and slower on it (Q12 1.087). Dependent
+Longbow feature: STATIC-FILTER-EVALUATION. Classification: UPSTREAMABLE
+(Arrow kernel). Tests: `short_string::tests` (differential against Arrow over
+NULLs, UTF-8, NULs, slices, buffered arrays and both operand orders; the path
+taken for each constant length).
+
 ## Family E: build keys and memory consumer of hash-join membership lookups
 
 Purpose: let Longbow replace a kept hash-join residual's `HashTableLookupExpr`

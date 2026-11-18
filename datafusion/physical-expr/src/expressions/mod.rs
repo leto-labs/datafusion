@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -20,6 +22,7 @@ mod literal;
 mod negative;
 mod no_op;
 mod not;
+mod short_string;
 mod similar_to_pattern;
 mod try_cast;
 mod unknown_column;
