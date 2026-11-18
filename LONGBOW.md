@@ -620,3 +620,19 @@ for key columns above 512 KiB (a no-op on aarch64, unmeasured); strings and
 other types compare as before.
 The test compares single- and two-column keys above that size, with NULLs
 and unequal candidates, against a direct comparison.
+
+### JT 6: own mappings for advised tables; the advice on by default
+
+Purpose: make the 2 MiB-page advice of parts 2 and 4 safe to leave on.
+Classification: UPSTREAMABLE. The advice of mjj.16 went on allocator memory
+and outlived the table: the allocator reused the range for other operators,
+whose faults there allocated huge pages with synchronous compaction (TPC-H
+SF100 on worker-01: q10 pull 27% slower in a suite process, which advises
+nothing itself). Now an array of a head table, a chain or an `ArrayMap` from
+4 MiB on gets its own anonymous mapping (`ZeroedArray`), 2 MiB aligned and
+advised `MADV_HUGEPAGE`, and is unmapped when dropped, so the advice ends
+with the table. Smaller arrays, other targets and a refused mapping use a
+`Vec`. The advice is on unless `LONGBOW_JOIN_TABLE_HUGE_PAGES` is `off`, `0`
+or `false`. Tests: a mapped array is zeroed, writable, 2 MiB aligned, carries
+the `hg` flag where the kernel has THP in `madvise` mode, and is unmapped on
+drop; the switch's values.

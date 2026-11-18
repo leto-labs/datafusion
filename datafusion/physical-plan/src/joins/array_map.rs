@@ -95,7 +95,7 @@ const PREFETCH_DISTANCE: usize = 16;
 #[derive(Debug)]
 pub struct ArrayMap {
     // data[probSideVal-offset] -> valIdxInBuildSide + 1; 0 for absent
-    data: Vec<u32>,
+    data: crate::joins::join_hash_map::ZeroedArray<u32>,
     // min val in buildSide
     offset: u64,
     // next[buildSideIdx] -> next matching valIdxInBuildSide + 1; 0 for end of chain.
@@ -173,8 +173,7 @@ impl ArrayMap {
         let size = (range + 1) as usize;
 
         // Longbow patch (JT): 2 MiB pages for a large direct array.
-        let mut data: Vec<u32> =
-            crate::joins::join_hash_map::zeroed_with_huge_pages(size);
+        let mut data = crate::joins::join_hash_map::zeroed_with_huge_pages::<u32>(size);
         let mut next: Vec<u32> = vec![];
         let mut num_of_distinct_key = 0;
 
@@ -236,7 +235,7 @@ impl ArrayMap {
 
     /// Returns the memory usage of this [`ArrayMap`] in bytes.
     pub fn size(&self) -> usize {
-        self.data.capacity() * size_of::<u32>() + self.next.capacity() * size_of::<u32>()
+        self.data.len() * size_of::<u32>() + self.next.capacity() * size_of::<u32>()
     }
 
     pub fn get_matched_indices_with_limit_offset(
