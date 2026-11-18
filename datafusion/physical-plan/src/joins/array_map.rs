@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -40,6 +42,9 @@ macro_rules! downcast_supported_integer {
         }
     };
 }
+
+/// Longbow patch (JT): probe rows between a slot's prefetch and its use.
+const PREFETCH_DISTANCE: usize = 16;
 
 /// A dense map for single-column integer join keys within a limited range.
 ///
@@ -167,7 +172,9 @@ impl ArrayMap {
         }
         let size = (range + 1) as usize;
 
-        let mut data: Vec<u32> = vec![0; size];
+        // Longbow patch (JT): 2 MiB pages for a large direct array.
+        let mut data: Vec<u32> =
+            crate::joins::join_hash_map::zeroed_with_huge_pages(size);
         let mut next: Vec<u32> = vec![];
         let mut num_of_distinct_key = 0;
 
@@ -271,6 +278,23 @@ impl ArrayMap {
         (value != 0).then_some(value)
     }
 
+    /// Longbow patch (JT): whether the direct array is large enough for
+    /// prefetches to pay.
+    #[inline]
+    fn prefetches(&self) -> bool {
+        crate::joins::join_hash_map::prefetch_pays(self.data.len() * size_of::<u32>())
+    }
+
+    /// Longbow patch (JT): hints the cache to load the slot of `key`. A key
+    /// outside the build's range prefetches nothing.
+    #[inline(always)]
+    fn prefetch(&self, key: u64) {
+        crate::joins::join_hash_map::prefetch_read(
+            &self.data,
+            key.wrapping_sub(self.offset).min(usize::MAX as u64) as usize,
+        );
+    }
+
     fn lookup_and_get_indices<T: ArrowNumericType>(
         &self,
         array: &ArrayRef,
@@ -289,6 +313,13 @@ impl ArrayMap {
 
         let have_null = arr.null_count() > 0;
 
+        // Longbow patch (JT): prefetch the slot of the row this far ahead.
+        let ahead = if self.prefetches() {
+            PREFETCH_DISTANCE
+        } else {
+            usize::MAX
+        };
+        let values = arr.values();
         if self.next.is_empty() {
             debug_assert!(
                 matches!(current_offset, AtRow { .. }),
@@ -301,6 +332,9 @@ impl ArrayMap {
             for prob_idx in rows..arr.len() {
                 if build_indices.len() == limit {
                     return Ok(Some(AtRow { row: prob_idx }));
+                }
+                if let Some(value) = values.get(prob_idx.saturating_add(ahead)) {
+                    self.prefetch(value.as_());
                 }
 
                 // short circuit
@@ -345,6 +379,9 @@ impl ArrayMap {
             for prob_side_idx in to_skip..arr.len() {
                 if remaining_output == 0 {
                     return Ok(Some(AtRow { row: prob_side_idx }));
+                }
+                if let Some(value) = values.get(prob_side_idx.saturating_add(ahead)) {
+                    self.prefetch(value.as_());
                 }
 
                 if have_null && arr.is_null(prob_side_idx) {
@@ -591,6 +628,51 @@ mod tests {
         assert_eq!(build_indices, expected_build_indices);
         assert!(result_offset.is_none());
 
+        Ok(())
+    }
+
+    /// Longbow patch (JT): a direct array above the prefetch size answers as
+    /// a small one: unique and duplicate keys, misses, out-of-range keys and
+    /// NULLs, resumed at a small limit.
+    #[test]
+    fn test_array_map_large_enough_to_prefetch() -> Result<()> {
+        for duplicates in [1_i64, 3] {
+            let build: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                (0..300_000_i64)
+                    .flat_map(|key| std::iter::repeat_n(key * 3, duplicates as usize)),
+            ));
+            let map = ArrayMap::try_new(&build, 0, 900_000)?;
+            assert!(map.prefetches());
+            let probe: ArrayRef = Arc::new(Int64Array::from_iter(
+                (-5..1_000_000_i64).map(|key| (key % 11 != 0).then_some(key)),
+            ));
+            let mut pairs = vec![];
+            let (mut offset, mut probes, mut builds) = (AtRow { row: 0 }, vec![], vec![]);
+            loop {
+                let next = map.get_matched_indices_with_limit_offset(
+                    std::slice::from_ref(&probe),
+                    1000,
+                    offset,
+                    &mut probes,
+                    &mut builds,
+                )?;
+                pairs.extend(probes.iter().copied().zip(builds.iter().copied()));
+                match next {
+                    Some(resume) => offset = resume,
+                    None => break,
+                }
+            }
+            let mut expected = vec![];
+            for (row, key) in (-5..1_000_000_i64).enumerate() {
+                if key % 11 != 0 && key >= 0 && key % 3 == 0 && key < 900_000 {
+                    let first = (key / 3 * duplicates) as u64;
+                    expected.extend(
+                        (first..first + duplicates as u64).map(|b| (row as u32, b)),
+                    );
+                }
+            }
+            assert_eq!(pairs, expected, "duplicates {duplicates}");
+        }
         Ok(())
     }
 }

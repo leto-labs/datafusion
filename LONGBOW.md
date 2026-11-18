@@ -599,3 +599,13 @@ scratch when partitioned. Tests: the two builds against each other and
 against hashbrown with forced 32-bit tag collisions and NULL keys; a refused
 reservation touches nothing; a one-batch CollectLeft join whose pool refuses
 the transient arrays returns the rows of an unbounded run.
+
+### JT 4: prefetching `ArrayMap`
+
+Purpose: overlap the misses of a probe into a large direct array.
+Classification: UPSTREAMABLE. Above 512 KiB the probe prefetches the slot 16
+rows ahead (an out-of-range key prefetches nothing; a no-op on aarch64, where
+Graviton is unmeasured), and with `LONGBOW_JOIN_TABLE_HUGE_PAGES=on` the
+array is advised to use 2 MiB pages. The
+test covers unique and duplicate keys, misses, out-of-range keys and NULLs
+above the prefetch size.
