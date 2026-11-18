@@ -435,10 +435,15 @@ fn exclude_using_columns(plan: &LogicalPlan) -> Result<HashSet<Column>> {
 }
 
 /// Longbow family AJ: the right `USING` columns of every ASOF join in DuckDB's
-/// `USING (k, ..., t)` form ([`crate::logical_plan::AsOfJoin::ordered_using`]).
+/// `USING (k, ..., t)` form ([`crate::logical_plan::AsOfJoin::ordered_using`])
+/// in the visible FROM tree of `plan`. A subquery alias hides the qualifiers
+/// below it, so the walk does not enter one.
 fn ordered_asof_right_columns(plan: &LogicalPlan) -> Result<HashSet<Column>> {
     let mut columns = HashSet::new();
-    plan.apply_with_subqueries(|plan| {
+    plan.apply(|plan| {
+        if matches!(plan, LogicalPlan::SubqueryAlias(_)) {
+            return Ok(TreeNodeRecursion::Jump);
+        }
         if let LogicalPlan::AsOfJoin(join) = plan
             && join.ordered_using
         {
