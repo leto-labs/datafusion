@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -13,7 +15,7 @@ use sqlparser::ast::{
 };
 use std::collections::HashSet;
 
-const JOIN_ON_HELP: &str =
+pub(super) const JOIN_ON_HELP: &str =
     "Compute the window function in a subquery and join on its result";
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
@@ -113,6 +115,16 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         constraint: JoinConstraint,
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
+        // Longbow family AJ: DuckDB's forms, marked by `asof_tokens`.
+        if let Some(inner) = super::asof::duckdb_kind(&sql_match_condition) {
+            return self.parse_duckdb_asof_join(
+                left,
+                right,
+                inner,
+                constraint,
+                planner_context,
+            );
+        }
         let join_schema = left.schema().join(right.schema())?;
         let match_condition =
             self.sql_to_expr(sql_match_condition, &join_schema, planner_context)?;
