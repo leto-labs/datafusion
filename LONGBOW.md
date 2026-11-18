@@ -423,3 +423,37 @@ Regressions: `scripts/vendored-tests.py datafusion-physical-plan -E
 test(lookups_expose_partition_build_keys_and_memory) |
 test(lookup_exposes_build_keys_and_memory_while_the_join_holds_them) |
 test(prepared)'`.
+
+## Family VB: visited bitmap of hash joins without a lock
+
+Purpose: let every probe partition of a hash join that returns build rows
+(`Left`, `LeftSemi`, `LeftAnti`, `LeftMark`, `Full`) mark its matched build
+rows without a lock. Upstream keeps the marks in a
+`Mutex<BooleanBufferBuilder>` and takes the mutex once per probe batch, with
+one bit set per matched row inside it. With a small build side and a large
+probe side the critical section is a fixed share of each partition's work,
+and the lock bounds the number of partitions that run. TPC-DS q14 at SF100
+(`item` semi-joined with 880 million fact rows per statement) ran on 19 of 48
+cores. Dependent Longbow feature: PULL-JOIN-SCALING (a proposed code: pull
+hash joins at 48 threads; the native join
+has its own matched bitmaps). Classification: UPSTREAMABLE.
+
+Change (`datafusion/physical-plan/src/joins/hash_join/`):
+
+- `visited.rs` (new): `VisitedBitmap`, one `AtomicU64` per 64 build rows.
+  `set` reads the word first and writes only a bit that is not set, so a
+  build row that many probe rows match causes one write. `snapshot` returns
+  the `BooleanBuffer` that the emission of build rows already used.
+- `exec.rs`, `exec/prepared.rs`: `JoinLeftData` holds a `VisitedBitmap`. The
+  reservation is the bitmap's size rounded up to 8 bytes.
+- `stream.rs`: the probe marks through `set`; the final state takes
+  `snapshot` after every probe partition has reported completion, as before.
+
+The nested loop join and the `NOT IN` state keep `SharedBitmapBuilder`.
+
+Tests: `joins::hash_join::visited::tests` (snapshot against marked rows for
+lengths around a word boundary, eight threads marking overlapping bits, an
+out-of-range index panics); the existing join tests (1,883 pass).
+
+Evidence: Longbow lane `leto-mjj.65`,
+`docs/research/idle-cores-2-20261118.md`, section 6.

@@ -935,9 +935,10 @@ impl HashJoinStream {
 
         // mark joined left-side indices as visited, if required by join type
         if need_produce_result_in_final(self.join_type) {
-            let mut bitmap = build_side.left_data.visited_indices_bitmap().lock();
+            // No lock: every probe partition marks into one atomic bitmap.
+            let bitmap = build_side.left_data.visited_indices_bitmap();
             left_indices.iter().flatten().for_each(|x| {
-                bitmap.set_bit(x as usize, true);
+                bitmap.set(x as usize);
             });
         }
 
@@ -1074,12 +1075,8 @@ impl HashJoinStream {
         };
 
         // Every probe partition has finished, so the bitmap is final: snapshot
-        // it once and release the lock for the whole emission phase.
-        let visited = build_side
-            .left_data
-            .visited_indices_bitmap()
-            .lock()
-            .finish_cloned();
+        // it once for the whole emission phase.
+        let visited = build_side.left_data.visited_indices_bitmap().snapshot();
 
         // The final build rows count as one logical input batch; the rows are
         // added chunk by chunk in `emit_unmatched_build_rows`.

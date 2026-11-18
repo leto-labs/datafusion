@@ -61,7 +61,7 @@ impl PreparedHashJoinBuild {
             build: Arc::clone(&self.build),
             // Prepared builds exclude null-aware joins.
             not_in: None,
-            visited_indices_bitmap: Mutex::new(BooleanBufferBuilder::new(0)),
+            visited_indices_bitmap: VisitedBitmap::empty(),
             probe_completion: ProbeCompletion::new(probe_threads),
         }
     }

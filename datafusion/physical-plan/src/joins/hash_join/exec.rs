@@ -29,6 +29,7 @@ use crate::joins::hash_join::shared_bounds::{
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
+use crate::joins::hash_join::visited::VisitedBitmap;
 use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
 use crate::joins::key_range_bitmap::KeyRangeBitmap;
 use crate::joins::probe_completion::{Completion, ProbeCompletion};
@@ -36,7 +37,7 @@ use crate::joins::utils::{
     OnceAsync, OnceFut, asymmetric_join_output_partitioning, emits_unmatched_left_rows,
     is_existence_join, reorder_output_after_swap, swap_join_projection, update_hash,
 };
-use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
+use crate::joins::{JoinOn, JoinOnRef, PartitionMode};
 use crate::metrics::{Count, MetricBuilder, MetricCategory};
 use crate::projection::{
     EmbeddedProjection, JoinData, ProjectionExec, try_embed_projection,
@@ -61,7 +62,7 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
+use arrow::array::{Array, ArrayRef};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -93,7 +94,6 @@ use datafusion_common::hash_utils::RandomState;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::TryStreamExt;
-use parking_lot::Mutex;
 
 use super::partitioned_hash_eval::SeededRandomState;
 
@@ -222,7 +222,7 @@ pub(super) struct JoinLeftData {
     /// The `NOT IN` state of a null-aware join, see [`NotInBuild`].
     not_in: Option<NotInBuild>,
     /// Shared bitmap for visited left indices within this consuming join.
-    visited_indices_bitmap: SharedBitmapBuilder,
+    visited_indices_bitmap: VisitedBitmap,
     /// Tracks the final probe partition and what every partition observed.
     /// See [`ProbeCompletion`] for the completion invariant.
     probe_completion: ProbeCompletion,
@@ -271,7 +271,7 @@ impl JoinLeftData {
     }
 
     /// returns a reference to the visited indices bitmap
-    pub(super) fn visited_indices_bitmap(&self) -> &SharedBitmapBuilder {
+    pub(super) fn visited_indices_bitmap(&self) -> &VisitedBitmap {
         &self.visited_indices_bitmap
     }
 
@@ -3432,21 +3432,18 @@ fn build_in_memory(
     reservation.try_grow(keys_size)?;
     metrics.build_mem_used.add(keys_size);
 
-    let allocate_bitmap = || -> Result<BooleanBufferBuilder> {
-        let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
+    let allocate_bitmap = || -> Result<VisitedBitmap> {
+        let bitmap_size = VisitedBitmap::size_bytes(num_rows);
         reservation.try_grow(bitmap_size)?;
         metrics.build_mem_used.add(bitmap_size);
-
-        let mut bitmap = BooleanBufferBuilder::new(batch.num_rows());
-        bitmap.append_n(num_rows, false);
-        Ok(bitmap)
+        Ok(VisitedBitmap::new(num_rows))
     };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
         allocate_bitmap()?
     } else {
-        BooleanBufferBuilder::new(0)
+        VisitedBitmap::empty()
     };
 
     let not_in = not_in
@@ -3556,7 +3553,7 @@ fn build_in_memory(
             reservation,
         }),
         not_in,
-        visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
+        visited_indices_bitmap,
         probe_completion: ProbeCompletion::new(probe_threads_count),
     };
 
