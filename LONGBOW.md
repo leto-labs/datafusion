@@ -560,3 +560,18 @@ q78 slower (Q9 probe 44 / 48 / 70 ns per row at 512 KiB / 8 MiB / 16 MiB;
 q78 30 / 32 / 34). The `ArrayMap` probe and both key-comparison loops now
 choose their loop once per call, monomorphized on the prefetch decision, as
 the head-table probe already did; the 512 KiB threshold stays.
+
+### JT 8: multi-column join keys compared column by column
+
+Purpose: take the boxed per-column comparator off multi-column key
+comparisons. Classification: UPSTREAMABLE. On TPC-H SF100 Q9 (pull, 48
+threads), lineitem x partsupp on (partkey, suppkey) compared its candidates
+through `JoinKeyComparator` (`arrow_cmp::compare_impl` and
+`equal_rows_arr_impl`, about 1.8 of the probe's 7.1 CPU-s per execution with
+parts 1-7). When there are several key columns and every one has the same
+type on both sides and a typed loop in `equal_rows_single_col` (no floats,
+dictionaries or nested types), `equal_rows_by_columns` filters the candidate
+pairs one column at a time with that loop: same pairs, same order, same NULL
+rule. Other keys keep the comparator. Test: two- and three-column keys
+(integers, strings, NULLs, unequal candidates, both NULL equalities) against
+the comparator; a float column keeps the comparator.

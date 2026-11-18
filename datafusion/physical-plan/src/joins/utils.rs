@@ -2573,6 +2573,18 @@ fn equal_rows_arr_impl(
     if let Some(res) = single_col_fast_path {
         return Ok(res);
     }
+    // Longbow patch (JT): multi-column keys whose every column has a typed
+    // loop filter the candidate pairs column by column, instead of the
+    // boxed per-column comparator for every pair.
+    if let Some(res) = equal_rows_by_columns(
+        indices_left,
+        indices_right,
+        left_arrays,
+        right_arrays,
+        null_equality,
+    ) {
+        return Ok(res);
+    }
 
     let comparator = match comparator {
         Some(comparator) => comparator,
@@ -2628,6 +2640,73 @@ fn equal_rows_arr_impl(
     }
 
     Ok((left_filtered.into(), right_filtered.into()))
+}
+
+/// Longbow patch (JT): the pairs of `indices_left` and `indices_right` whose
+/// multi-column keys are equal, filtered one column at a time by
+/// [`equal_rows_single_col`]: a pair is kept when every column is equal
+/// under `null_equality`, as `JoinKeyComparator::is_equal` keeps it, and the
+/// kept pairs stay in their order. `None` (the caller compares with the
+/// comparator) unless there are several columns and each has the same type
+/// on both sides and a typed loop.
+fn equal_rows_by_columns(
+    indices_left: &UInt64Array,
+    indices_right: &UInt32Array,
+    left_arrays: &[ArrayRef],
+    right_arrays: &[ArrayRef],
+    null_equality: NullEquality,
+) -> Option<(UInt64Array, UInt32Array)> {
+    if left_arrays.len() < 2
+        || !left_arrays.iter().zip(right_arrays).all(|(left, right)| {
+            left.data_type() == right.data_type() && has_single_col_loop(left.data_type())
+        })
+    {
+        return None;
+    }
+    let mut kept = (indices_left.clone(), indices_right.clone());
+    for (left, right) in left_arrays.iter().zip(right_arrays) {
+        if kept.0.is_empty() {
+            break;
+        }
+        let keys = BuildKeyPrefetch::new(std::slice::from_ref(left), kept.0.values());
+        kept = equal_rows_single_col(
+            &kept.0,
+            &kept.1,
+            left.as_ref(),
+            right.as_ref(),
+            null_equality,
+            &keys,
+        )?;
+    }
+    Some(kept)
+}
+
+/// Longbow patch (JT): whether [`equal_rows_single_col`] has a loop for keys
+/// of `data_type` (its match, without floats).
+fn has_single_col_loop(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Decimal128(..)
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Timestamp(..)
+    )
 }
 
 /// Specialized single-column equi-join key filtering.
@@ -6024,6 +6103,108 @@ mod tests {
                 .collect();
             assert!(!expected.is_empty() && expected.len() < pairs.len());
             assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    /// Longbow patch (JT): multi-column keys filtered column by column keep
+    /// exactly the pairs (and their order) of the comparator, for both NULL
+    /// equalities, with NULLs, unequal candidates and string columns; keys
+    /// with a float column keep the comparator.
+    #[test]
+    fn equal_rows_by_columns_matches_the_comparator() -> Result<()> {
+        use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
+        let rows = 3_000_u64;
+        let mut state = 5_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let build_a: ArrayRef = Arc::new(Int64Array::from_iter(
+            (0..rows as i64).map(|v| (v % 31 != 0).then_some(v % 50)),
+        ));
+        let build_b: ArrayRef = Arc::new(Int32Array::from_iter(
+            (0..rows as i32).map(|v| (v % 17 != 0).then_some(v % 7)),
+        ));
+        let build_s: ArrayRef = Arc::new(StringArray::from_iter(
+            (0..rows).map(|v| (v % 13 != 0).then(|| format!("k{}", v % 3))),
+        ));
+        let build_f: ArrayRef = Arc::new(Float64Array::from_iter_values(
+            (0..rows).map(|v| (v % 5) as f64),
+        ));
+        let pairs: Vec<(u64, u32)> =
+            (0..20_000_u32).map(|p| (next() % rows, p)).collect();
+        let probe = |build: &ArrayRef| -> ArrayRef {
+            // Each probe row copies its candidate's key, two in three times.
+            let indices = UInt64Array::from_iter_values(
+                pairs
+                    .iter()
+                    .map(|(b, p)| if p % 3 == 0 { (b + 1) % rows } else { *b }),
+            );
+            take(build.as_ref(), &indices, None).unwrap()
+        };
+        let left = UInt64Array::from_iter_values(pairs.iter().map(|(b, _)| *b));
+        let right = UInt32Array::from_iter_values(pairs.iter().map(|(_, p)| *p));
+        for null_equality in [
+            NullEquality::NullEqualsNothing,
+            NullEquality::NullEqualsNull,
+        ] {
+            for build in [
+                vec![Arc::clone(&build_a), Arc::clone(&build_b)],
+                vec![
+                    Arc::clone(&build_s),
+                    Arc::clone(&build_a),
+                    Arc::clone(&build_b),
+                ],
+                vec![Arc::clone(&build_b), Arc::clone(&build_f)],
+            ] {
+                let probe_arrays: Vec<ArrayRef> = build.iter().map(probe).collect();
+                let by_columns = equal_rows_by_columns(
+                    &left,
+                    &right,
+                    &build,
+                    &probe_arrays,
+                    null_equality,
+                );
+                let has_float = build
+                    .iter()
+                    .any(|a| matches!(a.data_type(), DataType::Float64));
+                assert_eq!(by_columns.is_none(), has_float);
+                let actual = equal_rows_arr(
+                    &left,
+                    &right,
+                    &build,
+                    &probe_arrays,
+                    null_equality,
+                    &mut None,
+                )?;
+                let sort_options = vec![SortOptions::default(); build.len()];
+                let comparator = JoinKeyComparator::new(
+                    &build,
+                    &probe_arrays,
+                    &sort_options,
+                    null_equality,
+                )?;
+                let expected: Vec<(u64, u32)> = pairs
+                    .iter()
+                    .copied()
+                    .filter(|(b, p)| comparator.is_equal(*b as usize, *p as usize))
+                    .collect();
+                let got: Vec<(u64, u32)> = actual
+                    .0
+                    .values()
+                    .iter()
+                    .copied()
+                    .zip(actual.1.values().iter().copied())
+                    .collect();
+                assert!(!expected.is_empty() && expected.len() < pairs.len());
+                assert_eq!(got, expected, "{null_equality:?}");
+                if let Some((l, r)) = by_columns {
+                    assert_eq!((l, r), actual);
+                }
+            }
         }
         Ok(())
     }
