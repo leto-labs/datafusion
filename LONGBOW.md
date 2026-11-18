@@ -733,6 +733,10 @@ as future work).
 - Both modes: the pending output rows of a side reference at most 32 distinct
   input batches before a flush; equality keys with a floating-point leaf are
   rejected.
+- Both modes accept either NULL placement: the input requirement lists the
+  NULLS FIRST and the NULLS LAST ordering as hard alternatives, the one the
+  input already satisfies first (distribution enforcement reads only the
+  first). A Parquet file's declared NULLS LAST order then needs no sort.
 
 Regressions: `scripts/vendored-tests.py datafusion-physical-plan asof`;
 `scripts/vendored-tests.py datafusion-proto --test proto_integration asof`.

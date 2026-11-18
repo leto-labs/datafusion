@@ -95,7 +95,9 @@ use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr_common::physical_expr::{
     PhysicalExprRef, fmt_sql, is_volatile,
 };
-use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequirements};
+use datafusion_physical_expr_common::sort_expr::{
+    LexOrdering, LexRequirement, OrderingRequirements,
+};
 use futures::{Stream, StreamExt, TryStreamExt, future::poll_fn, ready, stream};
 
 use crate::execution_plan::{Boundedness, EmissionType};
@@ -484,9 +486,40 @@ impl ExecutionPlan for AsOfJoinExec {
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        // Longbow family AP: the merge skips every row with a NULL equality
+        // key or match value before it compares, so NULLs may come first or
+        // last. An input ordered NULLS LAST (a Parquet file's declared order)
+        // then needs no sort. Distribution enforcement reads only the first
+        // alternative, so the one the input already satisfies comes first.
+        let either = |ordering: &LexOrdering, input: &Arc<dyn ExecutionPlan>| {
+            let nulls_last =
+                LexOrdering::new(ordering.iter().map(|e| PhysicalSortExpr {
+                    expr: Arc::clone(&e.expr),
+                    options: SortOptions {
+                        nulls_first: false,
+                        ..e.options
+                    },
+                }))
+                .expect("a non-empty ordering");
+            let nulls_first: LexRequirement = ordering.clone().into();
+            let nulls_last: LexRequirement = nulls_last.into();
+            let properties = input.equivalence_properties();
+            let last_first = !properties
+                .ordering_satisfy_requirement(nulls_first.clone())
+                .unwrap_or(false)
+                && properties
+                    .ordering_satisfy_requirement(nulls_last.clone())
+                    .unwrap_or(false);
+            let alternatives = if last_first {
+                [nulls_last, nulls_first]
+            } else {
+                [nulls_first, nulls_last]
+            };
+            OrderingRequirements::new_alternatives(alternatives, false)
+        };
         vec![
-            Some(OrderingRequirements::from(self.left_ordering.clone())),
-            Some(OrderingRequirements::from(self.right_ordering.clone())),
+            either(&self.left_ordering, &self.left),
+            either(&self.right_ordering, &self.right),
         ]
     }
 

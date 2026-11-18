@@ -412,3 +412,85 @@ async fn sparse_matches_flush_before_pinning_many_input_batches() -> Result<()> 
     }
     Ok(())
 }
+
+/// Inputs ordered with NULLs last (a Parquet file's declared order) satisfy
+/// the join's requirement and give the rows of NULLS FIRST inputs.
+#[tokio::test]
+async fn nulls_last_inputs_need_no_sort_and_match_nulls_first() -> Result<()> {
+    let (l, r) = (schema("id"), schema("price"));
+    let left = |nulls_first: bool| {
+        let mut rows = vec![
+            (Some("A"), Some(1), 1),
+            (Some("A"), Some(4), 2),
+            (Some("A"), None, 3),
+            (Some("B"), Some(2), 4),
+            (None, Some(3), 5),
+        ];
+        if nulls_first {
+            rows.sort_by_key(|(k, t, _)| (k.is_some(), *k, t.is_some(), *t));
+        }
+        batch(
+            &l,
+            rows.iter().map(|r| r.0).collect(),
+            rows.iter().map(|r| r.1).collect(),
+            rows.iter().map(|r| r.2).collect(),
+        )
+    };
+    let right = |nulls_first: bool| {
+        let mut rows = vec![
+            (Some("A"), Some(2), 20),
+            (Some("A"), Some(4), 40),
+            (Some("A"), None, 77),
+            (Some("B"), Some(1), 101),
+            (None, Some(2), 999),
+        ];
+        if nulls_first {
+            rows.sort_by_key(|(k, t, _)| (k.is_some(), *k, t.is_some(), *t));
+        }
+        batch(
+            &r,
+            rows.iter().map(|r| r.0).collect(),
+            rows.iter().map(|r| r.1).collect(),
+            rows.iter().map(|r| r.2).collect(),
+        )
+    };
+    let mut results = Vec::new();
+    for nulls_first in [true, false] {
+        for mode in [AsOfJoinMode::Broadcast, AsOfJoinMode::Partitioned] {
+            let exec = join(
+                vec![vec![left(nulls_first)]],
+                vec![vec![right(nulls_first)]],
+                Operator::GtEq,
+                mode,
+            )?;
+            for (requirement, input) in exec
+                .required_input_ordering()
+                .into_iter()
+                .zip([exec.left(), exec.right()])
+            {
+                let ordering = input.properties().output_ordering().cloned();
+                // TestMemoryExec declares no ordering; the requirement lists
+                // both NULL placements.
+                assert!(ordering.is_none());
+                assert!(
+                    matches!(requirement, Some(OrderingRequirements::Hard(ref a)) if a.len() == 2)
+                );
+            }
+            let batches = collect(exec as _, context(2)).await?;
+            results.push(batches_to_sort_string(&batches));
+        }
+    }
+    assert!(results.windows(2).all(|w| w[0] == w[1]), "{results:#?}");
+    assert_snapshot!(results[0], @r"
+    +-----+----+----+-------+
+    | key | ts | id | price |
+    +-----+----+----+-------+
+    |     | 3  | 5  |       |
+    | A   |    | 3  |       |
+    | A   | 1  | 1  |       |
+    | A   | 4  | 2  | 40    |
+    | B   | 2  | 4  | 101   |
+    +-----+----+----+-------+
+    ");
+    Ok(())
+}
