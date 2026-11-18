@@ -552,6 +552,8 @@ impl<'a, 'b> DFParserBuilder<'a, 'b> {
                     .map_err(ParserError::from)?
             }
         };
+        // Longbow family AJ: DuckDB's ASOF join forms (see `asof_tokens`).
+        let tokens = crate::asof_tokens::rewrite_duckdb_asof(self.dialect, tokens);
 
         Ok(DFParser {
             parser: Parser::new(self.dialect)
