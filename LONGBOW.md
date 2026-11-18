@@ -636,3 +636,16 @@ with the table. Smaller arrays, other targets and a refused mapping use a
 or `false`. Tests: a mapped array is zeroed, writable, 2 MiB aligned, carries
 the `hg` flag where the kernel has THP in `madvise` mode, and is unmapped on
 drop; the switch's values.
+
+### JT 7: one probe loop per prefetch mode
+
+Purpose: keep the probe of small tables at its pre-JT cost. Classification:
+UPSTREAMABLE. Parts 4 and 5 checked per probe row (or candidate pair) whether
+to prefetch. On TPC-DS SF100 q14 (worker-01, 48 threads, pull), whose probe is
+almost all `ArrayMap` lookups into small arrays, that check cost 12-18% of the
+probe (14.4-14.7 to 16.4-17.3 CPU-s per execution) at every prefetch threshold
+from 512 KiB to 16 MiB, while raising the threshold made TPC-H Q9 and TPC-DS
+q78 slower (Q9 probe 44 / 48 / 70 ns per row at 512 KiB / 8 MiB / 16 MiB;
+q78 30 / 32 / 34). The `ArrayMap` probe and both key-comparison loops now
+choose their loop once per call, monomorphized on the prefetch decision, as
+the head-table probe already did; the 512 KiB threshold stays.

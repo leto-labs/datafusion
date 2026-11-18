@@ -2419,13 +2419,17 @@ impl<'a> BuildKeyPrefetch<'a> {
         }
     }
 
+    /// Whether any build key column is large enough to prefetch. The
+    /// comparison loops take one loop without [`Self::ahead_of`] when not.
+    #[inline(always)]
+    fn active(&self) -> bool {
+        !self.columns.is_empty()
+    }
+
     /// Prefetches the build keys of the pair `KEY_PREFETCH_DISTANCE` after
     /// `pair`.
     #[inline(always)]
     fn ahead_of(&self, pair: usize) {
-        if self.columns.is_empty() {
-            return;
-        }
         if let Some(&row) = self.build_rows.get(pair + KEY_PREFETCH_DISTANCE) {
             for (bytes, width) in &self.columns {
                 crate::joins::join_hash_map::prefetch_read(
@@ -2591,22 +2595,36 @@ fn equal_rows_arr_impl(
     let mut left_filtered = Vec::with_capacity(indices_left.len());
     let mut right_filtered = Vec::with_capacity(indices_right.len());
 
-    for (pair, (left, right)) in indices_left
-        .values()
-        .iter()
-        .zip(indices_right.values())
-        .enumerate()
-    {
-        keys.ahead_of(pair);
-        let left_idx = usize::try_from(*left).map_err(|_| {
-            internal_datafusion_err!("Join index {left} can not be represented as usize")
-        })?;
-        let right_idx = *right as usize;
+    // Longbow patch (JT): one loop per prefetch mode (see `BuildKeyPrefetch`).
+    macro_rules! compare_pairs {
+        ($prefetch:expr) => {
+            for (pair, (left, right)) in indices_left
+                .values()
+                .iter()
+                .zip(indices_right.values())
+                .enumerate()
+            {
+                if $prefetch {
+                    keys.ahead_of(pair);
+                }
+                let left_idx = usize::try_from(*left).map_err(|_| {
+                    internal_datafusion_err!(
+                        "Join index {left} can not be represented as usize"
+                    )
+                })?;
+                let right_idx = *right as usize;
 
-        if comparator.is_equal(left_idx, right_idx) {
-            left_filtered.push(*left);
-            right_filtered.push(*right);
-        }
+                if comparator.is_equal(left_idx, right_idx) {
+                    left_filtered.push(*left);
+                    right_filtered.push(*right);
+                }
+            }
+        };
+    }
+    if keys.active() {
+        compare_pairs!(true);
+    } else {
+        compare_pairs!(false);
     }
 
     Ok((left_filtered.into(), right_filtered.into()))
@@ -2642,26 +2660,39 @@ fn equal_rows_single_col(
             let mut left_filtered = Vec::with_capacity(indices_left.len());
             let mut right_filtered = Vec::with_capacity(indices_right.len());
 
-            for (pair, (left_idx, right_idx)) in indices_left
-                .values()
-                .iter()
-                .zip(indices_right.values())
-                .enumerate()
-            {
-                keys.ahead_of(pair);
-                let i = *left_idx as usize;
-                let j = *right_idx as usize;
+            // Longbow patch (JT): one loop per prefetch mode (see
+            // `BuildKeyPrefetch`).
+            macro_rules! compare_pairs {
+                ($prefetch:expr) => {
+                    for (pair, (left_idx, right_idx)) in indices_left
+                        .values()
+                        .iter()
+                        .zip(indices_right.values())
+                        .enumerate()
+                    {
+                        if $prefetch {
+                            keys.ahead_of(pair);
+                        }
+                        let i = *left_idx as usize;
+                        let j = *right_idx as usize;
 
-                let is_equal = match (l.is_null(i), r.is_null(j)) {
-                    (false, false) => l.value(i) == r.value(j),
-                    (true, true) => null_equals_null,
-                    _ => false,
+                        let is_equal = match (l.is_null(i), r.is_null(j)) {
+                            (false, false) => l.value(i) == r.value(j),
+                            (true, true) => null_equals_null,
+                            _ => false,
+                        };
+
+                        if is_equal {
+                            left_filtered.push(*left_idx);
+                            right_filtered.push(*right_idx);
+                        }
+                    }
                 };
-
-                if is_equal {
-                    left_filtered.push(*left_idx);
-                    right_filtered.push(*right_idx);
-                }
+            }
+            if keys.active() {
+                compare_pairs!(true);
+            } else {
+                compare_pairs!(false);
             }
 
             return Some((left_filtered.into(), right_filtered.into()));
