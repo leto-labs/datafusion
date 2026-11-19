@@ -833,7 +833,10 @@ Change (`datafusion/physical-plan/src/joins/hash_join/`):
 - `shared_bounds.rs`: `PushdownStrategy::BoundsOnly`. A build that wrote a
   partition publishes its bounds (which saw every build row) and no
   membership form; in `Partitioned` routing only that partition's branch.
-- `datafusion/common/src/config.rs`: the six options of the design.
+- `datafusion/common/src/config.rs`: the six options of the design, and
+  `hash_join_spill_relief_divisor` (8) and `hash_join_spill_role_reversal`
+  (true) of section 3.
+- `spill/chunks.rs` (section 3): the build-chunk join, below.
 
 Partition function: `(hash * K[level]) >> (64 - log2(16))` over the join
 hash (`HASH_JOIN_SEED`), with one odd multiplier per level that is not the
@@ -851,11 +854,11 @@ consumer is spillable only for an eligible join. An ineligible join's own
 refused build fails as before, with the context "The hash join did not
 spill because ..."; a refusal that comes out of its build input keeps its
 text (the wrapped input sets a flag; no error text is matched). A join above
-`hash_join_spill_max_depth` (at most 7, one multiplier per level) is
-eligible for its floor only: it writes no partition, and a refusal its floor
-cannot cover fails with the reason: one key value fills the partition when
-it kept more than half of the rows its parent divided, the pool had no room
-for it otherwise.
+`hash_join_spill_max_depth` (at most 7, one multiplier per level), and a
+join of a written partition that kept more than half of the rows its parent
+divided (a hot key: another level would write it again almost whole), is
+indivisible: it writes no partition and builds on its floor when the floor
+holds it; a refusal its floor cannot cover raises the run's chunk signal.
 
 Metrics, registered at the first relief: `spill_count`, `spilled_bytes`,
 `spilled_rows`, `build_spilled_rows`, `build_spilled_bytes`,
@@ -895,10 +898,43 @@ keeps full went from 5.58 to at most 4.62 workspaces above the limit with
 four streams); the floor above the depth limit and the hot-key test by
 share; the refusal context by flag.
 
-Not in this family (`add-join-spill` section 3): build chunks with probe
-replay for a partition that cannot be divided (one hot key fails at the
-depth limit; `hash_join_spill_max_replay_passes` is reserved), and role
-reversal of a written partition whose probe is the smaller side.
+Section 3 (lane `leto-mjj.98`):
+
+- Build chunks (`spill/chunks.rs`). A run of a written partition is tried
+  whole. If its indivisible join is refused beyond its floor it raises the
+  run's `ChunkSignal` and fails before it produced a row; the run then
+  joins the partition in chunks. Each chunk is a stock `CollectLeft` join
+  whose build reads the build file from a `Cursor` until the pool refuses a
+  batch together with an estimate of its table (copy, 48 B per row, 256 B):
+  that batch goes back to the cursor, and the first batch of a chunk is
+  charged without refusal, so every chunk progresses. A refused table gives
+  half of its batches back; a table over one batch is built on a private
+  pool and charged without refusal. The probe replays the partition's probe
+  files. Inner, LeftSemi, LeftAnti and LeftMark are the union of their
+  chunks (each build row is in one chunk and sees every probe row). Joins
+  that emit probe rows keep one matched bit per probe row, numbered by a
+  column the probe leaf appends: Right runs Inner chunks and then emits the
+  unmarked probe rows with null build columns; RightSemi runs RightSemi over
+  the unmarked rows; RightAnti and RightMark mark with RightSemi chunks and
+  then emit the unmarked rows, or every row with its mark. A partition that
+  needs more than `hash_join_spill_max_replay_passes` (64) chunks fails with
+  `ResourcesExhausted` naming the bound. Later own runs of a partition that
+  a stream found needs chunks start in chunks. Each stream chunks its own
+  runs: chunk tables are not shared between streams.
+- Role reversal. A written partition whose probe files are smaller (in
+  bytes) than its build file is joined with `swap_inputs`, built over the
+  probe files: the own runs of a build with one member (every
+  `Partitioned` build, `CollectLeft` over one probe partition) and the
+  build-row pass of a join that emits build rows (one join over every
+  stream's probe file). The own runs of a build with several members are
+  not reversed, because each stream would read the whole build file. A
+  stream's output is still the output of its own probe rows, so the
+  declared output partitioning holds. A reversed join that cannot hold its
+  build falls back to chunks in the partition's own orientation.
+- `hash_join_spill_relief_divisor`: a relief releases the refused bytes and
+  at least 1/N of what the build held (0: the refused bytes only).
+- Metrics `spill_reliefs`, `spill_reversed_runs`, `spill_chunked_runs`,
+  `spill_replay_passes`.
 
 Tests (`spill/tests.rs`, `exec.rs`, `core/tests/memory_limit`): every join
 type, both null equalities, with and without a join filter, in `CollectLeft`
@@ -913,13 +949,18 @@ and reproduction tests; the
 partitions to join are decided after every stream registered its files; a
 spilled build publishes bounds only, in both modes, and filters no matching
 probe row; the `join_by_key_*` memory-limit queries spill and answer in three
-quarters of their build memory, where spilling off fails, and in half of it
-fail at the depth limit with that reason (one `service` value holds about
-half of the rows: the case of `add-join-spill` section 3).
+quarters of their build memory, where spilling off fails, and in half and a
+quarter of it join the partition of one `service` value (about half of the
+rows) in build chunks. Section 3 (`spill/tests/skew.rs`): a hot key and a
+NULL key under `NullEqualsNull` in every join type and shape, the replay
+bound, one join when the partition fits, reversal of every type, reversal
+under pressure, a reversed join that falls back to chunks, and independent
+bits for every pair of levels.
 
 Evidence: Longbow lanes `leto-mjj.90`,
-`~/data/longbow/benchmarks/MJJ90-20261119/`, and `leto-mjj.99`,
-`~/data/longbow/benchmarks/MJJ99-20261119/`.
+`~/data/longbow/benchmarks/MJJ90-20261119/`, `leto-mjj.99`,
+`~/data/longbow/benchmarks/MJJ99-20261119/`, and `leto-mjj.98`,
+`~/data/longbow/benchmarks/MJJ98-20261119/`.
 
 ### Family KB: chunked key-range bitmap
 
