@@ -881,3 +881,15 @@ half of the rows: the case of `add-join-spill` section 3).
 
 Evidence: Longbow lane `leto-mjj.90`,
 `~/data/longbow/benchmarks/MJJ90-20261119/`.
+
+### Family KB: chunked key-range bitmap
+
+UPSTREAMABLE. Longbow's native join passes the concatenated keys of each
+driver directly to `KeyRangeBitmap::try_new_chunks`. Each chunk contributes
+bits to the global range after the existing distinct-key cutoff. The
+single-array constructor shares the same mapping and saturation check.
+The change saves a whole-build copy during native filter publication.
+The regression compares the bits, capacity and bitmap eligibility with
+the single-array path for nullable, sliced keys across 96 chunks.
+
+See Longbow lane `leto-mjj.101`.

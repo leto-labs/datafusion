@@ -3,6 +3,8 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 //! Bitmap over a hash join build side's key range, for container pruning.
+//!
+//! Modified by Leto Labs for Longbow: build one bitmap from driver key chunks.
 
 use arrow::array::{Array, ArrayRef, BooleanArray, downcast_integer_array};
 use arrow::buffer::{BooleanBuffer, MutableBuffer};
@@ -71,7 +73,21 @@ impl KeyRangeBitmap {
         max: &ScalarValue,
         distinct_keys: usize,
     ) -> Option<Self> {
-        if !ArrayMap::is_supported_type(array.data_type()) {
+        Self::try_new_chunks(std::iter::once(array.as_ref()), min, max, distinct_keys)
+    }
+
+    /// Builds the same bitmap as from concatenated keys, adding each chunk
+    /// to the common bitmap. Chunks must have one type and their non-null
+    /// values must lie within `[min, max]`.
+    pub fn try_new_chunks<'a>(
+        arrays: impl IntoIterator<Item = &'a dyn Array>,
+        min: &ScalarValue,
+        max: &ScalarValue,
+        distinct_keys: usize,
+    ) -> Option<Self> {
+        let mut arrays = arrays.into_iter();
+        let first = arrays.next()?;
+        if !ArrayMap::is_supported_type(first.data_type()) {
             return None;
         }
         let offset = ArrayMap::key_to_u64(min)?;
@@ -89,7 +105,14 @@ impl KeyRangeBitmap {
 
         let shift = (0u32..63).find(|s| (span >> s) < buckets).unwrap_or(63);
 
-        let bits = bucket_bits(array, offset, shift, buckets);
+        let mut words = MutableBuffer::new_null(buckets as usize);
+        for keys in std::iter::once(first).chain(arrays) {
+            if keys.data_type() != first.data_type() {
+                return None;
+            }
+            set_bucket_bits(keys, offset, shift, buckets, words.as_slice_mut());
+        }
+        let bits = BooleanBuffer::new(words.into(), 0, buckets as usize);
 
         // Every bucket set means nothing can be excluded.
         let reachable = ((span >> shift) + 1) as usize;
@@ -252,13 +275,6 @@ impl KeyRangeBitmap {
     }
 }
 
-/// One bit per bucket, set for each bucket holding a non-null key of `keys`.
-fn bucket_bits(keys: &dyn Array, offset: u64, shift: u32, buckets: u64) -> BooleanBuffer {
-    let mut words = MutableBuffer::new_null(buckets as usize);
-    set_bucket_bits(keys, offset, shift, buckets, words.as_slice_mut());
-    BooleanBuffer::new(words.into(), 0, buckets as usize)
-}
-
 /// Sets the bit of each bucket holding a non-null key of `keys` in `bytes`.
 fn set_bucket_bits(
     keys: &dyn Array,
@@ -339,6 +355,75 @@ mod tests {
     }
     fn may(b: &KeyRangeBitmap, lo: i64, hi: i64) -> bool {
         b.may_contain_range(lo as u64, hi as u64)
+    }
+
+    #[test]
+    fn chunked_bitmap_matches_concatenated_keys() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::compute::concat;
+
+        let keys = Int64Array::from_iter((0..65_536).map(|i| match i % 7 {
+            0 => None,
+            1 => Some(i64::MIN),
+            2 => Some(i64::MAX),
+            _ => Some((i % 1024) * 1024 - 1_000_000),
+        }));
+        // 96 drivers, with nonzero Arrow offsets and nulls in most chunks.
+        let chunks: Vec<ArrayRef> = (0..96)
+            .map(|i| {
+                let start = i * keys.len() / 96;
+                let end = (i + 1) * keys.len() / 96;
+                Arc::new(keys.slice(start, end - start)) as ArrayRef
+            })
+            .collect();
+        let min = ScalarValue::Int64(Some(i64::MIN));
+        let max = ScalarValue::Int64(Some(i64::MAX));
+        let whole =
+            concat(&chunks.iter().map(AsRef::as_ref).collect::<Vec<_>>()).unwrap();
+        for distinct in [1024, MAX_BUCKETS as usize] {
+            let expected = KeyRangeBitmap::try_new(&whole, &min, &max, distinct);
+            let got = KeyRangeBitmap::try_new_chunks(
+                chunks.iter().map(AsRef::as_ref),
+                &min,
+                &max,
+                distinct,
+            );
+            assert_eq!(
+                got.as_ref().map(|b| &b.bits),
+                expected.as_ref().map(|b| &b.bits)
+            );
+            assert_eq!(
+                got.as_ref().map(KeyRangeBitmap::size),
+                expected.as_ref().map(KeyRangeBitmap::size)
+            );
+        }
+
+        let supported = Int32Array::from(vec![Some(-4096), None, Some(4096)]);
+        let unsupported = StringArray::from(vec!["key"]);
+        let min = ScalarValue::Int32(Some(-4096));
+        let max = ScalarValue::Int32(Some(4096));
+        assert!(
+            KeyRangeBitmap::try_new_chunks(
+                [&supported as &dyn Array, &unsupported],
+                &min,
+                &max,
+                2,
+            )
+            .is_none()
+        );
+
+        let even = Int64Array::from_iter_values((0..32).step_by(2));
+        let odd = Int64Array::from_iter_values((1..32).step_by(2));
+        assert!(
+            KeyRangeBitmap::try_new_chunks(
+                [&even as &dyn Array, &odd],
+                &ScalarValue::Int64(Some(0)),
+                &ScalarValue::Int64(Some(31)),
+                0,
+            )
+            .is_none(),
+            "collectively saturated"
+        );
     }
 
     #[test]
