@@ -182,6 +182,12 @@ impl ParallelBuild {
 
     /// A power of two: at most one per thread, at least [`MIN_SHARD_ROWS`]
     /// rows each; 1 means the native build.
+    /// Longbow patch (JT 9): whether a build of `rows` rows takes the
+    /// parallel path (unless its pool refuses the transient lists).
+    pub(super) fn is_parallel(&self, rows: usize) -> bool {
+        self.shards(rows) >= 2
+    }
+
     fn shards(&self, rows: usize) -> usize {
         if rows < self.min_rows || rows >= u32::MAX as usize {
             return 1;

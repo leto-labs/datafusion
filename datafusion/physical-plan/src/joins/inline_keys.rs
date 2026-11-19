@@ -479,6 +479,21 @@ impl DenseKeys {
         Ok(Self { encoding, keys })
     }
 
+    /// Keys that the build encoded already, one per build row.
+    pub fn from_parts(encoding: InlineKeys, keys: Vec<u64>) -> Self {
+        Self { encoding, keys }
+    }
+
+    /// The number of keys.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether there are no keys.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
     /// Bytes of the keys.
     pub fn bytes_for(rows: usize) -> usize {
         rows * size_of::<u64>()

@@ -867,6 +867,12 @@ pub fn huge_page_advice() -> bool {
 pub struct SlotLayout {
     head_bits: u32,
     key_bits: u32,
+    /// Precomputed: `head_bits + 1 + key_bits`, and the masks of the head,
+    /// the key and the tag.
+    tag_shift: u32,
+    head_mask: u64,
+    key_mask: u64,
+    tag_mask: u64,
 }
 
 /// The fewest hash bits that a [`PackedU64`] slot keeps as its tag. Two
@@ -884,21 +890,25 @@ impl SlotLayout {
             return None;
         }
         let head_bits = (u64::BITS - (rows as u64).leading_zeros()).max(1);
-        let used = head_bits + 1 + key_bits;
-        (used + MIN_TAG_BITS <= u64::BITS).then_some(Self {
+        let tag_shift = head_bits + 1 + key_bits;
+        (tag_shift + MIN_TAG_BITS <= u64::BITS).then_some(Self {
             head_bits,
             key_bits,
+            tag_shift,
+            head_mask: low_bits(head_bits),
+            key_mask: low_bits(key_bits),
+            tag_mask: low_bits(u64::BITS - tag_shift),
         })
     }
 
     #[inline(always)]
     fn tag_shift(self) -> u32 {
-        self.head_bits + 1 + self.key_bits
+        self.tag_shift
     }
 
-    #[inline(always)]
+    #[cfg(test)]
     fn tag_bits(self) -> u32 {
-        u64::BITS - self.tag_shift()
+        u64::BITS - self.tag_shift
     }
 
     /// The bits of the inline key.
@@ -1047,16 +1057,13 @@ impl HeadWord for PackedU64 {
 
     #[inline(always)]
     fn tag(layout: SlotLayout, hash: u64) -> u64 {
-        hash & low_bits(layout.tag_bits())
+        hash & layout.tag_mask
     }
 
     #[inline(always)]
     fn read(layout: SlotLayout, words: &[u64], slot: usize) -> (u64, u64) {
         let word = words[slot];
-        (
-            word >> layout.tag_shift(),
-            word & low_bits(layout.head_bits),
-        )
+        (word >> layout.tag_shift(), word & layout.head_mask)
     }
 
     #[inline(always)]
@@ -1069,8 +1076,8 @@ impl HeadWord for PackedU64 {
         key: u64,
         mixed: bool,
     ) {
-        debug_assert!(head <= low_bits(layout.head_bits));
-        debug_assert!(key <= low_bits(layout.key_bits));
+        debug_assert!(head <= layout.head_mask);
+        debug_assert!(key <= layout.key_mask);
         words[slot] = (tag << layout.tag_shift())
             | (key << (layout.head_bits + 1))
             | (u64::from(mixed) << layout.head_bits)
@@ -1085,7 +1092,7 @@ impl HeadWord for PackedU64 {
     #[inline(always)]
     fn head_of(layout: SlotLayout, row: usize) -> u64 {
         let head = row as u64 + 1;
-        assert!(head <= low_bits(layout.head_bits), "inline join map row");
+        assert!(head <= layout.head_mask, "inline join map row");
         head
     }
 
@@ -1093,7 +1100,7 @@ impl HeadWord for PackedU64 {
     fn read_key(layout: SlotLayout, words: &[u64], slot: usize) -> (u64, bool) {
         let word = words[slot];
         (
-            (word >> (layout.head_bits + 1)) & low_bits(layout.key_bits),
+            (word >> (layout.head_bits + 1)) & layout.key_mask,
             (word >> layout.head_bits) & 1 != 0,
         )
     }
@@ -1423,11 +1430,15 @@ pub trait PartitionedBuild: JoinHashMapType {
 
 /// Transient bytes of [`build_partitioned`] for `rows` build rows: a hash
 /// for every row, then the scattered hashes and row numbers; with `inline`
-/// keys also the scattered keys (each batch's keys live only while it is
-/// scattered).
+/// keys the scattered row numbers are words that also hold the keys (each
+/// batch's keys live only while it is scattered).
 pub fn partitioned_build_bytes(rows: usize, inline: bool) -> usize {
-    let keys = if inline { size_of::<u64>() } else { 0 };
-    rows * (2 * size_of::<u64>() + size_of::<u32>() + keys)
+    let row = if inline {
+        size_of::<u64>()
+    } else {
+        size_of::<u32>()
+    };
+    rows * (2 * size_of::<u64>() + row)
 }
 
 macro_rules! partitioned_build {
@@ -1496,32 +1507,46 @@ impl<T: HeadWord> HeadTable<T> {
         }
         let total = starts[starts.len() - 1];
         let mut scattered_hashes = vec![0_u64; total];
+        if T::INLINE {
+            // Longbow patch (JT 9): an inline table scatters each row with
+            // its key (encoded batch by batch) in one word, key above row.
+            let row_bits = self.layout.head_bits;
+            let mut scattered = vec![0_u64; total];
+            rows.rows_with_keys(|row, hash, key| {
+                let at = &mut starts[partition_of(hash)];
+                scattered_hashes[*at] = hash;
+                scattered[*at] = (key << row_bits) | row as u64;
+                *at += 1;
+                Ok(())
+            })?;
+            let row_mask = low_bits(row_bits);
+            return self.insert_all(
+                scattered
+                    .iter()
+                    .zip(&scattered_hashes)
+                    .map(|(&word, &hash)| {
+                        ((word & row_mask) as usize, hash, word >> row_bits)
+                    }),
+                row_bound,
+                previous,
+            );
+        }
         let mut scattered_rows = vec![0_u32; total];
-        // Longbow patch (JT 9): an inline table also scatters the keys,
-        // encoded batch by batch.
-        let mut scattered_keys = vec![0_u64; if T::INLINE { total } else { 0 }];
-        rows.rows_with_keys(|row, hash, key| {
+        for row in rows.rows() {
+            let hash = hashes[row];
             let at = &mut starts[partition_of(hash)];
             scattered_hashes[*at] = hash;
-            if T::INLINE {
-                scattered_keys[*at] = key;
-            }
             scattered_rows[*at] = u32::try_from(row).map_err(|_| {
                 internal_datafusion_err!("partitioned join build above u32 rows")
             })?;
             *at += 1;
-            Ok(())
-        })?;
+        }
         // In partition order and, within a partition, in the given order.
         self.insert_all(
             scattered_rows
                 .iter()
                 .zip(&scattered_hashes)
-                .enumerate()
-                .map(|(at, (&row, &hash))| {
-                    let key = if T::INLINE { scattered_keys[at] } else { 0 };
-                    (row as usize, hash, key)
-                }),
+                .map(|(&row, &hash)| (row as usize, hash, 0)),
             row_bound,
             previous,
         )
@@ -1542,7 +1567,9 @@ impl<T: HeadWord> HeadTable<T> {
 /// failing a query that fits without the partitioning.
 ///
 /// Longbow patch (JT 9): with `inline` keys, every row's encoded key goes
-/// to the map beside its hash.
+/// to the map beside its hash. With `dense` keys, every row's encoded key is
+/// appended to the given vector (charged by the caller) in row order, while
+/// the key columns are hashed.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn build_partitioned<'a, M: PartitionedBuild>(
     map: &mut M,
@@ -1552,6 +1579,7 @@ pub(crate) fn build_partitioned<'a, M: PartitionedBuild>(
     random_state: &datafusion_common::hash_utils::RandomState,
     null_equality: datafusion_common::NullEquality,
     inline: Option<&InlineKeys>,
+    mut dense: Option<(&InlineKeys, &mut Vec<u64>)>,
     reservation: &mut datafusion_execution::memory_pool::MemoryReservation,
 ) -> Result<Option<usize>> {
     let transient = partitioned_build_bytes(num_rows, inline.is_some());
@@ -1575,6 +1603,9 @@ pub(crate) fn build_partitioned<'a, M: PartitionedBuild>(
                 ));
             };
             datafusion_common::hash_utils::create_hashes(&keys, random_state, slice)?;
+            if let Some((encoding, out)) = dense.as_mut() {
+                out.extend_from_slice(&encoding.encode_build(&keys)?);
+            }
             let valid = crate::joins::utils::matchable_join_keys(&keys, null_equality);
             layout.push((offset, rows, valid));
             offset += rows;
@@ -3283,6 +3314,7 @@ mod tests {
                 &random_state,
                 null_equality,
                 None,
+                None,
                 &mut reservation,
             )
             .unwrap();
@@ -3442,6 +3474,7 @@ mod tests {
             rows,
             &RandomState::with_seed(0),
             NullEquality::NullEqualsNothing,
+            None,
             None,
             &mut reservation,
         )

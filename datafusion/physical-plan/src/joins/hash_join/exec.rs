@@ -3028,7 +3028,8 @@ fn is_perfect_hash_join_candidate(
 /// built row by row (its build keys then mostly stay in the cache), the
 /// build has too many rows, or the keys have no encoding
 /// ([`InlineKeys`]). The key columns' ranges come from the build's
-/// dynamic-filter `bounds` when present, else from a scan of the keys.
+/// dynamic-filter `bounds` when present, else from a scan of the keys,
+/// unless `bounds_only` (a parallel build, which a serial scan would delay).
 fn inline_keys_for_build(
     on_left: &[PhysicalExprRef],
     schema: &SchemaRef,
@@ -3036,6 +3037,7 @@ fn inline_keys_for_build(
     bounds: Option<&PartitionBounds>,
     num_rows: usize,
     null_equality: NullEquality,
+    bounds_only: bool,
 ) -> Result<Option<InlineKeys>> {
     if !inline_keys_enabled()
         || num_rows >= u32::MAX as usize
@@ -3071,6 +3073,9 @@ fn inline_keys_for_build(
         if ranges.iter().all(Option::is_some) {
             return Ok(InlineKeys::from_ranges(&types, &ranges));
         }
+    }
+    if bounds_only {
+        return Ok(None);
     }
     let keys = batches
         .iter()
@@ -3345,7 +3350,15 @@ async fn collect_left_input(
 
     // Longbow patch (JT 9): large tables keep the build keys beside their
     // chain heads when they fit the slots; several key columns that fit 64
-    // bits but not the slots keep a dense array of encoded keys instead.
+    // bits but not the slots keep a dense array of encoded keys instead,
+    // encoded while a partitioned build hashes them. A parallel build takes
+    // only inline keys whose ranges the dynamic-filter bounds already give:
+    // a serial scan of the keys, or a serial encoding of the consolidated
+    // keys, would delay the whole build.
+    let parallel_build = !prepared
+        && parallel
+            .as_ref()
+            .is_some_and(|parallel| parallel.is_parallel(num_rows));
     let (inline, dense) = match inline_keys_for_build(
         &on_left,
         &schema,
@@ -3353,11 +3366,12 @@ async fn collect_left_input(
         bounds.as_ref(),
         num_rows,
         null_equality,
+        parallel_build,
     )? {
         Some(keys) if JoinHashMapInline::layout_for(num_rows, &keys).is_some() => {
             (Some(keys), None)
         }
-        Some(keys) if keys.columns_len() > 1 => (None, Some(keys)),
+        Some(keys) if keys.columns_len() > 1 && !parallel_build => (None, Some(keys)),
         _ => (None, None),
     };
 
@@ -3445,6 +3459,14 @@ fn build_in_memory(
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
 
     let compact = matches!(path, BuildPath::Compacted);
+    // Longbow patch (JT 9): dense keys are charged before any is encoded;
+    // a partitioned build encodes them while it hashes.
+    if dense.is_some() {
+        let bytes = DenseKeys::bytes_for(num_rows);
+        reservation.try_grow(bytes)?;
+        metrics.build_mem_used.add(bytes);
+    }
+    let mut dense_rows: Option<Vec<u64>> = None;
     // Longbow patch (JT): the reservation's size while a partitioned build
     // held its transient arrays.
     let mut partitioned_peak = None;
@@ -3503,6 +3525,7 @@ fn build_in_memory(
                     random_state,
                     null_equality,
                     Some(&encoding),
+                    None,
                     &mut reservation,
                 )? {
                     Some(peak) => {
@@ -3526,6 +3549,7 @@ fn build_in_memory(
             && JoinHashMapU32::partitions_build(num_rows)
         {
             let mut map = new_join_hashmap_u32(num_rows, &mut reservation, metrics)?;
+            let mut rows = dense.as_ref().map(|_| Vec::with_capacity(num_rows));
             if let Some(peak) = build_partitioned(
                 &mut map,
                 on_left,
@@ -3534,10 +3558,12 @@ fn build_in_memory(
                 random_state,
                 null_equality,
                 None,
+                dense.as_ref().zip(rows.as_mut()),
                 &mut reservation,
             )? {
                 partitioned_peak = Some(peak);
                 partitioned = true;
+                dense_rows = rows.filter(|rows| rows.len() == num_rows);
             }
             Box::new(map)
         } else {
@@ -3604,16 +3630,12 @@ fn build_in_memory(
         (batch, left_values)
     };
 
-    // Longbow patch (JT 9): the encoded keys of a hash-only map, charged
-    // before they are allocated.
-    let dense_keys = match dense {
-        Some(encoding) if matches!(join_hash_map, Map::HashMap(_)) => {
-            let bytes = DenseKeys::bytes_for(num_rows);
-            reservation.try_grow(bytes)?;
-            metrics.build_mem_used.add(bytes);
-            Some(DenseKeys::try_new(encoding, &left_values)?)
-        }
-        _ => None,
+    // Longbow patch (JT 9): the encoded keys of a hash-only map (charged
+    // above), from the partitioned build or else from the build keys.
+    let dense_keys = match (dense, dense_rows) {
+        (Some(encoding), Some(rows)) => Some(DenseKeys::from_parts(encoding, rows)),
+        (Some(encoding), None) => Some(DenseKeys::try_new(encoding, &left_values)?),
+        (None, _) => None,
     };
 
     // Rewrite float `-0.0` to `+0.0` once here, so the per probe batch key
