@@ -33,8 +33,10 @@ use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
 use crate::joins::hash_join::visited::VisitedBitmap;
+use crate::joins::inline_keys::{self, DenseKeys, InlineKeys, inline_keys_enabled};
 use crate::joins::join_hash_map::{
-    JoinHashMapU32, JoinHashMapU64, PartitionedBuild, build_partitioned,
+    JoinHashMapInline, JoinHashMapU32, JoinHashMapU64, PartitionedBuild,
+    build_partitioned,
 };
 use crate::joins::key_range_bitmap::KeyRangeBitmap;
 use crate::joins::probe_completion::{Completion, ProbeCompletion};
@@ -106,6 +108,8 @@ use super::partitioned_hash_eval::SeededRandomState;
 
 mod prepared;
 pub use prepared::PreparedHashJoinBuild;
+#[cfg(test)]
+mod jt9_review_tests;
 mod shared_build;
 #[cfg(test)]
 mod shared_build_tests;
@@ -220,6 +224,9 @@ struct JoinBuildData {
     bounds: Option<PartitionBounds>,
     /// IN-list values or a hash-table reference used for filter pushdown.
     membership: PushdownStrategy,
+    /// Longbow patch (JT 9): the encoded key of every build row, for keys
+    /// that fit 64 bits but not the map's slots.
+    dense_keys: Option<DenseKeys>,
     // Keep the reservation after the allocations it accounts for.
     reservation: MemoryReservation,
 }
@@ -282,6 +289,12 @@ impl JoinLeftData {
     /// NULL masks were derived from the original keys instead.
     pub(super) fn values(&self) -> &[ArrayRef] {
         &self.build.values
+    }
+
+    /// Longbow patch (JT 9): the encoded build keys of a map without inline
+    /// keys, when the keys fit 64 bits.
+    pub(super) fn dense_keys(&self) -> Option<&DenseKeys> {
+        self.build.dense_keys.as_ref()
     }
 
     /// returns a reference to the visited indices bitmap
@@ -3081,6 +3094,88 @@ fn is_perfect_hash_join_candidate(
     Ok(ArrayMap::is_supported_type(&data_type))
 }
 
+/// Longbow patch (JT 9): the inline-key encoding of a build of `num_rows`
+/// rows, or `None` when its table keeps only hashes: inline keys are off
+/// ([`inline_keys::INLINE_KEYS_ENV`]), the table is small enough to be
+/// built row by row (its build keys then mostly stay in the cache), the
+/// build has too many rows, or the keys have no encoding
+/// ([`InlineKeys`]). The key columns' ranges come from the build's
+/// dynamic-filter `bounds` when present, else from a scan of the keys,
+/// unless `bounds_only` (a parallel build, which a serial scan would delay).
+fn inline_keys_for_build(
+    on_left: &[PhysicalExprRef],
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    bounds: Option<&PartitionBounds>,
+    num_rows: usize,
+    null_equality: NullEquality,
+    bounds_only: bool,
+) -> Result<Option<InlineKeys>> {
+    if !inline_keys_enabled()
+        || num_rows >= u32::MAX as usize
+        || !JoinHashMapU32::partitions_build(num_rows)
+    {
+        return Ok(None);
+    }
+    let types = on_left
+        .iter()
+        .map(|expr| expr.data_type(schema))
+        .collect::<Result<Vec<_>>>()?;
+    if !types.iter().all(inline_keys::is_supported) {
+        return Ok(None);
+    }
+    let scalar = |value: &datafusion_common::ScalarValue| {
+        value
+            .to_array_of_size(1)
+            .ok()
+            .and_then(|array| inline_keys::min_max(array.as_ref()))
+            .map(|(value, _)| value)
+    };
+    // `UInt64` bounds are ordered unsigned, the encoding's ranges signed.
+    if null_equality == NullEquality::NullEqualsNothing
+        && !types.contains(&DataType::UInt64)
+        && let Some(bounds) = bounds
+    {
+        let ranges = (0..on_left.len())
+            .map(|index| {
+                let bound = bounds.get_column_bounds(index)?;
+                Some((scalar(&bound.min)?, scalar(&bound.max)?))
+            })
+            .collect::<Vec<_>>();
+        if ranges.iter().all(Option::is_some) {
+            return Ok(InlineKeys::from_ranges(&types, &ranges));
+        }
+    }
+    if bounds_only {
+        return Ok(None);
+    }
+    let keys = batches
+        .iter()
+        .map(|batch| evaluate_expressions_to_arrays(on_left, batch))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(InlineKeys::for_build(&keys, null_equality))
+}
+
+/// Longbow patch (JT 9): the inline map of a partitioned build, reserving
+/// its head table (which can exceed hashbrown's estimate) and chain array.
+fn new_join_hashmap_inline(
+    num_rows: usize,
+    keys: InlineKeys,
+    reservation: &mut MemoryReservation,
+    metrics: &BuildProbeJoinMetrics,
+) -> Result<(JoinHashMapInline, usize)> {
+    let fixed_size = size_of::<JoinHashMapInline>();
+    let bytes = estimate_memory_size::<(u32, u64)>(num_rows, fixed_size)?
+        .max(JoinHashMapInline::table_bytes(num_rows) + fixed_size)
+        .checked_add(num_rows * size_of::<u32>())
+        .ok_or_else(|| {
+            datafusion_common::exec_datafusion_err!("Hash join table size overflow")
+        })?;
+    reservation.try_grow(bytes)?;
+    metrics.build_mem_used.add(bytes);
+    Ok((JoinHashMapInline::with_capacity(num_rows, keys), bytes))
+}
+
 /// Longbow patch (JT): the `u32` map of [`new_join_hashmap`], with the same
 /// reservation, for the partitioned build of `collect_left_input`.
 fn new_join_hashmap_u32(
@@ -3436,6 +3531,42 @@ async fn collect_left_input(
         _ => None,
     };
 
+    // Longbow patch (JT 9): a parallel (sharded) build keeps the build keys
+    // beside its chain heads when they fit the slots, encoded in its
+    // parallel hash pass, and only with ranges that the dynamic-filter
+    // bounds already give (a serial scan would delay the whole build). A
+    // partitioned build of several key columns keeps a dense array of
+    // encoded keys instead, encoded while it hashes them; one of a single
+    // key column keeps hashes only (measured: its inline keys cost the
+    // scatter more than its probe gained, leto-mjj.71).
+    let parallel_build = !prepared
+        && parallel
+            .as_ref()
+            .is_some_and(|parallel| parallel.is_parallel(num_rows));
+    let keys = if parallel_build || on_left.len() > 1 {
+        inline_keys_for_build(
+            &on_left,
+            &schema,
+            &batches,
+            bounds.as_ref(),
+            num_rows,
+            null_equality,
+            parallel_build,
+        )?
+    } else {
+        None
+    };
+    let (inline, dense) = match keys {
+        Some(keys)
+            if parallel_build
+                && JoinHashMapInline::layout_for(num_rows, &keys).is_some() =>
+        {
+            (Some(keys), None)
+        }
+        Some(keys) if !parallel_build && keys.columns_len() > 1 => (None, Some(keys)),
+        _ => (None, None),
+    };
+
     // Longbow family H: a CollectLeft build of at least
     // `longbow.execution.parallel_hash_build_rows` rows builds one sharded
     // table in parallel and consolidates `batches` itself (see
@@ -3454,6 +3585,7 @@ async fn collect_left_input(
                 &on_left,
                 &random_state,
                 null_equality,
+                inline.clone(),
                 &mut reservation,
                 &metrics,
             )
@@ -3484,6 +3616,8 @@ async fn collect_left_input(
             &array_map_created_count,
             prepared,
             path,
+            inline,
+            dense,
         )
     });
     match (result, fallback) {
@@ -3563,6 +3697,10 @@ fn build_chunk(
         array_map_created_count,
         false,
         BuildPath::Native,
+        // A build chunk's table keeps only hashes, as the other spill
+        // builds (family JT 9).
+        None,
+        None,
     )?;
     let table = pool.reserved();
     let headroom = chunk.take_headroom();
@@ -3636,6 +3774,10 @@ fn build_spilled(
                 array_map_created_count,
                 false,
                 BuildPath::Native,
+                // The table of a spilling build's in-memory partitions keeps
+                // only hashes.
+                None,
+                None,
             )
         })?;
     if spilled.is_some() {
@@ -3674,6 +3816,150 @@ fn build_in_memory(
     on_left: &[PhysicalExprRef],
     metrics: &BuildProbeJoinMetrics,
     reservation: &mut MemoryReservation,
+    bounds: Option<PartitionBounds>,
+    with_visited_indices_bitmap: bool,
+    probe_threads_count: usize,
+    should_compute_dynamic_filters: bool,
+    config: &ConfigOptions,
+    null_equality: NullEquality,
+    not_in: Option<NotIn>,
+    array_map_created_count: &Count,
+    prepared: bool,
+    path: BuildPath,
+    inline: Option<InlineKeys>,
+    dense: Option<InlineKeys>,
+) -> Result<JoinLeftData> {
+    // Longbow patch (JT 9): dense keys are optional. When a build that holds
+    // them is refused memory, it is built once more without them, from the
+    // rows it still holds, so a build that fits with inline keys off also
+    // fits with them on. Dense keys never come with a prebuilt (parallel)
+    // map, whose map the first attempt would consume.
+    let retry = match (&dense, &path) {
+        (Some(_), BuildPath::Native) => Some(BuildPath::Native),
+        (Some(_), BuildPath::Compacted) => Some(BuildPath::Compacted),
+        _ => None,
+    };
+    let Some(retry_path) = retry else {
+        return build_in_memory_once(
+            random_state,
+            schema,
+            batches,
+            num_rows,
+            max_batch_rows,
+            input_bytes,
+            copy_bytes,
+            on_left,
+            metrics,
+            reservation,
+            bounds,
+            with_visited_indices_bitmap,
+            probe_threads_count,
+            should_compute_dynamic_filters,
+            config,
+            null_equality,
+            not_in,
+            array_map_created_count,
+            prepared,
+            path,
+            inline,
+            dense,
+        );
+    };
+    let (held_before, used_before, batches_before) = (
+        reservation.size(),
+        metrics.build_mem_used.value(),
+        batches.len(),
+    );
+    let first = build_in_memory_once(
+        random_state,
+        schema,
+        batches,
+        num_rows,
+        max_batch_rows,
+        input_bytes,
+        copy_bytes,
+        on_left,
+        metrics,
+        reservation,
+        bounds.clone(),
+        with_visited_indices_bitmap,
+        probe_threads_count,
+        should_compute_dynamic_filters,
+        config,
+        null_equality,
+        not_in,
+        array_map_created_count,
+        prepared,
+        path,
+        inline.clone(),
+        dense,
+    );
+    match first {
+        Err(error) if spill::is_refusal(&error) => {
+            // Everything the attempt allocated is dropped; `batches` still
+            // holds every build row, possibly concatenated into one batch
+            // (whose charge the concatenation adopted). Charge exactly what
+            // the batches hold again, and nothing of the attempt.
+            let held_rows = if batches.len() == batches_before {
+                input_bytes
+            } else {
+                // As `concat_build_batches` charges the concatenated batch.
+                batches.iter().map(get_record_batch_memory_size).sum()
+            };
+            let held = held_before.saturating_sub(input_bytes) + held_rows;
+            if reservation.size() > held {
+                reservation.shrink(reservation.size() - held);
+            } else {
+                reservation.try_grow(held - reservation.size())?;
+            }
+            // The gauge of this build alone: back to before the attempt,
+            // with the rows as they are held now.
+            metrics
+                .build_mem_used
+                .set((used_before + held_rows).saturating_sub(input_bytes));
+            build_in_memory_once(
+                random_state,
+                schema,
+                batches,
+                num_rows,
+                max_batch_rows,
+                held_rows,
+                copy_bytes,
+                on_left,
+                metrics,
+                reservation,
+                bounds,
+                with_visited_indices_bitmap,
+                probe_threads_count,
+                should_compute_dynamic_filters,
+                config,
+                null_equality,
+                not_in,
+                array_map_created_count,
+                prepared,
+                retry_path,
+                inline,
+                None,
+            )
+        }
+        result => result,
+    }
+}
+
+/// One attempt of [`build_in_memory`] (Longbow patch JT 9: with or without
+/// dense keys).
+#[expect(clippy::too_many_arguments)]
+fn build_in_memory_once(
+    random_state: &RandomState,
+    schema: &SchemaRef,
+    batches: &mut Vec<RecordBatch>,
+    num_rows: usize,
+    max_batch_rows: usize,
+    input_bytes: usize,
+    copy_bytes: usize,
+    on_left: &[PhysicalExprRef],
+    metrics: &BuildProbeJoinMetrics,
+    reservation: &mut MemoryReservation,
     mut bounds: Option<PartitionBounds>,
     with_visited_indices_bitmap: bool,
     probe_threads_count: usize,
@@ -3684,10 +3970,24 @@ fn build_in_memory(
     array_map_created_count: &Count,
     prepared: bool,
     path: BuildPath,
+    inline: Option<InlineKeys>,
+    dense: Option<InlineKeys>,
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
 
     let compact = matches!(path, BuildPath::Compacted);
+    // Longbow patch (JT 9): dense keys are charged before any is encoded (a
+    // partitioned build encodes them while it hashes); a pool that refuses
+    // them gets the key comparison instead.
+    let dense = dense.filter(|_| {
+        let bytes = DenseKeys::bytes_for(num_rows);
+        let admitted = reservation.try_grow(bytes).is_ok();
+        if admitted {
+            metrics.build_mem_used.add(bytes);
+        }
+        admitted
+    });
+    let mut dense_rows: Option<Vec<u64>> = None;
     // Longbow patch (JT): the reservation's size while a partitioned build
     // held its transient arrays.
     let mut partitioned_peak = None;
@@ -3730,10 +4030,47 @@ fn build_in_memory(
         // as the loop below. A pool that refuses the partitioning's transient
         // arrays gets the row-by-row build instead of an error.
         let mut partitioned = false;
-        let mut hashmap: Box<dyn JoinHashMapType> = if num_rows <= u32::MAX as usize
+        // Longbow patch (JT 9): an inline map is only built partitioned; when
+        // the pool refuses that build's transient arrays, the map is released
+        // and a hash-only map is built row by row.
+        let inline_map = match inline {
+            Some(keys) => {
+                let encoding = keys.clone();
+                let (mut map, bytes) =
+                    new_join_hashmap_inline(num_rows, keys, reservation, metrics)?;
+                match build_partitioned(
+                    &mut map,
+                    on_left,
+                    batches,
+                    num_rows,
+                    random_state,
+                    null_equality,
+                    Some(&encoding),
+                    None,
+                    reservation,
+                )? {
+                    Some(peak) => {
+                        partitioned_peak = Some(peak);
+                        partitioned = true;
+                        Some(Box::new(map) as Box<dyn JoinHashMapType>)
+                    }
+                    None => {
+                        drop(map);
+                        reservation.shrink(bytes);
+                        metrics.build_mem_used.sub(bytes);
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let mut hashmap: Box<dyn JoinHashMapType> = if let Some(map) = inline_map {
+            map
+        } else if num_rows <= u32::MAX as usize
             && JoinHashMapU32::partitions_build(num_rows)
         {
             let mut map = new_join_hashmap_u32(num_rows, reservation, metrics)?;
+            let mut rows = dense.as_ref().map(|_| Vec::with_capacity(num_rows));
             if let Some(peak) = build_partitioned(
                 &mut map,
                 on_left,
@@ -3741,10 +4078,13 @@ fn build_in_memory(
                 num_rows,
                 random_state,
                 null_equality,
+                None,
+                dense.as_ref().zip(rows.as_mut()),
                 reservation,
             )? {
                 partitioned_peak = Some(peak);
                 partitioned = true;
+                dense_rows = rows.filter(|rows| rows.len() == num_rows);
             }
             Box::new(map)
         } else {
@@ -3809,6 +4149,14 @@ fn build_in_memory(
         )?
     } else {
         (batch, left_values)
+    };
+
+    // Longbow patch (JT 9): the encoded keys of a hash-only map (charged
+    // above), from the partitioned build or else from the build keys.
+    let dense_keys = match (dense, dense_rows) {
+        (Some(encoding), Some(rows)) => Some(DenseKeys::from_parts(encoding, rows)),
+        (Some(encoding), None) => Some(DenseKeys::try_new(encoding, &left_values)?),
+        (None, _) => None,
     };
 
     // Rewrite float `-0.0` to `+0.0` once here, so the per probe batch key
@@ -3955,6 +4303,7 @@ fn build_in_memory(
             values: normalized_values,
             bounds,
             membership,
+            dense_keys,
             reservation: reservation.take(),
         }),
         not_in,

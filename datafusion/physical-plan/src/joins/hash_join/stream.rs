@@ -21,6 +21,7 @@ use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
 };
 use crate::joins::hash_join::spill::StreamSpill;
+use crate::joins::inline_keys::{DenseKeys, EncodedKeys};
 use crate::joins::join_hash_map::ProbeOffset;
 use crate::joins::join_hash_map::ProbeOffset::AtRow;
 use crate::joins::probe_completion::{Completion, ProbeSideSummary};
@@ -38,6 +39,13 @@ use crate::{
         need_produce_result_in_final,
     },
 };
+
+/// Longbow patch (JT 9), test instrumentation from the leto-mjj.71 review: probe
+/// chunks answered by the packed-slot probe, the dense-key filter and the
+/// key comparison, so a differential test can report which path it ran.
+#[cfg(test)]
+pub(crate) static JT9_REVIEW_PROBES: [std::sync::atomic::AtomicUsize; 3] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
 
 use arrow::array::{Array, ArrayRef, UInt32Array, UInt64Array};
 use arrow::buffer::{BooleanBuffer, NullBuffer};
@@ -192,6 +200,9 @@ pub(super) struct ProcessProbeBatchState {
     /// Key comparator for this batch, built on first use and reused by every
     /// chunk
     key_comparator: Option<JoinKeyComparator>,
+    /// Longbow patch (JT 9): the probe keys in the encoding of the build
+    /// map's inline keys, when it has them and the probe key types match.
+    inline_keys: Option<EncodedKeys>,
 }
 
 impl ProcessProbeBatchState {
@@ -826,7 +837,8 @@ impl HashJoinStream {
                 // Precalculate hash values for fetched batch
                 let keys_values = evaluate_expressions_to_arrays(&self.on_right, &batch)?;
 
-                let valid_keys = if let Map::HashMap(_) =
+                let mut inline_keys = None;
+                let valid_keys = if let Map::HashMap(map) =
                     self.build_side.try_as_ready()?.left_data.map()
                 {
                     self.hashes_buffer.clear();
@@ -836,6 +848,11 @@ impl HashJoinStream {
                         &self.random_state,
                         &mut self.hashes_buffer,
                     )?;
+                    let left_data = &self.build_side.try_as_ready()?.left_data;
+                    inline_keys = map
+                        .inline_keys()
+                        .or_else(|| left_data.dense_keys().map(DenseKeys::encoding))
+                        .and_then(|encoding| encoding.encode(&keys_values));
                     matchable_join_keys(&keys_values, self.null_equality)
                 } else {
                     None
@@ -853,6 +870,7 @@ impl HashJoinStream {
                         joined_probe_idx: None,
                         matched_probe_idx: None,
                         key_comparator: None,
+                        inline_keys,
                     });
             }
             Some(Err(err)) => return Poll::Ready(Err(err)),
@@ -922,19 +940,73 @@ impl HashJoinStream {
         // get the matched by join keys indices
         let (left_indices, right_indices, next_offset) = match build_side.left_data.map()
         {
-            Map::HashMap(map) => lookup_join_hashmap(
-                map.as_ref(),
-                build_side.left_data.values(),
-                &state.values,
-                self.null_equality,
-                &self.hashes_buffer,
-                state.valid_keys.as_ref(),
-                self.batch_size,
-                state.offset,
-                &mut self.probe_indices_buffer,
-                &mut self.build_indices_buffer,
-                &mut state.key_comparator,
-            )?,
+            // Longbow patch (JT 9): the inline-key probe emits only pairs
+            // with equal keys, so no key comparison follows.
+            Map::HashMap(map)
+                if let Some(probe) = &state.inline_keys
+                    && map.inline_keys().is_some() =>
+            {
+                #[cfg(test)]
+                JT9_REVIEW_PROBES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let next_offset = map.get_inline_matched_indices_with_limit_offset(
+                    &self.hashes_buffer,
+                    probe,
+                    build_side.left_data.values(),
+                    self.batch_size,
+                    state.offset,
+                    &mut self.probe_indices_buffer,
+                    &mut self.build_indices_buffer,
+                )?;
+                let build_indices: UInt64Array =
+                    std::mem::take(&mut self.build_indices_buffer).into();
+                let probe_indices: UInt32Array =
+                    std::mem::take(&mut self.probe_indices_buffer).into();
+                array_map_buffers = Some((
+                    build_indices.values().clone(),
+                    probe_indices.values().clone(),
+                ));
+                (build_indices, probe_indices, next_offset)
+            }
+            // Longbow patch (JT 9): dense build keys replace the key
+            // comparison of the hash-only candidates.
+            Map::HashMap(map)
+                if let Some(probe) = &state.inline_keys
+                    && let Some(dense) = build_side.left_data.dense_keys() =>
+            {
+                #[cfg(test)]
+                JT9_REVIEW_PROBES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let next_offset = map.get_matched_indices_with_limit_offset(
+                    &self.hashes_buffer,
+                    state.valid_keys.as_ref(),
+                    self.batch_size,
+                    state.offset,
+                    &mut self.probe_indices_buffer,
+                    &mut self.build_indices_buffer,
+                );
+                let (build_indices, probe_indices) = dense.filter(
+                    &self.build_indices_buffer,
+                    &self.probe_indices_buffer,
+                    probe,
+                );
+                (build_indices.into(), probe_indices.into(), next_offset)
+            }
+            Map::HashMap(map) => {
+                #[cfg(test)]
+                JT9_REVIEW_PROBES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                lookup_join_hashmap(
+                    map.as_ref(),
+                    build_side.left_data.values(),
+                    &state.values,
+                    self.null_equality,
+                    &self.hashes_buffer,
+                    state.valid_keys.as_ref(),
+                    self.batch_size,
+                    state.offset,
+                    &mut self.probe_indices_buffer,
+                    &mut self.build_indices_buffer,
+                    &mut state.key_comparator,
+                )?
+            }
             Map::ArrayMap(array_map) => {
                 let next_offset = array_map.get_matched_indices_with_limit_offset(
                     &state.values,
