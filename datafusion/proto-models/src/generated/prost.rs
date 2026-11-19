@@ -2113,6 +2113,34 @@ pub struct FileScanExecConf {
     /// fields form the suffix of schema, after file and partition fields.
     #[prost(uint32, tag = "902")]
     pub virtual_column_count: u32,
+    /// Longbow family FI. Replaces file_groups and statistics. Keeping the old
+    /// required statistics absent makes legacy decoders reject this encoding.
+    #[prost(message, optional, tag = "903")]
+    pub indexed_files: ::core::option::Option<IndexedScanFiles>,
+}
+/// File metadata is scoped to a single scan. Group and range order are
+/// significant and a range may be absent (the whole file).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IndexedScanFiles {
+    #[prost(message, repeated, tag = "1")]
+    pub files: ::prost::alloc::vec::Vec<PartitionedFile>,
+    #[prost(message, repeated, tag = "2")]
+    pub groups: ::prost::alloc::vec::Vec<ScanRangeGroup>,
+    #[prost(message, optional, tag = "3")]
+    pub scan_statistics: ::core::option::Option<super::datafusion_common::Statistics>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScanRangeGroup {
+    #[prost(message, repeated, tag = "1")]
+    pub files: ::prost::alloc::vec::Vec<ScanFileRange>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScanFileRange {
+    /// Zero-based index into IndexedScanFiles.files.
+    #[prost(uint32, tag = "1")]
+    pub file_index: u32,
+    #[prost(message, optional, tag = "2")]
+    pub range: ::core::option::Option<FileRange>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParquetScanExecNode {

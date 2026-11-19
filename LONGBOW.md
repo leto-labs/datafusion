@@ -13,9 +13,9 @@ qualification.
 
 ## Reserved protobuf tags
 
-Every protobuf field that a fork family adds uses a tag of 900 or more, so a
-later upstream field cannot collide with it (design D6 of the Longbow change
-`upgrade-datafusion-56`). Regenerate `datafusion/proto-models/src/generated/`
+Every field a fork family adds to an upstream protobuf message uses a tag
+of 900 or more to avoid collisions with later upstream fields (design D6 of
+the Longbow change `upgrade-datafusion-56`). Regenerate `datafusion/proto-models/src/generated/`
 with the fork's generator (`datafusion/proto-models/regen.sh`) after a change.
 
 | Message | Field | Tag | Family |
@@ -23,6 +23,7 @@ with the fork's generator (`datafusion/proto-models/regen.sh`) after a change.
 | `PartitionedFile` | `optional string e_tag` | 900 | D |
 | `PartitionedFile` | `optional string version` | 901 | D |
 | `FileScanExecConf` | `uint32 virtual_column_count` | 902 | RP |
+| `FileScanExecConf` | `IndexedScanFiles indexed_files` | 903 | FI |
 | `AsOfJoinExecNode` | `bool partitioned` | 900 | AP |
 
 Fields that upstream now owns and that the 55.2 fork had assigned differently
@@ -1059,3 +1060,21 @@ The regression compares the bits, capacity and bitmap eligibility with
 the single-array path for nullable, sliced keys across 96 chunks.
 
 See Longbow lane `leto-mjj.101`.
+
+## Family FI: a scan-local file table in the physical plan codec
+
+Purpose: share the wire metadata and conversion work for ranges of the same
+file. Dependent feature: CORE-PLAN-FIDELITY. Audit classification: UPSTREAMABLE.
+Lane: leto-mjj.120.
+
+The shared `FileScanConfig` codec assigns file descriptors in first-use order.
+Descriptors with the same path can differ in object validators, size, timestamp,
+partition values, statistics or Arrow schema. Each group stores ordered
+references alongside optional ranges, including whole-file entries and empty
+groups. Decode reconstructs the ordinary file groups, sharing the decoded
+statistics and Arrow schema for ranges of each descriptor.
+
+The indexed payload carries the required scan statistics, so a pre-FI decoder
+that ignores tag 903 fails when it expects the legacy scan statistics. The
+fork accepts legacy input. Longbow requires stage codec v21 at the peer
+handshake and retains its column-pruned statistics patch above the native scan.

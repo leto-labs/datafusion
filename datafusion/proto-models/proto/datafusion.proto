@@ -1384,6 +1384,27 @@ message FileScanExecConf {
   // Longbow family RP (reserved fork range >= 900, see LONGBOW.md): virtual
   // fields form the suffix of schema, after file and partition fields.
   uint32 virtual_column_count = 902;
+  // Longbow family FI. Replaces file_groups and statistics. Keeping the old
+  // required statistics absent makes legacy decoders reject this encoding.
+  IndexedScanFiles indexed_files = 903;
+}
+
+// File metadata is scoped to a single scan. Group and range order are
+// significant and a range may be absent (the whole file).
+message IndexedScanFiles {
+  repeated PartitionedFile files = 1;
+  repeated ScanRangeGroup groups = 2;
+  datafusion_common.Statistics scan_statistics = 3;
+}
+
+message ScanRangeGroup {
+  repeated ScanFileRange files = 1;
+}
+
+message ScanFileRange {
+  // Zero-based index into IndexedScanFiles.files.
+  uint32 file_index = 1;
+  FileRange range = 2;
 }
 
 message ParquetScanExecNode {

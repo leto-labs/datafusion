@@ -350,6 +350,99 @@ mod file_scan_config_serde {
     }
 
     #[test]
+    fn indexed_scan_preserves_order_and_shares_metadata() -> Result<()> {
+        let serde = FileScanSerdeHarness::new();
+        let mut config = test_config(None);
+        let mut first = config.file_groups[0][0].clone().with_range(0, 10);
+        first.object_meta.e_tag = Some("a".to_owned());
+        first.object_meta.version = Some("1".to_owned());
+        let second = first.clone().with_range(10, 20);
+        // A repeated path may refer to another generation or carry different stats.
+        let mut another_generation = first.clone();
+        another_generation.object_meta.version = Some("2".to_owned());
+        another_generation.range = None;
+        let mut other_stats = second.clone();
+        other_stats.statistics = None;
+        config.file_groups = vec![
+            FileGroup::new(vec![first, another_generation]),
+            FileGroup::new(vec![]),
+            FileGroup::new(vec![other_stats, second]),
+        ];
+
+        let encoded = serde.encode(&config)?;
+        assert!(encoded.file_groups.is_empty());
+        assert!(encoded.statistics.is_none());
+        let indexed = encoded.indexed_files.as_ref().unwrap();
+        assert_eq!(indexed.files.len(), 3);
+        assert!(indexed.files.iter().all(|file| file.range.is_none()));
+
+        // Compare every previously serialized field, in original group order.
+        let legacy_groups = config
+            .file_groups
+            .iter()
+            .map(protobuf::FileGroup::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        let decoded = serde.decode(&encoded)?;
+        let decoded_groups = decoded
+            .file_groups
+            .iter()
+            .map(protobuf::FileGroup::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(legacy_groups, decoded_groups);
+        let a = &decoded.file_groups[0][0];
+        let b = &decoded.file_groups[2][1];
+        assert!(Arc::ptr_eq(
+            a.statistics.as_ref().unwrap(),
+            b.statistics.as_ref().unwrap(),
+        ));
+        assert!(Arc::ptr_eq(
+            a.arrow_schema.as_ref().unwrap(),
+            b.arrow_schema.as_ref().unwrap(),
+        ));
+
+        let legacy = protobuf::FileScanExecConf {
+            file_groups: legacy_groups,
+            statistics: indexed.scan_statistics.clone(),
+            indexed_files: None,
+            ..encoded.clone()
+        };
+        assert_eq!(serde.encode(&serde.decode(&legacy)?)?, encoded);
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_file_scan_rejects_invalid_references_and_mixed_encodings() -> Result<()> {
+        let serde = FileScanSerdeHarness::new();
+        let valid = serde.encode(&test_config(None))?;
+        let mut invalid_reference = valid.clone();
+        invalid_reference.indexed_files.as_mut().unwrap().groups[0].files[0].file_index =
+            u32::MAX;
+        assert!(
+            serde
+                .decode(&invalid_reference)
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid indexed scan file reference")
+        );
+
+        let mut mixed = valid;
+        mixed.statistics = mixed
+            .indexed_files
+            .as_ref()
+            .unwrap()
+            .scan_statistics
+            .clone();
+        assert!(
+            serde
+                .decode(&mixed)
+                .unwrap_err()
+                .to_string()
+                .contains("mixes indexed and legacy")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn new_file_scan_config_serde_roundtrips_all_partitioning_variants() -> Result<()> {
         let serde = FileScanSerdeHarness::new();
 
@@ -574,9 +667,12 @@ mod file_scan_config_serde {
                 },
             ),
             (
-                "statistics",
+                "scan_statistics",
                 protobuf::FileScanExecConf {
-                    statistics: None,
+                    indexed_files: valid.indexed_files.clone().map(|mut indexed| {
+                        indexed.scan_statistics = None;
+                        indexed
+                    }),
                     ..valid.clone()
                 },
             ),

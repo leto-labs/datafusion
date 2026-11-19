@@ -7756,6 +7756,9 @@ impl serde::Serialize for FileScanExecConf {
         if self.virtual_column_count != 0 {
             len += 1;
         }
+        if self.indexed_files.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.FileScanExecConf", len)?;
         if !self.file_groups.is_empty() {
             struct_ser.serialize_field("fileGroups", &self.file_groups)?;
@@ -7806,6 +7809,9 @@ impl serde::Serialize for FileScanExecConf {
         if self.virtual_column_count != 0 {
             struct_ser.serialize_field("virtualColumnCount", &self.virtual_column_count)?;
         }
+        if let Some(v) = self.indexed_files.as_ref() {
+            struct_ser.serialize_field("indexedFiles", v)?;
+        }
         struct_ser.end()
     }
 }
@@ -7841,6 +7847,8 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             "preserveOrder",
             "virtual_column_count",
             "virtualColumnCount",
+            "indexed_files",
+            "indexedFiles",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -7860,6 +7868,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             FileCompressionType,
             PreserveOrder,
             VirtualColumnCount,
+            IndexedFiles,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -7896,6 +7905,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                             "fileCompressionType" | "file_compression_type" => Ok(GeneratedField::FileCompressionType),
                             "preserveOrder" | "preserve_order" => Ok(GeneratedField::PreserveOrder),
                             "virtualColumnCount" | "virtual_column_count" => Ok(GeneratedField::VirtualColumnCount),
+                            "indexedFiles" | "indexed_files" => Ok(GeneratedField::IndexedFiles),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -7930,6 +7940,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                 let mut file_compression_type__ = None;
                 let mut preserve_order__ = None;
                 let mut virtual_column_count__ = None;
+                let mut indexed_files__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::FileGroups => {
@@ -8029,6 +8040,12 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::IndexedFiles => {
+                            if indexed_files__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("indexedFiles"));
+                            }
+                            indexed_files__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(FileScanExecConf {
@@ -8047,6 +8064,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                     file_compression_type: file_compression_type__,
                     preserve_order: preserve_order__,
                     virtual_column_count: virtual_column_count__.unwrap_or_default(),
+                    indexed_files: indexed_files__,
                 })
             }
         }
@@ -10619,6 +10637,132 @@ impl<'de> serde::Deserialize<'de> for InListNode {
             }
         }
         deserializer.deserialize_struct("datafusion.InListNode", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for IndexedScanFiles {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.files.is_empty() {
+            len += 1;
+        }
+        if !self.groups.is_empty() {
+            len += 1;
+        }
+        if self.scan_statistics.is_some() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion.IndexedScanFiles", len)?;
+        if !self.files.is_empty() {
+            struct_ser.serialize_field("files", &self.files)?;
+        }
+        if !self.groups.is_empty() {
+            struct_ser.serialize_field("groups", &self.groups)?;
+        }
+        if let Some(v) = self.scan_statistics.as_ref() {
+            struct_ser.serialize_field("scanStatistics", v)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for IndexedScanFiles {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "files",
+            "groups",
+            "scan_statistics",
+            "scanStatistics",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Files,
+            Groups,
+            ScanStatistics,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "files" => Ok(GeneratedField::Files),
+                            "groups" => Ok(GeneratedField::Groups),
+                            "scanStatistics" | "scan_statistics" => Ok(GeneratedField::ScanStatistics),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = IndexedScanFiles;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion.IndexedScanFiles")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<IndexedScanFiles, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut files__ = None;
+                let mut groups__ = None;
+                let mut scan_statistics__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Files => {
+                            if files__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("files"));
+                            }
+                            files__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Groups => {
+                            if groups__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("groups"));
+                            }
+                            groups__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::ScanStatistics => {
+                            if scan_statistics__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("scanStatistics"));
+                            }
+                            scan_statistics__ = map_.next_value()?;
+                        }
+                    }
+                }
+                Ok(IndexedScanFiles {
+                    files: files__.unwrap_or_default(),
+                    groups: groups__.unwrap_or_default(),
+                    scan_statistics: scan_statistics__,
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion.IndexedScanFiles", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for InsertOp {
@@ -26888,6 +27032,117 @@ impl<'de> serde::Deserialize<'de> for ScalarUdfExprNode {
         deserializer.deserialize_struct("datafusion.ScalarUDFExprNode", FIELDS, GeneratedVisitor)
     }
 }
+impl serde::Serialize for ScanFileRange {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.file_index != 0 {
+            len += 1;
+        }
+        if self.range.is_some() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion.ScanFileRange", len)?;
+        if self.file_index != 0 {
+            struct_ser.serialize_field("fileIndex", &self.file_index)?;
+        }
+        if let Some(v) = self.range.as_ref() {
+            struct_ser.serialize_field("range", v)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for ScanFileRange {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "file_index",
+            "fileIndex",
+            "range",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            FileIndex,
+            Range,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "fileIndex" | "file_index" => Ok(GeneratedField::FileIndex),
+                            "range" => Ok(GeneratedField::Range),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = ScanFileRange;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion.ScanFileRange")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<ScanFileRange, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut file_index__ = None;
+                let mut range__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::FileIndex => {
+                            if file_index__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("fileIndex"));
+                            }
+                            file_index__ =
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Range => {
+                            if range__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("range"));
+                            }
+                            range__ = map_.next_value()?;
+                        }
+                    }
+                }
+                Ok(ScanFileRange {
+                    file_index: file_index__.unwrap_or_default(),
+                    range: range__,
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion.ScanFileRange", FIELDS, GeneratedVisitor)
+    }
+}
 impl serde::Serialize for ScanLimit {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -26979,6 +27234,97 @@ impl<'de> serde::Deserialize<'de> for ScanLimit {
             }
         }
         deserializer.deserialize_struct("datafusion.ScanLimit", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for ScanRangeGroup {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.files.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion.ScanRangeGroup", len)?;
+        if !self.files.is_empty() {
+            struct_ser.serialize_field("files", &self.files)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for ScanRangeGroup {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "files",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Files,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "files" => Ok(GeneratedField::Files),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = ScanRangeGroup;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion.ScanRangeGroup")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<ScanRangeGroup, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut files__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Files => {
+                            if files__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("files"));
+                            }
+                            files__ = Some(map_.next_value()?);
+                        }
+                    }
+                }
+                Ok(ScanRangeGroup {
+                    files: files__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion.ScanRangeGroup", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for SelectionExecNode {

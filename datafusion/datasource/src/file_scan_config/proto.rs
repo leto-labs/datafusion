@@ -16,8 +16,8 @@
 //! `FileSource::try_to_proto` hook (CSV, JSON, Arrow, Parquet, Avro) builds its
 //! `*ScanExecNode` around [`FileScanConfig::try_to_proto`] and decodes with
 //! [`FileScanConfig::try_from_proto`], keeping a single copy of the shared
-//! wire logic. Existing fields remain wire-compatible with the old central
-//! serializer; new options use optional fields with legacy defaults.
+//! wire logic. Indexed scans store file metadata once and retain group and
+//! range order separately.
 //!
 //! Child physical expressions (sort orderings, hash/range partitioning, and
 //! projection expressions) are (de)serialized through `ctx.encode_expr` /
@@ -44,17 +44,18 @@ use datafusion_proto_models::protobuf;
 
 use crate::file::FileSource;
 use crate::file_compression_type::FileCompressionType;
+use crate::file_groups::FileGroup;
 use crate::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use crate::table_schema::TableSchema;
+
+mod indexed_files;
 
 impl FileScanConfig {
     /// Serialize the shared, format-agnostic part of a file scan into a
     /// [`protobuf::FileScanExecConf`].
     ///
     /// Each concrete [`FileSource::try_to_proto`]
-    /// wraps the returned value in its own `*ScanExecNode`. Existing fields are
-    /// byte-compatible with the former `serialize_file_scan_config` in
-    /// `datafusion-proto`.
+    /// wraps the returned value in its own `*ScanExecNode`.
     pub fn try_to_proto(
         &self,
         ctx: &ExecutionPlanEncodeCtx<'_>,
@@ -90,10 +91,7 @@ impl FileScanConfig {
             );
         }
 
-        let proto_file_groups = file_groups
-            .iter()
-            .map(TryInto::try_into)
-            .collect::<Result<Vec<_>>>()?;
+        let indexed_files = indexed_files::encode(file_groups, &self.statistics())?;
 
         let mut proto_output_ordering = Vec::with_capacity(output_ordering.len());
         for order in output_ordering {
@@ -149,11 +147,10 @@ impl FileScanConfig {
                     (*file_compression_type.get_variant()).into();
                 compression as i32
             });
-        let statistics = self.statistics();
-
         Ok(protobuf::FileScanExecConf {
-            file_groups: proto_file_groups,
-            statistics: Some((&statistics).into()),
+            indexed_files: Some(indexed_files),
+            file_groups: vec![],
+            statistics: None,
             limit: limit
                 .map(|limit| usize_to_wire::<u32>(limit, "FileScanConfig", "limit"))
                 .transpose()?
@@ -181,8 +178,7 @@ impl FileScanConfig {
     /// and a `file_source` the caller has already rebuilt (typically from the
     /// table schema via [`FileScanConfig::parse_table_schema_from_proto`]).
     ///
-    /// Existing fields are byte-compatible with the former
-    /// `parse_protobuf_file_scan_config`.
+    /// Accepts legacy files and scan statistics when no indexed files are present.
     pub fn try_from_proto(
         conf: &protobuf::FileScanExecConf,
         ctx: &ExecutionPlanDecodeCtx<'_>,
@@ -192,6 +188,7 @@ impl FileScanConfig {
         // handled here instead of being silently ignored.
         let protobuf::FileScanExecConf {
             file_groups,
+            indexed_files,
             schema: proto_schema,
             // Superseded by `projection_exprs`; current encoders leave this
             // legacy column-index projection empty.
@@ -223,19 +220,28 @@ impl FileScanConfig {
                 )
             })?
             .try_into()?;
-        let decoded_statistics = statistics
-            .as_ref()
-            .ok_or_else(|| {
-                internal_datafusion_err!(
-                    "FileScanExecConf is missing required field 'statistics'"
-                )
-            })?
-            .try_into()?;
-
-        let decoded_file_groups = file_groups
-            .iter()
-            .map(TryInto::try_into)
-            .collect::<Result<Vec<_>>>()?;
+        let (decoded_file_groups, decoded_statistics) = match indexed_files {
+            Some(indexed) => {
+                if !file_groups.is_empty() || statistics.is_some() {
+                    return datafusion_common::plan_err!(
+                        "FileScanExecConf mixes indexed and legacy file groups or statistics"
+                    );
+                }
+                indexed_files::decode(indexed)?
+            }
+            None => {
+                let statistics = statistics.as_ref().ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "FileScanExecConf is missing required field 'statistics'"
+                    )
+                })?;
+                let groups = file_groups
+                    .iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<FileGroup>>>()?;
+                (groups, statistics.try_into()?)
+            }
+        };
 
         let decoded_object_store_url = match object_store_url.is_empty() {
             false => ObjectStoreUrl::parse(object_store_url)?,
