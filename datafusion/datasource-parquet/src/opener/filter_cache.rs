@@ -25,6 +25,11 @@
 //! predicates snapshot it. An entry is kept only when the generation did not
 //! change while it was built, so it equals what a file opened at that
 //! generation would prepare.
+//!
+//! The file-level pruning predicate (statistics of the whole file, before
+//! its metadata is read) of a predicate whose dynamic filters can no longer
+//! change is kept the same way; a predicate that can still change keeps its
+//! per-file `FilePruner`, which also drives early stopping.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -183,11 +188,23 @@ impl Entry {
     }
 }
 
+/// A file-level pruning predicate: the scan predicate (after per-file
+/// literal folding) against the logical file schema, which file statistics
+/// are evaluated against before any metadata is read.
+struct FileLevelEntry {
+    predicate: Arc<dyn PhysicalExpr>,
+    logical: SchemaRef,
+    generation: u64,
+    pruning: Option<Arc<PruningPredicate>>,
+    creation_errors: usize,
+}
+
 /// The prepared filters of one scan, shared by its partitions and by the
 /// clones of its `ParquetSource`.
 #[derive(Default)]
 pub(crate) struct PreparedFilterCache {
     entries: Mutex<VecDeque<Entry>>,
+    file_level: Mutex<VecDeque<FileLevelEntry>>,
 }
 
 /// Prints no contents: a plan's debug output must not change as its scans
@@ -257,6 +274,62 @@ impl PreparedFilterCache {
             filters: Arc::clone(&filters),
         });
         Ok(filters)
+    }
+
+    /// The file-level pruning predicate of `predicate` against `logical`, as
+    /// [`datafusion_pruning::FilePruner`] builds it for a predicate whose
+    /// dynamic filters can no longer change, built once per generation.
+    /// Creation errors of the build are added to `errors` on every call, as
+    /// a build per file would add them.
+    pub(crate) fn file_pruning(
+        &self,
+        predicate: &Arc<dyn PhysicalExpr>,
+        logical: &SchemaRef,
+        errors: &Count,
+    ) -> Option<Arc<PruningPredicate>> {
+        let generation = snapshot_generation(predicate);
+        let matches = |entry: &FileLevelEntry| {
+            Arc::ptr_eq(&entry.predicate, predicate)
+                && same_schema(&entry.logical, logical)
+        };
+        {
+            let entries = self
+                .file_level
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = entries
+                .iter()
+                .find(|entry| matches(entry) && entry.generation == generation)
+            {
+                errors.add(entry.creation_errors);
+                return entry.pruning.clone();
+            }
+        }
+        let local = Count::new();
+        let pruning = datafusion_pruning::build_pruning_predicate(
+            Arc::clone(predicate),
+            logical,
+            &local,
+        );
+        errors.add(local.value());
+        if snapshot_generation(predicate) == generation {
+            let mut entries = self
+                .file_level
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            entries.retain(|entry| !matches(entry));
+            if entries.len() >= CAPACITY {
+                entries.pop_front();
+            }
+            entries.push_back(FileLevelEntry {
+                predicate: Arc::clone(predicate),
+                logical: Arc::clone(logical),
+                generation,
+                pruning: pruning.clone(),
+                creation_errors: local.value(),
+            });
+        }
+        pruning
     }
 
     /// The number of entries (tests).

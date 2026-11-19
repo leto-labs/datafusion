@@ -318,3 +318,69 @@ async fn oo_one_set_of_file_metrics_per_open() {
         "each reader adds its own bytes"
     );
 }
+
+#[tokio::test]
+async fn oo_a_settled_predicate_shares_one_file_level_pruning_predicate() {
+    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+    let schema = int_schema();
+    let with_range = |path: &str, len: u64, min: i32, max: i32| {
+        PartitionedFile::new(path, len).with_statistics(Arc::new(Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics::new_unknown()
+                    .with_min_value(Precision::Exact(ScalarValue::Int32(Some(min))))
+                    .with_max_value(Precision::Exact(ScalarValue::Int32(Some(max))))
+                    .with_null_count(Precision::Exact(0)),
+            ],
+        }))
+    };
+    let low = write_pages(&store, "low.parquet", (1..=100).collect()).await;
+    let high = write_pages(&store, "high.parquet", (101..=200).collect()).await;
+    let metrics = ExecutionPlanMetricsSet::new();
+    let morselizer = ParquetMorselizerBuilder::new()
+        .with_store(store)
+        .with_schema(Arc::clone(&schema))
+        .with_predicate(logical2physical(&col("a").gt(lit(150i32)), &schema))
+        .with_metrics(metrics.clone())
+        .build();
+    let low = with_range("low.parquet", low, 1, 100);
+    let high = with_range("high.parquet", high, 101, 200);
+
+    let first = morselizer.prepare_open_file(low.clone()).unwrap();
+    let second = morselizer.prepare_open_file(high.clone()).unwrap();
+    assert!(
+        first.file_pruner.is_none(),
+        "a static predicate needs no FilePruner"
+    );
+    let (Some(a), Some(b)) = (&first.settled_file_pruning, &second.settled_file_pruning)
+    else {
+        panic!("file-level pruning predicates");
+    };
+    assert!(
+        Arc::ptr_eq(a, b),
+        "one file-level pruning predicate per scan"
+    );
+
+    // The shared predicate prunes the file whose statistics rule it out.
+    let (_, rows) =
+        count_batches_and_rows(open_file(&morselizer, low).await.unwrap()).await;
+    assert_eq!(rows, 0);
+    let (_, rows) =
+        count_batches_and_rows(open_file(&morselizer, high).await.unwrap()).await;
+    assert!(rows > 0);
+    let pruned = metrics
+        .clone_inner()
+        .sum_by_name("files_ranges_pruned_statistics")
+        .expect("file pruning metric");
+    let MetricValue::PruningMetrics {
+        pruning_metrics, ..
+    } = pruned
+    else {
+        panic!("pruning metric");
+    };
+    assert_eq!(
+        (pruning_metrics.pruned(), pruning_metrics.matched()),
+        (1, 1)
+    );
+}
