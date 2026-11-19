@@ -710,7 +710,7 @@ impl Drop for AsyncIPCStreamWriter {
 }
 
 /// Encodes Arrow IPC streams without performing I/O.
-struct IPCStreamEncoder {
+pub(crate) struct IPCStreamEncoder {
     encoder: Option<StreamEncoder>,
 }
 
@@ -727,7 +727,10 @@ impl IPCStreamEncoder {
     /// contract local and build-visible during Cargo feature resolution,
     /// rather than relying solely on workspace-level feature unification;
     /// see #21917.
-    fn new(schema: &Schema, spill_compression: SpillCompression) -> Result<Self> {
+    pub(crate) fn new(
+        schema: &Schema,
+        spill_compression: SpillCompression,
+    ) -> Result<Self> {
         let metadata_version = MetadataVersion::V5;
         // Depending on the schema, some array types such as StringViewArray require larger (16 byte in this case) alignment.
         // If the actual buffer layout after IPC read does not satisfy the alignment requirement,
@@ -747,13 +750,16 @@ impl IPCStreamEncoder {
         })
     }
 
-    fn encode(&mut self, batch: &RecordBatch) -> Result<(usize, usize, Vec<Buffer>)> {
+    pub(crate) fn encode(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<(usize, usize, Vec<Buffer>)> {
         let buffers = self.encoder.as_mut().unwrap().encode(batch)?;
         let bytes = buffers.iter().map(Buffer::len).sum();
         Ok((batch.num_rows(), bytes, buffers))
     }
 
-    fn finish(&mut self) -> Result<(usize, Vec<Buffer>)> {
+    pub(crate) fn finish(&mut self) -> Result<(usize, Vec<Buffer>)> {
         let buffers = self.encoder.take().unwrap().finish()?;
         let bytes = buffers.iter().map(Buffer::len).sum();
         Ok((bytes, buffers))

@@ -806,34 +806,32 @@ impl HashJoinStream {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
-        match ready!(self.right.poll_next_unpin(cx)) {
-            None => {
+        use super::spill::ProbeInput;
+
+        let input = match &mut self.spill {
+            Some(spill) => ready!(spill.poll_probe_input(
+                &mut self.right,
+                &self.on_right,
+                &self.random_state,
+                cx,
+            ))?,
+            None => match ready!(self.right.poll_next_unpin(cx)).transpose()? {
+                Some(batch) => ProbeInput::Batch(batch),
+                None => ProbeInput::End,
+            },
+        };
+        match input {
+            ProbeInput::End => {
                 // Release the probe-side input pipeline's resources. The schema
-                // is preserved so callers that still query `self.right.schema()`
-                // (e.g. for unmatched-build emission) keep working.
-                let right_schema = self.right.schema();
-                self.right = Box::pin(EmptyRecordBatchStream::new(right_schema));
-                // Longbow family JS: this stream's probe files are complete
-                // before it reports its completion to the in-memory table.
-                if let Some(spill) = &mut self.spill {
-                    spill.end_probe()?;
+                // is preserved for callers that still query it.
+                if self.spill.is_none() {
+                    let right_schema = self.right.schema();
+                    self.right = Box::pin(EmptyRecordBatchStream::new(right_schema));
                 }
                 self.state = HashJoinStreamState::ExhaustedProbeSide;
             }
-            Some(Ok(batch)) => {
-                // Longbow family JS (hook 2): rows of written partitions go
-                // to this stream's probe files.
-                let batch = match &mut self.spill {
-                    Some(spill) => {
-                        match spill.route(batch, &self.on_right, &self.random_state)? {
-                            Some(batch) => batch,
-                            None => {
-                                return Poll::Ready(Ok(StatefulStreamResult::Continue));
-                            }
-                        }
-                    }
-                    None => batch,
-                };
+            ProbeInput::Routed => {}
+            ProbeInput::Batch(batch) => {
                 // Precalculate hash values for fetched batch
                 let keys_values = evaluate_expressions_to_arrays(&self.on_right, &batch)?;
 
@@ -873,7 +871,6 @@ impl HashJoinStream {
                         inline_keys,
                     });
             }
-            Some(Err(err)) => return Poll::Ready(Err(err)),
         }
 
         Poll::Ready(Ok(StatefulStreamResult::Continue))

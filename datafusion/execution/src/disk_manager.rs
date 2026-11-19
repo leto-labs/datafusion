@@ -329,6 +329,11 @@ impl DiskManager {
         self.factory.is_some() || self.local_dirs.lock().is_some()
     }
 
+    /// Whether spill files are created by a custom factory.
+    pub fn has_custom_temp_file_factory(&self) -> bool {
+        self.factory.is_some()
+    }
+
     /// Return a temporary file from a randomized choice in the configured locations
     ///
     /// If the file can not be created for some reason, returns an
@@ -501,6 +506,10 @@ impl SpillWriter for FileSpillWriter {
 }
 
 impl SpillFile for RefCountedTempFile {
+    fn supports_reopen_for_append(&self) -> bool {
+        true
+    }
+
     fn path(&self) -> Option<&Path> {
         Some(self.path())
     }

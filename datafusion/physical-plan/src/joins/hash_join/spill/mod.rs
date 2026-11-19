@@ -69,7 +69,10 @@ use futures::{StreamExt, ready};
 pub(crate) use chunks::ChunkBuild;
 use chunks::ChunkRun;
 pub(crate) use files::SpillFilesExec;
-use files::{ChunkSignal, Cursor, FileSource, Origin, Stage};
+use files::{
+    ChunkSignal, Cursor, FileSource, Origin, PartitionFileWriter, PollShortWrite,
+    SPILL_WRITER_SLOTS, Stage, short_write_permit, spill_file_error,
+};
 
 use super::exec::{HashJoinExec, HashJoinExecBuilder, JoinLeftData};
 use crate::attempt_tasks::AttemptTasks;
@@ -82,9 +85,8 @@ use crate::joins::utils::{
 use crate::metrics::{
     Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, SpillMetrics,
 };
-use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::SpillManager;
-use crate::stream::RecordBatchStreamAdapter;
+use crate::stream::{EmptyRecordBatchStream, RecordBatchStreamAdapter};
 use crate::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion_common::JoinSide;
 use datafusion_physical_expr::projection::ProjectionRef;
@@ -563,6 +565,8 @@ impl JoinSpill {
                 probe_schema: Arc::clone(&eligible.template.probe_schema),
             }),
             phase: Phase::Waiting,
+            pending_probe: None,
+            short_write: PollShortWrite::default(),
             last: false,
         }))
     }
@@ -605,7 +609,7 @@ impl JoinSpillMetrics {
 
 /// A partition file being written, with a buffer of rows not yet written.
 struct PartWriter {
-    file: InProgressSpillFile,
+    file: PartitionFileWriter,
     buffer: Vec<RecordBatch>,
     buffered_rows: usize,
     buffered_bytes: usize,
@@ -633,7 +637,7 @@ impl PartWriter {
         unit: Option<usize>,
     ) -> Result<Self> {
         Ok(Self {
-            file: manager.create_in_progress_file(description)?,
+            file: PartitionFileWriter::new(manager, description)?,
             buffer: vec![],
             buffered_rows: 0,
             buffered_bytes: 0,
@@ -643,70 +647,79 @@ impl PartWriter {
         })
     }
 
-    fn append_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.file.append_batch(batch)?;
-        self.bytes += get_record_batch_memory_size(batch);
-        Ok(())
-    }
-
     /// Writes `batches` as batches of up to [`WRITE_BATCH_ROWS`] rows and,
     /// for a build file, of at most `unit` bytes with their table: a piece
-    /// above it is written in slices.
+    /// above it is written in slices. Writes go through the scoped writer
+    /// of family JS's descriptor bound (one writer slot per write).
     fn write(
         &mut self,
         batches: &[RecordBatch],
         metrics: &JoinSpillMetrics,
         side: Side,
     ) -> Result<()> {
-        let schema = Arc::clone(self.file.spill_manager.schema());
+        let schema = Arc::clone(self.file.schema());
         let (rows_metric, bytes_metric) = metrics.side(side);
         let before = metrics.spill.spilled_bytes.value();
         let unit = self.unit.unwrap_or(usize::MAX);
         let sizes: Vec<usize> =
             batches.iter().map(get_record_batch_memory_size).collect();
         let mut start = 0;
-        while start < batches.len() {
-            let piece = &batches[start];
-            let piece_rows = piece.num_rows();
-            if piece_rows > 1 && unit_bytes(sizes[start], piece_rows) > unit {
-                // Rows per slice from the piece's mean row width.
-                let row_bytes = sizes[start].div_ceil(piece_rows);
-                let fit = (unit.saturating_sub(256) / (2 * row_bytes + 48)).max(1);
-                let mut offset = 0;
-                while offset < piece_rows {
-                    let length = fit.min(piece_rows - offset);
-                    self.append_batch(&piece.slice(offset, length))?;
-                    offset += length;
+        // Slices of a piece above the unit, written before the next group.
+        let mut slices: std::collections::VecDeque<RecordBatch> = Default::default();
+        let mut bytes = 0;
+        let written = self.file.write(std::iter::from_fn(|| {
+            let next = match slices.pop_front() {
+                Some(slice) => Ok(slice),
+                None if start == batches.len() => return None,
+                None => {
+                    let piece = &batches[start];
+                    let piece_rows = piece.num_rows();
+                    if piece_rows > 1 && unit_bytes(sizes[start], piece_rows) > unit {
+                        // Rows per slice from the piece's mean row width.
+                        let row_bytes = sizes[start].div_ceil(piece_rows);
+                        let fit =
+                            (unit.saturating_sub(256) / (2 * row_bytes + 48)).max(1);
+                        let mut offset = 0;
+                        while offset < piece_rows {
+                            let length = fit.min(piece_rows - offset);
+                            slices.push_back(piece.slice(offset, length));
+                            offset += length;
+                        }
+                        start += 1;
+                        Ok(slices.pop_front().expect("a slice"))
+                    } else {
+                        let mut end = start;
+                        let (mut rows, mut group_bytes) = (0, 0);
+                        while end < batches.len()
+                            && (end == start
+                                || (rows < WRITE_BATCH_ROWS
+                                    && unit_bytes(
+                                        group_bytes + sizes[end],
+                                        rows + batches[end].num_rows(),
+                                    ) <= unit))
+                        {
+                            rows += batches[end].num_rows();
+                            group_bytes += sizes[end];
+                            end += 1;
+                        }
+                        let group = &batches[start..end];
+                        start = end;
+                        if group.len() == 1 {
+                            Ok(group[0].clone())
+                        } else {
+                            concat_batches(&schema, group).map_err(Into::into)
+                        }
+                    }
                 }
-                self.rows += piece_rows;
-                rows_metric.add(piece_rows);
-                start += 1;
-                continue;
+            };
+            if let Ok(batch) = &next {
+                bytes += get_record_batch_memory_size(batch);
             }
-            let mut end = start;
-            let (mut rows, mut bytes) = (0, 0);
-            while end < batches.len()
-                && (end == start
-                    || (rows < WRITE_BATCH_ROWS
-                        && unit_bytes(
-                            bytes + sizes[end],
-                            rows + batches[end].num_rows(),
-                        ) <= unit))
-            {
-                rows += batches[end].num_rows();
-                bytes += sizes[end];
-                end += 1;
-            }
-            let group = &batches[start..end];
-            if group.len() == 1 {
-                self.append_batch(&group[0])?;
-            } else {
-                self.append_batch(&concat_batches(&schema, group)?)?;
-            }
-            self.rows += rows;
-            rows_metric.add(rows);
-            start = end;
-        }
+            Some(next)
+        }))?;
+        self.rows += written;
+        self.bytes += bytes;
+        rows_metric.add(written);
         bytes_metric.add(metrics.spill.spilled_bytes.value().saturating_sub(before));
         Ok(())
     }
@@ -921,12 +934,13 @@ impl BuildSpill {
     /// Hook 1: takes `batch` after its reservation was refused, or in spill
     /// mode. The first call moves the `retained` batches, which
     /// `reservation` holds, into partitions.
-    pub(super) fn push(
+    pub(super) async fn push(
         &mut self,
         batch: &RecordBatch,
         retained: &mut Vec<RecordBatch>,
         reservation: &MemoryReservation,
     ) -> Result<()> {
+        let _permit = short_write_permit(&SPILL_WRITER_SLOTS).await;
         let activating = !self.active;
         let forced = activating
             && self.should_force(
@@ -960,11 +974,12 @@ impl BuildSpill {
     /// rows in `batches`, still charged to `reservation`, enter spill mode.
     /// Rows whose table fits the floor stay; otherwise half are written (a
     /// table and its copy are about twice the rows).
-    pub(super) fn take_refused_build(
+    pub(super) async fn take_refused_build(
         &mut self,
         batches: &mut Vec<RecordBatch>,
         reservation: &MemoryReservation,
     ) -> Result<()> {
+        let _permit = short_write_permit(&SPILL_WRITER_SLOTS).await;
         self.activate(batches, reservation)?;
         self.settle_workspace(reservation);
         if !self.fits_floor(self.charged) {
@@ -1267,7 +1282,7 @@ impl BuildSpill {
     /// Returns the table, the written partitions, and, for a table built on
     /// the floor, the charge that must replace the table's own reservation
     /// (which then belongs to a private pool).
-    pub(super) fn finish<T>(
+    pub(super) async fn finish<T>(
         mut self,
         reservation: &mut MemoryReservation,
         mut build: impl FnMut(
@@ -1276,7 +1291,10 @@ impl BuildSpill {
             Floor,
         ) -> Result<T>,
     ) -> Result<(T, Option<Arc<SpilledBuild>>, Option<MemoryReservation>)> {
-        self.finish_writers()?;
+        {
+            let _permit = short_write_permit(&SPILL_WRITER_SLOTS).await;
+            self.finish_writers()?;
+        }
         loop {
             let mut batches = self.take_in_memory();
             match build(&mut batches, reservation, Floor::No) {
@@ -1286,6 +1304,7 @@ impl BuildSpill {
                     return Ok((table, spilled, None));
                 }
                 Err(error) if is_refusal(&error) => {
+                    let _permit = short_write_permit(&SPILL_WRITER_SLOTS).await;
                     // The rows are back in `batches`; `reservation` still
                     // holds them (and whatever the attempt grew). They were
                     // counted when they came.
@@ -2175,11 +2194,14 @@ impl SpilledBuild {
         let rows = match file {
             Some(file) => self
                 .build_manager
-                .read_spill_as_stream_unbuffered(Arc::clone(&file.file), None)?
+                .read_spill_as_stream_unbuffered(Arc::clone(&file.file), None)
+                .map_err(spill_file_error)?
                 .map(move |batch| {
                     // The file lives until its rows are read.
                     let _file = &file;
-                    batch.and_then(|batch| output.emit(&batch))
+                    batch
+                        .map_err(spill_file_error)
+                        .and_then(|batch| output.emit(&batch))
                 })
                 .boxed(),
             None => futures::stream::empty().boxed(),
@@ -2399,6 +2421,12 @@ struct Probed {
     divided: usize,
 }
 
+pub(super) enum ProbeInput {
+    Batch(RecordBatch),
+    Routed,
+    End,
+}
+
 /// The probe side of one output stream of a spilling join.
 pub(super) struct StreamSpill {
     context: Arc<TaskContext>,
@@ -2412,6 +2440,8 @@ pub(super) struct StreamSpill {
     null_equality: NullEquality,
     output: Arc<UnmatchedOutput>,
     phase: Phase,
+    pending_probe: Option<ProbeInput>,
+    short_write: PollShortWrite,
     /// The in-memory table's completion count chose this stream to emit the
     /// build rows.
     last: bool,
@@ -2526,9 +2556,44 @@ impl StreamSpill {
         }));
         Ok(true)
     }
+    /// Poll the input before taking a slot. The input can itself be a
+    /// spilling join, and must be able to acquire its own slot first.
+    pub(super) fn poll_probe_input(
+        &mut self,
+        right: &mut SendableRecordBatchStream,
+        on_right: &[PhysicalExprRef],
+        random_state: &RandomState,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<ProbeInput>> {
+        if self.pending_probe.is_none() {
+            self.pending_probe =
+                Some(match ready!(right.poll_next_unpin(cx)).transpose()? {
+                    Some(batch) => ProbeInput::Batch(batch),
+                    None => {
+                        // Release the input's files and reservations before
+                        // waiting to write the partition trailers.
+                        *right = Box::pin(EmptyRecordBatchStream::new(right.schema()));
+                        ProbeInput::End
+                    }
+                });
+        }
+        let _permit = ready!(self.short_write.poll(&SPILL_WRITER_SLOTS, cx));
+        let input = match self.pending_probe.take().unwrap() {
+            ProbeInput::Batch(batch) => self
+                .route(batch, on_right, random_state)?
+                .map_or(ProbeInput::Routed, ProbeInput::Batch),
+            ProbeInput::End => {
+                self.end_probe()?;
+                ProbeInput::End
+            }
+            ProbeInput::Routed => unreachable!(),
+        };
+        Poll::Ready(Ok(input))
+    }
+
     /// Hook 2: sends the rows of written partitions to this stream's files.
     /// Returns the rows that stay, `None` if none do.
-    pub(super) fn route(
+    fn route(
         &mut self,
         batch: RecordBatch,
         on_right: &[PhysicalExprRef],
@@ -2605,7 +2670,7 @@ impl StreamSpill {
     /// The probe input ended: finishes this stream's probe files and, for
     /// the build-row pass, registers them. Runs before the stream reports
     /// its completion to the in-memory table.
-    pub(super) fn end_probe(&mut self) -> Result<()> {
+    fn end_probe(&mut self) -> Result<()> {
         let Phase::Routing(_) = &self.phase else {
             return Ok(());
         };
@@ -2656,8 +2721,11 @@ impl StreamSpill {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<RecordBatch>>> {
-        if let Err(error) = self.end_probe() {
-            return Poll::Ready(Some(Err(error)));
+        if matches!(self.phase, Phase::Routing(_)) {
+            let _permit = ready!(self.short_write.poll(&SPILL_WRITER_SLOTS, cx));
+            if let Err(error) = self.end_probe() {
+                return Poll::Ready(Some(Err(error)));
+            }
         }
         if let Phase::Probed(_) = &self.phase {
             let Phase::Probed(probed) = std::mem::replace(&mut self.phase, Phase::Done)

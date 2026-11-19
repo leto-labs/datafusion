@@ -12,6 +12,7 @@
 //! the files creates it, at run time.
 
 use std::fmt;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -19,23 +20,256 @@ use std::task::{Context, Poll};
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion_common::Result;
 use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::{
+    DataFusionError, Result, exec_datafusion_err, resources_datafusion_err,
+};
 use datafusion_common::{assert_or_internal_err, internal_err};
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_execution::spill_file::SpillFile;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
-use futures::StreamExt;
+use futures::future::BoxFuture;
+use futures::{StreamExt, TryStreamExt};
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use super::{JoinSpillMetrics, SpilledFile};
 use crate::SendableRecordBatchStream as Rows;
 use crate::execution_plan::{Boundedness, EmissionType, SchedulingType};
+use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::SpillManager;
+use crate::spill::{IPCStreamEncoder, gc_view_arrays};
 use crate::stream::RecordBatchStreamAdapter;
 use crate::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     ReplaceChildrenOptions, SendableRecordBatchStream,
 };
+
+/// A flush on a reopenable backend holds one handle only while it writes.
+/// Callers admit each synchronous spill operation with a short-write permit
+/// before creating, writing or finishing partition files.
+pub(super) struct PartitionFileWriter {
+    manager: Arc<SpillManager>,
+    file: Arc<dyn SpillFile>,
+    writer: PartitionWriter,
+}
+
+enum PartitionWriter {
+    Reopenable(Option<IPCStreamEncoder>),
+    Persistent(Option<(InProgressSpillFile, PersistentPermit)>),
+}
+
+const MAX_OPEN_JOIN_SPILL_WRITERS: usize = 128;
+pub(super) static SPILL_WRITER_SLOTS: Semaphore =
+    Semaphore::const_new(MAX_OPEN_JOIN_SPILL_WRITERS);
+// Leave at least one slot in the shared budget for short operations. A
+// persistent writer can need to reach probe EOF before it releases its slot.
+const MAX_PERSISTENT_WRITERS: usize = MAX_OPEN_JOIN_SPILL_WRITERS - 1;
+static PERSISTENT_SPILL_WRITERS: Semaphore = Semaphore::const_new(MAX_PERSISTENT_WRITERS);
+
+struct PersistentPermit {
+    _total: SemaphorePermit<'static>,
+    _persistent: SemaphorePermit<'static>,
+}
+
+fn persistent_writer_permit() -> Result<PersistentPermit> {
+    let exhausted = |_| {
+        exec_datafusion_err!(
+            "hash join spill could not admit a custom backend's persistent writer (capacity {MAX_PERSISTENT_WRITERS} of {MAX_OPEN_JOIN_SPILL_WRITERS} slots)"
+        )
+    };
+    let persistent = PERSISTENT_SPILL_WRITERS.try_acquire().map_err(exhausted)?;
+    let total = SPILL_WRITER_SLOTS.try_acquire().map_err(exhausted)?;
+    Ok(PersistentPermit {
+        _total: total,
+        _persistent: persistent,
+    })
+}
+
+pub(super) async fn short_write_permit(
+    slots: &'static Semaphore,
+) -> SemaphorePermit<'static> {
+    slots
+        .acquire()
+        .await
+        .expect("spill writer semaphore is never closed")
+}
+
+/// Keeps a queued acquisition across stream polls. The uncontended path
+/// acquires directly, with no allocation.
+#[derive(Default)]
+pub(super) struct PollShortWrite(Option<BoxFuture<'static, SemaphorePermit<'static>>>);
+
+impl PollShortWrite {
+    pub(super) fn poll(
+        &mut self,
+        slots: &'static Semaphore,
+        cx: &mut Context<'_>,
+    ) -> Poll<SemaphorePermit<'static>> {
+        if self.0.is_none() {
+            if let Ok(permit) = slots.try_acquire() {
+                return Poll::Ready(permit);
+            }
+            self.0 = Some(Box::pin(short_write_permit(slots)));
+        }
+        let permit = futures::ready!(self.0.as_mut().unwrap().as_mut().poll(cx));
+        self.0 = None;
+        Poll::Ready(permit)
+    }
+}
+
+pub(super) fn spill_file_error(error: DataFusionError) -> DataFusionError {
+    classify_spill_file_error(error, false)
+}
+
+fn classify_spill_file_error(
+    error: DataFusionError,
+    local_tempfile: bool,
+) -> DataFusionError {
+    #[cfg(not(unix))]
+    let _ = local_tempfile;
+    #[cfg(unix)]
+    {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        while let Some(cause) = source {
+            if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                // tempfile adds the path to the error text and exposes the
+                // original error's source, losing the OS code in the chain.
+                let code = io.raw_os_error().or_else(|| {
+                    if !local_tempfile {
+                        return None;
+                    }
+                    let message = io.to_string();
+                    [libc::EMFILE, libc::ENFILE].into_iter().find(|code| {
+                        let original = std::io::Error::from_raw_os_error(*code);
+                        io.kind() == original.kind()
+                            && message.starts_with(&original.to_string())
+                    })
+                });
+                match code {
+                    Some(libc::EMFILE) => {
+                        return resources_datafusion_err!(
+                            "hash join spill exhausted the process open-file limit (RLIMIT_NOFILE)"
+                        );
+                    }
+                    Some(libc::ENFILE) => {
+                        return resources_datafusion_err!(
+                            "hash join spill exhausted the system-wide open-file limit"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            source = cause.source();
+        }
+    }
+    error
+}
+
+impl PartitionFileWriter {
+    pub(super) fn new(manager: &SpillManager, description: &str) -> Result<Self> {
+        let disk = &manager.env().disk_manager;
+        let file = disk.create_tmp_file(description).map_err(|error| {
+            classify_spill_file_error(error, !disk.has_custom_temp_file_factory())
+        })?;
+        let writer = if file.supports_reopen_for_append() {
+            PartitionWriter::Reopenable(None)
+        } else {
+            PartitionWriter::Persistent(None)
+        };
+        Ok(Self {
+            manager: Arc::new(manager.clone()),
+            file,
+            writer,
+        })
+    }
+
+    pub(super) fn schema(&self) -> &SchemaRef {
+        self.manager.schema()
+    }
+
+    pub(super) fn write(
+        &mut self,
+        batches: impl Iterator<Item = Result<RecordBatch>>,
+    ) -> Result<usize> {
+        self.write_inner(batches.peekable())
+            .map_err(spill_file_error)
+    }
+
+    fn write_inner(
+        &mut self,
+        mut batches: std::iter::Peekable<impl Iterator<Item = Result<RecordBatch>>>,
+    ) -> Result<usize> {
+        if batches.peek().is_none() {
+            return Ok(0);
+        }
+        let mut written = 0;
+        match &mut self.writer {
+            PartitionWriter::Reopenable(encoder) => {
+                let mut writer = self.file.open_writer()?;
+                if encoder.is_none() {
+                    *encoder = Some(IPCStreamEncoder::new(
+                        self.manager.schema().as_ref(),
+                        self.manager.compression,
+                    )?);
+                    self.manager.metrics.spill_file_count.add(1);
+                }
+                let encoder = encoder.as_mut().unwrap();
+                for batch in batches {
+                    let batch = gc_view_arrays(&batch?)?;
+                    let (rows, bytes, buffers) = encoder.encode(&batch)?;
+                    for buffer in buffers {
+                        writer.write_all(buffer.as_slice())?;
+                    }
+                    written += rows;
+                    self.manager.metrics.spilled_rows.add(rows);
+                    self.manager.metrics.spilled_bytes.add(bytes);
+                }
+                writer.flush()?;
+            }
+            PartitionWriter::Persistent(writer) => {
+                if writer.is_none() {
+                    *writer = Some((
+                        InProgressSpillFile::new(
+                            Arc::clone(&self.manager),
+                            Arc::clone(&self.file),
+                        ),
+                        persistent_writer_permit()?,
+                    ));
+                }
+                let (writer, _) = writer.as_mut().unwrap();
+                for batch in batches {
+                    let batch = batch?;
+                    writer.append_batch(&batch)?;
+                    written += batch.num_rows();
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    pub(super) fn finish(&mut self) -> Result<Option<Arc<dyn SpillFile>>> {
+        self.finish_inner().map_err(spill_file_error)
+    }
+
+    fn finish_inner(&mut self) -> Result<Option<Arc<dyn SpillFile>>> {
+        match &mut self.writer {
+            PartitionWriter::Reopenable(Some(encoder)) => {
+                let mut writer = self.file.open_writer()?;
+                let (bytes, buffers) = encoder.finish()?;
+                for buffer in buffers {
+                    writer.write_all(buffer.as_slice())?;
+                }
+                writer.flush()?;
+                writer.finish()?;
+                self.manager.metrics.spilled_bytes.add(bytes);
+                Ok(Some(Arc::clone(&self.file)))
+            }
+            PartitionWriter::Persistent(Some((writer, _))) => writer.finish(),
+            _ => Ok(None),
+        }
+    }
+}
 
 /// Where a [`SpillFilesExec`] partition finds its files.
 pub(super) enum FileSource {
@@ -150,7 +384,7 @@ impl Cursor {
                 .read_spill_as_stream_unbuffered(Arc::clone(&self.file.file), None)
             {
                 Ok(reader) => state.reader = Some(reader),
-                Err(error) => return Poll::Ready(Some(Err(error))),
+                Err(error) => return Poll::Ready(Some(Err(spill_file_error(error)))),
             }
         }
         let reader = state.reader.as_mut().expect("a reader");
@@ -159,7 +393,7 @@ impl Cursor {
             state.ended = true;
             state.reader = None;
         }
-        next
+        next.map(|batch| batch.map(|batch| batch.map_err(spill_file_error)))
     }
 }
 
@@ -495,9 +729,12 @@ impl ExecutionPlan for SpillFilesExec {
             .map(|file| {
                 self.spill_manager
                     .read_spill_as_stream_unbuffered(Arc::clone(&file.file), None)
+                    .map_err(spill_file_error)
             })
             .collect::<Result<Vec<_>>>()?;
-        let rows = futures::stream::iter(streams).flatten();
+        let rows = futures::stream::iter(streams)
+            .flatten()
+            .map_err(spill_file_error);
         let Some(row_ids) = self.row_ids.clone() else {
             return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rows)));
         };
@@ -510,5 +747,97 @@ impl ExecutionPlan for SpillFilesExec {
             number_rows(&batch, first, &numbered, row_ids.skip_matched.as_deref())
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rows)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::config::SpillCompression;
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+    use crate::metrics::{ExecutionPlanMetricsSet, SpillMetrics};
+
+    #[tokio::test]
+    async fn join_spill_local_writers_wait_for_capacity() -> Result<()> {
+        static SLOTS: Semaphore = Semaphore::const_new(2);
+        let held = SLOTS.acquire_many(2).await.unwrap();
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
+        let manager = SpillManager::new(
+            RuntimeEnvBuilder::new().build_arc()?,
+            SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            Arc::clone(&schema),
+        );
+        let writes = (0..5).map(|key| {
+            let manager = &manager;
+            let schema = &schema;
+            async move {
+                let mut slot = PollShortWrite::default();
+                let file = {
+                    let _permit =
+                        futures::future::poll_fn(|cx| slot.poll(&SLOTS, cx)).await;
+                    let batch = RecordBatch::try_new(
+                        Arc::clone(schema),
+                        vec![Arc::new(Int64Array::from(vec![key]))],
+                    )?;
+                    let mut writer = PartitionFileWriter::new(manager, "contended join")?;
+                    writer.write(std::iter::once(Ok(batch.clone())))?;
+                    (writer.finish()?.unwrap(), batch)
+                };
+                let actual = manager
+                    .read_spill_as_stream_unbuffered(file.0, None)?
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                assert_eq!(actual, vec![file.1]);
+                Ok::<_, DataFusionError>(())
+            }
+        });
+        let mut writes = Box::pin(futures::future::try_join_all(writes));
+        assert!(futures::poll!(&mut writes).is_pending());
+        assert_eq!(manager.metrics.spill_file_count.value(), 0);
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), writes)
+            .await
+            .expect("local writers must resume when capacity is released")?;
+        assert_eq!(manager.metrics.spill_file_count.value(), 5);
+        assert_eq!(SLOTS.available_permits(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_spill_reopens_one_ipc_stream_in_append_order() -> Result<()> {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
+        let runtime = RuntimeEnvBuilder::new().build_arc()?;
+        let manager = SpillManager::new(
+            runtime,
+            SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            Arc::clone(&schema),
+        )
+        .with_compression_type(SpillCompression::Lz4Frame);
+        let batches = [[3, 1], [4, 2], [6, 5]]
+            .map(|keys| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from_iter_values(keys))],
+                )
+            })
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut writer = PartitionFileWriter::new(&manager, "reopen order")?;
+        for batch in &batches {
+            assert_eq!(writer.write(std::iter::once(Ok(batch.clone())))?, 2);
+        }
+        let file = writer.finish()?.unwrap();
+        assert_eq!(manager.metrics.spill_file_count.value(), 1);
+        let actual = manager
+            .read_spill_as_stream_unbuffered(file, None)?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(actual, batches);
+        Ok(())
     }
 }
