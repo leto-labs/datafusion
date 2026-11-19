@@ -1059,3 +1059,52 @@ The regression compares the bits, capacity and bitmap eligibility with
 the single-array path for nullable, sliced keys across 96 chunks.
 
 See Longbow lane `leto-mjj.101`.
+
+## Family OO: open a Parquet file once per generation and scan
+
+Purpose: stop repeating per-file setup that depends only on the file
+generation or the scan (lane leto-mjj.96, task 5.29d). Dependent Longbow
+feature: SCAN-OPEN-ONCE. Audit classification: UPSTREAMABLE. Upstream
+references: apache/datafusion#27488 (open) writes a deferred page-index load
+back to `CachedParquetFileReaderFactory`'s cache by downcasting the factory,
+which a wrapping factory hides; #24288 (open) asks for masked loading and
+caching. Arrow 60.1 already decodes masked page indexes (`ColumnChunkMask`
+in `ArrowReaderOptions`).
+
+1. **Page index once per file generation.** The opener asks for the page
+   index entries it needs through `AsyncFileReader::get_metadata`, with the
+   column-index mask (page-pruning predicate leaves) and the offset-index
+   mask (read leaves, predicate leaves and leaf 0 for page counts), each in
+   the row groups that statistics kept (`PageIndexRequest`). A reader of a
+   shared metadata cache (`DFParquetMetadata::fetch_metadata`) returns cached
+   metadata that covers the request; otherwise it loads the complete page
+   index of the generation once and writes it back, so later opens and
+   queries parse nothing. A reader without a cache keeps the footer it
+   returned and loads only the requested entries onto it, through itself;
+   the footer is cloned only when it is shared. A reader that ignores the
+   request is followed by a masked load from the reader. A changed file has
+   another `ObjectMeta`, so `is_valid_for` rejects its cached footer and the
+   new generation is parsed again. Prepared scans (family PQ) request the
+   offset indexes of their read columns the same way. Page-index bytes that
+   the cached path reads go to the store directly and are not in
+   `bytes_scanned`.
+2. **Filters once per scan and physical schema.** `ParquetSource` holds a
+   `PreparedFilterCache` that its clones and every partition's morselizer
+   share. An entry holds the adapted predicate and projection, the
+   row-group pruning predicate with its lazily built inversion for full-match
+   detection, and the page pruning predicate. Its key is every input of the
+   preparation: the per-file predicate and projection expressions (pointer
+   equality, so a per-file literal rewrite is a new key), the logical,
+   rewrite and pruning schemas (equal values), virtual columns, the adapter
+   factory, `max_in_list_size` and `enable_page_index`. A predicate with a
+   dynamic filter is also keyed by its snapshot generation, and an entry is
+   kept only when the generation did not change during its build, so a hit
+   equals what a file opened at that generation would prepare. Pruning
+   predicate creation errors of the build are added to every file's counter
+   that uses the entry. At most 16 entries; the debug output prints none.
+3. **One `ParquetFileMetrics` per open.** The opener passes its metrics to
+   the reader factory as a `PartitionedFile` extension (`OpenFileMetrics`);
+   the default and cached factories give them to the open's readers (the
+   first reader, the replacement after Bloom-filter I/O and a prepared
+   scan's extra readers) instead of registering a new set. Each reader adds
+   its own bytes to the scan efficiency ratio.
