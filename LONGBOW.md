@@ -1025,6 +1025,13 @@ Evidence: Longbow lanes `leto-mjj.90`,
 `~/data/longbow/benchmarks/MJJ90-20261119/`, and `leto-mjj.99`,
 `~/data/longbow/benchmarks/MJJ99-20261119/`.
 
+**Descriptor bound (leto-mjj.113).** Local partition writers keep a single IPC
+encoder and reopen their file for each flush and trailer, so no writer handle
+stays open between flushes. A process-wide limit of 128 concurrent writer
+permits also covers custom backends that keep their writer until commit.
+Descriptor exhaustion during join spill I/O reports the open-file limit as a
+resource error. The compressed IPC round-trip test checks exact batch order.
+
 ### Family KB: chunked key-range bitmap
 
 UPSTREAMABLE. Longbow's native join passes the concatenated keys of each

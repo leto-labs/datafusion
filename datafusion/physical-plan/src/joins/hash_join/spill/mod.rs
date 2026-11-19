@@ -66,7 +66,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, ready};
 
 pub(crate) use files::SpillFilesExec;
-use files::{FileSource, Origin, Stage};
+use files::{FileSource, Origin, PartitionFileWriter, Stage, spill_file_error};
 
 use super::exec::{HashJoinExec, HashJoinExecBuilder, JoinLeftData};
 use crate::attempt_tasks::AttemptTasks;
@@ -79,7 +79,6 @@ use crate::joins::utils::{
 use crate::metrics::{
     Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, SpillMetrics,
 };
-use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::RecordBatchStreamAdapter;
 use crate::{ExecutionPlan, SendableRecordBatchStream};
@@ -536,7 +535,7 @@ impl JoinSpillMetrics {
 
 /// A partition file being written, with a buffer of rows not yet written.
 struct PartWriter {
-    file: InProgressSpillFile,
+    file: PartitionFileWriter,
     buffer: Vec<RecordBatch>,
     buffered_rows: usize,
     buffered_bytes: usize,
@@ -546,7 +545,7 @@ struct PartWriter {
 impl PartWriter {
     fn new(manager: &SpillManager, description: &str) -> Result<Self> {
         Ok(Self {
-            file: manager.create_in_progress_file(description)?,
+            file: PartitionFileWriter::new(manager, description)?,
             buffer: vec![],
             buffered_rows: 0,
             buffered_bytes: 0,
@@ -561,11 +560,14 @@ impl PartWriter {
         metrics: &JoinSpillMetrics,
         side: Side,
     ) -> Result<()> {
-        let schema = Arc::clone(self.file.spill_manager.schema());
+        let schema = Arc::clone(self.file.schema());
         let (rows_metric, bytes_metric) = metrics.side(side);
         let before = metrics.spill.spilled_bytes.value();
         let mut start = 0;
-        while start < batches.len() {
+        let written = self.file.write(std::iter::from_fn(|| {
+            if start == batches.len() {
+                return None;
+            }
             let mut end = start;
             let mut rows = 0;
             while end < batches.len() && (end == start || rows < WRITE_BATCH_ROWS) {
@@ -573,15 +575,15 @@ impl PartWriter {
                 end += 1;
             }
             let group = &batches[start..end];
-            if group.len() == 1 {
-                self.file.append_batch(&group[0])?;
-            } else {
-                self.file.append_batch(&concat_batches(&schema, group)?)?;
-            }
-            self.rows += rows;
-            rows_metric.add(rows);
             start = end;
-        }
+            Some(if group.len() == 1 {
+                Ok(group[0].clone())
+            } else {
+                concat_batches(&schema, group).map_err(Into::into)
+            })
+        }))?;
+        self.rows += written;
+        rows_metric.add(written);
         bytes_metric.add(metrics.spill.spilled_bytes.value().saturating_sub(before));
         Ok(())
     }
@@ -1901,11 +1903,14 @@ impl SpilledBuild {
         let rows = match file {
             Some(file) => self
                 .build_manager
-                .read_spill_as_stream_unbuffered(Arc::clone(&file.file), None)?
+                .read_spill_as_stream_unbuffered(Arc::clone(&file.file), None)
+                .map_err(spill_file_error)?
                 .map(move |batch| {
                     // The file lives until its rows are read.
                     let _file = &file;
-                    batch.and_then(|batch| output.emit(&batch))
+                    batch
+                        .map_err(spill_file_error)
+                        .and_then(|batch| output.emit(&batch))
                 })
                 .boxed(),
             None => futures::stream::empty().boxed(),

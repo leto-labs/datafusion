@@ -501,6 +501,10 @@ impl SpillWriter for FileSpillWriter {
 }
 
 impl SpillFile for RefCountedTempFile {
+    fn supports_reopen_for_append(&self) -> bool {
+        true
+    }
+
     fn path(&self) -> Option<&Path> {
         Some(self.path())
     }

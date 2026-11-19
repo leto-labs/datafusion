@@ -31,6 +31,13 @@ pub trait SpillFile: Send + Sync {
     /// Opens a writer for appending data to this file.
     fn open_writer(&self) -> Result<Box<dyn SpillWriter>>;
 
+    /// Whether successive writer handles can append to the same byte stream.
+    /// A true backend must allow a handle to be flushed and dropped, then
+    /// reopened at EOF without committing or resetting the existing stream.
+    fn supports_reopen_for_append(&self) -> bool {
+        false
+    }
+
     /// Opens an asynchronous writer for appending data to this file.
     ///
     /// The default implementation adapts [`Self::open_writer`] for backwards
