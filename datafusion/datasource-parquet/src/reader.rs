@@ -15,6 +15,8 @@ use datafusion_common::HashMap;
 use datafusion_datasource::PartitionedFile;
 use datafusion_execution::cache::cache_manager::FileMetadata;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
+use datafusion_execution::object_store::ObjectStoreUrl;
+use datafusion_physical_plan::metrics::Count;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -64,6 +66,18 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
     /// override this bound; wrappers must forward it.
     fn read_ahead_row_groups(&self, _selected_row_groups: usize) -> usize {
         0
+    }
+
+    /// This factory with every metadata cache entry that its readers insert
+    /// reserving `copies` derived copies
+    /// ([`crate::metadata::CachedParquetMetaData::derived`], Longbow family
+    /// OO); `None` for a factory without a shared metadata cache (the
+    /// default).
+    fn with_derived_copies(
+        &self,
+        _copies: usize,
+    ) -> Option<Arc<dyn ParquetFileReaderFactory>> {
+        None
     }
 
     /// Like [`Self::create_reader`], and also return advice that receives the
@@ -204,25 +218,62 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
 /// [`ParquetFileReader::get_metadata`] forwards the [`parquet::file::metadata::PageIndexPolicy`] from
 /// [`ArrowReaderOptions`] to [`DFParquetMetadata::fetch_metadata`], so callers such as the
 /// parquet opener can skip page-index I/O during the initial metadata load.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct CachedParquetFileReaderFactory {
     store: Arc<dyn ObjectStore>,
+    /// The URL that `store` is registered under: it namespaces the cache
+    /// (Longbow family OO).
+    object_store_url: ObjectStoreUrl,
     metadata_cache: Arc<FileMetadataCache>,
+    derived_copies: usize,
 }
 
 impl CachedParquetFileReaderFactory {
+    /// A factory of readers of `store`, the store registered under
+    /// `object_store_url`, that share `metadata_cache`. Entries are keyed by
+    /// the URL and the file's location, so stores never share an entry
+    /// (Longbow family OO).
     pub fn new(
         store: Arc<dyn ObjectStore>,
+        object_store_url: ObjectStoreUrl,
         metadata_cache: Arc<FileMetadataCache>,
     ) -> Self {
         Self {
             store,
+            object_store_url,
             metadata_cache,
+            derived_copies: 0,
         }
+    }
+
+    /// Every entry its readers insert reserves `copies` derived copies
+    /// ([`crate::metadata::CachedParquetMetaData::derived`]).
+    pub fn with_derived_copies(mut self, copies: usize) -> Self {
+        self.derived_copies = copies;
+        self
+    }
+}
+
+impl Debug for CachedParquetFileReaderFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedParquetFileReaderFactory")
+            .field("store", &self.store)
+            .field("object_store_url", &self.object_store_url)
+            .field("derived_copies", &self.derived_copies)
+            .finish_non_exhaustive()
     }
 }
 
 impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
+    fn with_derived_copies(
+        &self,
+        copies: usize,
+    ) -> Option<Arc<dyn ParquetFileReaderFactory>> {
+        Some(Arc::new(
+            CachedParquetFileReaderFactory::with_derived_copies(self.clone(), copies),
+        ))
+    }
+
     fn create_reader(
         &self,
         partition_index: usize,
@@ -239,7 +290,9 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
             partitioned_file,
         )
         .with_metadata_hint(metadata_size_hint)
-        .with_metadata_cache(Some(Arc::clone(&self.metadata_cache)));
+        .with_metadata_cache(Some(Arc::clone(&self.metadata_cache)))
+        .with_object_store_url(Some(self.object_store_url.clone()))
+        .with_derived_copies(self.derived_copies);
 
         Ok(Box::new(reader))
     }
@@ -268,6 +321,10 @@ pub struct ParquetFileReader {
     store: Arc<dyn ObjectStore>,
     partitioned_file: PartitionedFile,
     metadata_cache: Option<Arc<FileMetadataCache>>,
+    /// Namespaces `metadata_cache`; without it the cache is not used
+    /// (Longbow family OO).
+    object_store_url: Option<ObjectStoreUrl>,
+    derived_copies: usize,
     metadata_size_hint: Option<usize>,
     /// The metadata this reader last returned when it does not share it
     /// through a cache, so that a later request for page index entries loads
@@ -295,6 +352,8 @@ impl ParquetFileReader {
             store,
             partitioned_file,
             metadata_cache: None,
+            object_store_url: None,
+            derived_copies: 0,
             metadata_size_hint: None,
             footer: None,
         }
@@ -316,6 +375,23 @@ impl ParquetFileReader {
         metadata_cache: Option<Arc<FileMetadataCache>>,
     ) -> Self {
         self.metadata_cache = metadata_cache;
+        self
+    }
+
+    /// Set the URL of the reader's object store. The metadata cache is used
+    /// only with it (Longbow family OO).
+    pub fn with_object_store_url(
+        mut self,
+        object_store_url: Option<ObjectStoreUrl>,
+    ) -> Self {
+        self.object_store_url = object_store_url;
+        self
+    }
+
+    /// Entries this reader inserts into the cache reserve `copies` derived
+    /// copies.
+    pub fn with_derived_copies(mut self, copies: usize) -> Self {
+        self.derived_copies = copies;
         self
     }
 
@@ -377,6 +453,7 @@ impl AsyncFileReader for ParquetFileReader {
     ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
         let object_meta = self.partitioned_file.object_meta.clone();
         let metadata_cache = self.metadata_cache.clone();
+        let object_store_url = self.object_store_url.clone();
 
         async move {
             #[cfg(feature = "parquet_encryption")]
@@ -388,8 +465,9 @@ impl AsyncFileReader for ParquetFileReader {
             let file_decryption_properties = None;
 
             let request = options.map(PageIndexRequest::from_options);
-            let shares_metadata =
-                metadata_cache.is_some() && file_decryption_properties.is_none();
+            let shares_metadata = metadata_cache.is_some()
+                && object_store_url.is_some()
+                && file_decryption_properties.is_none();
             let error = |e: datafusion_common::DataFusionError| {
                 ParquetError::General(format!(
                     "Failed to fetch metadata for file {}: {e}",
@@ -407,18 +485,27 @@ impl AsyncFileReader for ParquetFileReader {
                 // Through this reader, so the bytes count as scanned.
                 let metadata =
                     request.load_with(footer, &mut *self).await.map_err(error)?;
+                request.validate(&metadata).map_err(error)?;
                 self.footer = Some(Arc::clone(&metadata));
                 return Ok(metadata);
             }
 
-            let metadata = DFParquetMetadata::new(&self.store, &object_meta)
+            // Longbow family OO: page index bytes that the metadata layer
+            // reads for this open are charged to it.
+            let index_bytes = Count::new();
+            let fetched = DFParquetMetadata::new(&self.store, &object_meta)
                 .with_decryption_properties(file_decryption_properties)
                 .with_file_metadata_cache(metadata_cache)
+                .with_object_store_url(object_store_url)
+                .with_derived_copies(self.derived_copies)
                 .with_metadata_size_hint(self.metadata_size_hint)
                 .with_page_index_request(request)
+                .with_page_index_bytes(Some(index_bytes.clone()))
                 .fetch_metadata()
-                .await
-                .map_err(error)?;
+                .await;
+            self.file_metrics.bytes_scanned.add(index_bytes.value());
+            self.scanned = self.scanned.saturating_add(index_bytes.value());
+            let metadata = fetched.map_err(error)?;
             if !shares_metadata {
                 self.footer = Some(Arc::clone(&metadata));
             }

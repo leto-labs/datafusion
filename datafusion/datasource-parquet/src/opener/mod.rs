@@ -3298,6 +3298,16 @@ mod test {
             .unwrap_or(0)
     }
 
+    /// The store URL of the in-memory stores of these tests (Longbow family OO).
+    fn test_store_url() -> ObjectStoreUrl {
+        ObjectStoreUrl::parse("memory://").unwrap()
+    }
+
+    /// The metadata cache key of `location` in [`test_store_url`].
+    fn test_cache_key(location: &Path) -> Path {
+        crate::metadata::file_metadata_cache_key(&test_store_url(), location)
+    }
+
     fn make_dynamic_expr(expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
         Arc::new(DynamicFilterPhysicalExpr::new(
             expr.children().into_iter().map(Arc::clone).collect(),
@@ -4646,6 +4656,7 @@ mod test {
             .with_parquet_file_reader_factory(Arc::new(
                 CachedParquetFileReaderFactory::new(
                     Arc::clone(&store),
+                    test_store_url(),
                     Arc::clone(&cache),
                 ),
             ))
@@ -4697,8 +4708,10 @@ mod test {
         )
         .await;
         let cache: Arc<FileMetadataCache> = Arc::new(DefaultCache::new(1024 * 1024));
+        // The same store as the scan's (Longbow family OO keys by store).
         let original = DFParquetMetadata::new(store.as_ref(), &file.object_meta)
             .with_file_metadata_cache(Some(Arc::clone(&cache)))
+            .with_object_store_url(Some(test_store_url()))
             .with_page_index_policy(Some(PageIndexPolicy::Optional))
             .fetch_metadata()
             .await
@@ -4714,6 +4727,7 @@ mod test {
             .with_parquet_file_reader_factory(Arc::new(
                 CachedParquetFileReaderFactory::new(
                     Arc::clone(&store),
+                    test_store_url(),
                     Arc::clone(&cache),
                 ),
             ))
@@ -4743,7 +4757,9 @@ mod test {
                 prepared.loaded.reader_metadata.metadata()
             ));
         }
-        let cached = cache.get(&file.object_meta.location).unwrap();
+        let cached = cache
+            .get(&test_cache_key(&file.object_meta.location))
+            .unwrap();
         let cached = cached
             .file_metadata
             .as_any()
@@ -4841,6 +4857,7 @@ mod test {
                 .with_parquet_file_reader_factory(Arc::new(
                     CachedParquetFileReaderFactory::new(
                         Arc::clone(&store),
+                        test_store_url(),
                         Arc::clone(&cache),
                     ),
                 ))
@@ -4870,7 +4887,9 @@ mod test {
             };
             assert_eq!(pruning_metrics.pruned(), 2);
             assert!(
-                cache.get(&file.object_meta.location).is_none(),
+                cache
+                    .get(&test_cache_key(&file.object_meta.location))
+                    .is_none(),
                 "encrypted metadata must not enter the shared cache"
             );
         }
@@ -5882,6 +5901,7 @@ mod test {
             .with_parquet_file_reader_factory(Arc::new(
                 CachedParquetFileReaderFactory::new(
                     Arc::clone(&store),
+                    test_store_url(),
                     Arc::clone(&metadata_cache),
                 ),
             ))
@@ -5893,7 +5913,7 @@ mod test {
         assert_eq!(counter_metric_value(&metrics, "page_index_load_skipped"), 1);
 
         let cached = metadata_cache
-            .get(&Path::from("test.parquet"))
+            .get(&test_cache_key(&Path::from("test.parquet")))
             .expect("metadata cache should contain the file");
         let extra_info = cached.file_metadata.extra_info();
         let page_index_cached = extra_info.get("page_index").map(String::as_str);
