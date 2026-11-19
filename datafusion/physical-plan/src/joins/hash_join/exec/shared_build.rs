@@ -71,8 +71,8 @@ use crate::attempt_tasks::{AttemptTasks, ScopedTask, spawn_producer, stopped_err
 use crate::joins::inline_keys::{EncodedKeys, InlineKeys};
 use crate::joins::join_hash_map::ProbeOffset;
 use crate::joins::join_hash_map::{
-    HeadLookup, HeadTable, HeadWord, InlineU32, JoinHashMapType, heads_contain_hashes,
-    heads_matched_indices, heads_matched_indices_with_limit_offset,
+    HeadLookup, HeadTable, HeadWord, JoinHashMapType, PackedU64, SlotLayout,
+    heads_contain_hashes, heads_matched_indices, heads_matched_indices_with_limit_offset,
     inline_matched_indices_with_limit_offset, prefetch_pays,
 };
 use crate::joins::utils::{BuildProbeJoinMetrics, matchable_join_keys};
@@ -235,7 +235,7 @@ impl ParallelBuild {
     }
 
     /// Longbow patch (JT 9): [`Self::build`] with shard tables of width
-    /// `W`; with `inline` keys (and `W` = [`InlineU32`]), every row's
+    /// `W`; with `inline` keys (and `W` = [`PackedU64`]), every row's
     /// encoded key goes into its shard beside its hash.
     #[expect(clippy::too_many_arguments)]
     pub(super) async fn build_with<W: HeadWord<Chain = u32>>(
@@ -260,6 +260,13 @@ impl ParallelBuild {
                 "a shared join build with inline slots needs inline keys"
             ));
         }
+        // Heads index the whole build, so every shard has the same fields.
+        let layout = match &inline {
+            Some(keys) => SlotLayout::packed(num_rows, keys.bits()).ok_or_else(|| {
+                internal_datafusion_err!("inline join keys do not fit the slots")
+            })?,
+            None => SlotLayout::default(),
+        };
         let shards = self.shards(num_rows);
         if shards < 2 {
             return Ok(None);
@@ -372,7 +379,7 @@ impl ParallelBuild {
                 if let Some(fault) = &fault {
                     tokio::time::sleep(fault.table_delay).await;
                 }
-                let table = fill_shard::<W>(&groups, shard, count, &next);
+                let table = fill_shard::<W>(&groups, shard, count, layout, &next);
                 #[cfg(test)]
                 if let Some(fault) = &fault {
                     fault.tables_done.fetch_add(1, Ordering::Relaxed);
@@ -470,7 +477,7 @@ impl ParallelBuild {
     ) -> Result<Option<Box<dyn JoinHashMapType>>> {
         let before = reservation.size();
         let built = if inline.is_some() {
-            self.build_with::<InlineU32>(
+            self.build_with::<PackedU64>(
                 batches,
                 num_rows,
                 schema,
@@ -1081,9 +1088,10 @@ fn fill_shard<W: HeadWord<Chain = u32>>(
     groups: &[HashedGroup],
     shard: usize,
     count: usize,
+    layout: SlotLayout,
     next: &[AtomicU32],
 ) -> Result<(HeadTable<W>, bool)> {
-    let mut table = HeadTable::with_capacity(count);
+    let mut table = HeadTable::with_layout(count, layout);
     let mut chained = false;
     let rows = groups.iter().rev().flat_map(|group| {
         group.rows[shard].iter().rev().map(move |&row| {
@@ -1108,7 +1116,7 @@ fn fill_shard<W: HeadWord<Chain = u32>>(
 /// holds two rows (`chained`), not on `len == next.len()`: unmatchable NULL-key
 /// rows own a chain slot but no entry, and must not disable it.
 ///
-/// Longbow patch (JT 9): with `W` = [`InlineU32`] the shards hold inline
+/// Longbow patch (JT 9): with `W` = [`PackedU64`] the shards hold inline
 /// keys, whose encoding is `keys`.
 pub(super) struct ShardedJoinHashMap<W: HeadWord = u32> {
     shards: Vec<HeadTable<W>>,

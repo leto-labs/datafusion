@@ -316,9 +316,11 @@ async fn inline_keys_match_the_hash_only_build_for_every_join_type() -> Result<(
         JoinType::LeftMark,
         JoinType::RightMark,
     ];
-    // `k` (with NULLs and duplicates), `v` (unique, every probe row
-    // matches) and both (rarely equal: an anti join of nearly every row).
-    for keys in [&[0][..], &[2][..], &[0, 2][..]] {
+    // Packed slots: `k` (with NULLs and duplicates) and `v` (unique, every
+    // probe row matches). Dense keys (too wide for the slots): both (rarely
+    // equal: an anti join of nearly every row) and `v` twice (every probe
+    // row matches).
+    for keys in [&[0][..], &[2][..], &[0, 2][..], &[2, 2][..]] {
         for join_type in join_types {
             for null_equality in [
                 NullEquality::NullEqualsNothing,
@@ -342,7 +344,7 @@ async fn inline_keys_match_the_hash_only_build_for_every_join_type() -> Result<(
                     assert!(
                         !outputs[0].rows.is_empty()
                             || join_type == JoinType::RightAnti
-                            || keys.len() == 2
+                            || keys == [0, 2]
                     );
                     assert_eq!(outputs[0].shards, outputs[1].shards);
                     assert!(
@@ -1188,7 +1190,7 @@ async fn sharded_map_keeps_the_unique_fast_path_with_null_build_keys() -> Result
 /// for unique and duplicate keys with NULLs on both sides.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_inline_sharded_map_equals_the_compared_native_probe() -> Result<()> {
-    use crate::joins::join_hash_map::InlineU32;
+    use crate::joins::join_hash_map::PackedU64;
     let rows = 140_000;
     for duplicates in [false, true] {
         let (schema, batches) = int_batches(rows, |i| {
@@ -1209,7 +1211,7 @@ async fn an_inline_sharded_map_equals_the_compared_native_probe() -> Result<()> 
         let encoding =
             InlineKeys::for_build(&keys, NullEquality::NullEqualsNothing).unwrap();
         let (sharded, batch, _copies) = ParallelBuild::for_test(1, 8)
-            .build_with::<InlineU32>(
+            .build_with::<PackedU64>(
                 &batches,
                 rows,
                 &schema,

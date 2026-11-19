@@ -157,10 +157,11 @@ fn check(case: &Case, share: i64, limits: &[usize]) {
         })
         .unwrap();
     let mut inline = JoinHashMapInline::with_capacity(rows, keys.clone());
+    let batch_keys = |_: usize| Ok(build_keys.clone());
     inline
         .update_partitioned(&BuildRows {
             hashes: &build_hashes,
-            keys: Some(&build_keys),
+            keys: Some(&batch_keys),
             batches: &layout,
         })
         .unwrap();
@@ -258,11 +259,11 @@ fn unique_keys_take_the_unique_path() {
             .unwrap();
     let mut inline = JoinHashMapInline::with_capacity(5_000, keys);
     let build_hashes = hashes(&case.build, 1);
-    let build_keys: Vec<u64> = (0..5_000).collect();
+    let batch_keys = |_: usize| Ok((0..5_000).collect());
     inline
         .update_partitioned(&BuildRows {
             hashes: &build_hashes,
-            keys: Some(&build_keys),
+            keys: Some(&batch_keys),
             batches: &[(0, 5_000, None)],
         })
         .unwrap();
@@ -271,7 +272,8 @@ fn unique_keys_take_the_unique_path() {
 
 #[test]
 fn a_tag_collision_of_different_keys_marks_the_chain_mixed() {
-    let mut table = HeadTable::<InlineU32>::with_capacity(8);
+    let layout = SlotLayout::packed(8, 4).unwrap();
+    let mut table = HeadTable::<PackedU64>::with_layout(8, layout);
     assert_eq!(table.insert(42, 1, 7), Ok(0));
     assert_eq!(table.find(42), (1, 7, false));
     // The same hash and key: still one key.
@@ -288,13 +290,32 @@ fn a_tag_collision_of_different_keys_marks_the_chain_mixed() {
 }
 
 #[test]
-fn an_inline_table_is_at_most_twice_the_u32_table() {
+fn a_packed_slot_keeps_every_field_at_its_widths() {
+    for (rows, key_bits) in [(1, 0), (8, 4), (300_000, 30), (1 << 31, 20), (5, 50)] {
+        let layout = SlotLayout::packed(rows, key_bits).unwrap();
+        assert!(layout.tag_bits() >= MIN_TAG_BITS);
+        let mut words = [0_u64; 1];
+        let head = rows as u64;
+        let key = low_bits(key_bits);
+        let tag = PackedU64::tag(layout, u64::MAX);
+        for mixed in [false, true] {
+            PackedU64::write_slot(layout, &mut words, 0, tag, head, key, mixed);
+            assert_eq!(PackedU64::read(layout, &words, 0), (tag, head));
+            assert_eq!(PackedU64::read_key(layout, &words, 0), (key, mixed));
+        }
+    }
+    // The tag would keep fewer than its minimum bits.
+    assert!(SlotLayout::packed(1 << 20, 64 - 21 - 1 - MIN_TAG_BITS + 1).is_none());
+    assert!(SlotLayout::packed(u32::MAX as usize, 1).is_none());
+}
+
+#[test]
+fn a_packed_table_has_the_bytes_of_a_u32_table() {
     for capacity in [1, 2, 3, 1000, 1 << 20, (1 << 20) + 1, 3 << 19, 5_000_000] {
-        let inline = HeadTable::<InlineU32>::bytes_for(capacity);
-        let narrow = HeadTable::<u32>::bytes_for(capacity);
-        assert!(inline <= 2 * narrow, "{capacity}: {inline} {narrow}");
-        // A load of at most 2/3.
-        assert!(inline / 16 * 2 >= capacity * 3, "{capacity}");
+        assert_eq!(
+            JoinHashMapInline::table_bytes(capacity),
+            HeadTable::<u32>::bytes_for(capacity)
+        );
     }
 }
 

@@ -299,23 +299,31 @@ impl JoinHashMapType for JoinHashMapU32 {
 
 /// Longbow patch (JT 9): [`JoinHashMapU32`] with inline keys: each slot of
 /// its head table also holds the encoded key of the chain's head row
-/// ([`InlineU32`]), so a probe reads no build key column. Built only from
+/// ([`PackedU64`], in the bytes of a `u32` slot), so a probe reads no build
+/// key column. Built only from
 /// whole rows with their keys ([`PartitionedBuild::update_partitioned`] or
 /// the shared build); [`JoinHashMapType::update_from_iter`], which has only
 /// hashes, is refused.
 pub struct JoinHashMapInline {
-    table: HeadTable<InlineU32>,
+    table: HeadTable<PackedU64>,
     next: ZeroedArray<u32>,
     chained: bool,
     keys: InlineKeys,
 }
 
 impl JoinHashMapInline {
-    /// A map for `cap` rows (below [`INLINE_MAX_ROWS`]) with `keys`.
+    /// The slot layout of a map for `cap` rows with `keys`, or `None` when
+    /// the keys do not fit its slots beside the heads and the tag.
+    pub fn layout_for(cap: usize, keys: &InlineKeys) -> Option<SlotLayout> {
+        SlotLayout::packed(cap, keys.bits())
+    }
+
+    /// A map for `cap` rows with `keys`, whose slots must fit them
+    /// ([`Self::layout_for`]).
     pub fn with_capacity(cap: usize, keys: InlineKeys) -> Self {
-        assert!(cap < INLINE_MAX_ROWS, "inline join map rows");
+        let layout = Self::layout_for(cap, &keys).expect("inline keys fit the slots");
         Self {
-            table: HeadTable::with_capacity(cap),
+            table: HeadTable::with_layout(cap, layout),
             next: zeroed_with_huge_pages(cap),
             chained: false,
             keys,
@@ -323,9 +331,10 @@ impl JoinHashMapInline {
     }
 
     /// Bytes of the head table of a map made for `cap` rows (the chain
-    /// array is not included, as in `estimate_memory_size`).
+    /// array is not included, as in `estimate_memory_size`): those of a
+    /// `u32` map.
     pub fn table_bytes(cap: usize) -> usize {
-        HeadTable::<InlineU32>::bytes_for(cap)
+        HeadTable::<PackedU64>::bytes_for(cap)
     }
 }
 
@@ -851,49 +860,93 @@ pub fn huge_page_advice() -> bool {
     })
 }
 
+/// Longbow patch (JT 9): the bit fields of a [`PackedU64`] slot, chosen per
+/// table: `head_bits` for the largest head (row + 1) and `key_bits` for the
+/// inline key; the tag takes the rest. Tables without inline keys ignore it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlotLayout {
+    head_bits: u32,
+    key_bits: u32,
+}
+
+/// The fewest hash bits that a [`PackedU64`] slot keeps as its tag. Two
+/// different keys of one probe run with equal tags share a chain, which is
+/// then marked mixed; at a load of at most one half that is about one insert
+/// in 2^11 at this width.
+pub const MIN_TAG_BITS: u32 = 10;
+
+impl SlotLayout {
+    /// The layout of a table whose heads are at most `rows` with inline
+    /// keys of `key_bits` bits, or `None` when the tag would keep fewer than
+    /// [`MIN_TAG_BITS`] bits (or `rows` does not fit a `u32` chain).
+    pub fn packed(rows: usize, key_bits: u32) -> Option<Self> {
+        if rows >= u32::MAX as usize || key_bits > 64 {
+            return None;
+        }
+        let head_bits = (u64::BITS - (rows as u64).leading_zeros()).max(1);
+        let used = head_bits + 1 + key_bits;
+        (used + MIN_TAG_BITS <= u64::BITS).then_some(Self {
+            head_bits,
+            key_bits,
+        })
+    }
+
+    #[inline(always)]
+    fn tag_shift(self) -> u32 {
+        self.head_bits + 1 + self.key_bits
+    }
+
+    #[inline(always)]
+    fn tag_bits(self) -> u32 {
+        u64::BITS - self.tag_shift()
+    }
+
+    /// The bits of the inline key.
+    pub fn key_bits(self) -> u32 {
+        self.key_bits
+    }
+}
+
+#[inline(always)]
+fn low_bits(bits: u32) -> u64 {
+    if bits >= u64::BITS {
+        u64::MAX
+    } else {
+        (1_u64 << bits) - 1
+    }
+}
+
 /// The width of the heads of a [`HeadTable`].
 pub(crate) trait HeadWord: Copy + Send + Sync + 'static {
     /// 64-bit words per slot.
     const WORDS: usize;
     /// Longbow patch (JT 9): whether a slot also keeps the inline key of
-    /// its head row ([`InlineU32`]).
+    /// its head row ([`PackedU64`]).
     const INLINE: bool = false;
     /// The type of the chain array's entries.
     type Chain: Copy;
     /// The hash bits that a slot stores.
-    fn tag(hash: u64) -> u64;
+    fn tag(layout: SlotLayout, hash: u64) -> u64;
     /// The tag and the head of a slot; head 0 is an empty slot.
-    fn read(words: &[u64], slot: usize) -> (u64, u64);
-    fn write(words: &mut [u64], slot: usize, tag: u64, head: u64);
-    /// Converts a head (row + 1) of this width.
-    fn of_head(head: u64) -> Self::Chain;
-    fn head_of(row: usize) -> u64;
-    /// Slots of a table made for `capacity` rows: twice the capacity,
-    /// rounded up to a power of two.
-    fn slots_for(capacity: usize) -> usize {
-        capacity
-            .saturating_mul(2)
-            .max(2)
-            .checked_next_power_of_two()
-            .expect("join table capacity")
-    }
-    /// The inline key of a slot's head and whether the slot's chain holds
-    /// rows of different keys; `(0, false)` for a table without keys.
-    #[inline(always)]
-    fn read_key(_words: &[u64], _slot: usize) -> (u64, bool) {
-        (0, false)
-    }
+    fn read(layout: SlotLayout, words: &[u64], slot: usize) -> (u64, u64);
     /// Writes a slot; `key` and `mixed` are kept only by an inline table.
-    #[inline(always)]
     fn write_slot(
+        layout: SlotLayout,
         words: &mut [u64],
         slot: usize,
         tag: u64,
         head: u64,
-        _key: u64,
-        _mixed: bool,
-    ) {
-        Self::write(words, slot, tag, head)
+        key: u64,
+        mixed: bool,
+    );
+    /// Converts a head (row + 1) of this width.
+    fn of_head(head: u64) -> Self::Chain;
+    fn head_of(layout: SlotLayout, row: usize) -> u64;
+    /// The inline key of a slot's head and whether the slot's chain holds
+    /// rows of different keys; `(0, false)` for a table without keys.
+    #[inline(always)]
+    fn read_key(_layout: SlotLayout, _words: &[u64], _slot: usize) -> (u64, bool) {
+        (0, false)
     }
 }
 
@@ -902,18 +955,26 @@ impl HeadWord for u32 {
     type Chain = u32;
 
     #[inline(always)]
-    fn tag(hash: u64) -> u64 {
+    fn tag(_: SlotLayout, hash: u64) -> u64 {
         hash & 0xFFFF_FFFF
     }
 
     #[inline(always)]
-    fn read(words: &[u64], slot: usize) -> (u64, u64) {
+    fn read(_: SlotLayout, words: &[u64], slot: usize) -> (u64, u64) {
         let word = words[slot];
         (word >> 32, word & 0xFFFF_FFFF)
     }
 
     #[inline(always)]
-    fn write(words: &mut [u64], slot: usize, tag: u64, head: u64) {
+    fn write_slot(
+        _: SlotLayout,
+        words: &mut [u64],
+        slot: usize,
+        tag: u64,
+        head: u64,
+        _key: u64,
+        _mixed: bool,
+    ) {
         words[slot] = (tag << 32) | head;
     }
 
@@ -923,7 +984,7 @@ impl HeadWord for u32 {
     }
 
     #[inline(always)]
-    fn head_of(row: usize) -> u64 {
+    fn head_of(_: SlotLayout, row: usize) -> u64 {
         // As `T::try_from(row + 1).unwrap()` before: a `u32` map has fewer
         // than `u32::MAX` rows.
         u64::from(u32::try_from(row + 1).expect("u32 join map row"))
@@ -935,17 +996,25 @@ impl HeadWord for u64 {
     type Chain = u64;
 
     #[inline(always)]
-    fn tag(hash: u64) -> u64 {
+    fn tag(_: SlotLayout, hash: u64) -> u64 {
         hash
     }
 
     #[inline(always)]
-    fn read(words: &[u64], slot: usize) -> (u64, u64) {
+    fn read(_: SlotLayout, words: &[u64], slot: usize) -> (u64, u64) {
         (words[2 * slot], words[2 * slot + 1])
     }
 
     #[inline(always)]
-    fn write(words: &mut [u64], slot: usize, tag: u64, head: u64) {
+    fn write_slot(
+        _: SlotLayout,
+        words: &mut [u64],
+        slot: usize,
+        tag: u64,
+        head: u64,
+        _key: u64,
+        _mixed: bool,
+    ) {
         words[2 * slot] = tag;
         words[2 * slot + 1] = head;
     }
@@ -956,46 +1025,56 @@ impl HeadWord for u64 {
     }
 
     #[inline(always)]
-    fn head_of(row: usize) -> u64 {
+    fn head_of(_: SlotLayout, row: usize) -> u64 {
         row as u64 + 1
     }
 }
 
-/// Longbow patch (JT 9): the slot of a `u32` table with inline keys: the
-/// `u32` slot word (tag, then head), whose head bit 31 marks a chain that
-/// holds rows of different keys, and the inline key
-/// ([`crate::joins::inline_keys::InlineKeys`]) of the head row. All rows of
-/// a chain without that mark have the slot's key, so a probe compares its
-/// key with the slot's and reads no build key. Heads stay below 2^31.
+/// Longbow patch (JT 9): a one-word slot with an inline key, in the bytes
+/// and at the load of a `u32` slot. From the top: the low hash bits as the
+/// tag, the inline key ([`crate::joins::inline_keys::InlineKeys`]) of the
+/// head row, a bit that marks a chain holding rows of different keys, and
+/// the head (row + 1), each as wide as the table's [`SlotLayout`] says.
+/// All rows of a chain without the mark have the slot's key, so a probe
+/// compares its key in the slot's own cache line and reads no build key.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct InlineU32;
+pub(crate) struct PackedU64;
 
-/// The head bit of an [`InlineU32`] slot whose chain mixes keys.
-const MIXED_CHAIN: u64 = 1 << 31;
-
-/// The largest row count of an [`InlineU32`] table.
-pub(crate) const INLINE_MAX_ROWS: usize = (MIXED_CHAIN - 1) as usize;
-
-impl HeadWord for InlineU32 {
-    const WORDS: usize = 2;
+impl HeadWord for PackedU64 {
+    const WORDS: usize = 1;
     const INLINE: bool = true;
     type Chain = u32;
 
     #[inline(always)]
-    fn tag(hash: u64) -> u64 {
-        hash & 0xFFFF_FFFF
+    fn tag(layout: SlotLayout, hash: u64) -> u64 {
+        hash & low_bits(layout.tag_bits())
     }
 
     #[inline(always)]
-    fn read(words: &[u64], slot: usize) -> (u64, u64) {
-        let word = words[2 * slot];
-        (word >> 32, word & (MIXED_CHAIN - 1))
+    fn read(layout: SlotLayout, words: &[u64], slot: usize) -> (u64, u64) {
+        let word = words[slot];
+        (
+            word >> layout.tag_shift(),
+            word & low_bits(layout.head_bits),
+        )
     }
 
     #[inline(always)]
-    fn write(words: &mut [u64], slot: usize, tag: u64, head: u64) {
-        let mixed = words[2 * slot] & MIXED_CHAIN;
-        words[2 * slot] = (tag << 32) | mixed | head;
+    fn write_slot(
+        layout: SlotLayout,
+        words: &mut [u64],
+        slot: usize,
+        tag: u64,
+        head: u64,
+        key: u64,
+        mixed: bool,
+    ) {
+        debug_assert!(head <= low_bits(layout.head_bits));
+        debug_assert!(key <= low_bits(layout.key_bits));
+        words[slot] = (tag << layout.tag_shift())
+            | (key << (layout.head_bits + 1))
+            | (u64::from(mixed) << layout.head_bits)
+            | head;
     }
 
     #[inline(always)]
@@ -1004,40 +1083,19 @@ impl HeadWord for InlineU32 {
     }
 
     #[inline(always)]
-    fn head_of(row: usize) -> u64 {
-        assert!(row < INLINE_MAX_ROWS, "inline join map row");
-        row as u64 + 1
-    }
-
-    /// One and a half times the capacity, rounded up to a power of two: a
-    /// slot is twice as wide as a `u32` slot, and a load of at most 2/3
-    /// keeps the bytes of a table at or below the `u32` table's for the
-    /// same rows in most sizes (at most twice them) while most probes end in
-    /// the slot's own cache line.
-    fn slots_for(capacity: usize) -> usize {
-        capacity
-            .saturating_add(capacity.div_ceil(2))
-            .max(2)
-            .checked_next_power_of_two()
-            .expect("join table capacity")
+    fn head_of(layout: SlotLayout, row: usize) -> u64 {
+        let head = row as u64 + 1;
+        assert!(head <= low_bits(layout.head_bits), "inline join map row");
+        head
     }
 
     #[inline(always)]
-    fn read_key(words: &[u64], slot: usize) -> (u64, bool) {
-        (words[2 * slot + 1], words[2 * slot] & MIXED_CHAIN != 0)
-    }
-
-    #[inline(always)]
-    fn write_slot(
-        words: &mut [u64],
-        slot: usize,
-        tag: u64,
-        head: u64,
-        key: u64,
-        mixed: bool,
-    ) {
-        words[2 * slot] = (tag << 32) | if mixed { MIXED_CHAIN } else { 0 } | head;
-        words[2 * slot + 1] = key;
+    fn read_key(layout: SlotLayout, words: &[u64], slot: usize) -> (u64, bool) {
+        let word = words[slot];
+        (
+            (word >> (layout.head_bits + 1)) & low_bits(layout.key_bits),
+            (word >> layout.head_bits) & 1 != 0,
+        )
     }
 }
 
@@ -1048,6 +1106,8 @@ pub(crate) struct TableFull;
 /// Chain heads by hash: the first row (+ 1) of each distinct hash.
 pub(crate) struct HeadTable<T: HeadWord> {
     words: ZeroedArray<u64>,
+    /// Longbow patch (JT 9): the slot fields of a [`PackedU64`] table.
+    layout: SlotLayout,
     /// The rows that the table was made for.
     capacity: usize,
     /// `64 - log2(slots)`.
@@ -1060,7 +1120,11 @@ pub(crate) struct HeadTable<T: HeadWord> {
 
 impl<T: HeadWord> HeadTable<T> {
     fn slots_for(capacity: usize) -> usize {
-        T::slots_for(capacity)
+        capacity
+            .saturating_mul(2)
+            .max(2)
+            .checked_next_power_of_two()
+            .expect("join table capacity")
     }
 
     /// Bytes of the slots of a table made for `capacity` rows.
@@ -1069,11 +1133,17 @@ impl<T: HeadWord> HeadTable<T> {
     }
 
     pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self::with_layout(capacity, SlotLayout::default())
+    }
+
+    /// Longbow patch (JT 9): a table whose slots have `layout`.
+    pub(crate) fn with_layout(capacity: usize, layout: SlotLayout) -> Self {
         let slots = Self::slots_for(capacity);
         let words = zeroed_with_huge_pages(slots * T::WORDS);
         Self {
             prefetch: prefetch_pays(words.len() * size_of::<u64>()),
             words,
+            layout,
             capacity,
             shift: 64 - slots.trailing_zeros(),
             mask: slots - 1,
@@ -1112,10 +1182,10 @@ impl<T: HeadWord> HeadTable<T> {
     /// The chain head of `hash`, or 0.
     #[inline(always)]
     pub(crate) fn head(&self, hash: u64) -> u64 {
-        let tag = T::tag(hash);
+        let tag = T::tag(self.layout, hash);
         let mut slot = self.position(hash);
         loop {
-            let (stored, head) = T::read(&self.words, slot);
+            let (stored, head) = T::read(self.layout, &self.words, slot);
             if head == 0 {
                 return 0;
             }
@@ -1130,15 +1200,15 @@ impl<T: HeadWord> HeadTable<T> {
     /// slot's inline key and mixed-chain mark ([`HeadWord::read_key`]).
     #[inline(always)]
     pub(crate) fn find(&self, hash: u64) -> (u64, u64, bool) {
-        let tag = T::tag(hash);
+        let tag = T::tag(self.layout, hash);
         let mut slot = self.position(hash);
         loop {
-            let (stored, head) = T::read(&self.words, slot);
+            let (stored, head) = T::read(self.layout, &self.words, slot);
             if head == 0 {
                 return (0, 0, false);
             }
             if stored == tag {
-                let (key, mixed) = T::read_key(&self.words, slot);
+                let (key, mixed) = T::read_key(self.layout, &self.words, slot);
                 return (head, key, mixed);
             }
             slot = (slot + 1) & self.mask;
@@ -1162,22 +1232,22 @@ impl<T: HeadWord> HeadTable<T> {
         head: u64,
         key: u64,
     ) -> Result<u64, TableFull> {
-        let tag = T::tag(hash);
+        let tag = T::tag(self.layout, hash);
         let mut slot = self.position(hash);
         loop {
-            let (stored, previous) = T::read(&self.words, slot);
+            let (stored, previous) = T::read(self.layout, &self.words, slot);
             if previous == 0 {
                 if self.len >= self.mask {
                     return Err(TableFull);
                 }
-                T::write_slot(&mut self.words, slot, tag, head, key, false);
+                T::write_slot(self.layout, &mut self.words, slot, tag, head, key, false);
                 self.len += 1;
                 return Ok(0);
             }
             if stored == tag {
-                let (old_key, mixed) = T::read_key(&self.words, slot);
+                let (old_key, mixed) = T::read_key(self.layout, &self.words, slot);
                 let mixed = mixed || (T::INLINE && old_key != key);
-                T::write_slot(&mut self.words, slot, tag, head, key, mixed);
+                T::write_slot(self.layout, &mut self.words, slot, tag, head, key, mixed);
                 return Ok(previous);
             }
             slot = (slot + 1) & self.mask;
@@ -1218,7 +1288,7 @@ impl<T: HeadWord> HeadTable<T> {
                     "join hash map row {row} is beyond its {row_bound} rows"
                 ));
             }
-            match table.insert(hash, T::head_of(row), key) {
+            match table.insert(hash, T::head_of(table.layout, row), key) {
                 Ok(0) => Ok(()),
                 Ok(head) => {
                     previous(row, T::of_head(head));
@@ -1290,9 +1360,10 @@ const PARTITION_BYTES: usize = 256 << 10;
 /// build inserts them: batch by batch, each batch's rows from its last.
 pub struct BuildRows<'a> {
     pub hashes: &'a [u64],
-    /// Longbow patch (JT 9): the inline key of every row, for a map with
-    /// inline keys.
-    pub keys: Option<&'a [u64]>,
+    /// Longbow patch (JT 9): for a map with inline keys, the inline keys of
+    /// the rows of `batches[i]` (in row order), computed when the build
+    /// reaches that batch.
+    pub keys: Option<&'a BatchKeys<'a>>,
     pub batches: &'a [(usize, usize, Option<NullBuffer>)],
 }
 
@@ -1307,6 +1378,33 @@ impl BuildRows<'_> {
                     .then_some(first + index)
             })
         })
+    }
+}
+
+/// Longbow patch (JT 9): the inline keys of one batch of a [`BuildRows`].
+pub type BatchKeys<'a> = dyn Fn(usize) -> Result<Vec<u64>> + 'a;
+
+impl BuildRows<'_> {
+    /// The rows in insertion order with their hashes and inline keys (0
+    /// without keys).
+    fn rows_with_keys(
+        &self,
+        mut add: impl FnMut(usize, u64, u64) -> Result<()>,
+    ) -> Result<()> {
+        for (index, (first, len, valid)) in self.batches.iter().enumerate() {
+            let keys = self.keys.map(|keys| keys(index)).transpose()?;
+            if keys.as_ref().is_some_and(|keys| keys.len() != *len) {
+                return Err(internal_datafusion_err!("join build keys of another batch"));
+            }
+            for index in (0..*len).rev() {
+                if valid.as_ref().is_none_or(|valid| valid.is_valid(index)) {
+                    let row = first + index;
+                    let key = keys.as_ref().map_or(0, |keys| keys[index]);
+                    add(row, self.hashes[row], key)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1325,9 +1423,10 @@ pub trait PartitionedBuild: JoinHashMapType {
 
 /// Transient bytes of [`build_partitioned`] for `rows` build rows: a hash
 /// for every row, then the scattered hashes and row numbers; with `inline`
-/// keys also a key for every row and the scattered keys.
+/// keys also the scattered keys (each batch's keys live only while it is
+/// scattered).
 pub fn partitioned_build_bytes(rows: usize, inline: bool) -> usize {
-    let keys = if inline { 2 * size_of::<u64>() } else { 0 };
+    let keys = if inline { size_of::<u64>() } else { 0 };
     rows * (2 * size_of::<u64>() + size_of::<u32>() + keys)
 }
 
@@ -1357,7 +1456,7 @@ macro_rules! partitioned_build {
 }
 // Row numbers of a partitioned build are `u32`: only the `u32` map has one.
 partitioned_build!(JoinHashMapU32, u32);
-partitioned_build!(JoinHashMapInline, InlineU32);
+partitioned_build!(JoinHashMapInline, PackedU64);
 
 impl<T: HeadWord> HeadTable<T> {
     /// Inserts `rows` as [`Self::insert_all`] in their order, but partition
@@ -1375,16 +1474,16 @@ impl<T: HeadWord> HeadTable<T> {
         F: FnMut(usize, T::Chain),
     {
         let hashes = rows.hashes;
-        let key_of = |row: usize| rows.keys.map_or(0, |keys| keys[row]);
         let slot_bits = 64 - self.shift;
         let partition_slots = (PARTITION_BYTES / (T::WORDS * size_of::<u64>())).max(1);
         let partition_bits = slot_bits.saturating_sub(partition_slots.trailing_zeros());
         if partition_bits == 0 {
-            return self.insert_all(
-                rows.rows().map(|row| (row, hashes[row], key_of(row))),
-                row_bound,
-                previous,
-            );
+            let mut all = Vec::new();
+            rows.rows_with_keys(|row, hash, key| {
+                all.push((row, hash, key));
+                Ok(())
+            })?;
+            return self.insert_all(all.into_iter(), row_bound, previous);
         }
         let low = slot_bits - partition_bits;
         let partition_of = |hash: u64| self.position(hash) >> low;
@@ -1398,20 +1497,21 @@ impl<T: HeadWord> HeadTable<T> {
         let total = starts[starts.len() - 1];
         let mut scattered_hashes = vec![0_u64; total];
         let mut scattered_rows = vec![0_u32; total];
-        // Longbow patch (JT 9): an inline table also scatters the keys.
+        // Longbow patch (JT 9): an inline table also scatters the keys,
+        // encoded batch by batch.
         let mut scattered_keys = vec![0_u64; if T::INLINE { total } else { 0 }];
-        for row in rows.rows() {
-            let hash = hashes[row];
+        rows.rows_with_keys(|row, hash, key| {
             let at = &mut starts[partition_of(hash)];
             scattered_hashes[*at] = hash;
             if T::INLINE {
-                scattered_keys[*at] = key_of(row);
+                scattered_keys[*at] = key;
             }
             scattered_rows[*at] = u32::try_from(row).map_err(|_| {
                 internal_datafusion_err!("partitioned join build above u32 rows")
             })?;
             *at += 1;
-        }
+            Ok(())
+        })?;
         // In partition order and, within a partition, in the given order.
         self.insert_all(
             scattered_rows
@@ -1461,8 +1561,6 @@ pub(crate) fn build_partitioned<'a, M: PartitionedBuild>(
     let peak = reservation.size();
     let result = (|| {
         let mut hashes = vec![0_u64; num_rows];
-        let mut row_keys =
-            Vec::with_capacity(if inline.is_some() { num_rows } else { 0 });
         let mut layout = Vec::new();
         let mut offset = 0;
         for batch in batches {
@@ -1477,18 +1575,27 @@ pub(crate) fn build_partitioned<'a, M: PartitionedBuild>(
                 ));
             };
             datafusion_common::hash_utils::create_hashes(&keys, random_state, slice)?;
-            if let Some(inline) = inline {
-                row_keys.extend_from_slice(&inline.encode_build(&keys)?);
-            }
             let valid = crate::joins::utils::matchable_join_keys(&keys, null_equality);
             layout.push((offset, rows, valid));
             offset += rows;
         }
         // Insert from the last batch, as the row-by-row build does.
         layout.reverse();
+        let count = batches.len();
+        let batch_keys = |index: usize| -> Result<Vec<u64>> {
+            let batch = &batches[count - 1 - index];
+            let keys =
+                datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays(
+                    on, batch,
+                )?;
+            match inline {
+                Some(inline) => inline.encode_build(&keys),
+                None => Ok(vec![]),
+            }
+        };
         map.update_partitioned(&BuildRows {
             hashes: &hashes[..offset],
-            keys: inline.map(|_| row_keys.as_slice()),
+            keys: inline.map(|_| &batch_keys as &BatchKeys<'_>),
             batches: &layout,
         })
     })();
@@ -1775,7 +1882,7 @@ fn contained_heads<L: HeadLookup, const PREFETCH: bool>(
 }
 
 /// Longbow patch (JT 9): [`heads_matched_indices_with_limit_offset`] over a
-/// table with inline keys ([`InlineU32`]), for probe rows with encoded keys
+/// table with inline keys ([`PackedU64`]), for probe rows with encoded keys
 /// `probe` (of the same [`InlineKeys`] as the table). Emits only pairs whose
 /// keys are equal, in the order and with the offsets of the hash-only probe
 /// followed by the key comparison, so the caller compares no keys:

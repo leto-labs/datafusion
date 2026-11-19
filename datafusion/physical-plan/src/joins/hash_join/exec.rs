@@ -30,9 +30,9 @@ use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
 use crate::joins::hash_join::visited::VisitedBitmap;
-use crate::joins::inline_keys::{self, InlineKeys, inline_keys_enabled};
+use crate::joins::inline_keys::{self, DenseKeys, InlineKeys, inline_keys_enabled};
 use crate::joins::join_hash_map::{
-    INLINE_MAX_ROWS, JoinHashMapInline, JoinHashMapU32, JoinHashMapU64, PartitionedBuild,
+    JoinHashMapInline, JoinHashMapU32, JoinHashMapU64, PartitionedBuild,
     build_partitioned,
 };
 use crate::joins::key_range_bitmap::KeyRangeBitmap;
@@ -217,6 +217,9 @@ struct JoinBuildData {
     bounds: Option<PartitionBounds>,
     /// IN-list values or a hash-table reference used for filter pushdown.
     membership: PushdownStrategy,
+    /// Longbow patch (JT 9): the encoded key of every build row, for keys
+    /// that fit 64 bits but not the map's slots.
+    dense_keys: Option<DenseKeys>,
     // Keep the reservation after the allocations it accounts for.
     reservation: MemoryReservation,
 }
@@ -272,6 +275,12 @@ impl JoinLeftData {
     /// NULL masks were derived from the original keys instead.
     pub(super) fn values(&self) -> &[ArrayRef] {
         &self.build.values
+    }
+
+    /// Longbow patch (JT 9): the encoded build keys of a map without inline
+    /// keys, when the keys fit 64 bits.
+    pub(super) fn dense_keys(&self) -> Option<&DenseKeys> {
+        self.build.dense_keys.as_ref()
     }
 
     /// returns a reference to the visited indices bitmap
@@ -3018,9 +3027,8 @@ fn is_perfect_hash_join_candidate(
 /// ([`inline_keys::INLINE_KEYS_ENV`]), the table is small enough to be
 /// built row by row (its build keys then mostly stay in the cache), the
 /// build has too many rows, or the keys have no encoding
-/// ([`InlineKeys`]). The ranges of several key columns come from the
-/// build's dynamic-filter `bounds` when present, else from a scan of the
-/// keys.
+/// ([`InlineKeys`]). The key columns' ranges come from the build's
+/// dynamic-filter `bounds` when present, else from a scan of the keys.
 fn inline_keys_for_build(
     on_left: &[PhysicalExprRef],
     schema: &SchemaRef,
@@ -3030,7 +3038,7 @@ fn inline_keys_for_build(
     null_equality: NullEquality,
 ) -> Result<Option<InlineKeys>> {
     if !inline_keys_enabled()
-        || num_rows >= INLINE_MAX_ROWS
+        || num_rows >= u32::MAX as usize
         || !JoinHashMapU32::partitions_build(num_rows)
     {
         return Ok(None);
@@ -3060,12 +3068,9 @@ fn inline_keys_for_build(
                 Some((scalar(&bound.min)?, scalar(&bound.max)?))
             })
             .collect::<Vec<_>>();
-        if types.len() == 1 || ranges.iter().all(Option::is_some) {
+        if ranges.iter().all(Option::is_some) {
             return Ok(InlineKeys::from_ranges(&types, &ranges));
         }
-    }
-    if types.len() == 1 && null_equality == NullEquality::NullEqualsNothing {
-        return Ok(InlineKeys::from_ranges(&types, &[None]));
     }
     let keys = batches
         .iter()
@@ -3339,15 +3344,22 @@ async fn collect_left_input(
     };
 
     // Longbow patch (JT 9): large tables keep the build keys beside their
-    // chain heads.
-    let inline = inline_keys_for_build(
+    // chain heads when they fit the slots; several key columns that fit 64
+    // bits but not the slots keep a dense array of encoded keys instead.
+    let (inline, dense) = match inline_keys_for_build(
         &on_left,
         &schema,
         &batches,
         bounds.as_ref(),
         num_rows,
         null_equality,
-    )?;
+    )? {
+        Some(keys) if JoinHashMapInline::layout_for(num_rows, &keys).is_some() => {
+            (Some(keys), None)
+        }
+        Some(keys) if keys.columns_len() > 1 => (None, Some(keys)),
+        _ => (None, None),
+    };
 
     // Longbow family H: a CollectLeft build of at least
     // `longbow.execution.parallel_hash_build_rows` rows builds one sharded
@@ -3394,6 +3406,7 @@ async fn collect_left_input(
         prepared,
         path,
         inline,
+        dense,
     )
 }
 
@@ -3427,6 +3440,7 @@ fn build_in_memory(
     prepared: bool,
     path: BuildPath,
     inline: Option<InlineKeys>,
+    dense: Option<InlineKeys>,
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
 
@@ -3590,6 +3604,18 @@ fn build_in_memory(
         (batch, left_values)
     };
 
+    // Longbow patch (JT 9): the encoded keys of a hash-only map, charged
+    // before they are allocated.
+    let dense_keys = match dense {
+        Some(encoding) if matches!(join_hash_map, Map::HashMap(_)) => {
+            let bytes = DenseKeys::bytes_for(num_rows);
+            reservation.try_grow(bytes)?;
+            metrics.build_mem_used.add(bytes);
+            Some(DenseKeys::try_new(encoding, &left_values)?)
+        }
+        _ => None,
+    };
+
     // Rewrite float `-0.0` to `+0.0` once here, so the per probe batch key
     // comparison does not rescan the build side. Arrays without `-0.0`, and
     // non-float keys, are shared rather than copied.
@@ -3734,6 +3760,7 @@ fn build_in_memory(
             values: normalized_values,
             bounds,
             membership,
+            dense_keys,
             reservation,
         }),
         not_in,

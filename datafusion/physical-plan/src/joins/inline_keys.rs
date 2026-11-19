@@ -17,12 +17,13 @@
 //!
 //! The encoding is injective over the build's key range:
 //!
-//! - one integer column (8 to 64 bits, signed or not, dates, times,
-//!   timestamps, durations): its value, reinterpreted as `u64`;
-//! - several such columns: each value minus the build's minimum of that
+//! - integer columns (8 to 64 bits, signed or not, dates, times,
+//!   timestamps, durations): each value minus the build's minimum of that
 //!   column, packed into its own bit field, when the fields of all columns
 //!   fit 64 bits. A probe value outside the build's range cannot match and
-//!   is marked invalid.
+//!   is marked invalid;
+//! - one such column without a known range: its value, reinterpreted as
+//!   `u64` (64 bits).
 //!
 //! Other keys (floats, strings, decimals, nested types, wider ranges) keep
 //! the hash-only table and the key comparison.
@@ -240,26 +241,25 @@ impl InlineKeys {
         }) {
             return None;
         }
-        let ranges = if types.len() == 1 {
-            // A single column needs no range.
-            vec![None]
-        } else {
-            (0..types.len())
-                .map(|index| {
-                    keys.iter()
-                        .filter_map(|batch| min_max(batch[index].as_ref()))
-                        .reduce(|(a, b), (lo, hi)| (a.min(lo), b.max(hi)))
-                })
-                .collect()
-        };
+        let ranges: Vec<_> = (0..types.len())
+            .map(|index| {
+                keys.iter()
+                    .filter_map(|batch| min_max(batch[index].as_ref()))
+                    .reduce(|(a, b), (lo, hi)| (a.min(lo), b.max(hi)))
+            })
+            .collect();
+        if types.len() == 1 && ranges[0].is_none() {
+            // No matchable row: the unpacked encoding.
+            return Self::from_ranges(&types, &[None]);
+        }
         Self::from_ranges(&types, &ranges)
     }
 
     /// The encoding of key columns of `types` whose non-null build values
-    /// lie in `ranges` (as [`min_max`] gives them; a single column ignores
-    /// its range). `None` when a type has no encoding, a column of several
-    /// has no range (no matchable row), or the ranges need more than 64
-    /// bits. The caller makes sure that NULL keys never match
+    /// lie in `ranges` (as [`min_max`] gives them; a single column without a
+    /// range keeps its 64 bits). `None` when a type has no encoding, a
+    /// column of several has no range (no matchable row), or the ranges need
+    /// more than 64 bits. The caller makes sure that NULL keys never match
     /// (`NullEqualsNothing`, or no NULL build key).
     pub fn from_ranges(
         types: &[DataType],
@@ -271,7 +271,7 @@ impl InlineKeys {
         {
             return None;
         }
-        if types.len() == 1 {
+        if types.len() == 1 && ranges[0].is_none() {
             return Some(Self {
                 columns: vec![KeyColumn {
                     data_type: types[0].clone(),
@@ -313,6 +313,26 @@ impl InlineKeys {
             .collect()
     }
 
+    /// The bits of an encoded key: 64 for an unpacked column, else the sum
+    /// of the columns' fields.
+    pub fn bits(&self) -> u32 {
+        self.columns
+            .iter()
+            .map(|c| {
+                if c.span == u64::MAX {
+                    u64::BITS
+                } else {
+                    u64::BITS - c.span.leading_zeros()
+                }
+            })
+            .sum()
+    }
+
+    /// The number of key columns.
+    pub fn columns_len(&self) -> usize {
+        self.columns.len()
+    }
+
     /// Whether `arrays` have the key types of this encoding.
     pub fn accepts(&self, arrays: &[ArrayRef]) -> bool {
         arrays.len() == self.columns.len()
@@ -331,11 +351,12 @@ impl InlineKeys {
         let rows = arrays[0].len();
         let mut keys = vec![0_u64; rows];
         let mut nulls: Option<NullBuffer> = None;
-        let single = self.columns.len() == 1;
+        // One column without a range: its values, unchecked.
+        let raw = self.columns.len() == 1 && self.columns[0].span == u64::MAX;
         let mut in_range: Option<BooleanBuffer> = None;
         for (array, column) in arrays.iter().zip(&self.columns) {
             nulls = NullBuffer::union(nulls.as_ref(), array.logical_nulls().as_ref());
-            if single {
+            if raw {
                 with_integer_values!(
                     array.data_type(),
                     array.as_ref(),
@@ -419,7 +440,7 @@ impl InlineKeys {
                 |values| values[row].as_i64(),
                 return None
             );
-            if self.columns.len() == 1 {
+            if column.span == u64::MAX {
                 return Some(value as u64);
             }
             let delta = value.wrapping_sub(column.min) as u64;
@@ -429,6 +450,90 @@ impl InlineKeys {
             key |= delta << column.shift;
         }
         Some(key)
+    }
+}
+
+/// Longbow patch (JT 9): the encoded key of every build row, for a join
+/// whose keys fit 64 bits but not a [`PackedU64`] slot beside the head and
+/// the tag (several columns). The hash-only table finds the candidates; one
+/// read of this array per candidate replaces the reads of every key column
+/// at the candidate's row and the comparator.
+///
+/// [`PackedU64`]: crate::joins::join_hash_map::PackedU64
+#[derive(Debug)]
+pub struct DenseKeys {
+    encoding: InlineKeys,
+    keys: Vec<u64>,
+}
+
+/// Candidate pairs between a key's prefetch and its compare.
+const DENSE_PREFETCH_DISTANCE: usize = 16;
+
+impl DenseKeys {
+    /// The keys of build key columns `arrays` (the whole build).
+    pub fn try_new(
+        encoding: InlineKeys,
+        arrays: &[ArrayRef],
+    ) -> datafusion_common::Result<Self> {
+        let keys = encoding.encode_build(arrays)?;
+        Ok(Self { encoding, keys })
+    }
+
+    /// Bytes of the keys.
+    pub fn bytes_for(rows: usize) -> usize {
+        rows * size_of::<u64>()
+    }
+
+    /// The encoding of the keys.
+    pub fn encoding(&self) -> &InlineKeys {
+        &self.encoding
+    }
+
+    /// Keeps the candidate pairs (`build[i]`, `probe[i]`) whose probe row is
+    /// valid in `probe_keys` and whose keys are equal: the result of the key
+    /// comparison of the same pairs, in the same order.
+    pub fn filter(
+        &self,
+        build: &[u64],
+        probe: &[u32],
+        probe_keys: &EncodedKeys,
+    ) -> (Vec<u64>, Vec<u32>) {
+        if crate::joins::join_hash_map::prefetch_pays(self.keys.len() * size_of::<u64>())
+        {
+            self.filter_with::<true>(build, probe, probe_keys)
+        } else {
+            self.filter_with::<false>(build, probe, probe_keys)
+        }
+    }
+
+    #[inline(always)]
+    fn filter_with<const PREFETCH: bool>(
+        &self,
+        build: &[u64],
+        probe: &[u32],
+        probe_keys: &EncodedKeys,
+    ) -> (Vec<u64>, Vec<u32>) {
+        let mut kept_build = Vec::with_capacity(build.len());
+        let mut kept_probe = Vec::with_capacity(probe.len());
+        if PREFETCH {
+            for &row in &build[..DENSE_PREFETCH_DISTANCE.min(build.len())] {
+                crate::joins::join_hash_map::prefetch_read(&self.keys, row as usize);
+            }
+        }
+        for (pair, (&b, &p)) in build.iter().zip(probe).enumerate() {
+            if PREFETCH && let Some(&ahead) = build.get(pair + DENSE_PREFETCH_DISTANCE) {
+                crate::joins::join_hash_map::prefetch_read(&self.keys, ahead as usize);
+            }
+            let p_row = p as usize;
+            if probe_keys.valid.as_ref().is_some_and(|v| v.is_null(p_row)) {
+                continue;
+            }
+            if self.keys[b as usize] == probe_keys.keys[p_row] {
+                kept_build.push(b);
+                kept_probe.push(p);
+            }
+        }
+        (kept_build, kept_probe)
     }
 }
 
@@ -454,10 +559,10 @@ mod tests {
     }
 
     #[test]
-    fn one_column_encodes_its_values() {
-        let build = vec![vec![i64s(&[Some(-5), Some(7), None])]];
-        let keys =
-            InlineKeys::for_build(&build, NullEquality::NullEqualsNothing).unwrap();
+    fn one_column_without_a_range_encodes_its_values() {
+        let build = vec![i64s(&[Some(-5), Some(7), None])];
+        let keys = InlineKeys::from_ranges(&[DataType::Int64], &[None]).unwrap();
+        assert_eq!(keys.bits(), 64);
         let probe = i64s(&[Some(-5), None, Some(i64::MAX), Some(i64::MIN)]);
         let encoded = keys.encode(&[probe]).unwrap();
         assert_eq!(encoded.keys[0], (-5_i64) as u64);
@@ -468,17 +573,44 @@ mod tests {
             (0..4).map(|i| valid.is_valid(i)).collect::<Vec<_>>(),
             [true, false, true, true]
         );
-        assert_eq!(keys.encode_row(&build[0], 1), Some(7));
+        assert_eq!(keys.encode_row(&build, 1), Some(7));
+        assert_eq!(keys.encode_row(&build, 2), None);
+    }
+
+    #[test]
+    fn one_column_with_a_range_packs_its_offsets() {
+        let build = vec![vec![i64s(&[Some(-5), Some(7), None])]];
+        let keys =
+            InlineKeys::for_build(&build, NullEquality::NullEqualsNothing).unwrap();
+        // -5..=7: 13 values, 4 bits.
+        assert_eq!(keys.columns(), [(DataType::Int64, -5, 12, 0)]);
+        assert_eq!(keys.bits(), 4);
+        let probe = i64s(&[Some(-5), None, Some(7), Some(8), Some(-6)]);
+        let encoded = keys.encode(&[probe]).unwrap();
+        assert_eq!((encoded.keys[0], encoded.keys[2]), (0, 12));
+        let valid = encoded.valid.unwrap();
+        assert_eq!(
+            (0..5).map(|i| valid.is_valid(i)).collect::<Vec<_>>(),
+            [true, false, true, false, false]
+        );
+        assert_eq!(keys.encode_row(&build[0], 1), Some(12));
         assert_eq!(keys.encode_row(&build[0], 2), None);
     }
 
     #[test]
     fn unsigned_64_bit_keys_keep_their_order_free_identity() {
+        // `UInt64` values are ranged as their signed reinterpretation, on
+        // the build and the probe alike.
         let build: ArrayRef = Arc::new(UInt64Array::from(vec![u64::MAX, 0]));
         let keys = InlineKeys::for_build(&[vec![build]], NullEquality::NullEqualsNothing)
             .unwrap();
+        let probe: ArrayRef = Arc::new(UInt64Array::from(vec![u64::MAX, 0, 1]));
+        let encoded = keys.encode(&[probe]).unwrap();
+        assert_eq!(&encoded.keys[..2], [0, 1]);
+        assert!(encoded.valid.unwrap().is_null(2));
+        let raw = InlineKeys::from_ranges(&[DataType::UInt64], &[None]).unwrap();
         let probe: ArrayRef = Arc::new(UInt64Array::from(vec![u64::MAX, 1]));
-        assert_eq!(keys.encode(&[probe]).unwrap().keys, [u64::MAX, 1]);
+        assert_eq!(raw.encode(&[probe]).unwrap().keys, [u64::MAX, 1]);
     }
 
     #[test]
@@ -559,6 +691,31 @@ mod tests {
             2
         );
         assert!(keys.encode_build(&[a, i64s(&[Some(1), Some(3)])]).is_err());
+    }
+
+    #[test]
+    fn dense_keys_keep_the_equal_pairs_in_order() {
+        let a = i64s(&[Some(1), Some(2), Some(1), None]);
+        let b = i64s(&[Some(5), Some(5), Some(6), Some(5)]);
+        let encoding = InlineKeys::for_build(
+            &[vec![Arc::clone(&a), Arc::clone(&b)]],
+            NullEquality::NullEqualsNothing,
+        )
+        .unwrap();
+        let dense = DenseKeys::try_new(encoding.clone(), &[a, b]).unwrap();
+        let probe = encoding
+            .encode(&[
+                i64s(&[Some(1), Some(2), None, Some(9)]),
+                i64s(&[Some(5); 4]),
+            ])
+            .unwrap();
+        // Candidates as a hash probe could give them, collisions included.
+        let build_rows = [0, 2, 1, 0, 3, 0, 1];
+        let probe_rows = [0, 0, 1, 1, 2, 3, 3];
+        assert_eq!(
+            dense.filter(&build_rows, &probe_rows, &probe),
+            (vec![0, 1], vec![0, 1])
+        );
     }
 
     #[test]

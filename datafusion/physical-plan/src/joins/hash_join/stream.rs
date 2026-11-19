@@ -20,7 +20,7 @@ use crate::joins::hash_join::not_in::NotInProbe;
 use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
 };
-use crate::joins::inline_keys::EncodedKeys;
+use crate::joins::inline_keys::{DenseKeys, EncodedKeys};
 use crate::joins::join_hash_map::ProbeOffset;
 use crate::joins::join_hash_map::ProbeOffset::AtRow;
 use crate::joins::probe_completion::{Completion, ProbeSideSummary};
@@ -793,8 +793,10 @@ impl HashJoinStream {
                         &self.random_state,
                         &mut self.hashes_buffer,
                     )?;
+                    let left_data = &self.build_side.try_as_ready()?.left_data;
                     inline_keys = map
                         .inline_keys()
+                        .or_else(|| left_data.dense_keys().map(DenseKeys::encoding))
                         .and_then(|encoding| encoding.encode(&keys_values));
                     matchable_join_keys(&keys_values, self.null_equality)
                 } else {
@@ -885,7 +887,10 @@ impl HashJoinStream {
         {
             // Longbow patch (JT 9): the inline-key probe emits only pairs
             // with equal keys, so no key comparison follows.
-            Map::HashMap(map) if let Some(probe) = &state.inline_keys => {
+            Map::HashMap(map)
+                if let Some(probe) = &state.inline_keys
+                    && map.inline_keys().is_some() =>
+            {
                 let next_offset = map.get_inline_matched_indices_with_limit_offset(
                     &self.hashes_buffer,
                     probe,
@@ -904,6 +909,27 @@ impl HashJoinStream {
                     probe_indices.values().clone(),
                 ));
                 (build_indices, probe_indices, next_offset)
+            }
+            // Longbow patch (JT 9): dense build keys replace the key
+            // comparison of the hash-only candidates.
+            Map::HashMap(map)
+                if let Some(probe) = &state.inline_keys
+                    && let Some(dense) = build_side.left_data.dense_keys() =>
+            {
+                let next_offset = map.get_matched_indices_with_limit_offset(
+                    &self.hashes_buffer,
+                    state.valid_keys.as_ref(),
+                    self.batch_size,
+                    state.offset,
+                    &mut self.probe_indices_buffer,
+                    &mut self.build_indices_buffer,
+                );
+                let (build_indices, probe_indices) = dense.filter(
+                    &self.build_indices_buffer,
+                    &self.probe_indices_buffer,
+                    probe,
+                );
+                (build_indices.into(), probe_indices.into(), next_offset)
             }
             Map::HashMap(map) => lookup_join_hashmap(
                 map.as_ref(),
