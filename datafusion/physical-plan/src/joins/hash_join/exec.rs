@@ -3335,8 +3335,28 @@ async fn collect_left_input(
         state.batches.push(batch);
     }
     drop(left_stream);
-    if let Some(chunk) = chunk.as_mut() {
-        chunk.release_headroom();
+    // Longbow family JS (build chunks): the table over the admitted rows.
+    if let Some(chunk) = chunk.take() {
+        let BuildSideState {
+            mut reservation,
+            batches,
+            metrics,
+            ..
+        } = state;
+        return build_chunk(
+            chunk,
+            batches,
+            &mut reservation,
+            &random_state,
+            &schema,
+            &on_left,
+            &metrics,
+            with_visited_indices_bitmap,
+            probe_threads_count,
+            &config,
+            null_equality,
+            &array_map_created_count,
+        );
     }
     if prepared && state.batches.is_empty() {
         // Even empty UTF-8 output retains an offset buffer.
@@ -3467,23 +3487,6 @@ async fn collect_left_input(
         )
     });
     match (result, fallback) {
-        (Err(error), _) if chunk.is_some() && spill::is_refusal(&error) => {
-            let chunk = chunk.expect("a chunk");
-            build_chunk(
-                &chunk,
-                batches,
-                &mut reservation,
-                &random_state,
-                &schema,
-                &on_left,
-                &metrics,
-                with_visited_indices_bitmap,
-                probe_threads_count,
-                &config,
-                null_equality,
-                &array_map_created_count,
-            )
-        }
         (Err(error), Some((mut spill, bounds))) if spill::is_refusal(&error) => {
             // The refused attempt left the rows charged to `reservation`.
             spill.take_refused_build(&mut batches, &reservation)?;
@@ -3507,14 +3510,18 @@ async fn collect_left_input(
     }
 }
 
-/// Longbow family JS: the table of a build chunk that the pool refused. The
-/// second half of its batches goes back to the cursor and the table is
-/// built again; a table over one batch (or rows already concatenated) is
-/// built on a private pool and its size charged without refusal, the
-/// smallest unit of design decision 5, so that every chunk progresses.
+/// Longbow family JS: the table of a build chunk. Its rows and an estimate
+/// of their table were admitted batch by batch (`ChunkBuild::admit`): a
+/// chunk splits before its build, at the first batch the pool refuses. The
+/// table is built on a private pool and its size moved into charge the pool
+/// already granted (the rows and the estimate, grown before the estimate's
+/// pieces go). Where the table needs more than the estimate, the rest is
+/// admitted by the pool; a rest that the pool refuses may be charged
+/// without refusal up to the chunk unit, and a larger one fails with
+/// `ResourcesExhausted`. No memory is used outside that envelope.
 #[expect(clippy::too_many_arguments)]
 fn build_chunk(
-    chunk: &ChunkBuild,
+    mut chunk: ChunkBuild,
     mut batches: Vec<RecordBatch>,
     reservation: &mut MemoryReservation,
     random_state: &RandomState,
@@ -3527,65 +3534,58 @@ fn build_chunk(
     null_equality: NullEquality,
     array_map_created_count: &Count,
 ) -> Result<JoinLeftData> {
-    let build = |batches: &mut Vec<RecordBatch>, reservation: &mut MemoryReservation| {
-        let num_rows = batches.iter().map(RecordBatch::num_rows).sum();
-        let max_batch_rows = batches.iter().map(RecordBatch::num_rows).max();
-        let input_bytes = reservation.size();
-        build_in_memory(
-            random_state,
-            schema,
-            batches,
-            num_rows,
-            max_batch_rows.unwrap_or(0),
-            input_bytes,
-            0,
-            on_left,
-            metrics,
-            reservation,
-            None,
-            with_visited_indices_bitmap,
-            probe_threads_count,
-            false,
-            config,
-            null_equality,
-            None,
-            array_map_created_count,
-            false,
-            BuildPath::Native,
-        )
-    };
-    // The refused attempt left the rows charged to `reservation`.
-    let charge_rows = |batches: &[RecordBatch], reservation: &MemoryReservation| {
-        let mut counter = RecordBatchMemoryCounter::new();
-        for batch in batches {
-            counter.count_batch(batch);
-        }
-        let counted = counter.memory_usage();
-        if counted < reservation.size() {
-            reservation.shrink(reservation.size() - counted);
-        } else {
-            reservation.grow(counted - reservation.size());
-        }
-    };
-    charge_rows(&batches, reservation);
-    while batches.len() > 1 {
-        let rest = batches.split_off(batches.len() / 2);
-        chunk.give_back(rest);
-        charge_rows(&batches, reservation);
-        match build(&mut batches, reservation) {
-            Ok(data) => return Ok(data),
-            Err(error) if spill::is_refusal(&error) => charge_rows(&batches, reservation),
-            Err(error) => return Err(error),
-        }
-    }
+    let num_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    let max_batch_rows = batches.iter().map(RecordBatch::num_rows).max();
     let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
     let mut attempt = MemoryConsumer::new("HashJoinInput")
         .with_can_spill(true)
         .register(&pool);
     attempt.grow(reservation.size());
-    let mut data = build(&mut batches, &mut attempt)?;
+    let input_bytes = attempt.size();
+    let mut data = build_in_memory(
+        random_state,
+        schema,
+        &mut batches,
+        num_rows,
+        max_batch_rows.unwrap_or(0),
+        input_bytes,
+        0,
+        on_left,
+        metrics,
+        &mut attempt,
+        None,
+        with_visited_indices_bitmap,
+        probe_threads_count,
+        false,
+        config,
+        null_equality,
+        None,
+        array_map_created_count,
+        false,
+        BuildPath::Native,
+    )?;
+    let table = pool.reserved();
+    let headroom = chunk.take_headroom();
+    let estimate: usize = headroom.iter().map(MemoryReservation::size).sum();
     let charge = reservation.take();
-    charge.grow(pool.reserved().saturating_sub(charge.size()));
+    let granted = charge.size() + estimate;
+    if table > granted {
+        let rest = table - granted;
+        if let Err(error) = charge.try_grow(rest) {
+            if !spill::is_refusal(&error) || rest > chunk.unit() {
+                return Err(error.context(format!(
+                    "Hash join spill: the table of a build chunk of {num_rows} rows \
+                     needs {rest} bytes beyond its admitted estimate"
+                )));
+            }
+            charge.grow(rest);
+        }
+    }
+    charge.grow(table.saturating_sub(charge.size()).min(estimate));
+    drop(headroom);
+    if charge.size() > table {
+        charge.shrink(charge.size() - table);
+    }
     let left = Arc::get_mut(&mut data.build)
         .ok_or_else(|| internal_datafusion_err!("shared build chunk"))?;
     left.reservation = charge;

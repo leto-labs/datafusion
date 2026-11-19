@@ -23,6 +23,7 @@ use datafusion_common::Result;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{assert_or_internal_err, internal_err};
 use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
 use futures::StreamExt;
 
@@ -69,27 +70,39 @@ impl FileSource {
 
 /// The read position in the build file of a partition joined in chunks.
 /// The chunk join's build stops at a refusal and gives back the batch it
-/// could not hold; the next chunk starts with it.
+/// could not hold, with the charge that covers it; the next chunk starts
+/// with it and takes the charge over.
 pub(crate) struct Cursor {
     file: SpilledFile,
     spill_manager: SpillManager,
+    /// The largest chunk unit charged without refusal
+    /// (`SpillOptions::chunk_unit`).
+    unit: usize,
     state: Mutex<CursorState>,
 }
 
 #[derive(Default)]
 struct CursorState {
     reader: Option<Rows>,
-    /// Batches given back, read before the file.
-    back: Vec<RecordBatch>,
+    /// Batches given back, read before the file, each with its charge.
+    back: Vec<(RecordBatch, MemoryReservation)>,
+    /// The charge of the batch given back that was read last, until the
+    /// chunk build takes it over.
+    transit: Option<MemoryReservation>,
     /// The file has been read to its end.
     ended: bool,
 }
 
 impl Cursor {
-    pub(super) fn new(file: SpilledFile, spill_manager: SpillManager) -> Self {
+    pub(super) fn new(
+        file: SpilledFile,
+        spill_manager: SpillManager,
+        unit: usize,
+    ) -> Self {
         Self {
             file,
             spill_manager,
+            unit,
             state: Mutex::default(),
         }
     }
@@ -98,9 +111,20 @@ impl Cursor {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Gives `batch` back: the next chunk reads it first.
-    pub(crate) fn give_back(&self, batch: RecordBatch) {
-        self.lock().back.push(batch);
+    pub(crate) fn unit(&self) -> usize {
+        self.unit
+    }
+
+    /// Gives `batch` back with `charge`, which covers it: the next chunk
+    /// reads it first.
+    pub(crate) fn give_back(&self, batch: RecordBatch, charge: MemoryReservation) {
+        self.lock().back.push((batch, charge));
+    }
+
+    /// The charge of the batch given back that was read last, if the last
+    /// batch read came back from a chunk.
+    pub(crate) fn take_transit(&self) -> Option<MemoryReservation> {
+        self.lock().transit.take()
     }
 
     /// Every row of the file was taken by a chunk.
@@ -111,7 +135,10 @@ impl Cursor {
 
     fn poll_next(&self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
         let mut state = self.lock();
-        if let Some(batch) = state.back.pop() {
+        if let Some((batch, charge)) = state.back.pop() {
+            // The chunk build takes the charge over as it admits the batch
+            // (`ChunkBuild::admit`, right after the read).
+            state.transit = Some(charge);
             return Poll::Ready(Some(Ok(batch)));
         }
         if state.ended {

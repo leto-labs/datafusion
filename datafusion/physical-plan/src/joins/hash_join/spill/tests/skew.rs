@@ -125,8 +125,11 @@ async fn hot_key_build_chunks_keep_every_join_type() -> Result<()> {
         Shape::CollectLeft(3),
         Shape::Partitioned(2),
     ]) {
+        // A pool that every stream's chunks share: with chunks admitted by
+        // bytes (review MJJ98), three streams in 64 KiB need more chunks
+        // than the replay bound; 192 KiB keeps the hot partition chunked.
         let config = no_reversal(spill_config(0, 4096, 3));
-        let metrics = check(&case, &build, &probe, config, 64 * 1024).await?;
+        let metrics = check(&case, &build, &probe, config, 192 * 1024).await?;
         assert!(
             metric(&metrics, "spill_chunked_runs").unwrap_or(0) > 0,
             "{}: not joined in chunks",
@@ -346,4 +349,80 @@ fn every_level_divides_the_level_above() {
             assert!(count.abs_diff(mean) < mean / 4, "level {level}: {next:?}");
         }
     }
+}
+
+/// Verification of the configured pool limit while chunk output is live
+/// (review MJJ98-REVIEW-20261119, finding 1).
+#[tokio::test]
+async fn review_chunk_respects_pool_limit() -> Result<()> {
+    let build = skewed("b", 30000, 100, false, 3001, 500);
+    let probe = sparse_probe(3000, false);
+    let case = Case {
+        join_type: JoinType::Right,
+        null_equality: NullEquality::NullEqualsNothing,
+        filter: false,
+        shape: Shape::CollectLeft(1),
+    };
+    let limit = 64 * 1024;
+    let config = no_reversal(spill_config(0, 4096, 3));
+    let plan = join_plan(&case, &build, &probe)?;
+    let context = task_context(config, Some(limit), true);
+    let mut stream = plan.execute(0, Arc::clone(&context))?;
+    while let Some(batch) = stream.next().await {
+        batch?;
+        if metric(&plan.metrics().unwrap(), "spill_chunked_runs").unwrap_or(0) > 0 {
+            let reserved = context.memory_pool().reserved();
+            drop(stream);
+            drop(plan);
+            assert_eq!(context.memory_pool().reserved(), 0);
+            // Design decision 8: at most (streams + 1) x workspace above the
+            // limit; one stream here. (Review MJJ98: 380,672 bytes before.)
+            let bound = limit + 2 * 4096;
+            println!("chunk reserves {reserved} bytes, bound {bound}");
+            assert!(
+                reserved <= bound,
+                "chunk reserves {reserved} bytes in a {limit}-byte pool"
+            );
+            return Ok(());
+        }
+    }
+    panic!("test did not reach a live chunk");
+}
+
+/// (Review MJJ98-REVIEW-20261119.) Dropping one stream during replay must
+/// leave the other stream's own
+/// probe rows and shared build file intact until it has finished.
+#[tokio::test]
+async fn review_drop_during_chunk_replay() -> Result<()> {
+    let build = skewed("b", 30000, 100, false, 3001, 500);
+    let probe = sparse_probe(6000, false);
+    let case = Case {
+        join_type: JoinType::Right,
+        null_equality: NullEquality::NullEqualsNothing,
+        filter: true,
+        shape: Shape::CollectLeft(2),
+    };
+    let config = no_reversal(spill_config(0, 4096, 3)).with_batch_size(64);
+    let context = task_context(config, Some(64 * 1024), true);
+    let plan = join_plan(&case, &build, &probe)?;
+    let mut first = plan.execute(0, Arc::clone(&context))?;
+    let second = plan.execute(1, Arc::clone(&context))?;
+    while let Some(batch) = first.next().await {
+        batch?;
+        if metric(&plan.metrics().unwrap(), "spill_replay_passes").unwrap_or(0) > 0 {
+            break;
+        }
+    }
+    assert!(metric(&plan.metrics().unwrap(), "spill_replay_passes").unwrap_or(0) > 0);
+    drop(first);
+    let actual = collect(second).await?;
+    let remaining: Vec<_> = probe.iter().skip(1).step_by(2).cloned().collect();
+    assert_eq!(
+        batches_to_sort_string(&actual),
+        expected(&case, &build, &remaining).await,
+    );
+    drop(plan);
+    assert_eq!(context.memory_pool().reserved(), 0);
+    assert_eq!(context.runtime_env().disk_manager.used_disk_space(), 0);
+    Ok(())
 }

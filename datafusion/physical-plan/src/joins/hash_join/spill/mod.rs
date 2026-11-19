@@ -170,6 +170,20 @@ impl SpillOptions {
         })
     }
 
+    /// The largest unit of a build chunk (one written build batch with its
+    /// table) that may be charged without refusal: three quarters of the
+    /// workspace. With [`Self::bits_unit`] a stream that chunks stays within
+    /// one workspace above the pool limit (design decision 8).
+    pub(super) fn chunk_unit(&self) -> usize {
+        self.workspace - self.workspace / 4
+    }
+
+    /// The largest matched bitmap that may be charged without refusal: the
+    /// other quarter of the workspace.
+    pub(super) fn bits_unit(&self) -> usize {
+        self.workspace / 4
+    }
+
     /// Bytes of one partition's write buffer: half the workspace, shared by
     /// the partitions and the unmatchable partition.
     fn buffer_bytes(&self) -> usize {
@@ -596,12 +610,28 @@ struct PartWriter {
     buffered_rows: usize,
     buffered_bytes: usize,
     rows: usize,
-    /// Bytes written to the file.
+    /// Bytes of the batches written, counted by this writer (the shared
+    /// spill metric also counts concurrent writers).
     bytes: usize,
+    /// A build file: no written batch may need more than this many bytes
+    /// with its table ([`unit_bytes`]), so that a build chunk's smallest
+    /// unit stays inside its share of the workspace.
+    unit: Option<usize>,
+}
+
+/// The bytes a build chunk holds for `rows` rows of `bytes` bytes: the
+/// rows, their copy, 48 bytes of table and keys per row, and the fixed
+/// parts (`chunks::table_estimate` plus the rows).
+pub(super) fn unit_bytes(bytes: usize, rows: usize) -> usize {
+    2 * bytes + rows * 48 + 256
 }
 
 impl PartWriter {
-    fn new(manager: &SpillManager, description: &str) -> Result<Self> {
+    fn new(
+        manager: &SpillManager,
+        description: &str,
+        unit: Option<usize>,
+    ) -> Result<Self> {
         Ok(Self {
             file: manager.create_in_progress_file(description)?,
             buffer: vec![],
@@ -609,10 +639,19 @@ impl PartWriter {
             buffered_bytes: 0,
             rows: 0,
             bytes: 0,
+            unit,
         })
     }
 
-    /// Writes `batches` as batches of up to [`WRITE_BATCH_ROWS`] rows.
+    fn append_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.file.append_batch(batch)?;
+        self.bytes += get_record_batch_memory_size(batch);
+        Ok(())
+    }
+
+    /// Writes `batches` as batches of up to [`WRITE_BATCH_ROWS`] rows and,
+    /// for a build file, of at most `unit` bytes with their table: a piece
+    /// above it is written in slices.
     fn write(
         &mut self,
         batches: &[RecordBatch],
@@ -622,27 +661,53 @@ impl PartWriter {
         let schema = Arc::clone(self.file.spill_manager.schema());
         let (rows_metric, bytes_metric) = metrics.side(side);
         let before = metrics.spill.spilled_bytes.value();
+        let unit = self.unit.unwrap_or(usize::MAX);
+        let sizes: Vec<usize> =
+            batches.iter().map(get_record_batch_memory_size).collect();
         let mut start = 0;
         while start < batches.len() {
+            let piece = &batches[start];
+            let piece_rows = piece.num_rows();
+            if piece_rows > 1 && unit_bytes(sizes[start], piece_rows) > unit {
+                // Rows per slice from the piece's mean row width.
+                let row_bytes = sizes[start].div_ceil(piece_rows);
+                let fit = (unit.saturating_sub(256) / (2 * row_bytes + 48)).max(1);
+                let mut offset = 0;
+                while offset < piece_rows {
+                    let length = fit.min(piece_rows - offset);
+                    self.append_batch(&piece.slice(offset, length))?;
+                    offset += length;
+                }
+                self.rows += piece_rows;
+                rows_metric.add(piece_rows);
+                start += 1;
+                continue;
+            }
             let mut end = start;
-            let mut rows = 0;
-            while end < batches.len() && (end == start || rows < WRITE_BATCH_ROWS) {
+            let (mut rows, mut bytes) = (0, 0);
+            while end < batches.len()
+                && (end == start
+                    || (rows < WRITE_BATCH_ROWS
+                        && unit_bytes(
+                            bytes + sizes[end],
+                            rows + batches[end].num_rows(),
+                        ) <= unit))
+            {
                 rows += batches[end].num_rows();
+                bytes += sizes[end];
                 end += 1;
             }
             let group = &batches[start..end];
             if group.len() == 1 {
-                self.file.append_batch(&group[0])?;
+                self.append_batch(&group[0])?;
             } else {
-                self.file.append_batch(&concat_batches(&schema, group)?)?;
+                self.append_batch(&concat_batches(&schema, group)?)?;
             }
             self.rows += rows;
             rows_metric.add(rows);
             start = end;
         }
-        let written = metrics.spill.spilled_bytes.value().saturating_sub(before);
-        bytes_metric.add(written);
-        self.bytes += written;
+        bytes_metric.add(metrics.spill.spilled_bytes.value().saturating_sub(before));
         Ok(())
     }
 
@@ -680,12 +745,18 @@ impl PartWriter {
         self.flush(metrics, side)?;
         let before = metrics.spill.spilled_bytes.value();
         let file = self.file.finish()?;
-        let trailer = metrics.spill.spilled_bytes.value().saturating_sub(before);
-        metrics.side(side).1.add(trailer);
+        metrics
+            .side(side)
+            .1
+            .add(metrics.spill.spilled_bytes.value().saturating_sub(before));
+        // The file's own size where the backend knows it; otherwise the
+        // bytes this writer wrote. Never the shared metric, which concurrent
+        // writers also move (the role reversal test compares these).
+        let bytes = self.bytes;
         Ok(file.map(|file| SpilledFile {
+            bytes: file.size().map_or(bytes, |size| size as usize),
             file,
             rows: self.rows,
-            bytes: self.bytes + trailer,
         }))
     }
 }
@@ -1095,7 +1166,11 @@ impl BuildSpill {
         let manager = self.manager.as_ref().ok_or_else(|| {
             datafusion_common::internal_datafusion_err!("no spill manager")
         })?;
-        let mut writer = PartWriter::new(manager, "HashJoin build partition")?;
+        let mut writer = PartWriter::new(
+            manager,
+            "HashJoin build partition",
+            Some(self.options.chunk_unit()),
+        )?;
         writer.write(&batches, &self.metrics, Side::Build)?;
         drop(batches);
         self.parts[part] = Part::Writing(Box::new(writer));
@@ -2484,6 +2559,7 @@ impl StreamSpill {
                 slot => slot.insert(PartWriter::new(
                     &router.manager,
                     "HashJoin probe partition",
+                    None,
                 )?),
             };
             // A buffered piece is charged; one the pool refuses is written
