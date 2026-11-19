@@ -470,6 +470,10 @@ struct PreparedParquetOpen {
     file_metrics: ParquetFileMetrics,
     baseline_metrics: BaselineMetrics,
     file_pruner: Option<FilePruner>,
+    /// Longbow family OO: the scan's file-level pruning predicate when the
+    /// predicate's dynamic filters can no longer change (then `file_pruner`
+    /// is `None`).
+    settled_file_pruning: Option<Arc<PruningPredicate>>,
     metadata_size_hint: Option<usize>,
     metrics: ExecutionPlanMetricsSet,
     parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
@@ -1009,14 +1013,34 @@ impl ParquetMorselizer {
         // filter that can prune via partition-value folding) and returns `None`
         // otherwise. For a static predicate the pruner's tracker reports no
         // changes, so it runs once and adds no ongoing cost.
-        let file_pruner = predicate.as_ref().and_then(|p| {
-            FilePruner::try_new(
-                Arc::clone(p),
-                &logical_file_schema,
-                &partitioned_file,
-                predicate_creation_errors.clone(),
-            )
-        });
+        //
+        // Longbow family OO: a predicate whose dynamic filters can no longer
+        // change is checked once, so its file-level pruning predicate is the
+        // same for every file of the scan; it comes from the scan's filter
+        // cache instead of a `FilePruner` per file. A predicate that can
+        // still change keeps its `FilePruner`, which early stopping watches.
+        let mut file_pruner = None;
+        let mut settled_file_pruning = None;
+        if let Some(p) = predicate.as_ref() {
+            let tracking = DynamicFilterTracking::classify(p);
+            if matches!(tracking, DynamicFilterTracking::Watching(_)) {
+                file_pruner = FilePruner::try_new(
+                    Arc::clone(p),
+                    &logical_file_schema,
+                    &partitioned_file,
+                    predicate_creation_errors.clone(),
+                );
+            } else if partitioned_file.statistics.is_some()
+                && (partitioned_file.has_statistics()
+                    || tracking.contains_dynamic_filter())
+            {
+                settled_file_pruning = self.filter_cache.file_pruning(
+                    p,
+                    &logical_file_schema,
+                    &predicate_creation_errors,
+                );
+            }
+        }
 
         let byte_progress = ByteProgress::new(
             if donated {
@@ -1041,6 +1065,7 @@ impl ParquetMorselizer {
             file_metrics,
             baseline_metrics,
             file_pruner,
+            settled_file_pruning,
             metadata_size_hint,
             metrics: self.metrics.clone(),
             parquet_file_reader_factory: Arc::clone(&self.parquet_file_reader_factory),
@@ -1113,11 +1138,44 @@ impl PreparedParquetOpen {
             // with every byte of it without having read any.
             return Ok(None);
         }
+        if let Some(pruning) = &self.settled_file_pruning
+            && let Some(statistics) = self.partitioned_file.statistics.as_ref()
+            && self.settled_prune(pruning, statistics)
+        {
+            self.file_metrics
+                .files_ranges_pruned_statistics
+                .add_pruned(1);
+            // Dropping `self` here credits the whole range: the scan is done
+            // with every byte of it without having read any.
+            return Ok(None);
+        }
 
         self.file_metrics
             .files_ranges_pruned_statistics
             .add_matched(1);
         Ok(Some(self))
+    }
+
+    /// Whether the file statistics prove that no row of the file matches:
+    /// the one-shot check of a `FilePruner` with a predicate that can no
+    /// longer change (Longbow family OO).
+    fn settled_prune(
+        &self,
+        pruning: &PruningPredicate,
+        statistics: &Arc<Statistics>,
+    ) -> bool {
+        let file_stats = datafusion_common::pruning::PrunableStatistics::new(
+            vec![Arc::clone(statistics)],
+            Arc::clone(&self.logical_file_schema),
+        );
+        match pruning.prune(&file_stats) {
+            Ok(values) => values.iter().all(|value| !value),
+            Err(e) => {
+                debug!("Ignoring error building pruning predicate for file: {e}");
+                self.predicate_creation_errors.add(1);
+                false
+            }
+        }
     }
 
     /// Load parquet metadata after file-level pruning is complete.
