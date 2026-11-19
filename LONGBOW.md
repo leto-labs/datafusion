@@ -1114,3 +1114,32 @@ in `ArrowReaderOptions`).
    first reader, the replacement after Bloom-filter I/O and a prepared
    scan's extra readers) instead of registering a new set. Each reader adds
    its own bytes to the scan efficiency ratio.
+
+Review fixes (MJJ96 independent review, 2026-11-19):
+
+- **Store identity.** The file metadata cache key is the object store
+  (scheme and authority of its `ObjectStoreUrl`, without credentials) plus
+  the location (`metadata::file_metadata_cache_key`); entries are validated
+  against the listed generation (size, modification time, ETag, version).
+  `CachedParquetFileReaderFactory::new` takes the store's URL, and
+  `DFParquetMetadata` and `ParquetFileReader` use the cache only with one
+  (`with_object_store_url`), so planning-time reads without a URL skip it.
+  A footer of one store never meets another store's index. Upstream
+  apache/datafusion#27580 (open) keys the cache the same way with a new key
+  type and a registry lookup for planning.
+- **Required validation.** `PageIndexRequest::validate` applies Arrow's
+  `Required` rule for the offset index (with any selected index range, every
+  selected chunk needs an offset index) from the footer, on cache hits and
+  loads alike; coverage includes it. The complete load for the cache is
+  optional, so a required request is enforced only within its own selection.
+- **Index bytes.** On a cache miss the footer is read first and the index
+  after it; index reads in the metadata layer go through a counting fetch
+  (`with_page_index_bytes`), and the reader adds them to `bytes_scanned` and
+  its scan-efficiency part. A warm hit adds nothing.
+- **Derived copies.** `CachedParquetMetaData::with_derived_copies` reserves
+  slots for copies derived from the entry's metadata (for example an
+  engine's copies with page-cache handles), charged at the footer's size in
+  the entry's fixed memory size and dropped with the entry
+  (`CachedParquetMetaData::derived`). `ParquetFileReaderFactory::with_derived_copies`
+  (default `None`; the cached factory returns a configured clone) lets a
+  wrapping factory reserve them.
