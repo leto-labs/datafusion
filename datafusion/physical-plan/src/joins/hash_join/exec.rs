@@ -3348,30 +3348,39 @@ async fn collect_left_input(
         _ => None,
     };
 
-    // Longbow patch (JT 9): large tables keep the build keys beside their
-    // chain heads when they fit the slots; several key columns that fit 64
-    // bits but not the slots keep a dense array of encoded keys instead,
-    // encoded while a partitioned build hashes them. A parallel build takes
-    // only inline keys whose ranges the dynamic-filter bounds already give:
-    // a serial scan of the keys, or a serial encoding of the consolidated
-    // keys, would delay the whole build.
+    // Longbow patch (JT 9): a parallel (sharded) build keeps the build keys
+    // beside its chain heads when they fit the slots, encoded in its
+    // parallel hash pass, and only with ranges that the dynamic-filter
+    // bounds already give (a serial scan would delay the whole build). A
+    // partitioned build of several key columns keeps a dense array of
+    // encoded keys instead, encoded while it hashes them; one of a single
+    // key column keeps hashes only (measured: its inline keys cost the
+    // scatter more than its probe gained, leto-mjj.71).
     let parallel_build = !prepared
         && parallel
             .as_ref()
             .is_some_and(|parallel| parallel.is_parallel(num_rows));
-    let (inline, dense) = match inline_keys_for_build(
-        &on_left,
-        &schema,
-        &batches,
-        bounds.as_ref(),
-        num_rows,
-        null_equality,
-        parallel_build,
-    )? {
-        Some(keys) if JoinHashMapInline::layout_for(num_rows, &keys).is_some() => {
+    let keys = if parallel_build || on_left.len() > 1 {
+        inline_keys_for_build(
+            &on_left,
+            &schema,
+            &batches,
+            bounds.as_ref(),
+            num_rows,
+            null_equality,
+            parallel_build,
+        )?
+    } else {
+        None
+    };
+    let (inline, dense) = match keys {
+        Some(keys)
+            if parallel_build
+                && JoinHashMapInline::layout_for(num_rows, &keys).is_some() =>
+        {
             (Some(keys), None)
         }
-        Some(keys) if keys.columns_len() > 1 && !parallel_build => (None, Some(keys)),
+        Some(keys) if !parallel_build && keys.columns_len() > 1 => (None, Some(keys)),
         _ => (None, None),
     };
 
@@ -3459,13 +3468,17 @@ fn build_in_memory(
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
 
     let compact = matches!(path, BuildPath::Compacted);
-    // Longbow patch (JT 9): dense keys are charged before any is encoded;
-    // a partitioned build encodes them while it hashes.
-    if dense.is_some() {
+    // Longbow patch (JT 9): dense keys are charged before any is encoded (a
+    // partitioned build encodes them while it hashes); a pool that refuses
+    // them gets the key comparison instead.
+    let dense = dense.filter(|_| {
         let bytes = DenseKeys::bytes_for(num_rows);
-        reservation.try_grow(bytes)?;
-        metrics.build_mem_used.add(bytes);
-    }
+        let admitted = reservation.try_grow(bytes).is_ok();
+        if admitted {
+            metrics.build_mem_used.add(bytes);
+        }
+        admitted
+    });
     let mut dense_rows: Option<Vec<u64>> = None;
     // Longbow patch (JT): the reservation's size while a partitioned build
     // held its transient arrays.

@@ -360,3 +360,64 @@ fn an_inline_map_refuses_rows_without_keys() {
             .is_err()
     );
 }
+
+#[test]
+fn a_refused_inline_partitioned_build_touches_nothing() {
+    use datafusion_execution::memory_pool::{
+        GreedyMemoryPool, MemoryConsumer, MemoryPool,
+    };
+    use datafusion_physical_expr::expressions::Column;
+    let rows = 300_000;
+    let values: ArrayRef = Arc::new(Int64Array::from_iter_values(0..rows as i64));
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int64, false),
+    ]));
+    let batch =
+        arrow::record_batch::RecordBatch::try_new(schema, vec![Arc::clone(&values)])
+            .unwrap();
+    let keys =
+        InlineKeys::for_build(&[vec![values]], NullEquality::NullEqualsNothing).unwrap();
+    let on: Vec<datafusion_physical_expr::PhysicalExprRef> =
+        vec![Arc::new(Column::new("k", 0))];
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(
+        partitioned_build_bytes(rows, true) - 1,
+    ));
+    let mut reservation = MemoryConsumer::new("build").register(&pool);
+    let mut map = JoinHashMapInline::with_capacity(rows, keys.clone());
+    let peak = build_partitioned(
+        &mut map,
+        &on,
+        std::slice::from_ref(&batch),
+        rows,
+        &datafusion_common::hash_utils::RandomState::with_seed(0),
+        NullEquality::NullEqualsNothing,
+        Some(&keys),
+        None,
+        &mut reservation,
+    )
+    .unwrap();
+    assert_eq!(
+        (peak, map.len(), reservation.size(), pool.reserved()),
+        (None, 0, 0, 0)
+    );
+    // Admitted, the same build inserts every row.
+    let pool: Arc<dyn MemoryPool> =
+        Arc::new(GreedyMemoryPool::new(partitioned_build_bytes(rows, true)));
+    let mut reservation = MemoryConsumer::new("build").register(&pool);
+    let peak = build_partitioned(
+        &mut map,
+        &on,
+        std::slice::from_ref(&batch),
+        rows,
+        &datafusion_common::hash_utils::RandomState::with_seed(0),
+        NullEquality::NullEqualsNothing,
+        Some(&keys),
+        None,
+        &mut reservation,
+    )
+    .unwrap();
+    assert_eq!(
+        (peak, map.len(), reservation.size()),
+        (Some(partitioned_build_bytes(rows, true)), rows, 0)
+    );
+}

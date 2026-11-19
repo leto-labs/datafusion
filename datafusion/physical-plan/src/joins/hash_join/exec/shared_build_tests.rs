@@ -1810,56 +1810,6 @@ async fn a_refused_partitioned_build_falls_back_to_the_row_by_row_build() -> Res
     Ok(())
 }
 
-/// Longbow patch (JT 9): a CollectLeft build whose pool refuses the inline
-/// map's partitioned build (its transient arrays include the keys) releases
-/// the inline map and builds a hash-only map, with the same rows and no
-/// charge left; an unrefused build is inline.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_refused_inline_build_falls_back_to_a_hash_only_build() -> Result<()> {
-    use crate::joins::join_hash_map::{JoinHashMapInline, partitioned_build_bytes};
-    inline_keys::set_inline_keys_for_test(Some(true));
-    let rows = 600_000;
-    let run = |pool: Arc<dyn MemoryPool>| async move {
-        let left = single_batch(table("l", rows, 4, 400_000, 0)).await?;
-        let right = table("r", 30_000, 3, 500_000, 0);
-        let on = join_on(&left.schema(), &right.schema(), &[0]);
-        let join = HashJoinExec::try_new(
-            Arc::new(CoalescePartitionsExec::new(left)),
-            right,
-            on,
-            None,
-            &JoinType::Inner,
-            None,
-            PartitionMode::CollectLeft,
-            NullEquality::NullEqualsNothing,
-            false,
-        )?;
-        let batches =
-            common::collect(join.execute(0, context(0, Some(Arc::clone(&pool))))?)
-                .await?;
-        let peak = join
-            .metrics()
-            .unwrap()
-            .sum_by_name("build_mem_used")
-            .map_or(0, |value| value.as_usize());
-        let rows = canonical(&join.schema(), &batches)?;
-        drop(join);
-        assert_eq!(pool.reserved(), 0);
-        Ok::<_, DataFusionError>((rows, peak))
-    };
-    let (expected, peak) = run(Arc::new(GreedyMemoryPool::new(usize::MAX))).await?;
-    let inline_transient = partitioned_build_bytes(rows, true);
-    // The inline table is charged at least its own slots.
-    assert!(peak > inline_transient + JoinHashMapInline::table_bytes(rows));
-    let saved = inline_transient - partitioned_build_bytes(rows, false);
-    let (actual, tight_peak) =
-        run(Arc::new(GreedyMemoryPool::new(peak - saved / 2))).await?;
-    assert!(!expected.is_empty());
-    assert_eq!(actual, expected);
-    assert!(tight_peak < peak, "{tight_peak} {peak}");
-    Ok(())
-}
-
 /// `plan`'s rows as one batch in one partition.
 async fn single_batch(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
     let schema = plan.schema();
