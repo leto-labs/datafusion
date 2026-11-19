@@ -39,10 +39,13 @@ mod files;
 mod tests;
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll};
 
-use arrow::array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow::array::{
+    ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array, UInt64Array,
+};
 use arrow::compute::{concat_batches, filter_record_batch, take_record_batch};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::config::ExecutionOptions;
@@ -63,7 +66,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, ready};
 
 pub(crate) use files::SpillFilesExec;
-use files::{FileSource, Origin};
+use files::{FileSource, Origin, Stage};
 
 use super::exec::{HashJoinExec, HashJoinExecBuilder, JoinLeftData};
 use crate::attempt_tasks::AttemptTasks;
@@ -271,10 +274,36 @@ pub(super) struct Eligible {
     random_state: RandomState,
     shared: Arc<SpillShared>,
     mode: PartitionMode,
-    /// Probe streams of this plan instance (the build's members).
-    probe_streams: usize,
+    /// The streams expected to probe the build (its members).
+    count: Expected,
     /// The `CollectLeft` build that the exec holds for its streams.
     shared_build: Option<Weak<OnceAsync<JoinLeftData>>>,
+    /// Above the depth limit: why the join writes no partition. It may
+    /// still build its table on its floor.
+    depth_limit: Option<String>,
+}
+
+/// Why a join above the depth limit cannot go on: a hot key when its
+/// partition kept more than half of the rows its parent divided (a uniform
+/// key spread keeps one in `hash_join_spill_partitions`), the pool otherwise.
+fn depth_limit_reason(origin: Option<Origin>, level: usize, max_depth: usize) -> String {
+    let rows = origin.map_or(0, |origin| origin.rows);
+    match origin {
+        Some(origin) if origin.hot() => format!(
+            "one key value fills its partition of {rows} build rows ({}% of the {} \
+             rows its parent join divided), which no spill level divides (the \
+             build-chunk join of add-join-spill section 3 is not implemented) and which \
+             is larger than its workspace floor; it is at spill level {level}, above \
+             datafusion.execution.hash_join_spill_max_depth ({max_depth})",
+            rows * 100 / origin.parent_rows.max(1),
+            origin.parent_rows,
+        ),
+        _ => format!(
+            "the memory pool had no room for its partition of {rows} build rows at \
+             spill level {level}, above datafusion.execution.hash_join_spill_max_depth \
+             ({max_depth}), and the partition is larger than its workspace floor"
+        ),
+    }
 }
 
 impl JoinSpill {
@@ -297,6 +326,7 @@ impl JoinSpill {
         let leaf = join.left().downcast_ref::<SpillFilesExec>();
         let level = leaf.map_or(0, SpillFilesExec::level);
         let options = SpillOptions::try_new(&config.execution)?;
+        let membership = shared.membership();
         let reason = if join.null_aware {
             Some("it is a null-aware anti join".to_string())
         } else if join.right().output_ordering().is_some() {
@@ -307,43 +337,44 @@ impl JoinSpill {
             Some("it uses a prepared build".to_string())
         } else if !context.runtime_env().disk_manager.tmp_files_enabled() {
             Some("the disk manager cannot create files".to_string())
-        } else if level > options.max_depth {
-            let origin = leaf.map(SpillFilesExec::origin);
-            let rows = origin.map_or(0, |origin| origin.rows);
-            Some(if origin.is_some_and(|origin| !origin.divided) {
-                format!(
-                    "one key value fills its partition of {rows} build rows, which no \
-                     spill level divides (the build-chunk join of add-join-spill \
-                     section 3 is not implemented); it is at spill level {level}, \
-                     above datafusion.execution.hash_join_spill_max_depth ({})",
-                    options.max_depth
-                )
-            } else {
-                format!(
-                    "the memory pool had no room for its partition of {rows} build rows \
-                     at spill level {level}, above \
-                     datafusion.execution.hash_join_spill_max_depth ({}), and the \
-                     partition is larger than its workspace floor",
-                    options.max_depth
-                )
-            })
         } else if !matches!(
             join.mode,
             PartitionMode::CollectLeft | PartitionMode::Partitioned
         ) {
             Some(format!("its partition mode is {:?}", join.mode))
+        } else if join.mode == PartitionMode::CollectLeft
+            && membership != Membership::Closed
+            && need_produce_result_in_final(join.join_type)
+        {
+            Some(
+                "its probe streams are open (any number may execute a partition), so \
+                 the build rows of a written partition could not be emitted exactly once"
+                    .to_string(),
+            )
         } else {
             None
         };
         if let Some(reason) = reason {
             return Ok(Self::Ineligible(reason));
         }
+        // Above the depth limit the join may still build on its floor, but
+        // it writes no partition (design decision 5, "Recursion").
+        let depth_limit = (level > options.max_depth).then(|| {
+            depth_limit_reason(leaf.map(SpillFilesExec::origin), level, options.max_depth)
+        });
         let right_partitions = join.right().output_partitioning().partition_count();
-        let probe_streams = match join.mode {
-            PartitionMode::CollectLeft => shared
-                .partitions()
-                .map_or(right_partitions, |range| range.len()),
-            _ => 1,
+        let count = match (join.mode, membership) {
+            (PartitionMode::CollectLeft, Membership::Closed) => Expected::Fixed(
+                shared
+                    .partitions()
+                    .map_or(right_partitions, |range| range.len()),
+            ),
+            (PartitionMode::CollectLeft, Membership::Open) => Expected::Open,
+            (PartitionMode::CollectLeft, Membership::Admitted) => Expected::Admitted {
+                admitted: 0,
+                closed: false,
+            },
+            _ => Expected::Fixed(1),
         };
         let metrics = match leaf {
             Some(leaf) => LazyMetrics::Inherited(leaf.metrics().clone()),
@@ -372,9 +403,10 @@ impl JoinSpill {
             random_state: random_state.clone(),
             shared: Arc::clone(shared),
             mode: join.mode,
-            probe_streams,
+            count,
             shared_build: (join.mode == PartitionMode::CollectLeft)
                 .then(|| Arc::downgrade(shared_build)),
+            depth_limit,
         })))
     }
 
@@ -391,24 +423,47 @@ impl JoinSpill {
         }
     }
 
-    /// Adds why the join did not spill to a refused build reservation.
+    /// Wraps the build input of an ineligible join and returns the function
+    /// that adds why the join did not spill to a refusal of the join's own
+    /// reservations. A refusal that the build input returned (an operator
+    /// below the join, another join among them) is marked by the wrapper and
+    /// keeps its text: the mark is a flag, not a match on the error text.
     pub(super) fn explain_refusal(
         &self,
-    ) -> impl Fn(DataFusionError) -> DataFusionError + Send + Sync + 'static + use<> {
+        input: SendableRecordBatchStream,
+    ) -> (
+        SendableRecordBatchStream,
+        impl Fn(DataFusionError) -> DataFusionError + Send + Sync + 'static + use<>,
+    ) {
         let reason = match self {
             Self::Ineligible(reason) => Some(reason.clone()),
             _ => None,
         };
-        // Only the join's own refusals: the build future also polls the
-        // build input, whose operators can be refused too.
-        move |error| match &reason {
+        let input_failed = Arc::new(AtomicBool::new(false));
+        let input = match &reason {
+            Some(_) => {
+                let failed = Arc::clone(&input_failed);
+                let schema = input.schema();
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    input.inspect(move |batch| {
+                        if batch.is_err() {
+                            failed.store(true, AtomicOrdering::Relaxed);
+                        }
+                    }),
+                )) as SendableRecordBatchStream
+            }
+            None => input,
+        };
+        let explain = move |error: DataFusionError| match &reason {
             Some(reason)
-                if is_refusal(&error) && error.to_string().contains("HashJoinInput") =>
+                if is_refusal(&error) && !input_failed.load(AtomicOrdering::Relaxed) =>
             {
                 error.context(format!("The hash join did not spill because {reason}"))
             }
             _ => error,
-        }
+        };
+        (input, explain)
     }
 
     /// The probe-side state of output stream `partition`.
@@ -440,6 +495,7 @@ impl JoinSpill {
                 probe_schema: Arc::clone(&eligible.template.probe_schema),
             }),
             phase: Phase::Waiting,
+            last: false,
         }))
     }
 }
@@ -613,14 +669,16 @@ pub(super) struct BuildSpill {
     manager: Option<SpillManager>,
     template: SubJoinTemplate,
     shared: Option<Arc<SpillShared>>,
-    probe_streams: usize,
+    count: Expected,
     shared_build: Option<Weak<OnceAsync<JoinLeftData>>>,
     lazy_metrics: LazyMetrics,
+    /// Above the depth limit: why no partition may be written.
+    depth_limit: Option<String>,
     active: bool,
     /// One part per partition, then the unmatchable part.
     parts: Vec<Part>,
-    /// Key partitions that received rows.
-    seen: Vec<bool>,
+    /// Build rows each key partition received.
+    rows_seen: Vec<usize>,
     /// Counts each buffer of the in-memory parts once.
     counter: RecordBatchMemoryCounter,
     /// What the build reservation holds for the in-memory parts.
@@ -684,15 +742,16 @@ impl BuildSpill {
             template: eligible.template.clone(),
             shared: (eligible.mode == PartitionMode::CollectLeft)
                 .then(|| Arc::clone(&eligible.shared)),
-            probe_streams: eligible.probe_streams,
+            count: eligible.count,
             shared_build: eligible.shared_build.clone(),
             lazy_metrics: eligible.metrics.for_partition(match &eligible.metrics {
                 LazyMetrics::Own { partition, .. } => *partition,
                 LazyMetrics::Inherited(_) => 0,
             }),
+            depth_limit: eligible.depth_limit.clone(),
             active: false,
             parts,
-            seen: vec![false; eligible.options.partitions],
+            rows_seen: vec![0; eligible.options.partitions],
             counter: RecordBatchMemoryCounter::new(),
             charged: 0,
             workspace: vec![],
@@ -764,9 +823,22 @@ impl BuildSpill {
         self.activate(batches, reservation)?;
         self.settle_workspace(reservation);
         if !self.fits_floor(self.charged) {
+            // Above the depth limit nothing is written; `finish` fails with
+            // the reason if the table is refused again.
             self.relieve(self.charged / 2, reservation)?;
         }
         Ok(())
+    }
+
+    /// A refusal that the join cannot answer, with the reason when it is
+    /// above the depth limit.
+    fn refused(&self, error: DataFusionError) -> DataFusionError {
+        match &self.depth_limit {
+            Some(reason) => {
+                error.context(format!("The hash join did not spill because {reason}"))
+            }
+            None => error,
+        }
     }
 
     fn activate(
@@ -831,8 +903,8 @@ impl BuildSpill {
 
     fn add(&mut self, part: usize, piece: RecordBatch) -> Result<()> {
         let limit = self.options.buffer_bytes();
-        if let Some(seen) = self.seen.get_mut(part) {
-            *seen = true;
+        if let Some(seen) = self.rows_seen.get_mut(part) {
+            *seen += piece.num_rows();
         }
         match &mut self.parts[part] {
             Part::Memory {
@@ -876,7 +948,7 @@ impl BuildSpill {
                         return Ok(());
                     }
                     if !self.relieve(delta, reservation)? {
-                        return Err(error);
+                        return Err(self.refused(error));
                     }
                 }
                 Err(error) => return Err(error),
@@ -898,16 +970,22 @@ impl BuildSpill {
     }
 
     /// Covers `bytes` of the rows' charge with workspace: the charge grows
-    /// before the workspace shrinks, so the pool never sees them free.
+    /// before the workspace shrinks, so the pool never sees them free. The
+    /// workspace is owed the bytes again: charge that a later write releases
+    /// refills it before it goes back to the pool.
     fn borrow(&mut self, bytes: usize, reservation: &MemoryReservation) {
         reservation.grow(bytes);
-        drop(take_held(&mut self.workspace, bytes));
+        let moved = held(&take_held(&mut self.workspace, bytes));
+        self.workspace_debt += moved;
     }
 
     /// Writes whole partitions, largest first, until the refused `need` and
     /// one eighth of what the parts held are released. Returns whether it
     /// wrote any.
     fn relieve(&mut self, need: usize, reservation: &MemoryReservation) -> Result<bool> {
+        if self.depth_limit.is_some() {
+            return Ok(false);
+        }
         let target = need.max(self.charged / 8);
         let mut released = 0;
         let mut wrote = false;
@@ -1042,17 +1120,20 @@ impl BuildSpill {
             match build(&mut batches, reservation) {
                 Ok(table) => {
                     self.charged = 0;
-                    let spilled = self.into_spilled(vec![], false);
+                    let spilled = self.into_spilled(false);
                     return Ok((table, spilled, None));
                 }
                 Err(error) if is_refusal(&error) => {
                     // The rows are back in `batches`; `reservation` still
-                    // holds them (and whatever the attempt grew).
+                    // holds them (and whatever the attempt grew). They were
+                    // counted when they came.
+                    let seen = self.rows_seen.clone();
                     for batch in std::mem::take(&mut batches) {
                         for (part, piece) in self.split(&batch)? {
                             self.add(part, piece)?;
                         }
                     }
+                    self.rows_seen = seen;
                     let counted = self.counter.memory_usage();
                     if counted >= reservation.size() {
                         reservation.grow(counted - reservation.size());
@@ -1066,7 +1147,7 @@ impl BuildSpill {
                     // A table and its copy are about twice the rows: write
                     // half of what stayed before trying again.
                     if !self.relieve(self.charged / 2, reservation)? {
-                        return Err(error);
+                        return Err(self.refused(error));
                     }
                     self.finish_writers()?;
                 }
@@ -1090,25 +1171,22 @@ impl BuildSpill {
             .register(&pool);
         let table = build(&mut batches, &mut attempt)?;
         let extra = pool.reserved().saturating_sub(self.charged);
-        let mut floor = take_held(&mut self.workspace, extra);
+        let floor = take_held(&mut self.workspace, extra);
+        // The estimate of `fits_floor` can be short (an empty table, a key
+        // copy of float keys, a membership form): the rest grows without
+        // refusal, as the smallest unit of design decision 8.
         let short = extra.saturating_sub(held(&floor));
-        if short > 0 {
-            // Only an empty table can be short of its estimate.
-            let piece = reservation.new_empty();
-            piece.grow(short);
-            floor.push(piece);
-        }
         self.charged = 0;
+        // One charge for the table, released with it: the rows' charge
+        // grows by the floor before the floor's pieces go.
         let charge = reservation.take();
-        let spilled = self.into_spilled(floor, true);
+        charge.grow(held(&floor) + short);
+        drop(floor);
+        let spilled = self.into_spilled(true);
         Ok((table, spilled, Some(charge)))
     }
 
-    fn into_spilled(
-        mut self,
-        floor: Vec<MemoryReservation>,
-        on_floor: bool,
-    ) -> Option<Arc<SpilledBuild>> {
+    fn into_spilled(mut self, on_floor: bool) -> Option<Arc<SpilledBuild>> {
         self.workspace.clear();
         if !self.parts.iter().any(Part::is_written) && !on_floor {
             return None;
@@ -1124,8 +1202,8 @@ impl BuildSpill {
             .iter()
             .map(Part::is_written)
             .collect();
-        let divided = self.seen.iter().filter(|seen| **seen).count() > 1;
-        let build_files = self
+        let parent_rows = self.rows_seen.iter().sum();
+        let build_files: Vec<Option<SpilledFile>> = self
             .parts
             .into_iter()
             .map(|part| match part {
@@ -1133,34 +1211,54 @@ impl BuildSpill {
                 _ => None,
             })
             .collect();
-        let mode = if need_produce_result_in_final(self.template.join_type) {
+        let join_type = self.template.join_type;
+        let mode = if need_produce_result_in_final(join_type) {
             Mode::Last
         } else {
             Mode::PerStream
         };
-        let members = self.probe_streams;
+        let own_type = match join_type {
+            JoinType::Left => Some(JoinType::Inner),
+            JoinType::Full => Some(JoinType::Right),
+            JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => None,
+            other => Some(other),
+        };
+        let final_hold = build_files
+            .iter()
+            .map(|file| mode == Mode::Last && file.is_some())
+            .collect();
+        let seated = match (self.count, &self.shared) {
+            (Expected::Fixed(_), Some(_)) => vec![false; slots],
+            _ => vec![],
+        };
         let spilled = Arc::new(SpilledBuild {
             level: self.level,
             shift: self.options.shift,
             partitions,
             written,
-            divided,
+            parent_rows,
             build_files: Mutex::new(build_files),
             template: self.template,
             build_manager: manager,
             metrics: self.metrics,
-            range,
             mode,
-            probes: Arc::new(ProbeRegistry::new(slots, partitions)),
+            own_type,
+            probes: ProbeRegistry::new(slots),
             members: Mutex::new(Members {
-                members,
+                count: self.count,
+                range,
+                seated,
+                arrived: 0,
                 finished: 0,
-                abandoned: false,
-                remaining: vec![members; partitions],
+                released: false,
+                emitter: false,
+                done: vec![0; partitions + 1],
+                final_hold,
                 joins: (0..partitions).map(|_| None).collect(),
+                next_id: 0,
+                violation: None,
             }),
             shared_build: self.shared_build.take(),
-            _floor_charge: floor,
         });
         if let Some(shared) = &self.shared {
             shared.register(&spilled);
@@ -1245,83 +1343,141 @@ fn partition_ids(
 /// How the written partitions of a build are joined after the probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// The join emits only rows that a probe row produces (Inner, Right,
-    /// RightSemi, RightAnti, RightMark), so its output keeps the probe's
-    /// partitioning: each stream joins its own probe file of each written
-    /// partition, sharing the partition's join with the streams that run it
-    /// at the same time. No stream waits for another.
+    /// Inner, Right, RightSemi, RightAnti, RightMark: every output row comes
+    /// from a probe row. Each stream joins its own probe file of each written
+    /// partition (an own run), sharing the partition's join with the streams
+    /// that run it at the same time. No stream waits for another.
     PerStream,
-    /// The join also emits build rows (Left, LeftSemi, LeftAnti, LeftMark,
-    /// Full), whose output partitioning is unknown: the last stream to end
-    /// its in-memory pass joins each written partition over every stream's
-    /// probe file, so one table sees every probe row. The others end at once.
+    /// Left, LeftSemi, LeftAnti, LeftMark, Full: the join also emits build
+    /// rows. A Left or Full stream makes own runs with the probe-preserving
+    /// form of the join (Inner, Right), so a stream gives the rows its probe
+    /// rows produce whatever the other streams do, as in the stock join. The
+    /// stream that the in-memory table's completion count chooses to emit the
+    /// build rows (the stock join's last probe partition) also emits those of
+    /// every written partition, with a join over every stream's probe file of
+    /// it (LeftAnti for Left and Full, the join type itself otherwise). With
+    /// no such stream (a stream stopped early or never ran) no build row is
+    /// emitted, as in the stock join.
     Last,
 }
 
-/// The probe files of a build's written partitions, by stream slot and
-/// partition.
-pub(crate) struct ProbeRegistry(Mutex<Vec<Vec<Option<SpilledFile>>>>);
+/// One partition that a stream joins after its in-memory pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// Its own probe file of a written partition.
+    Own(usize),
+    /// `Last`: the build rows of a written partition, or the unmatchable
+    /// partition (index `partitions`).
+    Final(usize),
+}
+
+/// `Last`: the probe files of a build's written partitions, by stream slot
+/// and partition, for the build-row pass. A stream registers them when its
+/// probe input ends, before it reports its completion to the in-memory
+/// table, so the stream that the count chooses sees every file.
+pub(crate) struct ProbeRegistry(Mutex<Vec<Option<Vec<Option<SpilledFile>>>>>);
 
 impl ProbeRegistry {
-    fn new(slots: usize, partitions: usize) -> Self {
-        Self(Mutex::new(vec![vec![None; partitions]; slots]))
+    fn new(slots: usize) -> Self {
+        Self(Mutex::new(vec![None; slots]))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Vec<Option<SpilledFile>>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Option<Vec<Option<SpilledFile>>>>> {
         self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     fn register(&self, slot: usize, files: Vec<Option<SpilledFile>>) -> Result<()> {
         match self.lock().get_mut(slot) {
-            Some(entry) => {
-                *entry = files;
+            Some(entry @ None) => {
+                *entry = Some(files);
                 Ok(())
+            }
+            Some(Some(_)) => {
+                internal_err!("hash join spill: probe slot {slot} registered twice")
             }
             None => internal_err!("hash join spill: no probe slot {slot}"),
         }
     }
 
-    /// Stream `slot`'s file of `part`; its reader deletes it when done.
-    pub(super) fn take(&self, slot: usize, part: usize) -> Option<SpilledFile> {
-        self.lock()
-            .get_mut(slot)
-            .and_then(|files| files.get_mut(part))
-            .and_then(Option::take)
-    }
-
     fn take_all(&self, part: usize) -> Vec<SpilledFile> {
         self.lock()
             .iter_mut()
+            .flatten()
             .filter_map(|files| files.get_mut(part).and_then(Option::take))
             .collect()
     }
 
-    fn rows(&self, slot: usize, part: usize) -> usize {
-        self.lock()
-            .get(slot)
-            .and_then(|files| files.get(part))
-            .and_then(Option::as_ref)
-            .map_or(0, |file| file.rows)
+    fn clear(&self) {
+        self.lock().iter_mut().for_each(|files| *files = None);
+    }
+}
+
+/// The streams expected to probe a build (its members).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Expected {
+    /// Each member probes one partition once: a `CollectLeft` join's bound
+    /// range or every probe partition, or the one stream of a `Partitioned`
+    /// build.
+    Fixed(usize),
+    /// The join of a written partition that its parent shares: the parent
+    /// admits each stream before it executes partition 0. Closed, so that
+    /// later streams make a new join, once every admitted stream ended its
+    /// in-memory pass.
+    Admitted { admitted: usize, closed: bool },
+    /// Any number of streams execute any partition, each with its own probe
+    /// input (`HashJoinExec::set_open_probe_streams`); their count is not
+    /// known, so nothing is released before the join is dropped.
+    Open,
+}
+
+impl Expected {
+    /// The number of members, once it is known.
+    fn known(&self) -> Option<usize> {
+        match self {
+            Self::Fixed(members) => Some(*members),
+            Self::Admitted {
+                admitted,
+                closed: true,
+            } => Some(*admitted),
+            _ => None,
+        }
     }
 }
 
 /// What the members of a build have done. Nothing here waits.
 struct Members {
-    /// Streams expected to probe the build: the bound range of a split
-    /// attempt, or every probe partition, or 1.
-    members: usize,
+    count: Expected,
+    /// `Fixed` `CollectLeft`: the bound partitions, and the partitions that
+    /// came.
+    range: Option<Range<usize>>,
+    seated: Vec<bool>,
+    /// Members that came: took a seat or left before.
+    arrived: usize,
     /// Members that ended their in-memory pass or left.
     finished: usize,
-    /// A member left before its in-memory pass ended. A build-emitting join
-    /// then joins no written partition, as the stock join emits no build
-    /// rows when a probe partition stops early.
-    abandoned: bool,
-    /// `PerStream`: members that have not finished each partition or left;
-    /// a partition's build file is deleted when this reaches 0.
-    remaining: Vec<usize>,
-    /// `PerStream`: the join of each partition while a stream runs it, and
-    /// how many do.
-    joins: Vec<Option<(Arc<dyn ExecutionPlan>, usize)>>,
+    /// The exec let go of the in-memory table.
+    released: bool,
+    /// `Last`: a stream was chosen to emit the build rows.
+    emitter: bool,
+    /// Per partition (then the unmatchable one): members done with their
+    /// own run of it, finished, skipped or left.
+    done: Vec<usize>,
+    /// `Last`: the build-row pass still needs the partition's build file.
+    final_hold: Vec<bool>,
+    /// The join of each partition while streams run it.
+    joins: Vec<Option<SharedJoin>>,
+    next_id: u64,
+    /// An impossible state found where no error can be returned (a drop);
+    /// the next stream that asks fails with it.
+    violation: Option<String>,
+}
+
+/// A partition's join that streams share while they run it.
+struct SharedJoin {
+    join: Arc<HashJoinExec>,
+    stage: Arc<Stage>,
+    users: usize,
+    id: u64,
 }
 
 /// The written partitions of one build, shared by the streams that probe
@@ -1331,24 +1487,22 @@ pub(crate) struct SpilledBuild {
     shift: u32,
     partitions: usize,
     written: Vec<bool>,
-    /// Whether this build's rows went to more than one key partition.
-    divided: bool,
+    /// The build rows this build divided over its key partitions.
+    parent_rows: usize,
     /// One file per partition, then the unmatchable partition's.
     build_files: Mutex<Vec<Option<SpilledFile>>>,
     template: SubJoinTemplate,
     build_manager: SpillManager,
     metrics: JoinSpillMetrics,
-    /// The output partitions a split attempt executes.
-    range: Option<Range<usize>>,
     mode: Mode,
-    probes: Arc<ProbeRegistry>,
+    /// The join type of own runs; none for LeftSemi, LeftAnti and LeftMark,
+    /// whose rows are all build rows.
+    own_type: Option<JoinType>,
+    probes: ProbeRegistry,
     members: Mutex<Members>,
     /// The exec's hold on a `CollectLeft` build, released once every
     /// member ended its in-memory pass.
     shared_build: Option<Weak<OnceAsync<JoinLeftData>>>,
-    /// Workspace moved to the table of a build charged on its floor; held
-    /// as long as the build.
-    _floor_charge: Vec<MemoryReservation>,
 }
 
 impl SpilledBuild {
@@ -1365,179 +1519,349 @@ impl SpilledBuild {
         self.written[partition]
     }
 
-    /// Streams that left before the build existed.
-    fn left_before_build(&self, count: usize) {
-        if count == 0 {
-            return;
-        }
-        let mut members = self.lock();
-        members.members = members.members.saturating_sub(count);
-        members.abandoned = true;
-        self.check_released(&members);
+    fn written_parts(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.partitions).filter(|part| self.written[*part])
     }
 
-    /// A member ended its in-memory pass with these probe files. Returns
-    /// whether it joins the written partitions of a `Last` build.
-    fn end_in_memory(
-        &self,
-        slot: usize,
-        files: Vec<Option<SpilledFile>>,
-    ) -> Result<bool> {
-        self.probes.register(slot, files)?;
+    /// Counts a member that came as stream `slot`. The states that the
+    /// count cannot explain are internal errors (design decision 5).
+    fn arrive(members: &mut Members, slot: usize) -> Result<()> {
+        members.arrived += 1;
+        match members.count {
+            Expected::Fixed(expected) => {
+                if let Some(range) = &members.range
+                    && !range.contains(&slot)
+                {
+                    return internal_err!(
+                        "hash join spill: a stream of partition {slot} probes a build \
+                         bound to partitions {range:?}"
+                    );
+                }
+                if let Some(seated) = members.seated.get_mut(slot) {
+                    if *seated {
+                        return internal_err!(
+                            "hash join spill: partition {slot} probes the build twice"
+                        );
+                    }
+                    *seated = true;
+                }
+                if members.arrived > expected {
+                    return internal_err!(
+                        "hash join spill: {} streams probe a build of {expected} members",
+                        members.arrived
+                    );
+                }
+            }
+            Expected::Admitted { admitted, .. } if members.arrived > admitted => {
+                return internal_err!(
+                    "hash join spill: {} streams probe a partition join that admitted \
+                     {admitted}",
+                    members.arrived
+                );
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Stream `slot` takes its seat when its build is ready.
+    fn seat(&self, slot: usize) -> Result<()> {
         let mut members = self.lock();
-        members.finished += 1;
-        let last = members.finished == members.members && !members.abandoned;
-        self.check_released(&members);
-        Ok(last)
+        if let Some(violation) = &members.violation {
+            return internal_err!("{violation}");
+        }
+        Self::arrive(&mut members, slot)
+    }
+
+    /// Stream `slot` left before it took its seat.
+    fn depart(&self, slot: usize) {
+        let mut members = self.lock();
+        if let Err(error) = Self::arrive(&mut members, slot) {
+            members.violation.get_or_insert_with(|| error.to_string());
+        }
+        self.leave_locked(&mut members);
     }
 
     /// A member left before its in-memory pass ended.
     fn leave_in_memory(&self) {
         let mut members = self.lock();
+        self.leave_locked(&mut members);
+    }
+
+    fn leave_locked(&self, members: &mut Members) {
         members.finished += 1;
-        members.abandoned = true;
-        self.check_released(&members);
-        drop(members);
-        if self.mode == Mode::PerStream {
-            for part in 0..self.partitions {
-                if self.written[part] {
-                    self.done_with(part);
-                }
+        for part in self.written_parts() {
+            members.done[part] += 1;
+        }
+        self.settle(members);
+    }
+
+    /// The parent admits a stream to this partition join; false once it is
+    /// closed.
+    fn admit(&self) -> bool {
+        match &mut self.lock().count {
+            Expected::Admitted {
+                admitted,
+                closed: false,
+            } => {
+                *admitted += 1;
+                true
             }
+            _ => false,
         }
     }
 
-    /// Frees the in-memory table once every member ended its in-memory
-    /// pass: the exec still holds the `CollectLeft` build for streams that
-    /// never came. Such a stream fails instead of building it again.
-    fn check_released(&self, members: &Members) {
-        if members.finished >= members.members
-            && let Some(shared_build) = self.shared_build.as_ref().and_then(Weak::upgrade)
-        {
-            shared_build.release(datafusion_common::internal_datafusion_err!(
-                "hash join spill: a stream started after every member ended its probe"
-            ));
-        }
-    }
-
-    /// The partitions that stream `slot` joins: in `PerStream` mode those
-    /// where its own probe file has rows; in `Last` mode, for the last
-    /// member, every written partition and the unmatchable one.
-    fn runs(&self, slot: usize, last: bool) -> Vec<usize> {
-        match self.mode {
-            Mode::PerStream => {
-                let mut runs = vec![];
-                for part in 0..self.partitions {
-                    if !self.written[part] {
-                        continue;
-                    }
-                    if self.probes.rows(slot, part) > 0 {
-                        runs.push(part);
-                    } else {
-                        self.probes.take(slot, part);
-                        self.done_with(part);
-                    }
-                }
-                runs
-            }
-            Mode::Last if last => {
-                let files = self.files();
-                (0..=self.partitions)
-                    .filter(|part| files[*part].is_some())
-                    .collect()
-            }
-            Mode::Last => vec![],
-        }
-    }
-
-    /// `PerStream`: a member is done with `part` (finished it, skipped it
-    /// or left); the last one deletes its build file.
-    fn done_with(&self, part: usize) {
+    /// A member ended its in-memory pass; `emit` if the in-memory table's
+    /// completion count chose it to emit the build rows.
+    fn end_in_memory(&self, emit: bool) -> Result<()> {
         let mut members = self.lock();
-        let remaining = &mut members.remaining[part];
-        *remaining = remaining.saturating_sub(1);
-        if *remaining == 0 {
-            members.joins[part] = None;
-            drop(members);
+        if let Some(violation) = &members.violation {
+            return internal_err!("{violation}");
+        }
+        members.finished += 1;
+        if let Some(expected) = match members.count {
+            Expected::Fixed(expected) => Some(expected),
+            Expected::Admitted { admitted, .. } => Some(admitted),
+            Expected::Open => None,
+        } && members.finished > expected
+        {
+            return internal_err!(
+                "hash join spill: {} streams ended their probe of a build of {expected} \
+                 members",
+                members.finished
+            );
+        }
+        if emit && self.mode == Mode::Last {
+            if members.emitter {
+                return internal_err!(
+                    "hash join spill: two streams were chosen to emit the build rows"
+                );
+            }
+            members.emitter = true;
+        }
+        self.settle(&mut members);
+        Ok(())
+    }
+
+    /// After a member finished: lets go of the in-memory table once every
+    /// member ended its in-memory pass, gives up the build-row pass when no
+    /// member was chosen for it, and deletes the files no member needs.
+    fn settle(&self, members: &mut Members) {
+        let all = match &mut members.count {
+            Expected::Fixed(expected) => members.finished >= *expected,
+            Expected::Admitted { admitted, closed } => {
+                if members.finished >= *admitted {
+                    *closed = true;
+                }
+                *closed
+            }
+            Expected::Open => false,
+        };
+        if all && !members.released {
+            members.released = true;
+            // The exec still holds the `CollectLeft` build for streams that
+            // never came. Such a stream fails instead of building it again.
+            if let Some(shared_build) = self.shared_build.as_ref().and_then(Weak::upgrade)
+            {
+                shared_build.release(datafusion_common::internal_datafusion_err!(
+                    "hash join spill: a stream started after every member ended its probe"
+                ));
+            }
+        }
+        if all && self.mode == Mode::Last && !members.emitter {
+            members.final_hold.iter_mut().for_each(|hold| *hold = false);
+            self.probes.clear();
+        }
+        for part in 0..=self.partitions {
+            self.prune(members, part);
+        }
+    }
+
+    /// Deletes `part`'s build file when no member and no build-row pass
+    /// needs it.
+    fn prune(&self, members: &Members, part: usize) {
+        if members.final_hold[part] {
+            return;
+        }
+        let own_done = self.own_type.is_none()
+            || part == self.partitions
+            || members
+                .count
+                .known()
+                .is_some_and(|expected| members.done[part] >= expected);
+        if own_done {
             self.files()[part] = None;
         }
     }
 
-    /// `PerStream`: the join of `part`, shared with the streams that run it
-    /// now, or a new one over the retained build file.
+    /// A member is done with its own run of `part`.
+    fn done_with(&self, part: usize) {
+        let mut members = self.lock();
+        members.done[part] += 1;
+        self.prune(&members, part);
+    }
+
+    /// The runs of a member with probe files `files`; `emit` adds the
+    /// build-row pass.
+    fn runs(&self, files: &[Option<SpilledFile>], emit: bool) -> Vec<Run> {
+        let mut runs = vec![];
+        if self.own_type.is_some() {
+            for part in self.written_parts() {
+                if files[part].as_ref().is_some_and(|file| file.rows > 0) {
+                    runs.push(Run::Own(part));
+                } else {
+                    self.done_with(part);
+                }
+            }
+        }
+        if emit && self.mode == Mode::Last {
+            let members = self.lock();
+            runs.extend(
+                (0..=self.partitions)
+                    .filter(|part| members.final_hold[*part])
+                    .map(Run::Final),
+            );
+        }
+        runs
+    }
+
+    /// The join of `part` for an own run, shared with the streams that run
+    /// it now, or a new one over the build file.
     fn shared_join(self: &Arc<Self>, part: usize) -> Result<JoinUse> {
         let mut members = self.lock();
-        if let Some((join, users)) = &mut members.joins[part] {
-            *users += 1;
+        if let Some(shared) = &mut members.joins[part]
+            && shared.join.spill_shared().admit()
+        {
+            shared.users += 1;
             return Ok(JoinUse {
                 build: Arc::clone(self),
                 part,
-                join: Arc::clone(join),
+                id: shared.id,
+                join: Arc::clone(&shared.join),
+                stage: Arc::clone(&shared.stage),
             });
         }
-        let build_file = self.files()[part].clone();
-        let probe = FileSource::Registry {
-            registry: Arc::clone(&self.probes),
-            part,
-            partitions: self.probes.lock().len(),
+        let Some(build_file) = self.files()[part].clone() else {
+            return internal_err!(
+                "hash join spill: the build file of written partition {part} is gone \
+                 while a member still joins it"
+            );
         };
-        let join = self.join_over(build_file, probe, self.range.clone())?;
-        members.joins[part] = Some((Arc::clone(&join), 1));
+        let stage = Arc::new(Stage::default());
+        let join_type = self.own_type.unwrap_or(self.template.join_type);
+        let join = self.join_over(
+            build_file,
+            FileSource::Staged(Arc::clone(&stage)),
+            join_type,
+            self.template.projection.clone(),
+        )?;
+        join.spill_shared().set_membership(Membership::Admitted);
+        if !join.spill_shared().admit() {
+            return internal_err!(
+                "hash join spill: a new partition join refused a stream"
+            );
+        }
+        let id = members.next_id;
+        members.next_id += 1;
+        members.joins[part] = Some(SharedJoin {
+            join: Arc::clone(&join),
+            stage: Arc::clone(&stage),
+            users: 1,
+            id,
+        });
         Ok(JoinUse {
             build: Arc::clone(self),
             part,
+            id,
             join,
+            stage,
         })
     }
 
-    /// `PerStream`: of the partitions `pending`, the index of one whose join
-    /// another stream runs now, so that streams share tables rather than
-    /// build several at once; otherwise the first.
-    fn next_run(&self, pending: &[usize]) -> usize {
+    /// Of the runs `pending`, the index of an own run whose join another
+    /// stream runs now, so that streams share tables rather than build
+    /// several at once; otherwise the first.
+    fn next_run(&self, pending: &[Run]) -> usize {
         let members = self.lock();
         pending
             .iter()
-            .position(|part| {
-                *part < members.joins.len() && members.joins[*part].is_some()
-            })
+            .position(
+                |run| matches!(run, Run::Own(part) if members.joins[*part].is_some()),
+            )
             .unwrap_or(0)
     }
 
-    /// `PerStream`: a stream stopped running the join of `part`.
-    fn release_join(&self, part: usize) {
+    /// A stream stopped running the join `id` of `part`.
+    fn release_join(&self, part: usize, id: u64) {
         let mut members = self.lock();
-        if let Some((_, users)) = &mut members.joins[part] {
-            *users -= 1;
-            if *users == 0 {
+        if let Some(shared) = &mut members.joins[part]
+            && shared.id == id
+        {
+            shared.users -= 1;
+            if shared.users == 0 {
                 members.joins[part] = None;
             }
         }
     }
 
-    /// `Last`: the join of `part` over every member's probe file.
-    fn last_join(&self, part: usize) -> Result<Arc<dyn ExecutionPlan>> {
-        let build_file = self.files()[part].take();
+    /// `Last`: the build-row pass of `part` takes its build file.
+    fn take_final(&self, part: usize) -> Result<Option<SpilledFile>> {
+        let mut members = self.lock();
+        if !members.final_hold[part] {
+            return internal_err!(
+                "hash join spill: the build-row pass of partition {part} ran twice"
+            );
+        }
+        let file = self.files()[part].clone();
+        members.final_hold[part] = false;
+        self.prune(&members, part);
+        Ok(file)
+    }
+
+    /// `Last`: the stream chosen for the build-row pass left before `part`.
+    fn drop_final(&self, part: usize) {
+        let mut members = self.lock();
+        members.final_hold[part] = false;
+        self.prune(&members, part);
+    }
+
+    /// `Last`: the join that emits the build rows of `part`, over every
+    /// member's probe file. Its output is in the build schema when the rows
+    /// must go through `UnmatchedOutput` (Left and Full).
+    fn final_join(&self, part: usize) -> Result<(Arc<HashJoinExec>, bool)> {
+        let Some(build_file) = self.take_final(part)? else {
+            return internal_err!(
+                "hash join spill: the build file of written partition {part} is gone \
+                 before its build rows were emitted"
+            );
+        };
         let probe = FileSource::Fixed(vec![self.probes.take_all(part)]);
-        self.join_over(build_file, probe, None)
+        let (join_type, projection, remap) = match self.template.join_type {
+            JoinType::Left | JoinType::Full => (JoinType::LeftAnti, None, true),
+            other => (other, self.template.projection.clone(), false),
+        };
+        let join = self.join_over(build_file, probe, join_type, projection)?;
+        Ok((join, remap))
     }
 
     /// A stock `CollectLeft` join of one written partition, one level
     /// deeper.
     fn join_over(
         &self,
-        build_file: Option<SpilledFile>,
+        build_file: SpilledFile,
         probe: FileSource,
-        range: Option<Range<usize>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+        join_type: JoinType,
+        projection: Option<ProjectionRef>,
+    ) -> Result<Arc<HashJoinExec>> {
         let level = self.level + 1;
         let template = &self.template;
         let origin = Origin {
-            divided: self.divided,
-            rows: build_file.as_ref().map_or(0, |file| file.rows),
+            rows: build_file.rows,
+            parent_rows: self.parent_rows,
         };
         let build = SpillFilesExec::new(
             Arc::clone(&template.build_schema),
-            FileSource::Fixed(vec![build_file.into_iter().collect()]),
+            FileSource::Fixed(vec![vec![build_file]]),
             self.build_manager.clone(),
             level,
             origin,
@@ -1556,64 +1880,90 @@ impl SpilledBuild {
             Arc::new(build),
             Arc::new(probe),
             template.on.clone(),
-            template.join_type,
+            join_type,
         )
         .with_filter(template.filter.clone())
-        .with_projection_ref(template.projection.clone())
+        .with_projection_ref(projection)
         .with_partition_mode(PartitionMode::CollectLeft)
         .with_null_equality(template.null_equality)
         .build()?;
-        if let Some(range) = range {
-            join.set_dynamic_filter_partitions(range)?;
-        }
         Ok(Arc::new(join))
     }
 
     /// `Last`: the rows of the unmatchable partition, each an unmatched
     /// build row.
-    fn unmatched_rows(&self, output: Arc<UnmatchedOutput>) -> SendableRecordBatchStream {
-        let file = self.files()[self.partitions].take();
+    fn unmatched_rows(
+        &self,
+        output: Arc<UnmatchedOutput>,
+    ) -> Result<SendableRecordBatchStream> {
+        let file = self.take_final(self.partitions)?;
         let schema = Arc::clone(&output.schema);
         let rows = match file {
-            Some(file) => match self
+            Some(file) => self
                 .build_manager
-                .read_spill_as_stream_unbuffered(Arc::clone(&file.file), None)
-            {
-                Ok(stream) => stream
-                    .map(move |batch| {
-                        // The file lives until its rows are read.
-                        let _file = &file;
-                        batch.and_then(|batch| output.emit(&batch))
-                    })
-                    .boxed(),
-                Err(error) => futures::stream::once(async { Err(error) }).boxed(),
-            },
+                .read_spill_as_stream_unbuffered(Arc::clone(&file.file), None)?
+                .map(move |batch| {
+                    // The file lives until its rows are read.
+                    let _file = &file;
+                    batch.and_then(|batch| output.emit(&batch))
+                })
+                .boxed(),
             None => futures::stream::empty().boxed(),
         };
-        Box::pin(RecordBatchStreamAdapter::new(schema, rows))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rows)))
     }
 }
 
-/// A stream's use of a `PerStream` partition join; dropping it lets the
-/// join go when no other stream runs it.
+/// A stream's use of a shared partition join; dropping it lets the join go
+/// when no other stream runs it.
 struct JoinUse {
     build: Arc<SpilledBuild>,
     part: usize,
-    join: Arc<dyn ExecutionPlan>,
+    id: u64,
+    join: Arc<HashJoinExec>,
+    stage: Arc<Stage>,
+}
+
+impl JoinUse {
+    /// Executes the join's one partition over `files`, this stream's probe
+    /// file of the partition.
+    fn execute(
+        &self,
+        files: Vec<SpilledFile>,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        self.stage.execute(files, || self.join.execute(0, context))
+    }
 }
 
 impl Drop for JoinUse {
     fn drop(&mut self) {
-        self.build.release_join(self.part);
+        self.build.release_join(self.part, self.id);
     }
 }
 
+/// Who probes a `CollectLeft` plan instance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Membership {
+    /// Each probe partition of the bound range (or every partition) is
+    /// executed once.
+    #[default]
+    Closed,
+    /// Any number of streams execute any partition, each with its own probe
+    /// input (Longbow's native hand-off).
+    Open,
+    /// A written partition's join that its parent shares (see
+    /// [`Expected::Admitted`]).
+    Admitted,
+}
+
 /// Per-plan-instance state of a join: the output partitions a split
-/// attempt executes, and the streams that went away before a `CollectLeft`
-/// build had spilled.
+/// attempt executes, who probes it, and the streams that went away before a
+/// `CollectLeft` build had spilled.
 #[derive(Debug, Default)]
 pub(crate) struct SpillShared {
     partitions: Mutex<Option<Range<usize>>>,
+    membership: Mutex<Membership>,
     /// Probe partitions of the join, recorded at its first execution.
     probe_partitions: OnceLock<usize>,
     /// The join's `spill_depth` gauge, registered at its first relief.
@@ -1624,13 +1974,18 @@ pub(crate) struct SpillShared {
 #[derive(Default)]
 struct Early {
     build: Option<Weak<SpilledBuild>>,
-    departed: usize,
+    registered: bool,
+    /// Partitions whose streams left before the build spilled.
+    departed: Vec<usize>,
+    /// `Admitted`: streams admitted before the build spilled.
+    admitted: usize,
 }
 
 impl std::fmt::Debug for Early {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Early")
             .field("departed", &self.departed)
+            .field("admitted", &self.admitted)
             .finish()
     }
 }
@@ -1650,6 +2005,14 @@ impl SpillShared {
             .clone()
     }
 
+    pub(crate) fn set_membership(&self, membership: Membership) {
+        *self.membership.lock().unwrap_or_else(|p| p.into_inner()) = membership;
+    }
+
+    fn membership(&self) -> Membership {
+        *self.membership.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     pub(super) fn record_probe_partitions(&self, partitions: usize) {
         let _ = self.probe_partitions.set(partitions);
     }
@@ -1658,12 +2021,14 @@ impl SpillShared {
         self.probe_partitions.get().copied().unwrap_or(1)
     }
 
-    /// Fresh state for `reset_state`, keeping the bound partitions.
+    /// Fresh state for `reset_state`, keeping the bound partitions and the
+    /// membership.
     pub(crate) fn reset(&self) -> Arc<Self> {
         let fresh = Self::default();
         if let Some(partitions) = self.partitions() {
             fresh.bind_partitions(partitions);
         }
+        fresh.set_membership(self.membership());
         Arc::new(fresh)
     }
 
@@ -1673,21 +2038,42 @@ impl SpillShared {
 
     fn register(&self, build: &Arc<SpilledBuild>) {
         let mut early = self.lock();
-        build.left_before_build(early.departed);
-        early.departed = 0;
+        if let Expected::Admitted { admitted, .. } = &mut build.lock().count {
+            *admitted = early.admitted;
+        }
+        for slot in std::mem::take(&mut early.departed) {
+            build.depart(slot);
+        }
         early.build = Some(Arc::downgrade(build));
+        early.registered = true;
     }
 
-    fn depart_early(&self) {
+    /// A stream of partition `slot` left before its build was ready.
+    fn depart_early(&self, slot: usize) {
         let mut early = self.lock();
-        let build = early.build.as_ref().and_then(Weak::upgrade);
-        match build {
-            Some(build) => {
-                drop(early);
-                build.leave_in_memory();
-            }
-            None => early.departed += 1,
+        if !early.registered {
+            early.departed.push(slot);
+            return;
         }
+        let build = early.build.as_ref().and_then(Weak::upgrade);
+        drop(early);
+        if let Some(build) = build {
+            build.depart(slot);
+        }
+    }
+
+    /// `Admitted`: admits one more stream; false once the join is closed.
+    fn admit(&self) -> bool {
+        let mut early = self.lock();
+        if !early.registered {
+            early.admitted += 1;
+            return true;
+        }
+        early
+            .build
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|build| build.admit())
     }
 }
 
@@ -1699,8 +2085,8 @@ struct Seat {
 
 enum SeatState {
     InMemory,
-    /// The partitions this stream still has to finish (`PerStream`).
-    Written(Vec<usize>),
+    /// The runs this stream still has to finish.
+    Written(Vec<Run>),
 }
 
 impl Drop for Seat {
@@ -1708,9 +2094,10 @@ impl Drop for Seat {
         match &self.state {
             SeatState::InMemory => self.build.leave_in_memory(),
             SeatState::Written(pending) => {
-                if self.build.mode == Mode::PerStream {
-                    for part in pending {
-                        self.build.done_with(*part);
+                for run in pending {
+                    match run {
+                        Run::Own(part) => self.build.done_with(*part),
+                        Run::Final(part) => self.build.drop_final(*part),
                     }
                 }
             }
@@ -1723,16 +2110,23 @@ enum Phase {
     Waiting,
     /// The build spilled: probe rows of written partitions go to files.
     Routing(Box<Router>),
+    /// The probe input ended: this stream's probe files are finished.
+    Probed(Box<Probed>),
     /// Joining the written partitions.
     Written(BoxStream<'static, Result<RecordBatch>>),
     Done,
 }
 
+struct Probed {
+    seat: Seat,
+    files: Vec<Option<SpilledFile>>,
+}
+
 /// The probe side of one output stream of a spilling join.
 pub(super) struct StreamSpill {
     context: Arc<TaskContext>,
-    /// This stream's probe-file slot, and its partition of `PerStream`
-    /// partition joins.
+    /// This stream's partition (0 in `Partitioned` mode): its seat, and its
+    /// probe-file slot for the build-row pass.
     slot: usize,
     shared: Option<Arc<SpillShared>>,
     metrics: LazyMetrics,
@@ -1741,6 +2135,9 @@ pub(super) struct StreamSpill {
     null_equality: NullEquality,
     output: Arc<UnmatchedOutput>,
     phase: Phase,
+    /// The in-memory table's completion count chose this stream to emit the
+    /// build rows.
+    last: bool,
 }
 
 /// How a stream emits the rows of the unmatchable partition: each is an
@@ -1767,6 +2164,20 @@ impl UnmatchedOutput {
             None,
         )
     }
+
+    /// An own run's batch under the join's schema: the probe-preserving
+    /// form (Inner, Right) declares some columns non-nullable that the join
+    /// (Left, Full) declares nullable.
+    fn own(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        if batch.schema() == self.schema {
+            return Ok(batch);
+        }
+        Ok(RecordBatch::try_new_with_options(
+            Arc::clone(&self.schema),
+            batch.columns().to_vec(),
+            &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+        )?)
+    }
 }
 
 struct Router {
@@ -1781,10 +2192,21 @@ struct Router {
 impl StreamSpill {
     /// The build is ready. Returns whether it spilled; if not, this state is
     /// no longer needed.
-    pub(super) fn on_build(&mut self, spilled: Option<&Arc<SpilledBuild>>) -> bool {
+    pub(super) fn on_build(
+        &mut self,
+        spilled: Option<&Arc<SpilledBuild>>,
+    ) -> Result<bool> {
         let Some(build) = spilled else {
             self.depart();
-            return false;
+            return Ok(false);
+        };
+        // From here on the seat, not the early count, records a departure.
+        self.shared = None;
+        self.phase = Phase::Done;
+        build.seat(self.slot)?;
+        let seat = Seat {
+            build: Arc::clone(build),
+            state: SeatState::InMemory,
         };
         let metrics = self.metrics.get().clone();
         let reservation =
@@ -1792,19 +2214,15 @@ impl StreamSpill {
                 .with_can_spill(true)
                 .register(self.context.memory_pool());
         self.phase = Phase::Routing(Box::new(Router {
-            seat: Seat {
-                build: Arc::clone(build),
-                state: SeatState::InMemory,
-            },
+            seat,
             manager: spill_manager(&self.context, &metrics, Arc::clone(&self.schema)),
             writers: (0..build.partitions).map(|_| None).collect(),
             metrics,
             reservation,
             hashes: vec![],
         }));
-        true
+        Ok(true)
     }
-
     /// Hook 2: sends the rows of written partitions to this stream's files.
     /// Returns the rows that stay, `None` if none do.
     pub(super) fn route(
@@ -1879,18 +2297,64 @@ impl StreamSpill {
         Ok((kept.num_rows() > 0).then_some(kept))
     }
 
+    /// The probe input ended: finishes this stream's probe files and, for
+    /// the build-row pass, registers them. Runs before the stream reports
+    /// its completion to the in-memory table.
+    pub(super) fn end_probe(&mut self) -> Result<()> {
+        let Phase::Routing(_) = &self.phase else {
+            return Ok(());
+        };
+        let Phase::Routing(router) = std::mem::replace(&mut self.phase, Phase::Done)
+        else {
+            unreachable!()
+        };
+        let Router {
+            seat,
+            metrics,
+            writers,
+            reservation,
+            ..
+        } = *router;
+        let files: Vec<Option<SpilledFile>> = writers
+            .into_iter()
+            .map(|writer| {
+                writer
+                    .map(|writer| writer.finish(&metrics, Side::Probe))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(Option::flatten)
+            .collect();
+        drop(reservation);
+        if seat.build.mode == Mode::Last {
+            seat.build.probes.register(self.slot, files.clone())?;
+        }
+        self.phase = Phase::Probed(Box::new(Probed { seat, files }));
+        Ok(())
+    }
+
+    /// The in-memory table's completion count chose (or did not choose)
+    /// this stream to emit the build rows.
+    pub(super) fn set_last(&mut self, last: bool) {
+        self.last = last;
+    }
+
     /// Hook 3: after the in-memory pass, joins the written partitions. The
     /// caller has dropped its reference to the in-memory table.
     pub(super) fn poll_written(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<RecordBatch>>> {
-        if let Phase::Routing(_) = &self.phase {
-            let Phase::Routing(router) = std::mem::replace(&mut self.phase, Phase::Done)
+        if let Err(error) = self.end_probe() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        if let Phase::Probed(_) = &self.phase {
+            let Phase::Probed(probed) = std::mem::replace(&mut self.phase, Phase::Done)
             else {
                 unreachable!()
             };
-            match self.start_written(*router) {
+            match self.start_written(*probed) {
                 Ok(stream) => self.phase = Phase::Written(stream),
                 Err(error) => return Poll::Ready(Some(Err(error))),
             }
@@ -1907,36 +2371,18 @@ impl StreamSpill {
 
     fn start_written(
         &self,
-        router: Router,
+        probed: Probed,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        let Router {
-            mut seat,
-            metrics,
-            writers,
-            reservation,
-            ..
-        } = router;
-        let files = writers
-            .into_iter()
-            .map(|writer| {
-                writer
-                    .map(|writer| writer.finish(&metrics, Side::Probe))
-                    .transpose()
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(Option::flatten)
-            .collect();
-        drop(reservation);
-        let last = seat.build.end_in_memory(self.slot, files)?;
-        let runs = seat.build.runs(self.slot, last);
+        let Probed { mut seat, files } = probed;
+        seat.build.end_in_memory(self.last)?;
+        let runs = seat.build.runs(&files, self.last);
         seat.state = SeatState::Written(runs.clone());
         let state = Written {
             seat,
             runs,
+            files,
             output: Arc::clone(&self.output),
             context: Arc::clone(&self.context),
-            partition: self.slot,
             current: None,
             failed: false,
         };
@@ -1950,7 +2396,7 @@ impl StreamSpill {
         if matches!(self.phase, Phase::Waiting)
             && let Some(shared) = self.shared.take()
         {
-            shared.depart_early();
+            shared.depart_early(self.slot);
         }
         self.phase = Phase::Done;
     }
@@ -1962,15 +2408,27 @@ impl Drop for StreamSpill {
     }
 }
 
+/// How a run's output becomes the join's output.
+enum Output {
+    /// An own run: the join's schema.
+    Own,
+    /// The build-row pass of a Left or Full join: LeftAnti rows, each an
+    /// unmatched build row.
+    Unmatched,
+    /// Already the join's output.
+    Same,
+}
+
 /// The written-partition phase of one stream.
 struct Written {
     seat: Seat,
-    /// The partitions this stream joins, in order; the first is current.
-    runs: Vec<usize>,
+    /// The runs of this stream, in order; the first is current.
+    runs: Vec<Run>,
+    /// This stream's probe files, by partition.
+    files: Vec<Option<SpilledFile>>,
     output: Arc<UnmatchedOutput>,
     context: Arc<TaskContext>,
-    partition: usize,
-    current: Option<(SendableRecordBatchStream, Option<JoinUse>)>,
+    current: Option<(SendableRecordBatchStream, Option<JoinUse>, Output)>,
     failed: bool,
 }
 
@@ -1980,9 +2438,20 @@ impl Written {
             return None;
         }
         loop {
-            if let Some((stream, _)) = &mut self.current {
+            if let Some((stream, _, output)) = &mut self.current {
                 match stream.next().await {
-                    Some(Ok(batch)) => return Some(Ok(batch)),
+                    Some(Ok(batch)) => {
+                        let batch = match output {
+                            Output::Own => self.output.own(batch),
+                            Output::Unmatched => self.output.emit(&batch),
+                            Output::Same => Ok(batch),
+                        };
+                        if batch.is_err() {
+                            self.failed = true;
+                            self.current = None;
+                        }
+                        return Some(batch);
+                    }
                     Some(Err(error)) => {
                         self.failed = true;
                         self.current = None;
@@ -1990,9 +2459,9 @@ impl Written {
                     }
                     None => {
                         self.current = None;
-                        let part = self.runs.remove(0);
+                        let run = self.runs.remove(0);
                         self.seat.state = SeatState::Written(self.runs.clone());
-                        if self.seat.build.mode == Mode::PerStream {
+                        if let Run::Own(part) = run {
                             self.seat.build.done_with(part);
                         }
                         continue;
@@ -2003,26 +2472,27 @@ impl Written {
                 return None;
             }
             let build = Arc::clone(&self.seat.build);
-            if build.mode == Mode::PerStream {
-                // The run to start moves to the front: `runs[0]` is current.
-                let next = build.next_run(&self.runs);
-                self.runs.swap(0, next);
-            }
-            let part = self.runs[0];
-            let started = match build.mode {
-                _ if part == build.partitions => {
-                    Ok((build.unmatched_rows(Arc::clone(&self.output)), None))
-                }
-                Mode::PerStream => build.shared_join(part).and_then(|using| {
-                    let stream = using
-                        .join
-                        .execute(self.partition, Arc::clone(&self.context))?;
-                    Ok((stream, Some(using)))
+            // The run to start moves to the front: `runs[0]` is current.
+            let next = build.next_run(&self.runs);
+            self.runs.swap(0, next);
+            let started = match self.runs[0] {
+                Run::Own(part) => build.shared_join(part).and_then(|using| {
+                    let files = self.files[part].take().into_iter().collect();
+                    let stream = using.execute(files, Arc::clone(&self.context))?;
+                    Ok((stream, Some(using), Output::Own))
                 }),
-                Mode::Last => build
-                    .last_join(part)
-                    .and_then(|join| join.execute(0, Arc::clone(&self.context)))
-                    .map(|stream| (stream, None)),
+                Run::Final(part) if part == build.partitions => build
+                    .unmatched_rows(Arc::clone(&self.output))
+                    .map(|stream| (stream, None, Output::Same)),
+                Run::Final(part) => build.final_join(part).and_then(|(join, remap)| {
+                    let stream = join.execute(0, Arc::clone(&self.context))?;
+                    let output = if remap {
+                        Output::Unmatched
+                    } else {
+                        Output::Same
+                    };
+                    Ok((stream, None, output))
+                }),
             };
             match started {
                 Ok(current) => self.current = Some(current),

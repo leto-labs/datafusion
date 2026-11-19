@@ -12,7 +12,7 @@
 //! the files creates it, at run time.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::SchemaRef;
 use datafusion_common::Result;
@@ -22,7 +22,7 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
 use futures::StreamExt;
 
-use super::{JoinSpillMetrics, ProbeRegistry, SpilledFile};
+use super::{JoinSpillMetrics, SpilledFile};
 use crate::execution_plan::{Boundedness, EmissionType, SchedulingType};
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::RecordBatchStreamAdapter;
@@ -35,41 +35,75 @@ use crate::{
 pub(super) enum FileSource {
     /// One list of files per output partition, fixed at creation.
     Fixed(Vec<Vec<SpilledFile>>),
-    /// Output partition `n` reads probe stream `n`'s file of partition
-    /// `part`, taken from the registry when `n` executes: the stream writes
-    /// it before it executes its partition of the join.
-    Registry {
-        registry: Arc<ProbeRegistry>,
-        part: usize,
-        partitions: usize,
-    },
+    /// One partition, executed once by each stream that shares the join:
+    /// each execution reads the files that the stream staged for it.
+    Staged(Arc<Stage>),
 }
 
 impl FileSource {
     fn partitions(&self) -> usize {
         match self {
             Self::Fixed(files) => files.len(),
-            Self::Registry { partitions, .. } => *partitions,
+            Self::Staged(_) => 1,
         }
     }
 
-    fn take(&self, partition: usize) -> Vec<SpilledFile> {
+    fn take(&self, partition: usize) -> Result<Vec<SpilledFile>> {
         match self {
-            Self::Fixed(files) => files[partition].clone(),
-            Self::Registry { registry, part, .. } => {
-                registry.take(partition, *part).into_iter().collect()
-            }
+            Self::Fixed(files) => Ok(files[partition].clone()),
+            Self::Staged(stage) => stage.take(),
         }
     }
 }
 
-/// What the rows of a build leaf went through: whether the join that wrote
-/// them divided its build over several partitions, and how many there are.
-/// A join over them that cannot spill says why from these facts.
+/// The files of the one execution of a shared join's probe leaf that is
+/// being opened.
+#[derive(Default)]
+pub(super) struct Stage {
+    /// Held while a stream opens its execution.
+    opening: Mutex<()>,
+    files: Mutex<Option<Vec<SpilledFile>>>,
+}
+
+impl Stage {
+    /// Runs `execute` (the join's `execute(0)`, which executes the probe
+    /// leaf at once) with `files` staged.
+    pub(super) fn execute<T>(
+        &self,
+        files: Vec<SpilledFile>,
+        execute: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _opening = self.opening.lock().unwrap_or_else(|p| p.into_inner());
+        *self.files.lock().unwrap_or_else(|p| p.into_inner()) = Some(files);
+        let result = execute();
+        self.files.lock().unwrap_or_else(|p| p.into_inner()).take();
+        result
+    }
+
+    fn take(&self) -> Result<Vec<SpilledFile>> {
+        match self.files.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            Some(files) => Ok(files),
+            None => internal_err!("hash join spill: a shared probe leaf ran unstaged"),
+        }
+    }
+}
+
+/// What the rows of a build leaf went through: how many there are, and how
+/// many the join that wrote them divided over its key partitions. A join
+/// over them that cannot spill says why from these facts.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Origin {
-    pub(super) divided: bool,
     pub(super) rows: usize,
+    pub(super) parent_rows: usize,
+}
+
+impl Origin {
+    /// The partition kept more than half of its parent's rows: a uniform
+    /// key spread keeps one in `hash_join_spill_partitions`, so one key (or
+    /// a few) holds it.
+    pub(super) fn hot(&self) -> bool {
+        self.rows.saturating_mul(2) > self.parent_rows
+    }
 }
 
 /// Reads spill files of one written partition, one list of files for each
@@ -206,7 +240,7 @@ impl ExecutionPlan for SpillFilesExec {
         let schema = Arc::clone(self.spill_manager.schema());
         let streams = self
             .source
-            .take(partition)
+            .take(partition)?
             .iter()
             // Unbuffered: the read runs in the consumer's poll. A buffered
             // read's producer task ends its stream as if the file ended when

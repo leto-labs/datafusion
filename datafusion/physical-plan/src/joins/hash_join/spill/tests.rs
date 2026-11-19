@@ -591,9 +591,9 @@ async fn join_that_fits_takes_the_unchanged_path() -> Result<()> {
 }
 
 /// A `CollectLeft` probe stream that goes away before or during the probe
-/// does not hold the others at the written-partition barrier.
+/// does not hold the others: no stream waits for another.
 #[tokio::test]
-async fn departed_streams_do_not_hold_the_barrier() -> Result<()> {
+async fn departed_streams_do_not_hold_the_others() -> Result<()> {
     let build = table("b", 1500, 211, 0, 100);
     let probe = table("p", 1500, 307, 2, 50);
     let case = Case {
@@ -639,9 +639,9 @@ async fn departed_streams_do_not_hold_the_barrier() -> Result<()> {
 }
 
 /// A split attempt that executes only some `CollectLeft` probe partitions
-/// binds them; its streams complete the barrier among themselves.
+/// binds them; they are the build's members.
 #[tokio::test]
-async fn split_attempt_barrier_counts_its_own_partitions() -> Result<()> {
+async fn split_attempt_counts_its_own_partitions() -> Result<()> {
     let build = table("b", 1500, 211, 0, 100);
     let probe = table("p", 1600, 307, 4, 100);
     let case = Case {
@@ -1260,4 +1260,880 @@ mod review {
         }
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Re-review of f34625e52 (MJJ90-REREVIEW-20261119): reproduction tests.
+    // Not part of the lane. `finding N` refers to that review's REVIEW.md.
+    // -----------------------------------------------------------------------
+    mod rereview {
+        use std::collections::HashMap;
+
+        use super::*;
+        use crate::joins::hash_join::spill::JoinSpill;
+
+        fn config(spilling: bool, force_rows: usize, workspace: usize) -> SessionConfig {
+            let mut config = spill_config(force_rows, workspace, 3);
+            config.options_mut().execution.enable_hash_join_spilling = spilling;
+            config
+        }
+
+        fn rows(batches: &[RecordBatch]) -> usize {
+            batches.iter().map(RecordBatch::num_rows).sum()
+        }
+
+        /// Executes every partition, lets partition 0 go (before its first
+        /// poll, or after one output batch) and collects the others one
+        /// after another.
+        async fn others_after_stream_0_left(
+            plan: &Arc<dyn ExecutionPlan>,
+            context: &Arc<TaskContext>,
+            polled: bool,
+        ) -> Result<Vec<RecordBatch>> {
+            let partitions = plan.output_partitioning().partition_count();
+            let mut streams = (0..partitions)
+                .map(|partition| plan.execute(partition, Arc::clone(context)))
+                .collect::<Result<Vec<_>>>()?;
+            let mut first = streams.remove(0);
+            if polled {
+                let _ = first.next().await;
+            }
+            drop(first);
+            let mut out = vec![];
+            for stream in streams {
+                out.extend(
+                    tokio::time::timeout(Duration::from_secs(60), collect(stream))
+                        .await
+                        .expect("stalled")?,
+                );
+            }
+            Ok(out)
+        }
+
+        /// Finding 1. One `CollectLeft` stream leaves early (a consumer that
+        /// drops one partition). The stock join still gives every row that
+        /// the probe rows of the other streams produce (and no build-only
+        /// row). The spilled join must give the same rows.
+        #[tokio::test]
+        async fn rereview_early_drop_keeps_the_other_streams_rows() -> Result<()> {
+            let build = table("b", 1500, 211, 0, 100);
+            let probe = table("p", 3000, 307, 2, 50);
+            let mut failures = vec![];
+            let mut report = vec![];
+            for join_type in JOIN_TYPES {
+                for polled in [false, true] {
+                    // These give no batch before their probe ends.
+                    if polled
+                        && matches!(
+                            join_type,
+                            JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark
+                        )
+                    {
+                        continue;
+                    }
+                    let case = Case {
+                        join_type,
+                        null_equality: NullEquality::NullEqualsNothing,
+                        filter: false,
+                        shape: Shape::CollectLeft(3),
+                    };
+                    let mut seen = vec![];
+                    for spilling in [false, true] {
+                        let plan = join_plan(&case, &build, &probe)?;
+                        let context = task_context(config(spilling, 1, 4096), None, true);
+                        let out =
+                            others_after_stream_0_left(&plan, &context, polled).await?;
+                        if spilling {
+                            assert!(spill_metrics(&plan).0 > 0, "nothing was written");
+                        }
+                        seen.push((rows(&out), batches_to_sort_string(&out)));
+                    }
+                    let line = format!(
+                        "{join_type} stream 0 polled={polled}: stock {} rows, spilled {} rows",
+                        seen[0].0, seen[1].0
+                    );
+                    if seen[0].1 != seen[1].1 {
+                        failures.push(line.clone());
+                    }
+                    report.push(line);
+                }
+            }
+            println!("{report:#?}");
+            assert!(failures.is_empty(), "{failures:#?}");
+            Ok(())
+        }
+
+        /// Finding 2. The member count comes from the bound range. If more
+        /// streams run than were bound, the spilled join must fail, not
+        /// return fewer rows than the stock join.
+        #[tokio::test]
+        async fn rereview_more_streams_than_bound_members() -> Result<()> {
+            let build = table("b", 1500, 211, 0, 100);
+            let probe = table("p", 1600, 307, 4, 100);
+            let case = Case {
+                join_type: JoinType::Inner,
+                null_equality: NullEquality::NullEqualsNothing,
+                filter: false,
+                shape: Shape::CollectLeft(4),
+            };
+            let mut outcomes = vec![];
+            for spilling in [false, true] {
+                let plan = join_plan(&case, &build, &probe)?;
+                plan.downcast_ref::<HashJoinExec>()
+                    .unwrap()
+                    .set_dynamic_filter_partitions(0..2)?;
+                let context = task_context(config(spilling, 1, 4096), None, true);
+                let streams = (0..4)
+                    .map(|partition| plan.execute(partition, Arc::clone(&context)))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut out = vec![];
+                let mut error = None;
+                for stream in streams {
+                    match collect(stream).await {
+                        Ok(batches) => out.extend(batches),
+                        Err(found) => {
+                            error = Some(found.to_string());
+                            break;
+                        }
+                    }
+                }
+                outcomes.push((error, rows(&out), batches_to_sort_string(&out)));
+            }
+            let (stock, spilled) = (&outcomes[0], &outcomes[1]);
+            assert!(stock.0.is_none(), "{:?}", stock.0);
+            println!(
+                "stock {} rows; spilled {} rows, error {:?}",
+                stock.1, spilled.1, spilled.0
+            );
+            assert!(
+                spilled.0.is_some() || spilled.2 == stock.2,
+                "2 members bound, 4 streams ran: stock {} rows, spilled {} rows, no error",
+                stock.1,
+                spilled.1
+            );
+            Ok(())
+        }
+
+        /// Control. Build-emitting joins (joined by the last member) in an
+        /// attempt that runs its partitions one after another, bound and
+        /// unbound: no stall and the complete answer.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn rereview_build_emitting_joins_one_partition_at_a_time() -> Result<()> {
+            let build = table("b", 1500, 211, 0, 100);
+            let probe = table("p", 1600, 307, 4, 100);
+            let mut failures = vec![];
+            for join_type in [
+                JoinType::Left,
+                JoinType::Full,
+                JoinType::LeftSemi,
+                JoinType::LeftAnti,
+                JoinType::LeftMark,
+            ] {
+                let case = Case {
+                    join_type,
+                    null_equality: NullEquality::NullEqualsNothing,
+                    filter: false,
+                    shape: Shape::CollectLeft(4),
+                };
+                let want = expected(&case, &build, &probe).await;
+                for (bound, concurrency) in
+                    [(true, 1), (true, 2), (true, 4), (false, 1), (false, 3)]
+                {
+                    let plan = join_plan(&case, &build, &probe)?;
+                    if bound {
+                        plan.downcast_ref::<HashJoinExec>()
+                            .unwrap()
+                            .set_dynamic_filter_partitions(0..4)?;
+                    }
+                    let context = task_context(config(true, 1, 4096), None, true);
+                    let label =
+                        format!("{join_type} bound={bound} concurrency={concurrency}");
+                    match run_claimed(&plan, &context, 0..4, concurrency).await {
+                        Ok(actual) => {
+                            if batches_to_sort_string(&actual) != want {
+                                failures.push(format!(
+                                    "{label}: wrong rows ({})",
+                                    rows(&actual)
+                                ));
+                            }
+                        }
+                        Err(error) => failures.push(format!("{label}: {error}")),
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+            Ok(())
+        }
+
+        /// Control. Every join type on a multi-thread runtime (the lane's
+        /// tests run their streams on one thread), forced and under a small
+        /// pool, several rounds: the "last member" choice and the shared
+        /// partition joins under real parallelism.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+        async fn rereview_parallel_streams_keep_every_join_type() -> Result<()> {
+            let build = table("b", 6000, 3001, 0, 200);
+            let probe = table("p", 3000, 4001, 3, 100);
+            let mut want: HashMap<String, String> = HashMap::new();
+            let mut failures = vec![];
+            let mut runs = 0;
+            for round in 0..6 {
+                for case in all_cases(&[Shape::CollectLeft(4), Shape::Partitioned(3)]) {
+                    let label = format!(
+                        "{} {:?} filter={} {:?}",
+                        case.join_type, case.null_equality, case.filter, case.shape
+                    );
+                    if !want.contains_key(&label) {
+                        want.insert(label.clone(), expected(&case, &build, &probe).await);
+                    }
+                    let (force, limit) = if round % 2 == 0 {
+                        (1, None)
+                    } else {
+                        (0, Some(96 * 1024))
+                    };
+                    let plan = join_plan(&case, &build, &probe)?;
+                    let context = task_context(spill_config(force, 4096, 3), limit, true);
+                    runs += 1;
+                    match run(&plan, context).await {
+                        Ok(actual) => {
+                            if batches_to_sort_string(&actual) != want[&label] {
+                                failures.push(format!(
+                                    "round {round} {label}: wrong rows ({})",
+                                    rows(&actual)
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            let text = error.to_string();
+                            failures.push(format!(
+                                "round {round} {label}: {}",
+                                &text[..text.len().min(300)]
+                            ));
+                        }
+                    }
+                }
+            }
+            println!("{runs} runs, {} failures", failures.len());
+            assert!(
+                failures.is_empty(),
+                "{} of {runs} runs failed: {:#?}",
+                failures.len(),
+                &failures[..failures.len().min(16)]
+            );
+            Ok(())
+        }
+
+        /// Control. Probe-preserving joins: two streams leave at different
+        /// points (also while they run a shared partition join); the other
+        /// two give exactly their own partitions' rows, and nothing stays
+        /// reserved or on disk.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+        async fn rereview_streams_that_leave_midway_do_not_disturb_the_others()
+        -> Result<()> {
+            let build = table("b", 6000, 3001, 0, 200);
+            let probe = table("p", 6000, 4001, 3, 50);
+            let mut failures = vec![];
+            for join_type in [
+                JoinType::Inner,
+                JoinType::Right,
+                JoinType::RightSemi,
+                JoinType::RightAnti,
+                JoinType::RightMark,
+            ] {
+                let case = Case {
+                    join_type,
+                    null_equality: NullEquality::NullEqualsNothing,
+                    filter: false,
+                    shape: Shape::CollectLeft(4),
+                };
+                let reference = join_plan(&case, &build, &probe)?;
+                let context = task_context(config(false, 0, 4096), None, true);
+                let mut want = vec![];
+                for partition in 2..4 {
+                    want.extend(
+                        collect(reference.execute(partition, Arc::clone(&context))?)
+                            .await?,
+                    );
+                }
+                let want = batches_to_sort_string(&want);
+                for pressure in [false, true] {
+                    for stop in [0usize, 1, 2, 5, 12, 40] {
+                        let label =
+                            format!("{join_type} pressure={pressure} stop={stop}");
+                        let plan = join_plan(&case, &build, &probe)?;
+                        let pool =
+                            PeakPool::new(if pressure { 96 * 1024 } else { 1 << 30 });
+                        let dyn_pool: Arc<dyn MemoryPool> = Arc::clone(&pool) as _;
+                        let config = spill_config(usize::from(!pressure), 4096, 3)
+                            .with_batch_size(64);
+                        let context = pool_context(config, dyn_pool);
+                        let disk = Arc::clone(&context.runtime_env().disk_manager);
+                        let mut streams = (0..4)
+                            .map(|partition| {
+                                plan.execute(partition, Arc::clone(&context))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let keep_3 = streams.pop().unwrap();
+                        let keep_2 = streams.pop().unwrap();
+                        let leavers = streams
+                            .into_iter()
+                            .zip([stop, stop * 3 + 1])
+                            .map(|(mut stream, batches)| {
+                                tokio::spawn(async move {
+                                    for _ in 0..batches {
+                                        if !matches!(stream.next().await, Some(Ok(_))) {
+                                            break;
+                                        }
+                                    }
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let keepers = [keep_2, keep_3]
+                            .into_iter()
+                            .map(|stream| tokio::spawn(collect(stream)))
+                            .collect::<Vec<_>>();
+                        let mut actual = vec![];
+                        let mut error = None;
+                        for keeper in keepers {
+                            match tokio::time::timeout(Duration::from_secs(60), keeper)
+                                .await
+                            {
+                                Ok(joined) => match joined.unwrap() {
+                                    Ok(batches) => actual.extend(batches),
+                                    Err(found) => error = Some(found.to_string()),
+                                },
+                                Err(_) => error = Some("stalled".to_string()),
+                            }
+                        }
+                        for leaver in leavers {
+                            let _ = leaver.await;
+                        }
+                        if let Some(error) = error {
+                            failures.push(format!("{label}: {error}"));
+                        } else if batches_to_sort_string(&actual) != want {
+                            failures
+                                .push(format!("{label}: wrong rows ({})", rows(&actual)));
+                        }
+                        drop(plan);
+                        for _ in 0..300 {
+                            if (pool.reserved(), disk.used_disk_space()) == (0, 0) {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        if (pool.reserved(), disk.used_disk_space()) != (0, 0) {
+                            failures.push(format!(
+                                "{label}: {} bytes reserved, {} bytes on disk after the \
+                                 plan was dropped",
+                                pool.reserved(),
+                                disk.used_disk_space()
+                            ));
+                        }
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+            Ok(())
+        }
+
+        /// Measurement. A pool that another consumer keeps full from the
+        /// start: every reservation of the join is refused, so it runs on
+        /// its floors. Prints the peak against the stated bound
+        /// `limit + (streams + 1) x workspace`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn rereview_peak_in_a_pool_that_stays_full() -> Result<()> {
+            let build = table("b", 20000, 9001, 0, 500);
+            let probe = table("p", 4000, 9001, 1, 250);
+            let limit = 64 * 1024;
+            let mut report = vec![];
+            let mut over = vec![];
+            let mut errors = vec![];
+            for shape in [
+                Shape::CollectLeft(1),
+                Shape::CollectLeft(4),
+                Shape::Partitioned(4),
+            ] {
+                for join_type in [JoinType::Inner, JoinType::Full] {
+                    for workspace in [4096usize, 16384, 65536] {
+                        let case = Case {
+                            join_type,
+                            null_equality: NullEquality::NullEqualsNothing,
+                            filter: false,
+                            shape,
+                        };
+                        let plan = join_plan(&case, &build, &probe)?;
+                        let pool = PeakPool::new(limit);
+                        let dyn_pool: Arc<dyn MemoryPool> = Arc::clone(&pool) as _;
+                        let competitor =
+                            MemoryConsumer::new("Competitor").register(&dyn_pool);
+                        competitor.try_grow(limit)?;
+                        let _ = pool.competitor.set(Mutex::new(competitor));
+                        pool.competing.store(true, Ordering::SeqCst);
+                        let context =
+                            pool_context(spill_config(0, workspace, 3), dyn_pool);
+                        let result = run(&plan, context).await;
+                        pool.competing.store(false, Ordering::SeqCst);
+                        let peak = pool.peak.load(Ordering::SeqCst);
+                        let streams = match shape {
+                            Shape::CollectLeft(streams) | Shape::Partitioned(streams) => {
+                                streams
+                            }
+                        };
+                        let bound = limit + (streams + 1) * workspace;
+                        let (written, _, depth) = spill_metrics(&plan);
+                        let label =
+                            format!("{join_type} {shape:?} workspace={workspace}");
+                        let outcome = match &result {
+                            Ok(actual) => {
+                                if batches_to_sort_string(actual)
+                                    == expected(&case, &build, &probe).await
+                                {
+                                    "ok".to_string()
+                                } else {
+                                    errors.push(format!("{label}: wrong rows"));
+                                    "wrong rows".to_string()
+                                }
+                            }
+                            Err(error) => {
+                                let text = error.to_string();
+                                errors.push(format!(
+                                    "{label}: {}",
+                                    &text[..text.len().min(400)]
+                                ));
+                                "error".to_string()
+                            }
+                        };
+                        let line = format!(
+                            "{label}: peak-limit={} bound-limit={} in workspaces={:.2} \
+                             written={written} depth={depth} -> {outcome}",
+                            peak - limit,
+                            bound - limit,
+                            (peak - limit) as f64 / workspace as f64,
+                        );
+                        if peak > bound {
+                            over.push(line.clone());
+                        }
+                        report.push(line);
+                    }
+                }
+            }
+            println!("{report:#?}");
+            assert!(errors.is_empty(), "{errors:#?}");
+            assert!(over.is_empty(), "above the stated bound: {over:#?}");
+            Ok(())
+        }
+
+        /// Measurement for finding 3. `CollectLeft` streams that join their
+        /// written partitions while the first level's in-memory table is
+        /// still held for the streams that come later: how often build rows
+        /// are written, and how deep, against one stream and against streams
+        /// that run together.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn rereview_first_level_table_stays_during_written_partitions() -> Result<()>
+        {
+            let build = table("b", 20000, 9001, 0, 500);
+            let probe = table("p", 8000, 9001, 1, 250);
+            let build_rows = rows(&build);
+            let build_bytes: usize = build
+                .iter()
+                .map(datafusion_common::utils::memory::get_record_batch_memory_size)
+                .sum();
+            let mut report = vec![];
+            for (streams, concurrency, bound) in [
+                (1, 1, false),
+                (4, 4, false),
+                (4, 4, true),
+                (4, 1, true),
+                (4, 1, false),
+                (8, 1, true),
+            ] {
+                let case = Case {
+                    join_type: JoinType::Inner,
+                    null_equality: NullEquality::NullEqualsNothing,
+                    filter: false,
+                    shape: Shape::CollectLeft(streams),
+                };
+                let plan = join_plan(&case, &build, &probe)?;
+                if bound {
+                    plan.downcast_ref::<HashJoinExec>()
+                        .unwrap()
+                        .set_dynamic_filter_partitions(0..streams)?;
+                }
+                let limit = build_bytes * 3 / 2;
+                let pool = PeakPool::new(limit);
+                let dyn_pool: Arc<dyn MemoryPool> = Arc::clone(&pool) as _;
+                // The hash table, not the perfect-hash array (these keys
+                // are dense), so that the table is the larger part.
+                let mut config = spill_config(0, 4096, 3);
+                let execution = &mut config.options_mut().execution;
+                execution.perfect_hash_join_small_build_threshold = 0;
+                execution.perfect_hash_join_min_key_density = f64::INFINITY;
+                let context = pool_context(config, dyn_pool);
+                let result = run_claimed(&plan, &context, 0..streams, concurrency).await;
+                let metrics = plan.metrics().unwrap();
+                let written_rows = metric(&metrics, "build_spilled_rows").unwrap_or(0);
+                let (partitions, _, depth) = spill_metrics(&plan);
+                let outcome = match result {
+                    Ok(actual) => {
+                        if batches_to_sort_string(&actual)
+                            == expected(&case, &build, &probe).await
+                        {
+                            "ok".to_string()
+                        } else {
+                            "WRONG ROWS".to_string()
+                        }
+                    }
+                    Err(error) => format!("error: {}", &error[..error.len().min(300)]),
+                };
+                report.push(format!(
+                    "streams={streams} at once={concurrency} bound={bound}: build rows \
+                     written {written_rows} ({:.2} x the build), partitions written \
+                     {partitions}, depth {depth}, peak/limit {:.2} -> {outcome}",
+                    written_rows as f64 / build_rows as f64,
+                    pool.peak.load(Ordering::SeqCst) as f64 / limit as f64,
+                ));
+            }
+            println!("{report:#?}");
+            assert!(
+                report.iter().all(|line| line.ends_with("-> ok")),
+                "{report:#?}"
+            );
+            Ok(())
+        }
+
+        /// Measurement for finding 3. What stays reserved after each
+        /// `CollectLeft` stream ends, when the streams run one after another.
+        #[tokio::test]
+        async fn rereview_reserved_between_streams_run_in_turn() -> Result<()> {
+            let build = table("b", 20000, 9001, 0, 500);
+            let probe = table("p", 8000, 9001, 1, 250);
+            let build_bytes: usize = build
+                .iter()
+                .map(datafusion_common::utils::memory::get_record_batch_memory_size)
+                .sum();
+            let case = Case {
+                join_type: JoinType::Inner,
+                null_equality: NullEquality::NullEqualsNothing,
+                filter: false,
+                shape: Shape::CollectLeft(4),
+            };
+            let plan = join_plan(&case, &build, &probe)?;
+            let limit = build_bytes * 3 / 2;
+            let pool = PeakPool::new(limit);
+            let dyn_pool: Arc<dyn MemoryPool> = Arc::clone(&pool) as _;
+            let mut config = spill_config(0, 4096, 3);
+            let execution = &mut config.options_mut().execution;
+            execution.perfect_hash_join_small_build_threshold = 0;
+            execution.perfect_hash_join_min_key_density = f64::INFINITY;
+            let context = pool_context(config, dyn_pool);
+            let mut report = vec![format!("limit {limit}, build {build_bytes} bytes")];
+            let mut out = vec![];
+            for partition in 0..4 {
+                let mut stream = plan.execute(partition, Arc::clone(&context))?;
+                let mut most = 0;
+                while let Some(batch) = stream.next().await {
+                    out.push(batch?);
+                    most = most.max(pool.reserved());
+                }
+                drop(stream);
+                let metrics = plan.metrics().unwrap();
+                report.push(format!(
+                    "after stream {partition}: reserved {} (most seen between its batches \
+                     {most}), build rows written so far {}, depth {}",
+                    pool.reserved(),
+                    metric(&metrics, "build_spilled_rows").unwrap_or(0),
+                    spill_metrics(&plan).2,
+                ));
+            }
+            println!("{report:#?}");
+            assert_eq!(
+                batches_to_sort_string(&out),
+                expected(&case, &build, &probe).await
+            );
+            Ok(())
+        }
+
+        /// Earlier finding 1 and 4. The lane's test
+        /// `empty_table_is_charged_without_refusal` with the parameters it
+        /// had at b86028d75 (a 512 byte workspace, four streams, a 2,048
+        /// byte pool), 12 times, and with workspaces up to the lane's 8 KiB.
+        #[tokio::test]
+        async fn rereview_empty_table_test_with_its_first_parameters() -> Result<()> {
+            let build = table("b", 2000, 1999, 0, 100);
+            let probe = table("p", 2000, 1999, 3, 100);
+            let case = Case {
+                join_type: JoinType::Inner,
+                null_equality: NullEquality::NullEqualsNothing,
+                filter: false,
+                shape: Shape::Partitioned(4),
+            };
+            let want = expected(&case, &build, &probe).await;
+            let mut report = vec![];
+            let mut failed = 0;
+            for workspace in [512usize, 1024, 2048, 4096, 8192] {
+                let mut pass = 0;
+                let mut errors: HashMap<String, usize> = HashMap::new();
+                for _ in 0..12 {
+                    let plan = join_plan(&case, &build, &probe)?;
+                    let context =
+                        task_context(spill_config(0, workspace, 3), Some(2048), true);
+                    match run(&plan, context).await {
+                        Ok(actual) => {
+                            assert_eq!(batches_to_sort_string(&actual), want);
+                            pass += 1;
+                        }
+                        Err(error) => {
+                            let text = error.to_string();
+                            let first = text.lines().next().unwrap_or("").to_string();
+                            *errors.entry(first).or_default() += 1;
+                        }
+                    }
+                }
+                failed += 12 - pass;
+                report.push(format!(
+                    "workspace={workspace}: pass {pass} of 12 {errors:?}"
+                ));
+            }
+            println!("{report:#?}");
+            assert_eq!(failed, 0, "{report:#?}");
+            Ok(())
+        }
+
+        /// Finding 4. A hot key that shares its partitions with a few other
+        /// keys: the build cannot be divided, and the reason must say so.
+        #[tokio::test]
+        async fn rereview_hot_key_among_other_keys_names_the_key() -> Result<()> {
+            let schema = table("b", 1, 1, 0, 1)[0].schema();
+            // 4 of 5 build rows have key 7; the others have 3001 keys.
+            let build: Vec<RecordBatch> = (0..40)
+                .map(|batch| {
+                    let rows = (batch * 500)..(batch * 500 + 500);
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![
+                            Arc::new(
+                                rows.clone()
+                                    .map(|row: i32| {
+                                        Some(if row % 5 != 0 {
+                                            7
+                                        } else {
+                                            100 + (row.wrapping_mul(7919))
+                                                .rem_euclid(3001)
+                                        })
+                                    })
+                                    .collect::<Int32Array>(),
+                            ),
+                            Arc::new(rows.collect::<Int32Array>()),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let probe = table("p", 2000, 9001, 1, 500);
+            let case = Case {
+                join_type: JoinType::Inner,
+                null_equality: NullEquality::NullEqualsNothing,
+                filter: false,
+                shape: Shape::CollectLeft(1),
+            };
+            let plan = join_plan(&case, &build, &probe)?;
+            let context = task_context(spill_config(0, 1024, 2), Some(48 * 1024), true);
+            let error = run(&plan, context).await.unwrap_err().to_string();
+            println!("{error}");
+            assert!(
+                error.contains("one key value fills its partition"),
+                "{error}"
+            );
+            Ok(())
+        }
+
+        /// Finding 6. The refusal of another operator, reported by a pool
+        /// that lists its top consumers, names a `HashJoinInput` consumer;
+        /// it must not get the join's "did not spill" context. (Adapted by
+        /// leto-mjj.99: the context now comes from a flag that the wrapped
+        /// build input sets, so the refusal travels through that input.)
+        #[tokio::test]
+        async fn rereview_refusal_context_on_another_operators_refusal() {
+            let context = task_context(spill_config(0, 1024, 3), Some(10_000), true);
+            let pool = context.memory_pool();
+            let join = MemoryConsumer::new("HashJoinInput[1]").register(pool);
+            join.try_grow(9_000).unwrap();
+            let aggregate =
+                MemoryConsumer::new("GroupedHashAggregateStream[0]").register(pool);
+            let refusal = aggregate.try_grow(5_000).unwrap_err();
+            let schema = table("b", 1, 1, 0, 1)[0].schema();
+            let input: crate::SendableRecordBatchStream =
+                Box::pin(crate::stream::RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    futures::stream::once(async move { Err(refusal) }),
+                ));
+            let spill =
+                JoinSpill::Ineligible("its probe input has an output ordering".into());
+            let (mut input, explain) = spill.explain_refusal(input);
+            let error = input.next().await.unwrap().unwrap_err();
+            let explained = explain(error).to_string();
+            println!("{explained}");
+            assert!(!explained.contains("did not spill"), "{explained}");
+            // The join's own refusal still says why.
+            let own = join.try_grow(5_000).unwrap_err();
+            let empty: crate::SendableRecordBatchStream =
+                Box::pin(crate::stream::RecordBatchStreamAdapter::new(
+                    schema,
+                    futures::stream::empty(),
+                ));
+            let (_, explain) = spill.explain_refusal(empty);
+            let explained = explain(own).to_string();
+            assert!(explained.contains("did not spill"), "{explained}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// leto-mjj.99: membership of a spilled build (design decision 5).
+// ---------------------------------------------------------------------------
+
+/// Executes `streams` streams of partition 0 of `plan`, all at once or one
+/// after another (each executed when the previous one ended).
+async fn partition_zero_streams(
+    plan: &Arc<dyn ExecutionPlan>,
+    context: &Arc<TaskContext>,
+    streams: usize,
+    at_once: bool,
+) -> Result<Vec<RecordBatch>> {
+    let mut out = vec![];
+    if at_once {
+        let handles = (0..streams)
+            .map(|_| {
+                let stream = plan.execute(0, Arc::clone(context));
+                tokio::spawn(async move { collect(stream?).await })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            out.extend(
+                tokio::time::timeout(Duration::from_secs(60), handle)
+                    .await
+                    .expect("join stalled")
+                    .expect("join task panicked")?,
+            );
+        }
+    } else {
+        for _ in 0..streams {
+            out.extend(collect(plan.execute(0, Arc::clone(context))?).await?);
+        }
+    }
+    Ok(out)
+}
+
+/// Longbow's native hand-off opens one stream of partition 0 for each
+/// driver, each over its own probe input. With open probe streams a join
+/// that emits no build rows spills and gives each stream its rows; the same
+/// streams on a closed join fail with an internal error instead of losing
+/// rows. A join that emits build rows does not spill with open streams.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_probe_streams_share_partition_zero() -> Result<()> {
+    let build = table("b", 1500, 211, 0, 100);
+    let probe = table("p", 1200, 307, 7, 100);
+    for join_type in [
+        JoinType::Inner,
+        JoinType::Right,
+        JoinType::RightSemi,
+        JoinType::RightAnti,
+        JoinType::RightMark,
+    ] {
+        let case = Case {
+            join_type,
+            null_equality: NullEquality::NullEqualsNothing,
+            filter: true,
+            shape: Shape::CollectLeft(1),
+        };
+        for at_once in [true, false] {
+            let label = format!("{join_type} at_once={at_once}");
+            let reference = join_plan(&case, &build, &probe)?;
+            let context =
+                task_context(SessionConfig::new().with_batch_size(256), None, true);
+            let want = batches_to_sort_string(
+                &partition_zero_streams(&reference, &context, 3, at_once).await?,
+            );
+            let open = join_plan(&case, &build, &probe)?;
+            open.downcast_ref::<HashJoinExec>()
+                .unwrap()
+                .set_open_probe_streams();
+            let context = task_context(spill_config(1, 4096, 3), None, true);
+            let actual = partition_zero_streams(&open, &context, 3, at_once).await?;
+            assert_eq!(batches_to_sort_string(&actual), want, "{label}");
+            assert!(spill_metrics(&open).0 > 0, "{label}: nothing was written");
+            let closed = join_plan(&case, &build, &probe)?;
+            let context = task_context(spill_config(1, 4096, 3), None, true);
+            match partition_zero_streams(&closed, &context, 3, at_once).await {
+                Ok(actual) => panic!(
+                    "{label}: a closed join answered {} rows for 3 streams of one \
+                     partition",
+                    actual.iter().map(RecordBatch::num_rows).sum::<usize>()
+                ),
+                Err(error) => {
+                    let text = error.to_string();
+                    assert!(
+                        text.contains("probes the build twice")
+                            || text.contains("a stream started after every member"),
+                        "{label}: {text}"
+                    );
+                }
+            }
+        }
+    }
+    let case = Case {
+        join_type: JoinType::Left,
+        null_equality: NullEquality::NullEqualsNothing,
+        filter: false,
+        shape: Shape::CollectLeft(1),
+    };
+    let plan = join_plan(&case, &build, &probe)?;
+    plan.downcast_ref::<HashJoinExec>()
+        .unwrap()
+        .set_open_probe_streams();
+    let context = task_context(spill_config(1, 4096, 3), None, true);
+    partition_zero_streams(&plan, &context, 1, true).await?;
+    assert_eq!(spill_metrics(&plan).0, 0, "an open Left join spilled");
+    Ok(())
+}
+
+/// A split attempt that binds fewer partitions than the probe has: the
+/// stock join never emits build rows then (its completion count covers
+/// every probe partition), and the spilled join gives the same rows, with
+/// the matches of the written partitions.
+#[tokio::test]
+async fn bound_range_build_rows_follow_the_stock_count() -> Result<()> {
+    let build = table("b", 1500, 211, 0, 100);
+    let probe = table("p", 1600, 307, 4, 100);
+    for join_type in JOIN_TYPES {
+        let case = Case {
+            join_type,
+            null_equality: NullEquality::NullEqualsNothing,
+            filter: false,
+            shape: Shape::CollectLeft(4),
+        };
+        let mut seen = vec![];
+        for spilling in [false, true] {
+            let plan = join_plan(&case, &build, &probe)?;
+            plan.downcast_ref::<HashJoinExec>()
+                .unwrap()
+                .set_dynamic_filter_partitions(1..3)?;
+            let mut config = spill_config(1, 4096, 3);
+            config.options_mut().execution.enable_hash_join_spilling = spilling;
+            let context = task_context(config, None, true);
+            let mut out = vec![];
+            for partition in 1..3 {
+                out.extend(
+                    collect(plan.execute(partition, Arc::clone(&context))?).await?,
+                );
+            }
+            if spilling {
+                assert!(
+                    spill_metrics(&plan).0 > 0,
+                    "{join_type}: nothing was written"
+                );
+            }
+            seen.push(batches_to_sort_string(&out));
+        }
+        assert_eq!(seen[0], seen[1], "{join_type}");
+    }
+    Ok(())
 }

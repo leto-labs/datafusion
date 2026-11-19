@@ -757,7 +757,8 @@ UPSTREAMABLE (related upstream: the hybrid-join epic apache/datafusion#24768;
 Off by default: `datafusion.execution.enable_hash_join_spilling = false`.
 With it off no code path changes, except that
 `set_dynamic_filter_partitions` also records the range for a join without a
-dynamic filter (the last binding wins; it never fails). With it on, a join
+dynamic filter (the last binding wins; it never fails), and
+`set_open_probe_streams` records only a flag. With it on, a join
 that fits runs the
 code it runs today: nothing is partitioned, copied or reserved before the
 first refusal, and no spill metric is registered.
@@ -782,11 +783,12 @@ Change (`datafusion/physical-plan/src/joins/hash_join/`):
   spill mode the same way, with the rows still charged.
 - The floor: when the rows in memory and their table fit in what the join
   holds (its charge and its workspace), a refused growth is covered by the
-  workspace (grown before the workspace shrinks) and a refused table is
-  built on a private pool, its size moved from the workspace into the
-  table's charge. A written partition's join in a full pool therefore
-  builds a small table instead of spilling to the depth limit; an empty
-  table always fits.
+  workspace (grown before the workspace shrinks; the workspace is refilled
+  from charge that later writes release) and a refused table is built on a
+  private pool, its size moved from the workspace into the table's charge,
+  which the table releases when it goes. A written partition's join in a
+  full pool therefore builds a small table instead of spilling to the depth
+  limit; an empty table always fits.
 - Hook 2, `fetch_probe_batch` (`stream.rs`): rows of written partitions go
   to this stream's probe file of the partition; rows whose key cannot match
   stay in the batch. The write buffers are charged with `try_grow`; a piece
@@ -795,21 +797,39 @@ Change (`datafusion/physical-plan/src/joins/hash_join/`):
   reference to the in-memory table and joins the written partitions with
   stock joins over their files. No stream waits for another (a split
   attempt may run its partitions one after another, Longbow's writers claim
-  the next partition when the last one ends). Joins that emit only rows a
-  probe row produces (Inner, Right, RightSemi, RightAnti, RightMark) keep
-  the probe's partitioning: each stream joins its own probe file of each
-  written partition; the partition's join is shared with the streams that
-  run it at the same time and built again from the retained build file for
-  a stream that comes later; the file is deleted when every member finished
-  the partition or left. Joins that also emit build rows (Left, LeftSemi,
-  LeftAnti, LeftMark, Full; unknown output partitioning) are joined by the
-  last member to end its in-memory pass, over every member's probe file;
-  if a member left before its probe ended, none is joined, as the stock
-  join emits no build rows then. Members are a split attempt's bound
-  partitions (`set_dynamic_filter_partitions`) or every probe partition.
-  Once every member ended its in-memory pass the exec lets go of the
-  `CollectLeft` build it holds for its streams (`OnceAsync::release`,
-  `joins/utils.rs`).
+  the next partition when the last one ends). Each stream joins its own
+  probe file of each written partition (an own run): Inner, Right,
+  RightSemi, RightAnti and RightMark with their own type, Left as Inner and
+  Full as Right, so a stream gives every row its probe rows produce whatever
+  the other streams do, as the stock join. A partition's join is shared with
+  the streams that run it at the same time (each executes its one partition
+  over the file it stages) and built again from the retained build file for
+  a stream that comes later. Build rows (Left, LeftSemi, LeftAnti, LeftMark,
+  Full): a stream finishes and registers its probe files when its probe
+  input ends, before it reports its completion to the in-memory table; the
+  stream that the table's completion count chooses (the stock join's last
+  probe partition) emits the in-memory build rows and then those of each
+  written partition, with a join over every stream's probe file of it
+  (LeftAnti, its rows emitted as unmatched build rows, for Left and Full;
+  the join type itself otherwise). Without such a stream (a stream stopped
+  early, never ran, or a split attempt bound fewer partitions than the probe
+  has) no build row is emitted, as in the stock join.
+- Members: a `CollectLeft` build's members are a split attempt's bound
+  partitions (`set_dynamic_filter_partitions`) or every probe partition;
+  each executes once. A stream of a partition outside the range, a
+  partition that probes twice, or more streams than members are internal
+  errors, as is a written partition's build file that is gone while a
+  member still joins it. Once every member ended its in-memory pass the
+  exec lets go of the build it holds for its streams (`OnceAsync::release`,
+  `joins/utils.rs`); a partition's build file is deleted when every member
+  finished, skipped or left it and the build-row pass took it.
+  `HashJoinExec::set_open_probe_streams` (new, public) declares that any
+  number of streams execute any partition, each over its own probe input
+  (Longbow's native hand-off): such a join spills only if it emits no build
+  rows and keeps its table and build files until it is dropped. A shared
+  partition join counts the streams its parent admits; once every admitted
+  stream ended its in-memory pass it lets go of its table and admits no
+  more (a later stream gets a new join).
 - `shared_bounds.rs`: `PushdownStrategy::BoundsOnly`. A build that wrote a
   partition publishes its bounds (which saw every build row) and no
   membership form; in `Partitioned` routing only that partition's branch.
@@ -825,13 +845,17 @@ build rows, and are dropped otherwise.
 
 Eligibility (`JoinSpill::decide`): the option, a disk manager that can
 create files, not null-aware, an unordered and bounded probe input, no
-prepared build, a `CollectLeft` or `Partitioned` mode and a level within the
-depth limit (at most 7, one multiplier per level). The build consumer is
-spillable only for an eligible join. An ineligible join's own refused build
-(a `HashJoinInput` refusal, not one of its build input) fails as before,
-with the context "The hash join did not spill because ...". At the depth
-limit the reason says whether one key value fills the partition (the join
-above it did not divide its rows) or the pool had no room for it.
+prepared build, a `CollectLeft` or `Partitioned` mode, and for a join that
+emits build rows a `CollectLeft` membership that is not open. The build
+consumer is spillable only for an eligible join. An ineligible join's own
+refused build fails as before, with the context "The hash join did not
+spill because ..."; a refusal that comes out of its build input keeps its
+text (the wrapped input sets a flag; no error text is matched). A join above
+`hash_join_spill_max_depth` (at most 7, one multiplier per level) is
+eligible for its floor only: it writes no partition, and a refusal its floor
+cannot cover fails with the reason: one key value fills the partition when
+it kept more than half of the rows its parent divided, the pool had no room
+for it otherwise.
 
 Metrics, registered at the first relief: `spill_count`, `spilled_bytes`,
 `spilled_rows`, `build_spilled_rows`, `build_spilled_bytes`,
@@ -859,6 +883,18 @@ without refusal only for what released charge did not cover; the empty
 table's charge kept for `CollectLeft` joins; a sub-join's files no longer
 taken before the join exists.
 
+Fixes from the re-review (`MJJ90-REREVIEW-20261119`, lane `leto-mjj.99`):
+own runs and the completion-count choice above replace a last-member rule
+that dropped the other streams' rows of written partitions after one stream
+left (Left 8,525 against 5,531 rows); the member checks replace a trusted
+count that deleted a build file early when more streams ran than were bound
+(7,585 against 6,010 rows, no error); open and admitted membership; a
+floor's charge released with its table rather than with the build, and the
+workspace refilled after a borrow (the peak in a pool that another consumer
+keeps full went from 5.58 to at most 4.62 workspaces above the limit with
+four streams); the floor above the depth limit and the hot-key test by
+share; the refusal context by flag.
+
 Not in this family (`add-join-spill` section 3): build chunks with probe
 replay for a partition that cannot be divided (one hot key fails at the
 depth limit; `hash_join_spill_max_replay_passes` is reserved), and role
@@ -871,7 +907,9 @@ unbounded join, under forced spilling and under a pool below the build; a
 second spill level; the depth limit; each ineligible reason; a join that
 fits registers no spill metric and charges the same build memory; streams
 that leave early or run in a split attempt, also one partition at a time,
-finish; the review's peak-reservation and lifecycle tests; the
+finish and give the stock join's rows; more streams than bound fail;
+open probe streams of partition 0; the reviews' peak-reservation, lifecycle
+and reproduction tests; the
 partitions to join are decided after every stream registered its files; a
 spilled build publishes bounds only, in both modes, and filters no matching
 probe row; the `join_by_key_*` memory-limit queries spill and answer in three
@@ -879,8 +917,9 @@ quarters of their build memory, where spilling off fails, and in half of it
 fail at the depth limit with that reason (one `service` value holds about
 half of the rows: the case of `add-join-spill` section 3).
 
-Evidence: Longbow lane `leto-mjj.90`,
-`~/data/longbow/benchmarks/MJJ90-20261119/`.
+Evidence: Longbow lanes `leto-mjj.90`,
+`~/data/longbow/benchmarks/MJJ90-20261119/`, and `leto-mjj.99`,
+`~/data/longbow/benchmarks/MJJ99-20261119/`.
 
 ### Family KB: chunked key-range bitmap
 

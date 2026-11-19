@@ -1200,13 +1200,29 @@ impl HashJoinExec {
         self.dynamic_filter.as_ref().map(|df| &df.filter)
     }
 
+    /// Longbow family JS: any number of streams may execute any partition of
+    /// this `CollectLeft` join, each over its own probe input (Longbow's
+    /// native hand-off opens one stream of partition 0 for each driver).
+    /// Such a join spills only if it emits no build rows, and keeps its
+    /// in-memory table and written build partitions until it is dropped.
+    /// Call before any partition runs.
+    pub fn set_open_probe_streams(&self) {
+        self.spill_shared.set_membership(spill::Membership::Open);
+    }
+
+    /// Longbow family JS: the spill state of this plan instance.
+    pub(super) fn spill_shared(&self) -> &Arc<SpillShared> {
+        &self.spill_shared
+    }
+
     /// Family SF: scopes dynamic-filter reports to the output partitions that
     /// this fresh plan instance executes. Call before any partition runs.
     /// Scoped reports never wait for sibling streams: unassigned and
     /// unfinished buckets keep every probe row until their complete build is
     /// known, and a CollectLeft filter is published once per complete build.
-    /// Without a dynamic filter it only records the partitions for family JS,
-    /// whose `CollectLeft` streams wait for each other.
+    /// Without a dynamic filter it only records the partitions for family JS:
+    /// they are the members of a spilled `CollectLeft` build, and a stream of
+    /// another partition fails with an internal error.
     pub fn set_dynamic_filter_partitions(&self, partitions: Range<usize>) -> Result<()> {
         assert_or_internal_err!(
             !partitions.is_empty()
@@ -1833,7 +1849,9 @@ impl ExecutionPlan for HashJoinExec {
                 })?
             }
             (None, PartitionMode::CollectLeft) => self.left_fut.try_once(|| {
-                let left_stream = self.left.execute(0, Arc::clone(&context))?;
+                // Longbow family JS: refusals of the build input keep their text.
+                let (left_stream, explain) =
+                    spill.explain_refusal(self.left.execute(0, Arc::clone(&context))?);
 
                 let reservation = MemoryConsumer::new("HashJoinInput")
                     .with_can_spill(spill.can_spill())
@@ -1856,10 +1874,11 @@ impl ExecutionPlan for HashJoinExec {
                     ParallelBuild::from_task(&context, &self.metrics, partition),
                     spill.build(),
                 )
-                .map_err(spill.explain_refusal()))
+                .map_err(explain))
             })?,
             (None, PartitionMode::Partitioned) => {
-                let left_stream = self.left.execute(partition, Arc::clone(&context))?;
+                let (left_stream, explain) = spill
+                    .explain_refusal(self.left.execute(partition, Arc::clone(&context))?);
 
                 let reservation =
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
@@ -1883,7 +1902,7 @@ impl ExecutionPlan for HashJoinExec {
                         None,
                         spill.build(),
                     )
-                    .map_err(spill.explain_refusal()),
+                    .map_err(explain),
                 )
             }
             (None, PartitionMode::Auto) => {

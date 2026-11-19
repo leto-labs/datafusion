@@ -693,7 +693,7 @@ impl HashJoinStream {
 
             // Check if the coalescer has finished (limit reached and flushed)
             if self.output_buffer.is_finished() {
-                // Longbow family JS: leave the written-partition barrier.
+                // Longbow family JS: this stream leaves its spilled build.
                 self.spill = None;
                 return Poll::Ready(None);
             }
@@ -772,7 +772,7 @@ impl HashJoinStream {
         // Longbow family JS: keep the probe-side spill state only if the
         // build spilled.
         if let Some(spill) = &mut self.spill
-            && !spill.on_build(left_data.spilled())
+            && !spill.on_build(left_data.spilled())?
         {
             self.spill = None;
         }
@@ -802,6 +802,11 @@ impl HashJoinStream {
                 // (e.g. for unmatched-build emission) keep working.
                 let right_schema = self.right.schema();
                 self.right = Box::pin(EmptyRecordBatchStream::new(right_schema));
+                // Longbow family JS: this stream's probe files are complete
+                // before it reports its completion to the in-memory table.
+                if let Some(spill) = &mut self.spill {
+                    spill.end_probe()?;
+                }
                 self.state = HashJoinStreamState::ExhaustedProbeSide;
             }
             Some(Ok(batch)) => {
@@ -1136,9 +1141,13 @@ impl HashJoinStream {
         // and only it receives the shared probe-side summary (see
         // `JoinLeftData::report_probe_completed` for why the flags are not
         // readable any other way here).
-        let Completion::Emit(probe_summary) =
-            build_side.left_data.report_probe_completed()
-        else {
+        let completion = build_side.left_data.report_probe_completed();
+        // Longbow family JS: the stream that emits the in-memory build rows
+        // also emits those of the written partitions.
+        if let Some(spill) = &mut self.spill {
+            spill.set_last(matches!(completion, Completion::Emit(_)));
+        }
+        let Completion::Emit(probe_summary) = completion else {
             timer.done();
             self.state = HashJoinStreamState::Completed;
             return Ok(StatefulStreamResult::Continue);
