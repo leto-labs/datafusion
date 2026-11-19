@@ -68,10 +68,12 @@ use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::FutureExt;
 
 use crate::attempt_tasks::{AttemptTasks, ScopedTask, spawn_producer, stopped_error};
+use crate::joins::inline_keys::{EncodedKeys, InlineKeys};
 use crate::joins::join_hash_map::ProbeOffset;
 use crate::joins::join_hash_map::{
-    HeadLookup, HeadTable, JoinHashMapType, heads_contain_hashes, heads_matched_indices,
-    heads_matched_indices_with_limit_offset, prefetch_pays,
+    HeadLookup, HeadTable, HeadWord, JoinHashMapType, PackedU64, SlotLayout,
+    heads_contain_hashes, heads_matched_indices, heads_matched_indices_with_limit_offset,
+    inline_matched_indices_with_limit_offset, prefetch_pays,
 };
 use crate::joins::utils::{BuildProbeJoinMetrics, matchable_join_keys};
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
@@ -180,6 +182,12 @@ impl ParallelBuild {
 
     /// A power of two: at most one per thread, at least [`MIN_SHARD_ROWS`]
     /// rows each; 1 means the native build.
+    /// Longbow patch (JT 9): whether a build of `rows` rows takes the
+    /// parallel path (unless its pool refuses the transient lists).
+    pub(super) fn is_parallel(&self, rows: usize) -> bool {
+        self.shards(rows) >= 2
+    }
+
     fn shards(&self, rows: usize) -> usize {
         if rows < self.min_rows || rows >= u32::MAX as usize {
             return 1;
@@ -219,12 +227,61 @@ impl ParallelBuild {
         reservation: &mut MemoryReservation,
     ) -> Result<Option<(Box<ShardedJoinHashMap>, RecordBatch, Arc<MemoryReservation>)>>
     {
+        self.build_with::<u32>(
+            batches,
+            num_rows,
+            schema,
+            on_left,
+            random_state,
+            null_equality,
+            None,
+            reservation,
+        )
+        .await
+    }
+
+    /// Longbow patch (JT 9): [`Self::build`] with shard tables of width
+    /// `W`; with `inline` keys (and `W` = [`PackedU64`]), every row's
+    /// encoded key goes into its shard beside its hash.
+    #[expect(clippy::too_many_arguments)]
+    pub(super) async fn build_with<W: HeadWord<Chain = u32>>(
+        &self,
+        batches: &[RecordBatch],
+        num_rows: usize,
+        schema: &SchemaRef,
+        on_left: &[PhysicalExprRef],
+        random_state: &RandomState,
+        null_equality: NullEquality,
+        inline: Option<InlineKeys>,
+        reservation: &mut MemoryReservation,
+    ) -> Result<
+        Option<(
+            Box<ShardedJoinHashMap<W>>,
+            RecordBatch,
+            Arc<MemoryReservation>,
+        )>,
+    > {
+        if W::INLINE != inline.is_some() {
+            return Err(internal_datafusion_err!(
+                "a shared join build with inline slots needs inline keys"
+            ));
+        }
+        // Heads index the whole build, so every shard has the same fields.
+        let layout = match &inline {
+            Some(keys) => SlotLayout::packed(num_rows, keys.bits()).ok_or_else(|| {
+                internal_datafusion_err!("inline join keys do not fit the slots")
+            })?,
+            None => SlotLayout::default(),
+        };
         let shards = self.shards(num_rows);
         if shards < 2 {
             return Ok(None);
         }
-        // One u64 hash and at most one u32 row id per build row.
-        let transient = num_rows.checked_mul(12).ok_or_else(|| {
+        // One u64 hash and at most one u32 row id per build row, and an
+        // inline key per row.
+        let per_row = if W::INLINE { 20 } else { 12 };
+        let inline = inline.map(Arc::new);
+        let transient = num_rows.checked_mul(per_row).ok_or_else(|| {
             internal_datafusion_err!("parallel hash build size overflow")
         })?;
         if !admitted(reservation.try_grow(transient))? {
@@ -260,6 +317,7 @@ impl ParallelBuild {
             let copies = Arc::clone(&copies);
             let compactions = Arc::clone(&compactions);
             let stop = Arc::clone(&stop);
+            let inline = inline.clone();
             work.push(async move {
                 hash_group(
                     &group,
@@ -268,6 +326,7 @@ impl ParallelBuild {
                     &on_left,
                     &random_state,
                     null_equality,
+                    inline.as_deref(),
                     &compactions,
                     &copies,
                     &stop,
@@ -281,7 +340,9 @@ impl ParallelBuild {
             .collect();
         let mut table_bytes = num_rows * size_of::<u32>();
         for &count in &counts {
-            table_bytes += estimate_memory_size::<(u64, u32)>(count, 0)?;
+            // Longbow patch (JT 9): an inline shard can exceed the estimate.
+            table_bytes += estimate_memory_size::<(u64, u32)>(count, 0)?
+                .max(HeadTable::<W>::bytes_for(count));
         }
         if !admitted(reservation.try_grow(table_bytes))? {
             // Every group task has finished: release the lists and any
@@ -324,7 +385,7 @@ impl ParallelBuild {
                 if let Some(fault) = &fault {
                     tokio::time::sleep(fault.table_delay).await;
                 }
-                let table = fill_shard(&groups, shard, count, &next);
+                let table = fill_shard::<W>(&groups, shard, count, layout, &next);
                 #[cfg(test)]
                 if let Some(fault) = &fault {
                     fault.tables_done.fetch_add(1, Ordering::Relaxed);
@@ -392,11 +453,9 @@ impl ParallelBuild {
             .add(shards);
         let chained = tables.iter().any(|(_, chained)| *chained);
         let tables = tables.into_iter().map(|(table, _)| table).collect();
-        Ok(Some((
-            Box::new(ShardedJoinHashMap::new(tables, next, chained)),
-            batch,
-            copies,
-        )))
+        let mut map = ShardedJoinHashMap::new(tables, next, chained);
+        map.keys = inline.map(|keys| Arc::unwrap_or_clone(keys));
+        Ok(Some((Box::new(map), batch, copies)))
     }
 
     /// [`Self::build`] inside `collect_left_input`, under the 56 build
@@ -406,6 +465,8 @@ impl ParallelBuild {
     /// trimmed to the tables, the chain and the memory that the consolidated
     /// batch retains once the inputs are dropped. `None` leaves everything as
     /// it was for the native build; an error leaves `batches` with every input.
+    ///
+    /// Longbow patch (JT 9): with `inline` keys the shards are inline tables.
     #[expect(clippy::too_many_arguments)]
     pub(super) async fn build_consolidated(
         &self,
@@ -416,12 +477,26 @@ impl ParallelBuild {
         on_left: &[PhysicalExprRef],
         random_state: &RandomState,
         null_equality: NullEquality,
+        inline: Option<InlineKeys>,
         reservation: &mut MemoryReservation,
         metrics: &BuildProbeJoinMetrics,
     ) -> Result<Option<Box<dyn JoinHashMapType>>> {
         let before = reservation.size();
-        let Some((map, batch, copies)) = self
-            .build(
+        let built = if inline.is_some() {
+            self.build_with::<PackedU64>(
+                batches,
+                num_rows,
+                schema,
+                on_left,
+                random_state,
+                null_equality,
+                inline,
+                reservation,
+            )
+            .await?
+            .map(|(map, batch, copies)| (map as Box<dyn JoinHashMapType>, batch, copies))
+        } else {
+            self.build(
                 batches,
                 num_rows,
                 schema,
@@ -431,7 +506,9 @@ impl ParallelBuild {
                 reservation,
             )
             .await?
-        else {
+            .map(|(map, batch, copies)| (map as Box<dyn JoinHashMapType>, batch, copies))
+        };
+        let Some((map, batch, copies)) = built else {
             return Ok(None);
         };
         // The tables and the chain (the transient hashes are released).
@@ -445,7 +522,7 @@ impl ParallelBuild {
         batches.push(batch);
         let retained = get_record_batch_memory_size(&batches[0]);
         adopt_copies(reservation, &copies, input_bytes, retained, metrics)?;
-        Ok(Some(map as Box<dyn JoinHashMapType>))
+        Ok(Some(map))
     }
 
     /// Build tasks run plan work (key evaluation), so under an attempt scope
@@ -623,6 +700,9 @@ fn groups(batches: &[RecordBatch], count: usize) -> Vec<(usize, Vec<RecordBatch>
 struct HashedGroup {
     offset: usize,
     hashes: Vec<u64>,
+    /// Longbow patch (JT 9): the inline key of every row, when the build
+    /// has inline keys; empty otherwise.
+    keys: Vec<u64>,
     /// Global row ids, ascending, per shard.
     rows: Vec<Vec<u32>>,
     /// Per column: this group's string-view values, concatenated and
@@ -922,6 +1002,7 @@ fn hash_group(
     on_left: &[PhysicalExprRef],
     random_state: &RandomState,
     null_equality: NullEquality,
+    inline: Option<&InlineKeys>,
     compactions: &[Option<Compaction>],
     copies: &MemoryReservation,
     stop: &AtomicBool,
@@ -929,6 +1010,7 @@ fn hash_group(
     let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
     let mask = shards - 1;
     let mut hashes = vec![0; total];
+    let mut keys_of_rows = Vec::with_capacity(if inline.is_some() { total } else { 0 });
     let mut valid = Vec::with_capacity(batches.len());
     let mut start = 0;
     for batch in batches {
@@ -939,6 +1021,9 @@ fn hash_group(
             random_state,
             &mut hashes[start..start + batch.num_rows()],
         )?;
+        if let Some(inline) = inline {
+            keys_of_rows.extend_from_slice(&inline.encode_build(&keys)?);
+        }
         valid.push(matchable_join_keys(&keys, null_equality));
         start += batch.num_rows();
     }
@@ -995,6 +1080,7 @@ fn hash_group(
     Ok(HashedGroup {
         offset,
         hashes,
+        keys: keys_of_rows,
         rows,
         views,
     })
@@ -1004,19 +1090,21 @@ fn hash_group(
 /// any hash got a second row. Each row's chain slot belongs to exactly one
 /// shard, so relaxed stores race with nothing; joining the task orders them
 /// before any read.
-fn fill_shard(
+fn fill_shard<W: HeadWord<Chain = u32>>(
     groups: &[HashedGroup],
     shard: usize,
     count: usize,
+    layout: SlotLayout,
     next: &[AtomicU32],
-) -> Result<(HeadTable<u32>, bool)> {
-    let mut table = HeadTable::with_capacity(count);
+) -> Result<(HeadTable<W>, bool)> {
+    let mut table = HeadTable::with_layout(count, layout);
     let mut chained = false;
     let rows = groups.iter().rev().flat_map(|group| {
-        group.rows[shard]
-            .iter()
-            .rev()
-            .map(move |&row| (row as usize, group.hashes[row as usize - group.offset]))
+        group.rows[shard].iter().rev().map(move |&row| {
+            let at = row as usize - group.offset;
+            let key = if W::INLINE { group.keys[at] } else { 0 };
+            (row as usize, group.hashes[at], key)
+        })
     });
     table.insert_all(rows, next.len(), |row, head| {
         next[row].store(head, Ordering::Relaxed);
@@ -1033,22 +1121,22 @@ fn fill_shard(
 /// As `JoinHashMapU32`, the unique-key fast path depends on whether any hash
 /// holds two rows (`chained`), not on `len == next.len()`: unmatchable NULL-key
 /// rows own a chain slot but no entry, and must not disable it.
-pub(super) struct ShardedJoinHashMap {
-    shards: Vec<HeadTable<u32>>,
+///
+/// Longbow patch (JT 9): with `W` = [`PackedU64`] the shards hold inline
+/// keys, whose encoding is `keys`.
+pub(super) struct ShardedJoinHashMap<W: HeadWord = u32> {
+    shards: Vec<HeadTable<W>>,
     mask: usize,
     next: Vec<u32>,
     len: usize,
     chained: bool,
     /// The shards together are large enough for prefetches to pay.
     prefetch: bool,
+    keys: Option<InlineKeys>,
 }
 
-impl ShardedJoinHashMap {
-    pub(super) fn new(
-        shards: Vec<HeadTable<u32>>,
-        next: Vec<u32>,
-        chained: bool,
-    ) -> Self {
+impl<W: HeadWord> ShardedJoinHashMap<W> {
+    pub(super) fn new(shards: Vec<HeadTable<W>>, next: Vec<u32>, chained: bool) -> Self {
         assert!(
             shards.len().is_power_of_two(),
             "shard count must be a power of two"
@@ -1062,6 +1150,7 @@ impl ShardedJoinHashMap {
             next,
             len,
             chained,
+            keys: None,
         }
     }
 
@@ -1072,10 +1161,15 @@ impl ShardedJoinHashMap {
     }
 }
 
-impl HeadLookup for ShardedJoinHashMap {
+impl<W: HeadWord> HeadLookup for ShardedJoinHashMap<W> {
     #[inline(always)]
     fn head(&self, hash: u64) -> u64 {
         self.shards[shard_of(hash, self.mask)].head(hash)
+    }
+
+    #[inline(always)]
+    fn find(&self, hash: u64) -> (u64, u64, bool) {
+        self.shards[shard_of(hash, self.mask)].find(hash)
     }
 
     #[inline(always)]
@@ -1089,7 +1183,7 @@ impl HeadLookup for ShardedJoinHashMap {
     }
 }
 
-impl Debug for ShardedJoinHashMap {
+impl<W: HeadWord> Debug for ShardedJoinHashMap<W> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ShardedJoinHashMap")
             .field("shards", &self.shards.len())
@@ -1098,7 +1192,7 @@ impl Debug for ShardedJoinHashMap {
     }
 }
 
-impl JoinHashMapType for ShardedJoinHashMap {
+impl<W: HeadWord<Chain = u32>> JoinHashMapType for ShardedJoinHashMap<W> {
     fn extend_zero(&mut self, len: usize) {
         self.next.resize(self.next.len() + len, 0);
     }
@@ -1108,6 +1202,11 @@ impl JoinHashMapType for ShardedJoinHashMap {
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
         deleted_offset: usize,
     ) -> Result<()> {
+        if W::INLINE {
+            return Err(internal_datafusion_err!(
+                "a join map with inline keys cannot insert rows without their keys"
+            ));
+        }
         for (row, &hash) in iter {
             let row_id = u32::try_from(row + 1).expect("shared build rows fit u32");
             if row - deleted_offset >= self.next.len() {
@@ -1117,7 +1216,7 @@ impl JoinHashMapType for ShardedJoinHashMap {
                 ));
             }
             let shard = &mut self.shards[shard_of(hash, self.mask)];
-            match shard.insert(hash, u64::from(row_id)) {
+            match shard.insert(hash, u64::from(row_id), 0) {
                 Ok(0) => self.len += 1,
                 Ok(previous) => {
                     self.next[row - deleted_offset] = previous as u32;
@@ -1170,5 +1269,39 @@ impl JoinHashMapType for ShardedJoinHashMap {
 
     fn len(&self) -> usize {
         self.len
+    }
+
+    fn inline_keys(&self) -> Option<&InlineKeys> {
+        self.keys.as_ref()
+    }
+
+    fn get_inline_matched_indices_with_limit_offset(
+        &self,
+        hash_values: &[u64],
+        probe: &EncodedKeys,
+        build_keys: &[ArrayRef],
+        limit: usize,
+        offset: ProbeOffset,
+        input_indices: &mut Vec<u32>,
+        match_indices: &mut Vec<u64>,
+    ) -> Result<Option<ProbeOffset>> {
+        let Some(keys) = self.keys.as_ref().filter(|_| W::INLINE) else {
+            return Err(internal_datafusion_err!(
+                "inline-key probe of a join map without inline keys"
+            ));
+        };
+        Ok(inline_matched_indices_with_limit_offset(
+            self,
+            &self.next,
+            !self.chained,
+            hash_values,
+            probe,
+            keys,
+            build_keys,
+            limit,
+            offset,
+            input_indices,
+            match_indices,
+        ))
     }
 }

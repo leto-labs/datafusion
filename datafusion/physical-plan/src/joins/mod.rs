@@ -45,6 +45,15 @@ mod symmetric_hash_join;
 pub mod utils;
 
 mod array_map;
+/// Longbow patch (JT 9): inline join keys.
+///
+/// # Public Only for Internal Use:
+///
+/// This is not a public API and is for internal use only; see [API policy] for details.
+///
+/// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+#[doc(hidden)]
+pub mod inline_keys;
 mod join_filter;
 /// Hash map implementations for join operations.
 ///

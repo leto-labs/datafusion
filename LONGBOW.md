@@ -536,7 +536,9 @@ Evidence: Longbow lane `leto-mjj.65`,
 ## Family JT: prefetching join table and partitioned build
 
 Dependent Longbow feature: JOIN-TABLE (scale-up task 5.2 V5). Five commits,
-each with its own purpose; the DataFusion 56 port carries them one by one.
+each with its own purpose; the DataFusion 56 port carries them one by one,
+adds JT 6 and JT 7, and leto-mjj.71 adds JT 9 (JT 8, a column-wise key
+compare, stays off the branch: no measured gain).
 
 ### JT 1: fallible `update_from_iter`
 
@@ -674,6 +676,88 @@ the head-table probe already did, and so does `heads_contain_hashes`; the
 head-table probe, `heads_contain_hashes` and the key comparison (prefetch
 forced on and off by a test hook) give equal pairs and resume offsets on the
 same input, at probe lengths 15, 16, 17 and 33 and limits 1, 15, 16 and 17.
+
+### JT 9: inline join keys beside the chain heads
+
+Purpose: take the second cache miss out of a probe into a large table. The
+key comparison read each candidate's build key at a random build row.
+Dependent Longbow feature: JOIN-TABLE (leto-mjj.71). Classification:
+UPSTREAMABLE.
+
+- `joins/inline_keys.rs`, `InlineKeys`: an injective encoding of a join's
+  integer keys (8 to 64 bits, signed or not, dates, times, timestamps,
+  durations) into one `u64`. Each value minus the build's minimum of its
+  column goes into its own bit field, when all fields fit 64 bits. A probe
+  value outside the build's range, or a NULL, matches nothing. The ranges
+  come from the build's dynamic-filter bounds when present (not for
+  `UInt64`), else from a scan of the build keys. Floats, strings,
+  decimals, wider ranges and `NullEqualsNull` builds with NULL keys keep the
+  key comparison. A build key outside its range is an internal error, never
+  a lost match.
+- `PackedU64` slots (`join_hash_map.rs`): one word at the bytes and load of
+  a `u32` slot. From the top it holds the low hash bits as the tag, the head
+  row's encoded key, a bit that marks a chain of different keys, and the
+  head (row + 1). The fields are sized per table (`SlotLayout`), and the tag
+  keeps at least 10 bits. A probe (`get_inline_matched_indices_with_limit_offset`)
+  compares its key in the slot's own cache line. It emits only equal pairs,
+  in the order and with the resume offsets of the hash-only probe followed
+  by the key comparison, which it replaces. A mixed chain (a tag collision
+  of different keys) encodes and compares each row's build key. Hash-only
+  lookups (`get_matched_indices*`, `contain_hashes`, dynamic filters, NOT
+  IN, membership) are unchanged.
+- `DenseKeys` (`inline_keys.rs`): the encoded key of every build row
+  (8 bytes per row, charged before it is filled). The hash-only table finds
+  the candidates, and one read of this array per candidate replaces the
+  reads of every key column and the comparator.
+- Which build gets what (`collect_left_input`), for builds whose `u32`
+  head table is above 4 MiB (more than 262,144 rows):
+  - A parallel (sharded) build (family H) gets packed slots when the keys
+    fit and the bounds give their ranges. Its hash groups encode the keys in
+    parallel (8 transient bytes per row).
+  - A partitioned build (JT 3) of several key columns gets dense keys,
+    encoded in its hash pass. A pool that refuses their charge gets the key
+    comparison.
+  - A partitioned build of one key column keeps hashes only.
+  - The table of a spilling build's in-memory partitions (family JS) keeps
+    hashes only.
+  - Measured (worker-01, TPC-H SF100 Q9 pull, 48 threads): packed slots on
+    per-partition builds cost their scatter more than their probe gained.
+    For orders, the probe was flat while the build grew; for Q21's 73 M-row
+    lineitem, the probe got slower.
+- A pool that refuses an inline partitioned build's transient arrays (a
+  parallel build that fell back) gets the hash-only map, as JT 3 does.
+- `LONGBOW_JOIN_INLINE_KEYS=off` (also `0`, `false`, `no`, `disabled`, any
+  case) turns inline and dense keys off. It is read once per process.
+
+Measured (worker-01, SF100, 48 threads, pull, bench partition, local
+policy, ABBA against the JT 1-7 base, median of 3 timed executions;
+leto-mjj.71, `~/data/longbow/benchmarks/MJJ71-20261119`):
+
+- TPC-H Q9 probe: 46.7-51.0 to 33.8-34.4 ns per row;
+- Q9 wall: 0.970;
+- Q21: 1.000;
+- TPC-DS q78: 0.999; q64: 0.997; q14: 1.007; q72: 0.986;
+- controls within noise;
+- memory: partsupp's table and keys 5,299 to 5,909 MiB (dense keys);
+  packed slots add no durable memory.
+
+Rejected variants on the same branch history: 16-byte slots (the table
+doubled; miss-heavy q78 probe 30 to 51 ns per row); dense keys after a
+parallel build's consolidation (serial, q78 wall 1.37).
+
+Tests:
+- the encoding (single and packed columns, ranges, NULLs, unsupported
+  types, refused probe types, out-of-range build keys);
+- the packed slot's fields at their widths;
+- the inline probe against the hash-only probe with the key comparison, on
+  generated builds: 40 to 70,000 rows, unique and duplicate keys, forced
+  chains of different keys, NULLs, one and two columns, at limits 1 to
+  unbounded;
+- the sharded inline map against the compared native probe;
+- every join type and NULL equality end to end, inline on and off, natively
+  and in parallel, with packed and dense keys;
+- dense-key filtering;
+- a refused inline partitioned build touches nothing.
 
 ## Family AJ: DuckDB's ASOF join forms
 
