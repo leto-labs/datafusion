@@ -1915,6 +1915,10 @@ impl ExecutionPlan for HashJoinExec {
             .map(|(_, right_expr)| Arc::clone(right_expr))
             .collect::<Vec<_>>();
 
+        // Longbow family JS: the probe-side spill state of an eligible join.
+        let spill_stream =
+            spill.stream(partition, self.schema(), &column_indices_after_projection);
+
         Ok(Box::pin(HashJoinStream::new(
             partition,
             self.schema(),
@@ -1934,7 +1938,7 @@ impl ExecutionPlan for HashJoinExec {
             build_accumulator,
             self.mode,
             self.fetch,
-            spill.stream(partition),
+            spill_stream,
         )))
     }
 

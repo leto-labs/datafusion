@@ -154,9 +154,12 @@ impl ExecutionPlan for SpillFilesExec {
         let schema = Arc::clone(self.spill_manager.schema());
         let streams = self.files[partition]
             .iter()
+            // Unbuffered: the read runs in the consumer's poll. A buffered
+            // read's producer task ends its stream as if the file ended when
+            // the attempt stops it, and holds uncharged batches ahead.
             .map(|file| {
                 self.spill_manager
-                    .read_spill_as_stream(Arc::clone(&file.file), None)
+                    .read_spill_as_stream_unbuffered(Arc::clone(&file.file), None)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Box::pin(RecordBatchStreamAdapter::new(

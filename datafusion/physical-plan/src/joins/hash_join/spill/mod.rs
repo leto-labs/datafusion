@@ -40,7 +40,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll};
 
-use arrow::array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array};
+use arrow::array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow::compute::{concat_batches, filter_record_batch, take_record_batch};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::config::ExecutionOptions;
@@ -51,7 +51,9 @@ use datafusion_common::utils::memory::{
 use datafusion_common::{
     DataFusionError, JoinType, NullEquality, Result, config_err, internal_err,
 };
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::memory_pool::{
+    MemoryConsumer, MemoryPool, MemoryReservation, UnboundedMemoryPool,
+};
 use datafusion_execution::{SpillFile, TaskContext};
 use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
@@ -65,15 +67,17 @@ use crate::attempt_tasks::AttemptTasks;
 use crate::execution_plan::ExecutionPlanProperties;
 use crate::joins::PartitionMode;
 use crate::joins::utils::{
-    JoinFilter, OnceAsync, emits_unmatched_left_rows, matchable_join_keys,
-    need_produce_result_in_final,
+    ColumnIndex, JoinFilter, OnceAsync, build_batch_from_indices,
+    emits_unmatched_left_rows, matchable_join_keys, need_produce_result_in_final,
 };
 use crate::metrics::{
     Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, SpillMetrics,
 };
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::SpillManager;
+use crate::stream::RecordBatchStreamAdapter;
 use crate::{ExecutionPlan, SendableRecordBatchStream};
+use datafusion_common::JoinSide;
 use datafusion_physical_expr::projection::ProjectionRef;
 
 /// Multipliers of the partition function, one per level. Odd, and none is
@@ -366,7 +370,12 @@ impl JoinSpill {
     }
 
     /// The probe-side state of output stream `partition`.
-    pub(super) fn stream(&self, partition: usize) -> Option<Box<StreamSpill>> {
+    pub(super) fn stream(
+        &self,
+        partition: usize,
+        schema: SchemaRef,
+        column_indices: &[ColumnIndex],
+    ) -> Option<Box<StreamSpill>> {
         let Self::Eligible(eligible) = self else {
             return None;
         };
@@ -383,6 +392,12 @@ impl JoinSpill {
             schema: Arc::clone(&eligible.template.probe_schema),
             options: eligible.options,
             null_equality: eligible.template.null_equality,
+            output: Arc::new(UnmatchedOutput {
+                schema,
+                column_indices: column_indices.to_vec(),
+                join_type: eligible.template.join_type,
+                probe_schema: Arc::clone(&eligible.template.probe_schema),
+            }),
             phase: Phase::Waiting,
         }))
     }
@@ -897,7 +912,26 @@ impl BuildSpill {
                     // A table and its copy are about twice the rows: write
                     // half of what stayed before trying again.
                     if !self.relieve(self.charged / 2, reservation)? {
-                        return Err(error);
+                        if self.parts.iter().any(
+                            |part| matches!(part, Part::Memory { rows, .. } if *rows > 0),
+                        ) {
+                            return Err(error);
+                        }
+                        // Every row is written and even the empty table is
+                        // refused: it is the smallest unit and is charged
+                        // without refusal (design decision 5).
+                        let pool: Arc<dyn MemoryPool> =
+                            Arc::new(UnboundedMemoryPool::default());
+                        let attempt = MemoryConsumer::new("HashJoinInput")
+                            .with_can_spill(true)
+                            .register(&pool);
+                        let table = build(&mut vec![], attempt)?;
+                        reservation.grow(pool.reserved());
+                        let mut spilled = self.into_spilled();
+                        if let Some(spilled) = spilled.as_mut().and_then(Arc::get_mut) {
+                            spilled.table_charge = Some(reservation.take());
+                        }
+                        return Ok((table, spilled));
                     }
                     self.finish_writers()?;
                 }
@@ -932,7 +966,7 @@ impl BuildSpill {
             shift: self.options.shift,
             partitions,
             written,
-            build_files,
+            build_files: Mutex::new(build_files),
             template: self.template,
             build_manager: manager,
             metrics: self.metrics,
@@ -941,6 +975,7 @@ impl BuildSpill {
             probe_files: Mutex::new(vec![vec![None; partitions]; slots]),
             runs: OnceLock::new(),
             shared_build: self.shared_build.take(),
+            table_charge: None,
         });
         if let Some(shared) = &self.shared {
             shared.register(&spilled);
@@ -1134,8 +1169,10 @@ pub(crate) struct SpilledBuild {
     shift: u32,
     partitions: usize,
     written: Vec<bool>,
-    /// One file per partition, then the unmatchable partition's.
-    build_files: Vec<Option<SpilledFile>>,
+    /// One file per partition, then the unmatchable partition's. A
+    /// partition's files move to its join when that join is created, so they
+    /// are deleted once the partition is joined.
+    build_files: Mutex<Vec<Option<SpilledFile>>>,
     template: SubJoinTemplate,
     build_manager: SpillManager,
     metrics: JoinSpillMetrics,
@@ -1149,6 +1186,8 @@ pub(crate) struct SpilledBuild {
     /// The exec's hold on a `CollectLeft` build, released once every
     /// member finished the in-memory pass.
     shared_build: Option<Weak<OnceAsync<JoinLeftData>>>,
+    /// The charge of an empty table built outside the pool.
+    table_charge: Option<MemoryReservation>,
 }
 
 impl SpilledBuild {
@@ -1177,10 +1216,13 @@ impl SpilledBuild {
     /// join is empty, then the unmatchable partition.
     fn runs(&self) -> &[usize] {
         self.runs.get_or_init(|| {
-            let probe_files = self.probe_files.lock().unwrap_or_else(|p| p.into_inner());
+            let mut build_files =
+                self.build_files.lock().unwrap_or_else(|p| p.into_inner());
+            let mut probe_files =
+                self.probe_files.lock().unwrap_or_else(|p| p.into_inner());
             let emits_build = need_produce_result_in_final(self.template.join_type);
             let mut runs: Vec<usize> = (0..self.partitions)
-                .filter(|part| self.written[*part] && self.build_files[*part].is_some())
+                .filter(|part| self.written[*part] && build_files[*part].is_some())
                 .filter(|part| {
                     emits_build
                         || probe_files.iter().any(|slot| {
@@ -1188,7 +1230,16 @@ impl SpilledBuild {
                         })
                 })
                 .collect();
-            if self.build_files[self.partitions].is_some() {
+            // The files of a skipped partition are deleted now.
+            for part in 0..self.partitions {
+                if !runs.contains(&part) {
+                    build_files[part] = None;
+                    for slot in probe_files.iter_mut() {
+                        slot[part] = None;
+                    }
+                }
+            }
+            if build_files[self.partitions].is_some() {
                 runs.push(self.partitions);
             }
             runs
@@ -1206,6 +1257,35 @@ impl SpilledBuild {
         }
     }
 
+    /// The rows of the unmatchable partition, emitted by the first member
+    /// that asks; the others emit none.
+    fn unmatched_rows(&self, output: Arc<UnmatchedOutput>) -> SendableRecordBatchStream {
+        let file = self
+            .build_files
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(self.partitions)
+            .and_then(Option::take);
+        let schema = Arc::clone(&output.schema);
+        let rows = match file {
+            Some(file) => match self
+                .build_manager
+                .read_spill_as_stream_unbuffered(Arc::clone(&file.file), None)
+            {
+                Ok(stream) => stream
+                    .map(move |batch| {
+                        // The file lives until its rows are read.
+                        let _file = &file;
+                        batch.and_then(|batch| output.emit(&batch))
+                    })
+                    .boxed(),
+                Err(error) => futures::stream::once(async { Err(error) }).boxed(),
+            },
+            None => futures::stream::empty().boxed(),
+        };
+        Box::pin(RecordBatchStreamAdapter::new(schema, rows))
+    }
+
     /// The stock join of run `run`, created by the first stream that asks.
     fn sub_join(&self, run: usize) -> Result<Arc<dyn ExecutionPlan>> {
         let mut inner = self.barrier.lock();
@@ -1217,21 +1297,31 @@ impl SpilledBuild {
         let part = self.runs()[run];
         let level = self.level + 1;
         let template = &self.template;
+        // The partition's files move to its join, which deletes them when
+        // the last stream drops it.
+        let build_file = self
+            .build_files
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(part)
+            .and_then(Option::take);
         let build = SpillFilesExec::new(
             Arc::clone(&template.build_schema),
-            vec![self.build_files[part].iter().cloned().collect()],
+            vec![build_file.into_iter().collect()],
             self.build_manager.clone(),
             level,
             self.metrics.clone(),
         );
-        let probe_files = self.probe_files.lock().unwrap_or_else(|p| p.into_inner());
+        let mut probe_files = self.probe_files.lock().unwrap_or_else(|p| p.into_inner());
         let probe = SpillFilesExec::new(
             Arc::clone(&template.probe_schema),
             probe_files
-                .iter()
-                .map(|slot| match slot.get(part) {
-                    Some(Some(file)) => vec![file.clone()],
-                    _ => vec![],
+                .iter_mut()
+                .map(|slot| {
+                    slot.get_mut(part)
+                        .and_then(Option::take)
+                        .into_iter()
+                        .collect()
                 })
                 .collect(),
             self.build_manager
@@ -1387,7 +1477,34 @@ pub(super) struct StreamSpill {
     schema: SchemaRef,
     options: SpillOptions,
     null_equality: NullEquality,
+    output: Arc<UnmatchedOutput>,
     phase: Phase,
+}
+
+/// How a stream emits the rows of the unmatchable partition: each is an
+/// unmatched build row, so it needs no table and no other row.
+struct UnmatchedOutput {
+    schema: SchemaRef,
+    column_indices: Vec<ColumnIndex>,
+    join_type: JoinType,
+    probe_schema: SchemaRef,
+}
+
+impl UnmatchedOutput {
+    fn emit(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let rows = batch.num_rows();
+        build_batch_from_indices(
+            &self.schema,
+            batch,
+            &RecordBatch::new_empty(Arc::clone(&self.probe_schema)),
+            &UInt64Array::from_iter_values(0..rows as u64),
+            &UInt32Array::new_null(rows),
+            &self.column_indices,
+            JoinSide::Left,
+            self.join_type,
+            None,
+        )
+    }
 }
 
 struct Router {
@@ -1545,6 +1662,7 @@ impl StreamSpill {
         seat.complete();
         let state = Written {
             seat,
+            output: Arc::clone(&self.output),
             context: Arc::clone(&self.context),
             partition: self.exec_partition,
             run: 0,
@@ -1576,6 +1694,7 @@ impl Drop for StreamSpill {
 /// The written-partition phase of one stream.
 struct Written {
     seat: Seat,
+    output: Arc<UnmatchedOutput>,
     context: Arc<TaskContext>,
     partition: usize,
     run: usize,
@@ -1613,10 +1732,14 @@ impl Written {
                 return None;
             }
             self.seat.build.barrier.started(self.run + 1).await;
-            let stream =
-                self.seat.build.sub_join(self.run).and_then(|join| {
+            let build = Arc::clone(&self.seat.build);
+            let stream = if build.runs()[self.run] == build.partitions {
+                Ok(build.unmatched_rows(Arc::clone(&self.output)))
+            } else {
+                build.sub_join(self.run).and_then(|join| {
                     join.execute(self.partition, Arc::clone(&self.context))
-                });
+                })
+            };
             match stream {
                 Ok(stream) => self.current = Some(stream),
                 Err(error) => {

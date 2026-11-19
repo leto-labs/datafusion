@@ -724,3 +724,81 @@ async fn early_stream_waits_for_every_probe_file() -> Result<()> {
     }
     Ok(())
 }
+
+/// Build rows whose key cannot match form a partition that no level can
+/// divide; they are emitted as unmatched build rows without a table, so a
+/// pool far below them still answers.
+#[tokio::test]
+async fn unmatchable_rows_need_no_table() -> Result<()> {
+    // Every third build key is NULL.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("bk", DataType::Int32, true),
+        Field::new("bv", DataType::Int32, false),
+    ]));
+    let build: Vec<RecordBatch> = (0..30)
+        .map(|batch| {
+            let rows = (batch * 200)..(batch * 200 + 200);
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(
+                        rows.clone()
+                            .map(|row| (row % 3 != 0).then_some(row % 997))
+                            .collect::<Int32Array>(),
+                    ),
+                    Arc::new(rows.collect::<Int32Array>()),
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+    let probe = table("p", 2000, 997, 1, 200);
+    for join_type in [
+        JoinType::Left,
+        JoinType::Full,
+        JoinType::LeftAnti,
+        JoinType::LeftMark,
+    ] {
+        for shape in [Shape::CollectLeft(2), Shape::Partitioned(2)] {
+            let case = Case {
+                join_type,
+                null_equality: NullEquality::NullEqualsNothing,
+                filter: false,
+                shape,
+            };
+            let plan = join_plan(&case, &build, &probe)?;
+            let context = task_context(spill_config(0, 1024, 3), Some(24 * 1024), true);
+            let actual = run(&plan, context)
+                .await
+                .unwrap_or_else(|error| panic!("{join_type} {shape:?}: {error}"));
+            assert_eq!(
+                batches_to_sort_string(&actual),
+                expected(&case, &build, &probe).await,
+                "{join_type} {shape:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A pool so small that even the empty table of a build whose rows are all
+/// written is refused: that table is charged without refusal.
+#[tokio::test]
+async fn empty_table_is_charged_without_refusal() -> Result<()> {
+    let build = table("b", 2000, 1999, 0, 100);
+    let probe = table("p", 2000, 1999, 3, 100);
+    let case = Case {
+        join_type: JoinType::Inner,
+        null_equality: NullEquality::NullEqualsNothing,
+        filter: false,
+        shape: Shape::Partitioned(4),
+    };
+    let plan = join_plan(&case, &build, &probe)?;
+    let context = task_context(spill_config(0, 512, 3), Some(2048), true);
+    let actual = run(&plan, context).await?;
+    assert_eq!(
+        batches_to_sort_string(&actual),
+        expected(&case, &build, &probe).await
+    );
+    Ok(())
+}

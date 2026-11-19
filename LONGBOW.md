@@ -814,6 +814,14 @@ Metrics, registered at the first relief: `spill_count`, `spilled_bytes`,
 gauge `spill_depth` (levels that wrote; 1 for the first level only). The
 joins of written partitions report into the first-level join's metrics.
 
+Review fixes from the Longbow oracle (`longbow-testkit` `join_spill`): the
+leaf reads its files unbuffered in the consumer's poll (a buffered read's
+producer task, stopped with its attempt, ends the stream as if the file
+ended); each written partition's files move to its join and are deleted
+when that partition is joined; the unmatchable partition is emitted from
+its file as unmatched build rows by one stream, without a table; and an
+empty table refused after every row was written is charged without refusal.
+
 Not in this family (`add-join-spill` section 3): build chunks with probe
 replay for a partition that cannot be divided (one hot key fails at the
 depth limit; `hash_join_spill_max_replay_passes` is reserved), and role
