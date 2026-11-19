@@ -311,6 +311,10 @@ pub struct ParquetSource {
     /// Sort order driving `PreparedAccessPlan::reorder_by_statistics`
     /// in the opener.
     sort_order_for_reorder: Option<LexOrdering>,
+    /// Longbow family OO: filters prepared once per scan and physical file
+    /// schema. Clones share it; entries are keyed by every input they
+    /// depend on, so a clone with another predicate or schema adds its own.
+    filter_cache: Arc<crate::opener::filter_cache::PreparedFilterCache>,
 }
 
 impl ParquetSource {
@@ -338,6 +342,7 @@ impl ParquetSource {
             encryption_factory: None,
             reverse_row_groups: false,
             sort_order_for_reorder: None,
+            filter_cache: Default::default(),
         }
     }
 
@@ -668,6 +673,7 @@ impl ParquetSource {
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             virtual_state,
             shared_work_source: None,
+            filter_cache: Arc::clone(&self.filter_cache),
         })
     }
 }
@@ -1156,6 +1162,8 @@ impl FileSource for ParquetSource {
                 encryption_factory: _,
             reverse_row_groups,
             sort_order_for_reorder,
+            // Longbow family OO: execution state, rebuilt on demand.
+            filter_cache: _,
         } = self;
 
         if schema_provider.is_some() {

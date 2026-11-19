@@ -5,7 +5,7 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::{ParquetAccessPlan, ParquetFileMetrics, RowGroupAccess};
 use crate::bloom_filter::BloomFilterStatistics;
@@ -26,6 +26,26 @@ use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::basic::ColumnOrder;
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::schema::types::SchemaDescriptor;
+
+/// The inversion of a row-group pruning predicate for full-match detection,
+/// built at most once for the physical schema of the files that share it
+/// (Longbow family OO).
+#[derive(Debug, Default)]
+pub(crate) struct InvertedPredicate(OnceLock<Option<PruningPredicate>>);
+
+impl InvertedPredicate {
+    /// The inversion of `predicate` for `arrow_schema`, built on first use.
+    /// Every caller passes the predicate and schema of the first call.
+    fn get(
+        &self,
+        predicate: &PruningPredicate,
+        arrow_schema: &Schema,
+    ) -> Option<&PruningPredicate> {
+        self.0
+            .get_or_init(|| build_inverted_predicate(predicate, arrow_schema))
+            .as_ref()
+    }
+}
 
 /// Reduces the [`ParquetAccessPlan`] based on row group level metadata.
 ///
@@ -305,6 +325,7 @@ impl RowGroupAccessPlanFilter {
             groups,
             None,
             predicate,
+            None,
             metrics,
         );
     }
@@ -324,6 +345,26 @@ impl RowGroupAccessPlanFilter {
         predicate: &PruningPredicate,
         metrics: &ParquetFileMetrics,
     ) {
+        self.prune_by_statistics_with_inverted(
+            arrow_schema,
+            metadata,
+            predicate,
+            None,
+            metrics,
+        );
+    }
+
+    /// [`Self::prune_by_statistics_with_metadata`] with the inversion of
+    /// `predicate` for `arrow_schema` built at most once in `inverted`
+    /// (Longbow family OO).
+    pub(crate) fn prune_by_statistics_with_inverted(
+        &mut self,
+        arrow_schema: &Schema,
+        metadata: &ParquetMetaData,
+        predicate: &PruningPredicate,
+        inverted: Option<&InvertedPredicate>,
+        metrics: &ParquetFileMetrics,
+    ) {
         let file_metadata = metadata.file_metadata();
         self.prune_by_statistics_inner(
             arrow_schema,
@@ -331,6 +372,7 @@ impl RowGroupAccessPlanFilter {
             metadata.row_groups(),
             file_metadata.column_orders().map(Vec::as_slice),
             predicate,
+            inverted,
             metrics,
         );
     }
@@ -342,6 +384,7 @@ impl RowGroupAccessPlanFilter {
         groups: &[RowGroupMetaData],
         column_orders: Option<&[ColumnOrder]>,
         predicate: &PruningPredicate,
+        inverted: Option<&InvertedPredicate>,
         metrics: &ParquetFileMetrics,
     ) {
         // scoped timer updates on drop
@@ -383,6 +426,7 @@ impl RowGroupAccessPlanFilter {
                     &pruning_stats,
                     groups,
                     predicate,
+                    inverted,
                     metrics,
                 );
             }
@@ -408,6 +452,7 @@ impl RowGroupAccessPlanFilter {
         pruning_stats: &RowGroupPruningStatistics<'_>,
         groups: &[RowGroupMetaData],
         predicate: &PruningPredicate,
+        inverted: Option<&InvertedPredicate>,
         metrics: &ParquetFileMetrics,
     ) {
         if candidate_row_group_indices.is_empty() {
@@ -415,8 +460,15 @@ impl RowGroupAccessPlanFilter {
         }
         let arrow_schema = pruning_stats.arrow_schema;
 
-        let Some(inverted_predicate) = build_inverted_predicate(predicate, arrow_schema)
-        else {
+        let built;
+        let inverted_predicate = match inverted {
+            Some(inverted) => inverted.get(predicate, arrow_schema),
+            None => {
+                built = build_inverted_predicate(predicate, arrow_schema);
+                built.as_ref()
+            }
+        };
+        let Some(inverted_predicate) = inverted_predicate else {
             return;
         };
 
