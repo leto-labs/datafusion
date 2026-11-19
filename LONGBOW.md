@@ -1027,9 +1027,15 @@ Evidence: Longbow lanes `leto-mjj.90`,
 
 **Descriptor bound (leto-mjj.113).** Local partition writers keep a single IPC
 encoder and reopen their file for each flush and trailer, so no writer handle
-stays open between flushes. A process-wide limit of 128 concurrent writer
-permits also covers custom backends that keep their writer until commit.
-Descriptor exhaustion during join spill I/O reports the open-file limit as a
+stays open between flushes. Short spill operations wait asynchronously
+for one of 128 process-wide slots before entering a synchronous write section.
+They release it before polling input or waiting for more work. Custom backends
+that must retain a writer until finalization can hold up to 127 of the same
+128 slots. The remaining slot lets short operations make progress even when
+every persistent slot is held. Admission of persistent writers returns a
+backend-capacity execution error when no slot is immediately available,
+since waiting before probe EOF could prevent that same probe from finalizing
+its existing writers. OS descriptor exhaustion reports the OS limit as a
 resource error. The compressed IPC round-trip test checks exact batch order.
 
 ### Family KB: chunked key-range bitmap

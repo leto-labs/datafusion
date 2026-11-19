@@ -3374,7 +3374,9 @@ async fn collect_left_input(
             state.metrics.build_input_batches.add(1);
             state.metrics.build_input_rows.add(batch.num_rows());
             state.num_rows += batch.num_rows();
-            spill.push(&batch, &mut state.batches, &state.reservation)?;
+            spill
+                .push(&batch, &mut state.batches, &state.reservation)
+                .await?;
             continue;
         }
         let batch_size = state.memory_counter.count_batch(&batch);
@@ -3384,7 +3386,9 @@ async fn collect_left_input(
                     state.metrics.build_input_batches.add(1);
                     state.metrics.build_input_rows.add(batch.num_rows());
                     state.num_rows += batch.num_rows();
-                    spill.push(&batch, &mut state.batches, &state.reservation)?;
+                    spill
+                        .push(&batch, &mut state.batches, &state.reservation)
+                        .await?;
                     continue;
                 }
                 _ => return Err(error),
@@ -3440,7 +3444,8 @@ async fn collect_left_input(
             &config,
             null_equality,
             &array_map_created_count,
-        );
+        )
+        .await;
     }
 
     // Bind the reservation first so error paths release allocations before their charge.
@@ -3567,7 +3572,7 @@ async fn collect_left_input(
     match (result, fallback) {
         (Err(error), Some((mut spill, bounds))) if spill::is_refusal(&error) => {
             // The refused attempt left the rows charged to `reservation`.
-            spill.take_refused_build(&mut batches, &reservation)?;
+            spill.take_refused_build(&mut batches, &reservation).await?;
             build_spilled(
                 spill,
                 &mut reservation,
@@ -3583,6 +3588,7 @@ async fn collect_left_input(
                 null_equality,
                 &array_map_created_count,
             )
+            .await
         }
         (result, _) => result,
     }
@@ -3591,7 +3597,7 @@ async fn collect_left_input(
 /// Longbow family JS: the table over the partitions of a spilling build
 /// that stayed in memory, built again with fewer of them while refused.
 #[expect(clippy::too_many_arguments)]
-fn build_spilled(
+async fn build_spilled(
     spill: BuildSpill,
     reservation: &mut MemoryReservation,
     bounds: Option<&PartitionBounds>,
@@ -3606,8 +3612,8 @@ fn build_spilled(
     null_equality: NullEquality,
     array_map_created_count: &Count,
 ) -> Result<JoinLeftData> {
-    let (mut data, spilled, floor_charge) =
-        spill.finish(reservation, |batches, reservation| {
+    let (mut data, spilled, floor_charge) = spill
+        .finish(reservation, |batches, reservation| {
             let num_rows = batches.iter().map(RecordBatch::num_rows).sum();
             let max_batch_rows = batches.iter().map(RecordBatch::num_rows).max();
             let input_bytes = reservation.size();
@@ -3637,7 +3643,8 @@ fn build_spilled(
                 None,
                 None,
             )
-        })?;
+        })
+        .await?;
     if spilled.is_some() {
         let build = Arc::get_mut(&mut data.build)
             .ok_or_else(|| internal_datafusion_err!("shared spilled build"))?;

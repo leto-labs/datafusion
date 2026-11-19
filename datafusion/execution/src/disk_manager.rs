@@ -329,6 +329,11 @@ impl DiskManager {
         self.factory.is_some() || self.local_dirs.lock().is_some()
     }
 
+    /// Whether spill files are created by a custom factory.
+    pub fn has_custom_temp_file_factory(&self) -> bool {
+        self.factory.is_some()
+    }
+
     /// Return a temporary file from a randomized choice in the configured locations
     ///
     /// If the file can not be created for some reason, returns an
