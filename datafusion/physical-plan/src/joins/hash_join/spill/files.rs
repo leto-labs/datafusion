@@ -22,7 +22,7 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
 use futures::StreamExt;
 
-use super::{JoinSpillMetrics, SpilledFile};
+use super::{JoinSpillMetrics, ProbeRegistry, SpilledFile};
 use crate::execution_plan::{Boundedness, EmissionType, SchedulingType};
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::RecordBatchStreamAdapter;
@@ -31,15 +31,57 @@ use crate::{
     ReplaceChildrenOptions, SendableRecordBatchStream,
 };
 
+/// Where a [`SpillFilesExec`] partition finds its files.
+pub(super) enum FileSource {
+    /// One list of files per output partition, fixed at creation.
+    Fixed(Vec<Vec<SpilledFile>>),
+    /// Output partition `n` reads probe stream `n`'s file of partition
+    /// `part`, taken from the registry when `n` executes: the stream writes
+    /// it before it executes its partition of the join.
+    Registry {
+        registry: Arc<ProbeRegistry>,
+        part: usize,
+        partitions: usize,
+    },
+}
+
+impl FileSource {
+    fn partitions(&self) -> usize {
+        match self {
+            Self::Fixed(files) => files.len(),
+            Self::Registry { partitions, .. } => *partitions,
+        }
+    }
+
+    fn take(&self, partition: usize) -> Vec<SpilledFile> {
+        match self {
+            Self::Fixed(files) => files[partition].clone(),
+            Self::Registry { registry, part, .. } => {
+                registry.take(partition, *part).into_iter().collect()
+            }
+        }
+    }
+}
+
+/// What the rows of a build leaf went through: whether the join that wrote
+/// them divided its build over several partitions, and how many there are.
+/// A join over them that cannot spill says why from these facts.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Origin {
+    pub(super) divided: bool,
+    pub(super) rows: usize,
+}
+
 /// Reads spill files of one written partition, one list of files for each
 /// output partition. Declares no ordering and is bounded, so a join over it
 /// is eligible to spill again, one level deeper.
 pub(crate) struct SpillFilesExec {
-    files: Vec<Vec<SpilledFile>>,
+    source: FileSource,
     spill_manager: SpillManager,
     /// The spill level of the rows in these files: the level of the join
     /// that reads them.
     level: usize,
+    origin: Origin,
     /// Metrics of the first-level join, which the joins of written
     /// partitions report into.
     metrics: JoinSpillMetrics,
@@ -49,22 +91,24 @@ pub(crate) struct SpillFilesExec {
 impl SpillFilesExec {
     pub(super) fn new(
         schema: SchemaRef,
-        files: Vec<Vec<SpilledFile>>,
+        source: FileSource,
         spill_manager: SpillManager,
         level: usize,
+        origin: Origin,
         metrics: JoinSpillMetrics,
     ) -> Self {
         let cache = PlanProperties::new(
             EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(files.len()),
+            Partitioning::UnknownPartitioning(source.partitions()),
             EmissionType::Incremental,
             Boundedness::Bounded,
         )
         .with_scheduling_type(SchedulingType::Cooperative);
         Self {
-            files,
+            source,
             spill_manager,
             level,
+            origin,
             metrics,
             cache: Arc::new(cache),
         }
@@ -72,6 +116,10 @@ impl SpillFilesExec {
 
     pub(super) fn level(&self) -> usize {
         self.level
+    }
+
+    pub(super) fn origin(&self) -> Origin {
+        self.origin
     }
 
     pub(super) fn metrics(&self) -> &JoinSpillMetrics {
@@ -82,7 +130,7 @@ impl SpillFilesExec {
 impl fmt::Debug for SpillFilesExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpillFilesExec")
-            .field("partitions", &self.files.len())
+            .field("partitions", &self.source.partitions())
             .field("level", &self.level)
             .finish()
     }
@@ -92,8 +140,12 @@ impl DisplayAs for SpillFilesExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let files: usize = self.files.iter().map(Vec::len).sum();
-                write!(f, "SpillFilesExec: level={}, files={files}", self.level)
+                write!(
+                    f,
+                    "SpillFilesExec: level={}, partitions={}",
+                    self.level,
+                    self.source.partitions()
+                )
             }
             DisplayFormatType::TreeRender => write!(f, "level={}", self.level),
         }
@@ -147,12 +199,14 @@ impl ExecutionPlan for SpillFilesExec {
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         assert_or_internal_err!(
-            partition < self.files.len(),
+            partition < self.source.partitions(),
             "SpillFilesExec invalid partition {partition} of {}",
-            self.files.len()
+            self.source.partitions()
         );
         let schema = Arc::clone(self.spill_manager.schema());
-        let streams = self.files[partition]
+        let streams = self
+            .source
+            .take(partition)
             .iter()
             // Unbuffered: the read runs in the consumer's poll. A buffered
             // read's producer task ends its stream as if the file ended when

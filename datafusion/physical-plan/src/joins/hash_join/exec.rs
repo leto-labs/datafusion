@@ -1213,8 +1213,8 @@ impl HashJoinExec {
                 && partitions.end <= self.right.output_partitioning().partition_count(),
             "invalid dynamic-filter execution partitions {partitions:?}"
         );
-        // Longbow family JS: the members of the written-partition barrier.
-        self.spill_shared.bind_partitions(partitions.clone())?;
+        // Longbow family JS: the members of a spilled CollectLeft build.
+        self.spill_shared.bind_partitions(partitions.clone());
         if let Some(df) = &self.dynamic_filter {
             assert_or_internal_err!(
                 df.build_accumulator.get().is_none(),
@@ -3367,7 +3367,7 @@ async fn collect_left_input(
     // `shared_build.rs`); the rest of the build below is shared.
     // Longbow family JS: an eligible join whose table is refused after its
     // whole input was admitted enters spill mode with the rows it holds.
-    let fallback = spill.map(|spill| (spill, reservation.new_empty(), bounds.clone()));
+    let fallback = spill.map(|spill| (spill, bounds.clone()));
 
     let path = match &parallel {
         Some(parallel) if !prepared => parallel
@@ -3398,7 +3398,7 @@ async fn collect_left_input(
             copy_bytes,
             &on_left,
             &metrics,
-            reservation,
+            &mut reservation,
             bounds,
             with_visited_indices_bitmap,
             probe_threads_count,
@@ -3412,10 +3412,8 @@ async fn collect_left_input(
         )
     });
     match (result, fallback) {
-        (Err(error), Some((mut spill, mut reservation, bounds)))
-            if spill::is_refusal(&error) =>
-        {
-            // The refused attempt released its charge; the rows are live.
+        (Err(error), Some((mut spill, bounds))) if spill::is_refusal(&error) => {
+            // The refused attempt left the rows charged to `reservation`.
             spill.take_refused_build(&mut batches, &reservation)?;
             build_spilled(
                 spill,
@@ -3455,39 +3453,45 @@ fn build_spilled(
     null_equality: NullEquality,
     array_map_created_count: &Count,
 ) -> Result<JoinLeftData> {
-    let (mut data, spilled) = spill.finish(reservation, |batches, reservation| {
-        let num_rows = batches.iter().map(RecordBatch::num_rows).sum();
-        let max_batch_rows = batches.iter().map(RecordBatch::num_rows).max();
-        let input_bytes = reservation.size();
-        build_in_memory(
-            random_state,
-            schema,
-            batches,
-            num_rows,
-            max_batch_rows.unwrap_or(0),
-            input_bytes,
-            0,
-            on_left,
-            metrics,
-            reservation,
-            bounds.cloned(),
-            with_visited_indices_bitmap,
-            probe_threads_count,
-            should_compute_dynamic_filters,
-            config,
-            null_equality,
-            None,
-            array_map_created_count,
-            false,
-            BuildPath::Native,
-        )
-    })?;
+    let (mut data, spilled, floor_charge) =
+        spill.finish(reservation, |batches, reservation| {
+            let num_rows = batches.iter().map(RecordBatch::num_rows).sum();
+            let max_batch_rows = batches.iter().map(RecordBatch::num_rows).max();
+            let input_bytes = reservation.size();
+            build_in_memory(
+                random_state,
+                schema,
+                batches,
+                num_rows,
+                max_batch_rows.unwrap_or(0),
+                input_bytes,
+                0,
+                on_left,
+                metrics,
+                reservation,
+                bounds.cloned(),
+                with_visited_indices_bitmap,
+                probe_threads_count,
+                should_compute_dynamic_filters,
+                config,
+                null_equality,
+                None,
+                array_map_created_count,
+                false,
+                BuildPath::Native,
+            )
+        })?;
     if spilled.is_some() {
-        // The membership forms describe only the rows in memory (design
-        // decision 6); the bounds cover every build row.
         let build = Arc::get_mut(&mut data.build)
             .ok_or_else(|| internal_datafusion_err!("shared spilled build"))?;
+        // The membership forms describe only the rows in memory (design
+        // decision 6); the bounds cover every build row.
         build.membership = PushdownStrategy::BoundsOnly;
+        // A table built on the floor charged a private pool: the real
+        // charge replaces it for as long as the table lives.
+        if let Some(charge) = floor_charge {
+            build.reservation = charge;
+        }
     }
     data.spilled = spilled;
     Ok(data)
@@ -3497,7 +3501,8 @@ fn build_spilled(
 /// the collected build `batches`, the second half of [`collect_left_input`].
 ///
 /// `reservation` already covers `batches`; the structures built here grow it
-/// further. On error the reservation is dropped, releasing everything, while
+/// further and move into the table. Longbow family JS: it is borrowed, so on
+/// error the caller still holds the charge of the rows, while
 /// `batches` keeps every build row (possibly concatenated into one batch) for
 /// callers that need to recover from a failed build.
 #[expect(clippy::too_many_arguments)]
@@ -3511,7 +3516,7 @@ fn build_in_memory(
     copy_bytes: usize,
     on_left: &[PhysicalExprRef],
     metrics: &BuildProbeJoinMetrics,
-    mut reservation: MemoryReservation,
+    reservation: &mut MemoryReservation,
     mut bounds: Option<PartitionBounds>,
     with_visited_indices_bitmap: bool,
     probe_threads_count: usize,
@@ -3540,7 +3545,7 @@ fn build_in_memory(
         schema,
         batches,
         on_left,
-        &mut reservation,
+        reservation,
         config.execution.perfect_hash_join_small_build_threshold,
         config.execution.perfect_hash_join_min_key_density,
         null_equality,
@@ -3548,7 +3553,7 @@ fn build_in_memory(
         let batch = if prepared {
             concat_batches(schema, batches.iter())?
         } else {
-            concat_build_batches(schema, batches, input_bytes, &mut reservation, metrics)?
+            concat_build_batches(schema, batches, input_bytes, reservation, metrics)?
         };
         let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
         let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
@@ -3571,7 +3576,7 @@ fn build_in_memory(
         let mut hashmap: Box<dyn JoinHashMapType> = if num_rows <= u32::MAX as usize
             && JoinHashMapU32::partitions_build(num_rows)
         {
-            let mut map = new_join_hashmap_u32(num_rows, &mut reservation, metrics)?;
+            let mut map = new_join_hashmap_u32(num_rows, reservation, metrics)?;
             if let Some(peak) = build_partitioned(
                 &mut map,
                 on_left,
@@ -3579,14 +3584,14 @@ fn build_in_memory(
                 num_rows,
                 random_state,
                 null_equality,
-                &mut reservation,
+                reservation,
             )? {
                 partitioned_peak = Some(peak);
                 partitioned = true;
             }
             Box::new(map)
         } else {
-            new_join_hashmap(num_rows, &mut reservation, metrics)?
+            new_join_hashmap(num_rows, reservation, metrics)?
         };
 
         let scratch_reservation = reservation.new_empty();
@@ -3625,7 +3630,7 @@ fn build_in_memory(
         let batch = if prepared {
             concat_batches(schema, batches.iter())?
         } else {
-            concat_build_batches(schema, batches, input_bytes, &mut reservation, metrics)?
+            concat_build_batches(schema, batches, input_bytes, reservation, metrics)?
         };
 
         let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
@@ -3642,7 +3647,7 @@ fn build_in_memory(
             left_values,
             batches,
             on_left,
-            &reservation,
+            reservation,
             metrics,
         )?
     } else {
@@ -3691,7 +3696,7 @@ fn build_in_memory(
                 &left_values,
                 &normalized_values,
                 random_state,
-                &mut reservation,
+                reservation,
                 metrics,
             )
         })
@@ -3772,7 +3777,7 @@ fn build_in_memory(
         // buffers, including through multi-key StructArray children.
         let retained = RecordBatchMemoryCounter::new().count_batch(&batch);
         prepared::reconcile_prepared_copy_reservation(
-            &reservation,
+            reservation,
             input_bytes,
             copy_bytes,
             retained,
@@ -3793,7 +3798,7 @@ fn build_in_memory(
             values: normalized_values,
             bounds,
             membership,
-            reservation,
+            reservation: reservation.take(),
         }),
         not_in,
         visited_indices_bitmap,

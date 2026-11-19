@@ -611,7 +611,7 @@ async fn join_by_key_spills(target_partitions: usize) {
     assert_contains!(&error, "Resources exhausted");
     assert_contains!(
         &error,
-        "did not spill because its partition is at spill level 4"
+        "did not spill because one key value fills its partition"
     );
 }
 
