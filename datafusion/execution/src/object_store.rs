@@ -165,21 +165,49 @@ pub trait ObjectStoreRegistry: Send + Sync + std::fmt::Debug + 'static {
     /// created and registered.
     fn get_store(&self, url: &Url) -> Result<Arc<dyn ObjectStore>>;
 
-    /// The registered store that [`Self::get_store`] resolves `url` to, for
-    /// caches keyed by store identity (Longbow family OO). A registry whose
-    /// `get_store` wraps the registered store per call (for example per
-    /// execution attempt) returns the registered store here, so that every
-    /// wrapper of one registration shares one identity, and a store
-    /// registered in its place has another. The default is `get_store`.
-    fn get_store_identity(&self, url: &Url) -> Result<Arc<dyn ObjectStore>> {
-        self.get_store(url)
+    /// [`Self::get_store`] together with the [`StoreId`] of the registration
+    /// it resolved, from one lookup, for caches keyed by store (Longbow
+    /// family OO). A registry that wraps the registered store per call
+    /// returns the wrapper with the registration's ID. `None` (the default)
+    /// means the registry assigns no IDs, and such caches are skipped.
+    fn get_store_with_id(
+        &self,
+        url: &Url,
+    ) -> Result<(Arc<dyn ObjectStore>, Option<StoreId>)> {
+        Ok((self.get_store(url)?, None))
+    }
+}
+
+/// The identity of one store registration (Longbow family OO): assigned from
+/// a process-wide counter when a store is registered, never reused, and new
+/// when another store is registered under the same URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StoreId(u64);
+
+impl StoreId {
+    /// A new, never used ID.
+    pub fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The ID's number.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for StoreId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "store-{}", self.0)
     }
 }
 
 /// The default [`ObjectStoreRegistry`]
 pub struct DefaultObjectStoreRegistry {
     /// A map from scheme to object store that serve list / read operations for the store
-    object_stores: DashMap<String, Arc<dyn ObjectStore>>,
+    /// Each with the ID of its registration (Longbow family OO).
+    object_stores: DashMap<String, (Arc<dyn ObjectStore>, StoreId)>,
 }
 
 impl std::fmt::Debug for DefaultObjectStoreRegistry {
@@ -207,15 +235,20 @@ impl DefaultObjectStoreRegistry {
     /// This will register [`LocalFileSystem`] to handle `file://` paths
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Self {
-        let object_stores: DashMap<String, Arc<dyn ObjectStore>> = DashMap::new();
-        object_stores.insert("file://".to_string(), Arc::new(LocalFileSystem::new()));
+        let object_stores: DashMap<String, (Arc<dyn ObjectStore>, StoreId)> =
+            DashMap::new();
+        object_stores.insert(
+            "file://".to_string(),
+            (Arc::new(LocalFileSystem::new()), StoreId::next()),
+        );
         Self { object_stores }
     }
 
     /// Default without any backend registered.
     #[cfg(target_arch = "wasm32")]
     pub fn new() -> Self {
-        let object_stores: DashMap<String, Arc<dyn ObjectStore>> = DashMap::new();
+        let object_stores: DashMap<String, (Arc<dyn ObjectStore>, StoreId)> =
+            DashMap::new();
         Self { object_stores }
     }
 }
@@ -237,12 +270,14 @@ impl ObjectStoreRegistry for DefaultObjectStoreRegistry {
         store: Arc<dyn ObjectStore>,
     ) -> Option<Arc<dyn ObjectStore>> {
         let s = get_url_key(url);
-        self.object_stores.insert(s, store)
+        self.object_stores
+            .insert(s, (store, StoreId::next()))
+            .map(|(store, _)| store)
     }
 
     fn deregister_store(&self, url: &Url) -> Result<Arc<dyn ObjectStore>> {
         let s = get_url_key(url);
-        let (_, object_store) = self.object_stores
+        let (_, (object_store, _)) = self.object_stores
             .remove(&s)
             .ok_or_else(|| {
                 internal_datafusion_err!("Failed to deregister object store. No suitable object store found for {url}. See `RuntimeEnv::register_object_store`")
@@ -252,10 +287,17 @@ impl ObjectStoreRegistry for DefaultObjectStoreRegistry {
     }
 
     fn get_store(&self, url: &Url) -> Result<Arc<dyn ObjectStore>> {
+        Ok(self.get_store_with_id(url)?.0)
+    }
+
+    fn get_store_with_id(
+        &self,
+        url: &Url,
+    ) -> Result<(Arc<dyn ObjectStore>, Option<StoreId>)> {
         let s = get_url_key(url);
         self.object_stores
             .get(&s)
-            .map(|o| Arc::clone(o.value()))
+            .map(|o| (Arc::clone(&o.value().0), Some(o.value().1)))
             .ok_or_else(|| {
                 internal_datafusion_err!("No suitable object store found for {url}. See `RuntimeEnv::register_object_store`")
             })

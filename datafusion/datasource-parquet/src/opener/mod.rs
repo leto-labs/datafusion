@@ -3298,9 +3298,38 @@ mod test {
             .unwrap_or(0)
     }
 
+    /// The registration ID of `store` in these tests (Longbow family OO):
+    /// one per store, which the table keeps alive.
+    fn test_store_id(
+        store: &Arc<dyn ObjectStore>,
+    ) -> datafusion_execution::object_store::StoreId {
+        use datafusion_execution::object_store::StoreId;
+        thread_local! {
+            static IDS: std::cell::RefCell<Vec<(Arc<dyn ObjectStore>, StoreId)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        IDS.with_borrow_mut(|ids| {
+            if let Some((_, id)) = ids.iter().find(|(kept, _)| Arc::ptr_eq(kept, store)) {
+                return *id;
+            }
+            let id = StoreId::next();
+            ids.push((Arc::clone(store), id));
+            id
+        })
+    }
+
     /// The metadata cache key of `location` in `store` (Longbow family OO).
     fn test_cache_key(store: &Arc<dyn ObjectStore>, location: &Path) -> Path {
-        crate::metadata::file_metadata_cache_key(store, location)
+        crate::metadata::file_metadata_cache_key(test_store_id(store), location)
+    }
+
+    /// A cached factory of `store`'s readers, keyed by its test ID.
+    fn test_cached_factory(
+        store: &Arc<dyn ObjectStore>,
+        cache: &Arc<FileMetadataCache>,
+    ) -> CachedParquetFileReaderFactory {
+        CachedParquetFileReaderFactory::new(Arc::clone(store), Arc::clone(cache))
+            .with_store_id(Some(test_store_id(store)))
     }
 
     fn make_dynamic_expr(expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
@@ -4648,12 +4677,9 @@ mod test {
         let provider = Arc::new(EnumSchemaProvider::default());
         let source = ParquetSource::new(Arc::clone(&schema))
             .with_schema_provider(provider.clone())
-            .with_parquet_file_reader_factory(Arc::new(
-                CachedParquetFileReaderFactory::new(
-                    Arc::clone(&store),
-                    Arc::clone(&cache),
-                ),
-            ))
+            .with_parquet_file_reader_factory(Arc::new(test_cached_factory(
+                &store, &cache,
+            )))
             .with_predicate(logical2physical(
                 &get_field(col("nested"), "e").eq(lit("b")),
                 &schema,
@@ -4705,7 +4731,7 @@ mod test {
         // The same store as the scan's (Longbow family OO keys by store).
         let original = DFParquetMetadata::new(store.as_ref(), &file.object_meta)
             .with_file_metadata_cache(Some(Arc::clone(&cache)))
-            .with_store_identity(&store)
+            .with_store_id(Some(test_store_id(&store)))
             .with_page_index_policy(Some(PageIndexPolicy::Optional))
             .fetch_metadata()
             .await
@@ -4718,12 +4744,9 @@ mod test {
         let mut opener = ParquetMorselizerBuilder::new()
             .with_store(Arc::clone(&store))
             .with_schema(Arc::clone(&schema))
-            .with_parquet_file_reader_factory(Arc::new(
-                CachedParquetFileReaderFactory::new(
-                    Arc::clone(&store),
-                    Arc::clone(&cache),
-                ),
-            ))
+            .with_parquet_file_reader_factory(Arc::new(test_cached_factory(
+                &store, &cache,
+            )))
             .build();
         // The default scan still rejects an invalid advisory Arrow hint.
         assert!(
@@ -4847,12 +4870,9 @@ mod test {
                 .with_predicate(logical2physical(&col("id").eq(lit(2i32)), &schema))
                 .with_pushdown_filters(true)
                 .with_enable_page_index(true)
-                .with_parquet_file_reader_factory(Arc::new(
-                    CachedParquetFileReaderFactory::new(
-                        Arc::clone(&store),
-                        Arc::clone(&cache),
-                    ),
-                ))
+                .with_parquet_file_reader_factory(Arc::new(test_cached_factory(
+                    &store, &cache,
+                )))
                 .build();
             opener.file_decryption_properties = Some(decrypt);
             opener.schema_provider = Some(Arc::new(EnumSchemaProvider::default()));
@@ -5890,12 +5910,10 @@ mod test {
             .with_row_group_stats_pruning(true)
             .with_pushdown_filters(false)
             .with_metrics(metrics.clone())
-            .with_parquet_file_reader_factory(Arc::new(
-                CachedParquetFileReaderFactory::new(
-                    Arc::clone(&store),
-                    Arc::clone(&metadata_cache),
-                ),
-            ))
+            .with_parquet_file_reader_factory(Arc::new(test_cached_factory(
+                &store,
+                &metadata_cache,
+            )))
             .build();
 
         let (_, rows) =

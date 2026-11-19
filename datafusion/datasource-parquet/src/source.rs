@@ -1299,25 +1299,13 @@ impl ParquetSource {
             false => ObjectStoreUrl::parse(&base_conf.object_store_url)?,
             true => ObjectStoreUrl::local_filesystem(),
         };
-        let store = ctx
-            .task_ctx()
-            .runtime_env()
-            .object_store(object_store_url.clone())?;
-        let metadata_cache = ctx
-            .task_ctx()
-            .runtime_env()
-            .cache_manager
-            .get_file_metadata_cache();
-        // Longbow family OO: keyed by the registered store's allocation.
-        let identity = ctx
-            .task_ctx()
-            .runtime_env()
-            .object_store_registry
-            .get_store_identity(object_store_url.as_ref())?;
-        let reader_factory = Arc::new(
-            CachedParquetFileReaderFactory::new(store, metadata_cache)
-                .with_store_identity(identity),
-        );
+        let runtime = ctx.task_ctx().runtime_env();
+        // Longbow family OO: the store and its registration from one lookup.
+        let reader_factory = Arc::new(CachedParquetFileReaderFactory::from_registry(
+            runtime.object_store_registry.as_ref(),
+            &object_store_url,
+            runtime.cache_manager.get_file_metadata_cache(),
+        )?);
 
         let mut source = ParquetSource::new(table_schema)
             .with_parquet_file_reader_factory(reader_factory)
