@@ -191,7 +191,17 @@ async fn run_in(
     keys: &[usize],
     context: Arc<TaskContext>,
 ) -> Result<Output> {
-    let left = table("l", BUILD_ROWS, 4, 90_000, 0);
+    run_rows(join_type, null_equality, keys, context, BUILD_ROWS).await
+}
+
+async fn run_rows(
+    join_type: JoinType,
+    null_equality: NullEquality,
+    keys: &[usize],
+    context: Arc<TaskContext>,
+    build_rows: usize,
+) -> Result<Output> {
+    let left = table("l", build_rows, 4, 90_000, 0);
     let right = table("r", 30_000, 3, 120_000, -1_000);
     let on = join_on(&left.schema(), &right.schema(), keys);
     let join = HashJoinExec::try_new(
@@ -282,6 +292,64 @@ async fn parallel_build_matches_native_for_every_join_type_and_null_equality()
             );
         }
     }
+    Ok(())
+}
+
+/// Longbow patch (JT 9): a build large enough for inline keys returns the
+/// rows of the hash-only build, natively (partitioned) and in parallel
+/// (sharded), for every join type and NULL equality, with one integer key
+/// and with two (packed into one field each).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inline_keys_match_the_hash_only_build_for_every_join_type() -> Result<()> {
+    use crate::joins::join_hash_map::PartitionedBuild;
+    let rows = 300_000;
+    assert!(JoinHashMapU32::partitions_build(rows));
+    let join_types = [
+        JoinType::Inner,
+        JoinType::Left,
+        JoinType::Right,
+        JoinType::Full,
+        JoinType::LeftSemi,
+        JoinType::RightSemi,
+        JoinType::LeftAnti,
+        JoinType::RightAnti,
+        JoinType::LeftMark,
+        JoinType::RightMark,
+    ];
+    for keys in [&[0][..], &[0, 2][..]] {
+        for join_type in join_types {
+            for null_equality in [
+                NullEquality::NullEqualsNothing,
+                NullEquality::NullEqualsNull,
+            ] {
+                for parallel_rows in [0, 1] {
+                    let mut outputs = vec![];
+                    for inline in [false, true] {
+                        inline_keys::set_inline_keys_for_test(Some(inline));
+                        outputs.push(
+                            run_rows(
+                                join_type,
+                                null_equality,
+                                keys,
+                                scoped_context(parallel_rows, None, None),
+                                rows,
+                            )
+                            .await?,
+                        );
+                    }
+                    assert!(
+                        !outputs[0].rows.is_empty() || join_type == JoinType::RightAnti
+                    );
+                    assert_eq!(outputs[0].shards, outputs[1].shards);
+                    assert!(
+                        outputs[0].rows == outputs[1].rows,
+                        "{keys:?} {join_type} {null_equality:?} {parallel_rows}"
+                    );
+                }
+            }
+        }
+    }
+    inline_keys::set_inline_keys_for_test(None);
     Ok(())
 }
 
@@ -486,7 +554,11 @@ async fn sharded_map_resumes_like_the_native_map() -> Result<()> {
 
 #[test]
 fn sharded_map_requires_a_power_of_two_shard_count() {
-    let tables = |count: usize| (0..count).map(|_| HeadTable::with_capacity(0)).collect();
+    let tables = |count: usize| {
+        (0..count)
+            .map(|_| HeadTable::<u32>::with_capacity(0))
+            .collect()
+    };
     assert!(ShardedJoinHashMap::new(tables(2), vec![], false).is_empty());
     let result =
         std::panic::catch_unwind(|| ShardedJoinHashMap::new(tables(3), vec![], false));
@@ -1106,6 +1178,126 @@ async fn sharded_map_keeps_the_unique_fast_path_with_null_build_keys() -> Result
     Ok(())
 }
 
+/// Longbow patch (JT 9): a sharded build with inline keys keeps the
+/// hash-only answers of the plain sharded map, and its inline probe returns
+/// exactly the pairs of the native map that have equal keys, at every limit,
+/// for unique and duplicate keys with NULLs on both sides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inline_sharded_map_equals_the_compared_native_probe() -> Result<()> {
+    use crate::joins::join_hash_map::InlineU32;
+    let rows = 140_000;
+    for duplicates in [false, true] {
+        let (schema, batches) = int_batches(rows, |i| {
+            (i % 17 != 0).then_some(if duplicates {
+                (i % 40_000) as i32
+            } else {
+                i as i32
+            })
+        });
+        let on: Vec<PhysicalExprRef> = vec![Arc::new(Column::new("k", 0))];
+        let random_state = RandomState::with_seed(0);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(usize::MAX));
+        let mut reservation = MemoryConsumer::new("test").register(&pool);
+        let keys = batches
+            .iter()
+            .map(|batch| evaluate_expressions_to_arrays(&on, batch))
+            .collect::<Result<Vec<_>>>()?;
+        let encoding =
+            InlineKeys::for_build(&keys, NullEquality::NullEqualsNothing).unwrap();
+        let (sharded, batch, _copies) = ParallelBuild::for_test(1, 8)
+            .build_with::<InlineU32>(
+                &batches,
+                rows,
+                &schema,
+                &on,
+                &random_state,
+                NullEquality::NullEqualsNothing,
+                Some(encoding.clone()),
+                &mut reservation,
+            )
+            .await?
+            .expect("parallel build");
+        assert_eq!(sharded.inline_keys(), Some(&encoding));
+        assert_eq!(sharded.is_chained(), duplicates);
+        let build_keys = evaluate_expressions_to_arrays(&on, &batch)?;
+        let mut native = JoinHashMapU32::with_capacity(rows);
+        let mut hashes = vec![0; rows];
+        update_hash(
+            &on,
+            &batch,
+            &mut native,
+            0,
+            &random_state,
+            &mut hashes,
+            0,
+            true,
+            NullEquality::NullEqualsNothing,
+        )?;
+        let probe: Int32Array = (0..6000)
+            .map(|i| (i % 5 != 0).then_some(i * 31 - 500))
+            .collect();
+        let probe_keys: Vec<ArrayRef> = vec![Arc::new(probe)];
+        let mut probe_hashes = vec![0; 6000];
+        create_hashes(&probe_keys, &random_state, &mut probe_hashes)?;
+        let valid = probe_keys[0].logical_nulls();
+        let encoded = encoding.encode(&probe_keys).unwrap();
+        let drain = |mut step: Box<
+            dyn FnMut(ProbeOffset, &mut Vec<u32>, &mut Vec<u64>) -> Option<ProbeOffset>
+                + '_,
+        >| {
+            let (mut all, mut offset) = (Vec::new(), ProbeOffset::AtRow { row: 0 });
+            let (mut input, mut matched) = (vec![], vec![]);
+            loop {
+                let next = step(offset, &mut input, &mut matched);
+                all.extend(input.iter().copied().zip(matched.iter().copied()));
+                match next {
+                    Some(next) => offset = next,
+                    None => break,
+                }
+            }
+            all
+        };
+        for limit in [1, 7, 4096] {
+            let hash_only = |map: &dyn JoinHashMapType| {
+                drain(Box::new(|offset, input, matched| {
+                    map.get_matched_indices_with_limit_offset(
+                        &probe_hashes,
+                        valid.as_ref(),
+                        limit,
+                        offset,
+                        input,
+                        matched,
+                    )
+                }))
+            };
+            let native_pairs = hash_only(&native);
+            assert_eq!(hash_only(sharded.as_ref()), native_pairs, "limit {limit}");
+            let build = build_keys[0].as_primitive::<arrow::datatypes::Int32Type>();
+            let probe = probe_keys[0].as_primitive::<arrow::datatypes::Int32Type>();
+            let expected: Vec<(u32, u64)> = native_pairs
+                .into_iter()
+                .filter(|&(p, b)| build.value(b as usize) == probe.value(p as usize))
+                .collect();
+            assert!(!expected.is_empty());
+            let inline = drain(Box::new(|offset, input, matched| {
+                sharded
+                    .get_inline_matched_indices_with_limit_offset(
+                        &probe_hashes,
+                        &encoded,
+                        &build_keys,
+                        limit,
+                        offset,
+                        input,
+                        matched,
+                    )
+                    .unwrap()
+            }));
+            assert_eq!(inline, expected, "limit {limit}");
+        }
+    }
+    Ok(())
+}
+
 /// Float keys hash by their normalized value (`-0.0` equals `0.0`) and the
 /// 56 build stores normalized keys once (#25972). The parallel build gives
 /// the native result for `-0.0`, `0.0`, NaN and NULL keys on both sides, and
@@ -1564,6 +1756,9 @@ async fn session_parallelism_bounds_the_shards() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_partitioned_build_falls_back_to_the_row_by_row_build() -> Result<()> {
     use crate::joins::join_hash_map::{PartitionedBuild, partitioned_build_bytes};
+    // The hash-only map; `a_refused_inline_build_falls_back_to_a_hash_only_build`
+    // covers the inline map.
+    inline_keys::set_inline_keys_for_test(Some(false));
     let rows = 600_000;
     assert!(JoinHashMapU32::partitions_build(rows));
     let run = |pool: Arc<dyn MemoryPool>| async move {
@@ -1595,7 +1790,7 @@ async fn a_refused_partitioned_build_falls_back_to_the_row_by_row_build() -> Res
         Ok::<_, DataFusionError>((rows, peak))
     };
     let (expected, peak) = run(Arc::new(GreedyMemoryPool::new(usize::MAX))).await?;
-    let transient = partitioned_build_bytes(rows);
+    let transient = partitioned_build_bytes(rows, false);
     assert!(peak > transient);
     let (actual, tight_peak) =
         run(Arc::new(GreedyMemoryPool::new(peak - transient / 2))).await?;
@@ -1606,6 +1801,56 @@ async fn a_refused_partitioned_build_falls_back_to_the_row_by_row_build() -> Res
         tight_peak <= peak - transient,
         "{tight_peak} {peak} {transient}"
     );
+    Ok(())
+}
+
+/// Longbow patch (JT 9): a CollectLeft build whose pool refuses the inline
+/// map's partitioned build (its transient arrays include the keys) releases
+/// the inline map and builds a hash-only map, with the same rows and no
+/// charge left; an unrefused build is inline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_inline_build_falls_back_to_a_hash_only_build() -> Result<()> {
+    use crate::joins::join_hash_map::{JoinHashMapInline, partitioned_build_bytes};
+    inline_keys::set_inline_keys_for_test(Some(true));
+    let rows = 600_000;
+    let run = |pool: Arc<dyn MemoryPool>| async move {
+        let left = single_batch(table("l", rows, 4, 400_000, 0)).await?;
+        let right = table("r", 30_000, 3, 500_000, 0);
+        let on = join_on(&left.schema(), &right.schema(), &[0]);
+        let join = HashJoinExec::try_new(
+            Arc::new(CoalescePartitionsExec::new(left)),
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        let batches =
+            common::collect(join.execute(0, context(0, Some(Arc::clone(&pool))))?)
+                .await?;
+        let peak = join
+            .metrics()
+            .unwrap()
+            .sum_by_name("build_mem_used")
+            .map_or(0, |value| value.as_usize());
+        let rows = canonical(&join.schema(), &batches)?;
+        drop(join);
+        assert_eq!(pool.reserved(), 0);
+        Ok::<_, DataFusionError>((rows, peak))
+    };
+    let (expected, peak) = run(Arc::new(GreedyMemoryPool::new(usize::MAX))).await?;
+    let inline_transient = partitioned_build_bytes(rows, true);
+    // The inline table is charged at least its own slots.
+    assert!(peak > inline_transient + JoinHashMapInline::table_bytes(rows));
+    let saved = inline_transient - partitioned_build_bytes(rows, false);
+    let (actual, tight_peak) =
+        run(Arc::new(GreedyMemoryPool::new(peak - saved / 2))).await?;
+    assert!(!expected.is_empty());
+    assert_eq!(actual, expected);
+    assert!(tight_peak < peak, "{tight_peak} {peak}");
     Ok(())
 }
 

@@ -11,11 +11,14 @@
 use std::fmt::{self, Debug};
 use std::ops::Sub;
 
+use arrow::array::ArrayRef;
 use arrow::array::BooleanArray;
 use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::datatypes::ArrowNativeType;
 use datafusion_common::{Result, internal_datafusion_err};
 use hashbrown::HashTable;
+
+use crate::joins::inline_keys::{EncodedKeys, InlineKeys};
 use hashbrown::hash_table::Entry::{Occupied, Vacant};
 
 /// Resume point of a chunked lookup, see
@@ -159,6 +162,34 @@ pub trait JoinHashMapType: Send + Sync {
 
     /// Returns the number of entries in the join hash map.
     fn len(&self) -> usize;
+
+    /// Longbow patch (JT 9): the encoding of the inline keys that this map
+    /// stores beside its chain heads, or `None` for a map without them.
+    fn inline_keys(&self) -> Option<&InlineKeys> {
+        None
+    }
+
+    /// Longbow patch (JT 9): [`Self::get_matched_indices_with_limit_offset`]
+    /// followed by the key comparison, for a map with
+    /// [`Self::inline_keys`]: emits only pairs with equal keys, in the same
+    /// order and with the same offsets. `probe` holds the probe rows' keys
+    /// in this map's encoding; its invalid rows match nothing. `build_keys`
+    /// are the build key columns (read only for chains that mix keys).
+    #[expect(clippy::too_many_arguments)]
+    fn get_inline_matched_indices_with_limit_offset(
+        &self,
+        _hash_values: &[u64],
+        _probe: &EncodedKeys,
+        _build_keys: &[ArrayRef],
+        _limit: usize,
+        _offset: ProbeOffset,
+        _input_indices: &mut Vec<u32>,
+        _match_indices: &mut Vec<u64>,
+    ) -> Result<Option<ProbeOffset>> {
+        Err(internal_datafusion_err!(
+            "inline-key probe of a join map without inline keys"
+        ))
+    }
 }
 
 // Longbow patch (JT): the `u32` and `u64` maps keep their chain encoding
@@ -214,7 +245,7 @@ impl JoinHashMapType for JoinHashMapU32 {
         let chained = &mut self.chained;
         let row_bound = next.len() + deleted_offset;
         self.table.insert_all(
-            iter.map(|(row, hash)| (row, *hash)),
+            iter.map(|(row, hash)| (row, *hash, 0)),
             row_bound,
             |row, prev| {
                 next[row - deleted_offset] = prev;
@@ -263,6 +294,129 @@ impl JoinHashMapType for JoinHashMapU32 {
 
     fn len(&self) -> usize {
         self.table.len()
+    }
+}
+
+/// Longbow patch (JT 9): [`JoinHashMapU32`] with inline keys: each slot of
+/// its head table also holds the encoded key of the chain's head row
+/// ([`InlineU32`]), so a probe reads no build key column. Built only from
+/// whole rows with their keys ([`PartitionedBuild::update_partitioned`] or
+/// the shared build); [`JoinHashMapType::update_from_iter`], which has only
+/// hashes, is refused.
+pub struct JoinHashMapInline {
+    table: HeadTable<InlineU32>,
+    next: ZeroedArray<u32>,
+    chained: bool,
+    keys: InlineKeys,
+}
+
+impl JoinHashMapInline {
+    /// A map for `cap` rows (below [`INLINE_MAX_ROWS`]) with `keys`.
+    pub fn with_capacity(cap: usize, keys: InlineKeys) -> Self {
+        assert!(cap < INLINE_MAX_ROWS, "inline join map rows");
+        Self {
+            table: HeadTable::with_capacity(cap),
+            next: zeroed_with_huge_pages(cap),
+            chained: false,
+            keys,
+        }
+    }
+
+    /// Bytes of the head table of a map made for `cap` rows (the chain
+    /// array is not included, as in `estimate_memory_size`).
+    pub fn table_bytes(cap: usize) -> usize {
+        HeadTable::<InlineU32>::bytes_for(cap)
+    }
+}
+
+impl Debug for JoinHashMapInline {
+    fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
+        Ok(())
+    }
+}
+
+impl JoinHashMapType for JoinHashMapInline {
+    fn extend_zero(&mut self, _: usize) {}
+
+    fn update_from_iter<'a>(
+        &mut self,
+        _iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
+        _deleted_offset: usize,
+    ) -> Result<()> {
+        Err(internal_datafusion_err!(
+            "a join map with inline keys cannot insert rows without their keys"
+        ))
+    }
+
+    fn get_matched_indices<'a>(
+        &self,
+        iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
+        deleted_offset: Option<usize>,
+    ) -> (Vec<u32>, Vec<u64>) {
+        heads_matched_indices(&self.table, &self.next, iter, deleted_offset)
+    }
+
+    fn get_matched_indices_with_limit_offset(
+        &self,
+        hash_values: &[u64],
+        valid_keys: Option<&NullBuffer>,
+        limit: usize,
+        offset: ProbeOffset,
+        input_indices: &mut Vec<u32>,
+        match_indices: &mut Vec<u64>,
+    ) -> Option<ProbeOffset> {
+        heads_matched_indices_with_limit_offset(
+            &self.table,
+            &self.next,
+            !self.chained,
+            hash_values,
+            valid_keys,
+            limit,
+            offset,
+            input_indices,
+            match_indices,
+        )
+    }
+
+    fn contain_hashes(&self, hash_values: &[u64]) -> BooleanArray {
+        heads_contain_hashes(&self.table, hash_values)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.table.len() == 0
+    }
+
+    fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    fn inline_keys(&self) -> Option<&InlineKeys> {
+        Some(&self.keys)
+    }
+
+    fn get_inline_matched_indices_with_limit_offset(
+        &self,
+        hash_values: &[u64],
+        probe: &EncodedKeys,
+        build_keys: &[ArrayRef],
+        limit: usize,
+        offset: ProbeOffset,
+        input_indices: &mut Vec<u32>,
+        match_indices: &mut Vec<u64>,
+    ) -> Result<Option<ProbeOffset>> {
+        Ok(inline_matched_indices_with_limit_offset(
+            &self.table,
+            &self.next,
+            !self.chained,
+            hash_values,
+            probe,
+            &self.keys,
+            build_keys,
+            limit,
+            offset,
+            input_indices,
+            match_indices,
+        ))
     }
 }
 
@@ -320,7 +474,7 @@ impl JoinHashMapType for JoinHashMapU64 {
         let chained = &mut self.chained;
         let row_bound = next.len() + deleted_offset;
         self.table.insert_all(
-            iter.map(|(row, hash)| (row, *hash)),
+            iter.map(|(row, hash)| (row, *hash, 0)),
             row_bound,
             |row, prev| {
                 next[row - deleted_offset] = prev;
@@ -701,18 +855,51 @@ pub fn huge_page_advice() -> bool {
 pub(crate) trait HeadWord: Copy + Send + Sync + 'static {
     /// 64-bit words per slot.
     const WORDS: usize;
+    /// Longbow patch (JT 9): whether a slot also keeps the inline key of
+    /// its head row ([`InlineU32`]).
+    const INLINE: bool = false;
+    /// The type of the chain array's entries.
+    type Chain: Copy;
     /// The hash bits that a slot stores.
     fn tag(hash: u64) -> u64;
     /// The tag and the head of a slot; head 0 is an empty slot.
     fn read(words: &[u64], slot: usize) -> (u64, u64);
     fn write(words: &mut [u64], slot: usize, tag: u64, head: u64);
     /// Converts a head (row + 1) of this width.
-    fn of_head(head: u64) -> Self;
+    fn of_head(head: u64) -> Self::Chain;
     fn head_of(row: usize) -> u64;
+    /// Slots of a table made for `capacity` rows: twice the capacity,
+    /// rounded up to a power of two.
+    fn slots_for(capacity: usize) -> usize {
+        capacity
+            .saturating_mul(2)
+            .max(2)
+            .checked_next_power_of_two()
+            .expect("join table capacity")
+    }
+    /// The inline key of a slot's head and whether the slot's chain holds
+    /// rows of different keys; `(0, false)` for a table without keys.
+    #[inline(always)]
+    fn read_key(_words: &[u64], _slot: usize) -> (u64, bool) {
+        (0, false)
+    }
+    /// Writes a slot; `key` and `mixed` are kept only by an inline table.
+    #[inline(always)]
+    fn write_slot(
+        words: &mut [u64],
+        slot: usize,
+        tag: u64,
+        head: u64,
+        _key: u64,
+        _mixed: bool,
+    ) {
+        Self::write(words, slot, tag, head)
+    }
 }
 
 impl HeadWord for u32 {
     const WORDS: usize = 1;
+    type Chain = u32;
 
     #[inline(always)]
     fn tag(hash: u64) -> u64 {
@@ -745,6 +932,7 @@ impl HeadWord for u32 {
 
 impl HeadWord for u64 {
     const WORDS: usize = 2;
+    type Chain = u64;
 
     #[inline(always)]
     fn tag(hash: u64) -> u64 {
@@ -773,6 +961,86 @@ impl HeadWord for u64 {
     }
 }
 
+/// Longbow patch (JT 9): the slot of a `u32` table with inline keys: the
+/// `u32` slot word (tag, then head), whose head bit 31 marks a chain that
+/// holds rows of different keys, and the inline key
+/// ([`crate::joins::inline_keys::InlineKeys`]) of the head row. All rows of
+/// a chain without that mark have the slot's key, so a probe compares its
+/// key with the slot's and reads no build key. Heads stay below 2^31.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InlineU32;
+
+/// The head bit of an [`InlineU32`] slot whose chain mixes keys.
+const MIXED_CHAIN: u64 = 1 << 31;
+
+/// The largest row count of an [`InlineU32`] table.
+pub(crate) const INLINE_MAX_ROWS: usize = (MIXED_CHAIN - 1) as usize;
+
+impl HeadWord for InlineU32 {
+    const WORDS: usize = 2;
+    const INLINE: bool = true;
+    type Chain = u32;
+
+    #[inline(always)]
+    fn tag(hash: u64) -> u64 {
+        hash & 0xFFFF_FFFF
+    }
+
+    #[inline(always)]
+    fn read(words: &[u64], slot: usize) -> (u64, u64) {
+        let word = words[2 * slot];
+        (word >> 32, word & (MIXED_CHAIN - 1))
+    }
+
+    #[inline(always)]
+    fn write(words: &mut [u64], slot: usize, tag: u64, head: u64) {
+        let mixed = words[2 * slot] & MIXED_CHAIN;
+        words[2 * slot] = (tag << 32) | mixed | head;
+    }
+
+    #[inline(always)]
+    fn of_head(head: u64) -> u32 {
+        head as u32
+    }
+
+    #[inline(always)]
+    fn head_of(row: usize) -> u64 {
+        assert!(row < INLINE_MAX_ROWS, "inline join map row");
+        row as u64 + 1
+    }
+
+    /// One and a half times the capacity, rounded up to a power of two: a
+    /// slot is twice as wide as a `u32` slot, and a load of at most 2/3
+    /// keeps the bytes of a table at or below the `u32` table's for the
+    /// same rows in most sizes (at most twice them) while most probes end in
+    /// the slot's own cache line.
+    fn slots_for(capacity: usize) -> usize {
+        capacity
+            .saturating_add(capacity.div_ceil(2))
+            .max(2)
+            .checked_next_power_of_two()
+            .expect("join table capacity")
+    }
+
+    #[inline(always)]
+    fn read_key(words: &[u64], slot: usize) -> (u64, bool) {
+        (words[2 * slot + 1], words[2 * slot] & MIXED_CHAIN != 0)
+    }
+
+    #[inline(always)]
+    fn write_slot(
+        words: &mut [u64],
+        slot: usize,
+        tag: u64,
+        head: u64,
+        key: u64,
+        mixed: bool,
+    ) {
+        words[2 * slot] = (tag << 32) | if mixed { MIXED_CHAIN } else { 0 } | head;
+        words[2 * slot + 1] = key;
+    }
+}
+
 /// An insert into a [`HeadTable`] without room for another hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TableFull;
@@ -792,11 +1060,7 @@ pub(crate) struct HeadTable<T: HeadWord> {
 
 impl<T: HeadWord> HeadTable<T> {
     fn slots_for(capacity: usize) -> usize {
-        capacity
-            .saturating_mul(2)
-            .max(2)
-            .checked_next_power_of_two()
-            .expect("join table capacity")
+        T::slots_for(capacity)
     }
 
     /// Bytes of the slots of a table made for `capacity` rows.
@@ -862,8 +1126,29 @@ impl<T: HeadWord> HeadTable<T> {
         }
     }
 
+    /// Longbow patch (JT 9): the chain head of `hash` (or 0), with the
+    /// slot's inline key and mixed-chain mark ([`HeadWord::read_key`]).
+    #[inline(always)]
+    pub(crate) fn find(&self, hash: u64) -> (u64, u64, bool) {
+        let tag = T::tag(hash);
+        let mut slot = self.position(hash);
+        loop {
+            let (stored, head) = T::read(&self.words, slot);
+            if head == 0 {
+                return (0, 0, false);
+            }
+            if stored == tag {
+                let (key, mixed) = T::read_key(&self.words, slot);
+                return (head, key, mixed);
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
     /// Makes `head` the chain head of `hash`; returns the head it replaces,
-    /// or 0 when `hash` is new.
+    /// or 0 when `hash` is new. `key` is the inline key of the row of
+    /// `head` (ignored by a table without keys); a chain that gets a row of
+    /// another key is marked mixed.
     ///
     /// A `u32` slot does not keep the whole hash, so the table cannot be
     /// rehashed into more slots. It takes up to twice the capacity that it
@@ -871,7 +1156,12 @@ impl<T: HeadWord> HeadTable<T> {
     /// that, when only one empty slot is left (it ends every probe), the
     /// insert fails with [`TableFull`] and changes nothing.
     #[inline(always)]
-    pub(crate) fn insert(&mut self, hash: u64, head: u64) -> Result<u64, TableFull> {
+    pub(crate) fn insert(
+        &mut self,
+        hash: u64,
+        head: u64,
+        key: u64,
+    ) -> Result<u64, TableFull> {
         let tag = T::tag(hash);
         let mut slot = self.position(hash);
         loop {
@@ -880,12 +1170,14 @@ impl<T: HeadWord> HeadTable<T> {
                 if self.len >= self.mask {
                     return Err(TableFull);
                 }
-                T::write(&mut self.words, slot, tag, head);
+                T::write_slot(&mut self.words, slot, tag, head, key, false);
                 self.len += 1;
                 return Ok(0);
             }
             if stored == tag {
-                T::write(&mut self.words, slot, tag, head);
+                let (old_key, mixed) = T::read_key(&self.words, slot);
+                let mixed = mixed || (T::INLINE && old_key != key);
+                T::write_slot(&mut self.words, slot, tag, head, key, mixed);
                 return Ok(previous);
             }
             slot = (slot + 1) & self.mask;
@@ -903,7 +1195,8 @@ impl<T: HeadWord> HeadTable<T> {
         )
     }
 
-    /// Inserts rows in iteration order, each with its hash. `previous` gets
+    /// Inserts rows in iteration order, each with its hash and inline key
+    /// (0 for a table without keys). `previous` gets
     /// each row that already had a chain head, and that head: the caller
     /// links the row to it. Keeps `PREFETCH_DISTANCE` rows in flight. Fails
     /// when the table is full or a row is not below `row_bound` (the end of
@@ -916,16 +1209,16 @@ impl<T: HeadWord> HeadTable<T> {
         mut previous: F,
     ) -> Result<()>
     where
-        I: Iterator<Item = (usize, u64)>,
-        F: FnMut(usize, T),
+        I: Iterator<Item = (usize, u64, u64)>,
+        F: FnMut(usize, T::Chain),
     {
-        let mut add = |table: &mut Self, row: usize, hash: u64| -> Result<()> {
+        let mut add = |table: &mut Self, row: usize, hash: u64, key: u64| -> Result<()> {
             if row >= row_bound {
                 return Err(internal_datafusion_err!(
                     "join hash map row {row} is beyond its {row_bound} rows"
                 ));
             }
-            match table.insert(hash, T::head_of(row)) {
+            match table.insert(hash, T::head_of(row), key) {
                 Ok(0) => Ok(()),
                 Ok(head) => {
                     previous(row, T::of_head(head));
@@ -935,30 +1228,30 @@ impl<T: HeadWord> HeadTable<T> {
             }
         };
         if !self.prefetch {
-            for (row, hash) in rows {
-                add(self, row, hash)?;
+            for (row, hash, key) in rows {
+                add(self, row, hash, key)?;
             }
             return Ok(());
         }
-        let mut ring = [(0_usize, 0_u64); PREFETCH_DISTANCE];
+        let mut ring = [(0_usize, 0_u64, 0_u64); PREFETCH_DISTANCE];
         let mut pending = 0;
         let mut at = 0;
-        for (row, hash) in rows {
+        for (row, hash, key) in rows {
             self.prefetch(hash);
             if pending == PREFETCH_DISTANCE {
-                let (old_row, old_hash) = ring[at];
-                add(self, old_row, old_hash)?;
+                let (old_row, old_hash, old_key) = ring[at];
+                add(self, old_row, old_hash, old_key)?;
             } else {
                 pending += 1;
             }
-            ring[at] = (row, hash);
+            ring[at] = (row, hash, key);
             at = (at + 1) % PREFETCH_DISTANCE;
         }
         // The oldest pending row is at `at` once the ring is full, else at 0.
         let first = if pending == PREFETCH_DISTANCE { at } else { 0 };
         for index in 0..pending {
-            let (row, hash) = ring[(first + index) % PREFETCH_DISTANCE];
-            add(self, row, hash)?;
+            let (row, hash, key) = ring[(first + index) % PREFETCH_DISTANCE];
+            add(self, row, hash, key)?;
         }
         Ok(())
     }
@@ -975,7 +1268,7 @@ impl<T: HeadWord> HeadTable<T> {
         for (hash, _) in map.iter() {
             if table.head(*hash) == 0 {
                 let (_, head) = map.find(*hash, |(h, _)| h == hash).expect("own entry");
-                table.insert(*hash, (*head).into()).expect("map fits");
+                table.insert(*hash, (*head).into(), 0).expect("map fits");
             }
         }
         table.len = map.len();
@@ -997,6 +1290,9 @@ const PARTITION_BYTES: usize = 256 << 10;
 /// build inserts them: batch by batch, each batch's rows from its last.
 pub struct BuildRows<'a> {
     pub hashes: &'a [u64],
+    /// Longbow patch (JT 9): the inline key of every row, for a map with
+    /// inline keys.
+    pub keys: Option<&'a [u64]>,
     pub batches: &'a [(usize, usize, Option<NullBuffer>)],
 }
 
@@ -1028,9 +1324,11 @@ pub trait PartitionedBuild: JoinHashMapType {
 }
 
 /// Transient bytes of [`build_partitioned`] for `rows` build rows: a hash
-/// for every row, then the scattered hashes and row numbers.
-pub fn partitioned_build_bytes(rows: usize) -> usize {
-    rows * (2 * size_of::<u64>() + size_of::<u32>())
+/// for every row, then the scattered hashes and row numbers; with `inline`
+/// keys also a key for every row and the scattered keys.
+pub fn partitioned_build_bytes(rows: usize, inline: bool) -> usize {
+    let keys = if inline { 2 * size_of::<u64>() } else { 0 };
+    rows * (2 * size_of::<u64>() + size_of::<u32>() + keys)
 }
 
 macro_rules! partitioned_build {
@@ -1041,6 +1339,11 @@ macro_rules! partitioned_build {
             }
 
             fn update_partitioned(&mut self, rows: &BuildRows<'_>) -> Result<()> {
+                if <$width as HeadWord>::INLINE && rows.keys.is_none() {
+                    return Err(internal_datafusion_err!(
+                        "a join map with inline keys was built without them"
+                    ));
+                }
                 let next = &mut self.next;
                 let chained = &mut self.chained;
                 let row_bound = next.len();
@@ -1054,6 +1357,7 @@ macro_rules! partitioned_build {
 }
 // Row numbers of a partitioned build are `u32`: only the `u32` map has one.
 partitioned_build!(JoinHashMapU32, u32);
+partitioned_build!(JoinHashMapInline, InlineU32);
 
 impl<T: HeadWord> HeadTable<T> {
     /// Inserts `rows` as [`Self::insert_all`] in their order, but partition
@@ -1068,15 +1372,16 @@ impl<T: HeadWord> HeadTable<T> {
         previous: F,
     ) -> Result<()>
     where
-        F: FnMut(usize, T),
+        F: FnMut(usize, T::Chain),
     {
         let hashes = rows.hashes;
+        let key_of = |row: usize| rows.keys.map_or(0, |keys| keys[row]);
         let slot_bits = 64 - self.shift;
         let partition_slots = (PARTITION_BYTES / (T::WORDS * size_of::<u64>())).max(1);
         let partition_bits = slot_bits.saturating_sub(partition_slots.trailing_zeros());
         if partition_bits == 0 {
             return self.insert_all(
-                rows.rows().map(|row| (row, hashes[row])),
+                rows.rows().map(|row| (row, hashes[row], key_of(row))),
                 row_bound,
                 previous,
             );
@@ -1093,10 +1398,15 @@ impl<T: HeadWord> HeadTable<T> {
         let total = starts[starts.len() - 1];
         let mut scattered_hashes = vec![0_u64; total];
         let mut scattered_rows = vec![0_u32; total];
+        // Longbow patch (JT 9): an inline table also scatters the keys.
+        let mut scattered_keys = vec![0_u64; if T::INLINE { total } else { 0 }];
         for row in rows.rows() {
             let hash = hashes[row];
             let at = &mut starts[partition_of(hash)];
             scattered_hashes[*at] = hash;
+            if T::INLINE {
+                scattered_keys[*at] = key_of(row);
+            }
             scattered_rows[*at] = u32::try_from(row).map_err(|_| {
                 internal_datafusion_err!("partitioned join build above u32 rows")
             })?;
@@ -1107,7 +1417,11 @@ impl<T: HeadWord> HeadTable<T> {
             scattered_rows
                 .iter()
                 .zip(&scattered_hashes)
-                .map(|(&row, &hash)| (row as usize, hash)),
+                .enumerate()
+                .map(|(at, (&row, &hash))| {
+                    let key = if T::INLINE { scattered_keys[at] } else { 0 };
+                    (row as usize, hash, key)
+                }),
             row_bound,
             previous,
         )
@@ -1126,6 +1440,10 @@ impl<T: HeadWord> HeadTable<T> {
 /// when the pool refuses them: a CollectLeft build cannot spill, so the
 /// caller then builds row by row, which gives the same chains, instead of
 /// failing a query that fits without the partitioning.
+///
+/// Longbow patch (JT 9): with `inline` keys, every row's encoded key goes
+/// to the map beside its hash.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn build_partitioned<'a, M: PartitionedBuild>(
     map: &mut M,
     on: &[datafusion_physical_expr::PhysicalExprRef],
@@ -1133,15 +1451,18 @@ pub(crate) fn build_partitioned<'a, M: PartitionedBuild>(
     num_rows: usize,
     random_state: &datafusion_common::hash_utils::RandomState,
     null_equality: datafusion_common::NullEquality,
+    inline: Option<&InlineKeys>,
     reservation: &mut datafusion_execution::memory_pool::MemoryReservation,
 ) -> Result<Option<usize>> {
-    let transient = partitioned_build_bytes(num_rows);
+    let transient = partitioned_build_bytes(num_rows, inline.is_some());
     if reservation.try_grow(transient).is_err() {
         return Ok(None);
     }
     let peak = reservation.size();
     let result = (|| {
         let mut hashes = vec![0_u64; num_rows];
+        let mut row_keys =
+            Vec::with_capacity(if inline.is_some() { num_rows } else { 0 });
         let mut layout = Vec::new();
         let mut offset = 0;
         for batch in batches {
@@ -1156,6 +1477,9 @@ pub(crate) fn build_partitioned<'a, M: PartitionedBuild>(
                 ));
             };
             datafusion_common::hash_utils::create_hashes(&keys, random_state, slice)?;
+            if let Some(inline) = inline {
+                row_keys.extend_from_slice(&inline.encode_build(&keys)?);
+            }
             let valid = crate::joins::utils::matchable_join_keys(&keys, null_equality);
             layout.push((offset, rows, valid));
             offset += rows;
@@ -1164,6 +1488,7 @@ pub(crate) fn build_partitioned<'a, M: PartitionedBuild>(
         layout.reverse();
         map.update_partitioned(&BuildRows {
             hashes: &hashes[..offset],
+            keys: inline.map(|_| row_keys.as_slice()),
             batches: &layout,
         })
     })();
@@ -1179,12 +1504,20 @@ pub(crate) trait HeadLookup {
     fn prefetch(&self, hash: u64);
     /// Whether the table is large enough for prefetches to pay.
     fn prefetches(&self) -> bool;
+    /// Longbow patch (JT 9): the chain head of `hash` (or 0) with its slot's
+    /// inline key and mixed-chain mark ([`HeadTable::find`]).
+    fn find(&self, hash: u64) -> (u64, u64, bool);
 }
 
 impl<T: HeadWord> HeadLookup for HeadTable<T> {
     #[inline(always)]
     fn head(&self, hash: u64) -> u64 {
         HeadTable::head(self, hash)
+    }
+
+    #[inline(always)]
+    fn find(&self, hash: u64) -> (u64, u64, bool) {
+        HeadTable::find(self, hash)
     }
 
     #[inline(always)]
@@ -1441,6 +1774,231 @@ fn contained_heads<L: HeadLookup, const PREFETCH: bool>(
     BooleanArray::new(buffer, None)
 }
 
+/// Longbow patch (JT 9): [`heads_matched_indices_with_limit_offset`] over a
+/// table with inline keys ([`InlineU32`]), for probe rows with encoded keys
+/// `probe` (of the same [`InlineKeys`] as the table). Emits only pairs whose
+/// keys are equal, in the order and with the offsets of the hash-only probe
+/// followed by the key comparison, so the caller compares no keys:
+///
+/// - a slot whose chain holds a single key matches exactly when that key is
+///   the probe's; then all of its rows match;
+/// - a chain that mixes keys (a 32-bit tag collision of different keys) has
+///   each row's key encoded from `build_keys` and compared.
+///
+/// `unique` is as for the hash-only probe. `limit` counts emitted pairs.
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn inline_matched_indices_with_limit_offset<L: HeadLookup>(
+    table: &L,
+    next_chain: &[u32],
+    unique: bool,
+    hash_values: &[u64],
+    probe: &EncodedKeys,
+    keys: &InlineKeys,
+    build_keys: &[ArrayRef],
+    limit: usize,
+    offset: ProbeOffset,
+    input_indices: &mut Vec<u32>,
+    match_indices: &mut Vec<u64>,
+) -> Option<ProbeOffset> {
+    let probe = InlineProbe {
+        hash_values,
+        keys: &probe.keys,
+        valid: probe.valid.as_ref(),
+        encoding: keys,
+        build_keys,
+    };
+    if table.prefetches() {
+        inline_heads::<L, true>(
+            table,
+            next_chain,
+            unique,
+            &probe,
+            limit,
+            offset,
+            input_indices,
+            match_indices,
+        )
+    } else {
+        inline_heads::<L, false>(
+            table,
+            next_chain,
+            unique,
+            &probe,
+            limit,
+            offset,
+            input_indices,
+            match_indices,
+        )
+    }
+}
+
+/// The probe side of [`inline_matched_indices_with_limit_offset`].
+struct InlineProbe<'a> {
+    hash_values: &'a [u64],
+    keys: &'a [u64],
+    valid: Option<&'a NullBuffer>,
+    encoding: &'a InlineKeys,
+    build_keys: &'a [ArrayRef],
+}
+
+impl InlineProbe<'_> {
+    /// Whether build row `row` of a mixed chain has probe key `key`.
+    #[cold]
+    fn build_row_has(&self, row: usize, key: u64) -> bool {
+        self.encoding.encode_row(self.build_keys, row) == Some(key)
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+#[inline(always)]
+fn inline_heads<L: HeadLookup, const PREFETCH: bool>(
+    table: &L,
+    next_chain: &[u32],
+    unique: bool,
+    probe: &InlineProbe<'_>,
+    limit: usize,
+    offset: ProbeOffset,
+    input_indices: &mut Vec<u32>,
+    match_indices: &mut Vec<u64>,
+) -> Option<ProbeOffset> {
+    input_indices.clear();
+    match_indices.clear();
+    let hash_values = probe.hash_values;
+    let len = hash_values.len();
+    let warm = |from: usize, end: usize| {
+        if PREFETCH {
+            for &hash in &hash_values[from.min(end)..(from + PREFETCH_DISTANCE).min(end)]
+            {
+                table.prefetch(hash);
+            }
+        }
+    };
+    let invalid = |row: usize| probe.valid.is_some_and(|valid| valid.is_null(row));
+
+    if unique {
+        debug_assert!(
+            matches!(offset, AtRow { .. }),
+            "unique keys cannot have mid-chain"
+        );
+        let (AtRow { row: start } | MidChain { row: start, .. }) = offset;
+        let end = (start + limit).min(len);
+        warm(start, end);
+        for row in start..end {
+            if PREFETCH && row + PREFETCH_DISTANCE < end {
+                table.prefetch(hash_values[row + PREFETCH_DISTANCE]);
+            }
+            if invalid(row) {
+                continue;
+            }
+            // A unique table has no mixed chain.
+            let (head, key, _) = table.find(hash_values[row]);
+            if head != 0 && key == probe.keys[row] {
+                input_indices.push(row as u32);
+                match_indices.push(head - 1);
+            }
+        }
+        return if end == len {
+            None
+        } else {
+            Some(AtRow { row: end })
+        };
+    }
+
+    let mut remaining = limit;
+    let to_skip = match offset {
+        AtRow { row } => row,
+        MidChain { row, next } => {
+            // The chain of `row` matched; filter it again if it is mixed.
+            let (_, _, mixed) = table.find(hash_values[row]);
+            if let Some(next_offset) = inline_chain(
+                next_chain,
+                probe,
+                row,
+                next,
+                mixed,
+                &mut remaining,
+                input_indices,
+                match_indices,
+                row == len - 1,
+            ) {
+                return Some(next_offset);
+            }
+            row + 1
+        }
+    };
+
+    warm(to_skip, len);
+    for row in to_skip..len {
+        if PREFETCH && row + PREFETCH_DISTANCE < len {
+            table.prefetch(hash_values[row + PREFETCH_DISTANCE]);
+        }
+        if invalid(row) {
+            continue;
+        }
+        let (head, key, mixed) = table.find(hash_values[row]);
+        if head == 0 || (!mixed && key != probe.keys[row]) {
+            continue;
+        }
+        if let Some(next_offset) = inline_chain(
+            next_chain,
+            probe,
+            row,
+            head,
+            mixed,
+            &mut remaining,
+            input_indices,
+            match_indices,
+            row == len - 1,
+        ) {
+            return Some(next_offset);
+        }
+    }
+    None
+}
+
+/// [`traverse_chain`] for [`inline_heads`]: emits the rows of the chain from
+/// `start` (row + 1); a `mixed` chain only the rows with the probe's key.
+/// Returns the resume offset when `remaining` reaches 0, as `traverse_chain`.
+#[expect(clippy::too_many_arguments)]
+#[inline(always)]
+fn inline_chain(
+    next_chain: &[u32],
+    probe: &InlineProbe<'_>,
+    probe_row: usize,
+    start: u64,
+    mixed: bool,
+    remaining: &mut usize,
+    input_indices: &mut Vec<u32>,
+    match_indices: &mut Vec<u64>,
+    is_last_input: bool,
+) -> Option<ProbeOffset> {
+    let mut row = start - 1;
+    loop {
+        let next = u64::from(next_chain[row as usize]);
+        if !mixed || probe.build_row_has(row as usize, probe.keys[probe_row]) {
+            match_indices.push(row);
+            input_indices.push(probe_row as u32);
+            *remaining -= 1;
+            if *remaining == 0 {
+                return if is_last_input && next == 0 {
+                    None
+                } else if next == 0 {
+                    Some(AtRow { row: probe_row + 1 })
+                } else {
+                    Some(MidChain {
+                        row: probe_row,
+                        next,
+                    })
+                };
+            }
+        }
+        if next == 0 {
+            return None;
+        }
+        row = next - 1;
+    }
+}
+
 /// Longbow patch (JT): hints the CPU to load `slice[index]` into all cache
 /// levels. Does nothing when `index` is out of bounds or the target has no
 /// prefetch instruction here.
@@ -1678,6 +2236,10 @@ impl<T: ZeroedValue + Debug> Debug for ZeroedArray<T> {
             .finish()
     }
 }
+
+#[cfg(test)]
+#[path = "join_hash_map_inline_tests.rs"]
+mod inline_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2005,8 +2567,8 @@ mod tests {
         // comparison then drops. Other hashes stay apart.
         let (a, b) = (0x1234_5678_9ABC_DEF0_u64, 0x8765_4321_9ABC_DEF0_u64);
         let mut table = HeadTable::<u32>::with_capacity(4);
-        table.insert(a, 1).unwrap();
-        let other = table.insert(b, 2).unwrap();
+        table.insert(a, 1, 0).unwrap();
+        let other = table.insert(b, 2, 0).unwrap();
         // `b` lands in the same probe run only if its slot is reached; the
         // table then reports `a`'s head as the head it replaces.
         if other != 0 {
@@ -2016,7 +2578,7 @@ mod tests {
         }
         // A `u64` table compares whole hashes.
         let mut wide = HeadTable::<u64>::with_capacity(4);
-        assert_eq!((wide.insert(a, 1), wide.insert(b, 2)), (Ok(0), Ok(0)));
+        assert_eq!((wide.insert(a, 1, 0), wide.insert(b, 2, 0)), (Ok(0), Ok(0)));
         assert_eq!((wide.head(a), wide.head(b), wide.len()), (1, 2, 2));
     }
 
@@ -2048,7 +2610,7 @@ mod tests {
         let mut table = HeadTable::<u64>::with_capacity(4);
         // Eight slots: seven distinct hashes fit, one slot stays empty.
         for hash in 0..7 {
-            assert_eq!(table.insert(hash, hash + 1), Ok(0));
+            assert_eq!(table.insert(hash, hash + 1, 0), Ok(0));
         }
         for hash in 0..7 {
             assert_eq!(table.head(hash), hash + 1);
@@ -2056,8 +2618,8 @@ mod tests {
         assert_eq!(table.head(100), 0);
         // An existing hash still takes a new head; a new one is refused and
         // changes nothing.
-        assert_eq!(table.insert(3, 50), Ok(4));
-        assert_eq!(table.insert(7, 8), Err(TableFull));
+        assert_eq!(table.insert(3, 50, 0), Ok(4));
+        assert_eq!(table.insert(7, 8, 0), Err(TableFull));
         assert_eq!((table.len(), table.head(7), table.head(3)), (7, 0, 50));
     }
 
@@ -2613,18 +3175,18 @@ mod tests {
                 num_rows,
                 &random_state,
                 null_equality,
+                None,
                 &mut reservation,
             )
             .unwrap();
             // The peak includes the transient arrays; they are returned.
-            assert_eq!(peak, Some(partitioned_build_bytes(num_rows)));
+            assert_eq!(peak, Some(partitioned_build_bytes(num_rows, false)));
             assert_eq!(reservation.size(), 0);
             assert_eq!(*actual.next, *expected.next);
             assert_eq!(actual.len(), expected.len());
             assert_eq!(actual.chained, expected.chained);
             // Probe with every value and some absent ones.
-            let probe: arrow::array::ArrayRef =
-                Arc::new(UInt64Array::from_iter_values(0..250_000));
+            let probe: ArrayRef = Arc::new(UInt64Array::from_iter_values(0..250_000));
             let mut probe_hashes = vec![0; probe.len()];
             create_hashes([&probe], &random_state, &mut probe_hashes).unwrap();
             for limit in [7, 8192] {
@@ -2675,6 +3237,7 @@ mod tests {
             actual
                 .update_partitioned(&BuildRows {
                     hashes: &build,
+                    keys: None,
                     batches: &layout,
                 })
                 .unwrap();
@@ -2760,8 +3323,9 @@ mod tests {
         .unwrap();
         let on: Vec<datafusion_physical_expr::PhysicalExprRef> =
             vec![Arc::new(Column::new("k", 0))];
-        let pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(partitioned_build_bytes(rows) - 1));
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(
+            partitioned_build_bytes(rows, false) - 1,
+        ));
         let mut reservation = MemoryConsumer::new("build").register(&pool);
         let mut map = JoinHashMapU32::with_capacity(rows);
         let peak = build_partitioned(
@@ -2771,6 +3335,7 @@ mod tests {
             rows,
             &RandomState::with_seed(0),
             NullEquality::NullEqualsNothing,
+            None,
             &mut reservation,
         )
         .unwrap();

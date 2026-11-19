@@ -30,8 +30,10 @@ use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
 use crate::joins::hash_join::visited::VisitedBitmap;
+use crate::joins::inline_keys::{self, InlineKeys, inline_keys_enabled};
 use crate::joins::join_hash_map::{
-    JoinHashMapU32, JoinHashMapU64, PartitionedBuild, build_partitioned,
+    INLINE_MAX_ROWS, JoinHashMapInline, JoinHashMapU32, JoinHashMapU64, PartitionedBuild,
+    build_partitioned,
 };
 use crate::joins::key_range_bitmap::KeyRangeBitmap;
 use crate::joins::probe_completion::{Completion, ProbeCompletion};
@@ -3011,6 +3013,87 @@ fn is_perfect_hash_join_candidate(
     Ok(ArrayMap::is_supported_type(&data_type))
 }
 
+/// Longbow patch (JT 9): the inline-key encoding of a build of `num_rows`
+/// rows, or `None` when its table keeps only hashes: inline keys are off
+/// ([`inline_keys::INLINE_KEYS_ENV`]), the table is small enough to be
+/// built row by row (its build keys then mostly stay in the cache), the
+/// build has too many rows, or the keys have no encoding
+/// ([`InlineKeys`]). The ranges of several key columns come from the
+/// build's dynamic-filter `bounds` when present, else from a scan of the
+/// keys.
+fn inline_keys_for_build(
+    on_left: &[PhysicalExprRef],
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    bounds: Option<&PartitionBounds>,
+    num_rows: usize,
+    null_equality: NullEquality,
+) -> Result<Option<InlineKeys>> {
+    if !inline_keys_enabled()
+        || num_rows >= INLINE_MAX_ROWS
+        || !JoinHashMapU32::partitions_build(num_rows)
+    {
+        return Ok(None);
+    }
+    let types = on_left
+        .iter()
+        .map(|expr| expr.data_type(schema))
+        .collect::<Result<Vec<_>>>()?;
+    if !types.iter().all(inline_keys::is_supported) {
+        return Ok(None);
+    }
+    let scalar = |value: &datafusion_common::ScalarValue| {
+        value
+            .to_array_of_size(1)
+            .ok()
+            .and_then(|array| inline_keys::min_max(array.as_ref()))
+            .map(|(value, _)| value)
+    };
+    // `UInt64` bounds are ordered unsigned, the encoding's ranges signed.
+    if null_equality == NullEquality::NullEqualsNothing
+        && !types.contains(&DataType::UInt64)
+        && let Some(bounds) = bounds
+    {
+        let ranges = (0..on_left.len())
+            .map(|index| {
+                let bound = bounds.get_column_bounds(index)?;
+                Some((scalar(&bound.min)?, scalar(&bound.max)?))
+            })
+            .collect::<Vec<_>>();
+        if types.len() == 1 || ranges.iter().all(Option::is_some) {
+            return Ok(InlineKeys::from_ranges(&types, &ranges));
+        }
+    }
+    if types.len() == 1 && null_equality == NullEquality::NullEqualsNothing {
+        return Ok(InlineKeys::from_ranges(&types, &[None]));
+    }
+    let keys = batches
+        .iter()
+        .map(|batch| evaluate_expressions_to_arrays(on_left, batch))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(InlineKeys::for_build(&keys, null_equality))
+}
+
+/// Longbow patch (JT 9): the inline map of a partitioned build, reserving
+/// its head table (which can exceed hashbrown's estimate) and chain array.
+fn new_join_hashmap_inline(
+    num_rows: usize,
+    keys: InlineKeys,
+    reservation: &mut MemoryReservation,
+    metrics: &BuildProbeJoinMetrics,
+) -> Result<(JoinHashMapInline, usize)> {
+    let fixed_size = size_of::<JoinHashMapInline>();
+    let bytes = estimate_memory_size::<(u32, u64)>(num_rows, fixed_size)?
+        .max(JoinHashMapInline::table_bytes(num_rows) + fixed_size)
+        .checked_add(num_rows * size_of::<u32>())
+        .ok_or_else(|| {
+            datafusion_common::exec_datafusion_err!("Hash join table size overflow")
+        })?;
+    reservation.try_grow(bytes)?;
+    metrics.build_mem_used.add(bytes);
+    Ok((JoinHashMapInline::with_capacity(num_rows, keys), bytes))
+}
+
 /// Longbow patch (JT): the `u32` map of [`new_join_hashmap`], with the same
 /// reservation, for the partitioned build of `collect_left_input`.
 fn new_join_hashmap_u32(
@@ -3255,6 +3338,17 @@ async fn collect_left_input(
         _ => None,
     };
 
+    // Longbow patch (JT 9): large tables keep the build keys beside their
+    // chain heads.
+    let inline = inline_keys_for_build(
+        &on_left,
+        &schema,
+        &batches,
+        bounds.as_ref(),
+        num_rows,
+        null_equality,
+    )?;
+
     // Longbow family H: a CollectLeft build of at least
     // `longbow.execution.parallel_hash_build_rows` rows builds one sharded
     // table in parallel and consolidates `batches` itself (see
@@ -3269,6 +3363,7 @@ async fn collect_left_input(
                 &on_left,
                 &random_state,
                 null_equality,
+                inline.clone(),
                 &mut reservation,
                 &metrics,
             )
@@ -3298,6 +3393,7 @@ async fn collect_left_input(
         &array_map_created_count,
         prepared,
         path,
+        inline,
     )
 }
 
@@ -3330,6 +3426,7 @@ fn build_in_memory(
     array_map_created_count: &Count,
     prepared: bool,
     path: BuildPath,
+    inline: Option<InlineKeys>,
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
 
@@ -3376,7 +3473,42 @@ fn build_in_memory(
         // as the loop below. A pool that refuses the partitioning's transient
         // arrays gets the row-by-row build instead of an error.
         let mut partitioned = false;
-        let mut hashmap: Box<dyn JoinHashMapType> = if num_rows <= u32::MAX as usize
+        // Longbow patch (JT 9): an inline map is only built partitioned; when
+        // the pool refuses that build's transient arrays, the map is released
+        // and a hash-only map is built row by row.
+        let inline_map = match inline {
+            Some(keys) => {
+                let encoding = keys.clone();
+                let (mut map, bytes) =
+                    new_join_hashmap_inline(num_rows, keys, &mut reservation, metrics)?;
+                match build_partitioned(
+                    &mut map,
+                    on_left,
+                    batches,
+                    num_rows,
+                    random_state,
+                    null_equality,
+                    Some(&encoding),
+                    &mut reservation,
+                )? {
+                    Some(peak) => {
+                        partitioned_peak = Some(peak);
+                        partitioned = true;
+                        Some(Box::new(map) as Box<dyn JoinHashMapType>)
+                    }
+                    None => {
+                        drop(map);
+                        reservation.shrink(bytes);
+                        metrics.build_mem_used.sub(bytes);
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let mut hashmap: Box<dyn JoinHashMapType> = if let Some(map) = inline_map {
+            map
+        } else if num_rows <= u32::MAX as usize
             && JoinHashMapU32::partitions_build(num_rows)
         {
             let mut map = new_join_hashmap_u32(num_rows, &mut reservation, metrics)?;
@@ -3387,6 +3519,7 @@ fn build_in_memory(
                 num_rows,
                 random_state,
                 null_equality,
+                None,
                 &mut reservation,
             )? {
                 partitioned_peak = Some(peak);
