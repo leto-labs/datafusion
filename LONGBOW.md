@@ -721,6 +721,16 @@ UPSTREAMABLE.
     rows, the key copies, the bitmaps), the build is retried once from the
     rows that it still holds, without dense keys. So a build that fits with
     the switch off also fits with it on (review finding, leto-mjj.71).
+  - The leto-mjj.115 follow-up keeps the JT 9 feature and audit
+    classification. A refused partitioning charge drops dense keys and
+    retries the partitioning on the empty map. The partitioning avoids
+    scattered build writes, and a pruning bitmap can avoid scanning
+    containers. Both take priority over faster comparisons of rows
+    reaching the join probe. The bitmap currently requires a single key,
+    while dense keys require multiple keys. A full build retry requires a
+    live dense-key charge at refusal. When that retry hashes a concatenated
+    batch after the pool refuses partitioning, it reserves the larger hash
+    buffer before allocating it and propagates a refusal of that charge.
   - A partitioned build of one key column keeps hashes only.
   - The table of a spilling build's in-memory partitions (family JS) keeps
     hashes only. The partitions read back from spill files are joined by
