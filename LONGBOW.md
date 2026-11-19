@@ -740,3 +740,98 @@ as future work).
 
 Regressions: `scripts/vendored-tests.py datafusion-physical-plan asof`;
 `scripts/vendored-tests.py datafusion-proto --test proto_integration asof`.
+
+## Family JS: hybrid hash join spill in `HashJoinExec`
+
+Purpose: an eligible `HashJoinExec` answers a refused build reservation by
+writing hash partitions of its build side, and their probe rows, to spill
+files, and joins each written partition after the probe with a stock
+`CollectLeft` `HashJoinExec` over the two files. The fork's hash join failed
+with `Resources exhausted` when a build did not fit (TPC-H SF1000 q7, q9,
+q18, q21 and q22 in a 100 GiB pool, 2026-11-18). Dependent Longbow feature:
+JOIN-SPILL (OpenSpec change `add-join-spill`, ADR 0068). Classification:
+UPSTREAMABLE (related upstream: the hybrid-join epic apache/datafusion#24768;
+#26182, in this base, keeps build rows when a build fails; #27399, #27401 and
+#26442 rewrite the files it hooks).
+
+Off by default: `datafusion.execution.enable_hash_join_spilling = false`.
+With it off no code path changes. With it on, a join that fits runs the
+code it runs today: nothing is partitioned, copied or reserved before the
+first refusal, and no spill metric is registered.
+
+Change (`datafusion/physical-plan/src/joins/hash_join/`):
+
+- `spill/` (new): eligibility, the partition function, the build-side
+  relief, the probe routing, the written-partition barrier and the leaf
+  `SpillFilesExec` that reads a partition's files back.
+- Hook 1, `collect_left_input` (`exec.rs`): a refused reservation of an
+  eligible join moves the retained batches into 16 partitions and writes
+  whole partitions, largest first, until it released the refused bytes and
+  one eighth of what it held (plus the 16 MiB workspace it keeps from then
+  on). Later rows of a written partition go to its file through a buffer.
+  At the end of the input the table is built over the partitions that
+  stayed; a refused table writes half of them and builds again (the #26182
+  contract returns the rows). A table refused after the whole input was
+  admitted enters spill mode the same way.
+- Hook 2, `fetch_probe_batch` (`stream.rs`): rows of written partitions go
+  to this stream's probe file of the partition; rows whose key cannot match
+  stay in the batch.
+- Hook 3, after the in-memory pass (`stream.rs`): the stream drops its
+  reference to the in-memory table and forwards, partition by partition, its
+  output partition of the stock join over the partition's files. A
+  `CollectLeft` join's streams step through the partitions together
+  (one written build in memory per join); a split attempt's bound partitions
+  (`set_dynamic_filter_partitions`, now recorded without a dynamic filter
+  too) are the barrier's members. Stream `n` forwards partition `n`, so the
+  declared output partitioning holds. The partitions to join are decided
+  once every member registered its probe files; then the exec lets go of
+  the `CollectLeft` build it holds for its streams (`OnceAsync::release`,
+  `joins/utils.rs`), so the in-memory table's memory returns to the pool
+  while the written partitions run.
+- `shared_bounds.rs`: `PushdownStrategy::BoundsOnly`. A build that wrote a
+  partition publishes its bounds (which saw every build row) and no
+  membership form; in `Partitioned` routing only that partition's branch.
+- `datafusion/common/src/config.rs`: the six options of the design.
+
+Partition function: `(hash * K[level]) >> (64 - log2(16))` over the join
+hash (`HASH_JOIN_SEED`), with one odd multiplier per level that is not the
+table's slot multiplier. A written partition's join is eligible again, one
+level deeper, up to `hash_join_spill_max_depth` (3). Rows whose key cannot
+match (a NULL under `NullEqualsNothing`) never enter a key partition: build
+rows of this kind form one more partition when the join emits unmatched
+build rows, and are dropped otherwise.
+
+Eligibility (`JoinSpill::decide`): the option, a disk manager that can
+create files, not null-aware, an unordered and bounded probe input, no
+prepared build, a `CollectLeft` or `Partitioned` mode and a level within the
+depth limit. The build consumer is spillable only for an eligible join. An
+ineligible join's refused build fails as before, with the context
+"The hash join did not spill because ...".
+
+Metrics, registered at the first relief: `spill_count`, `spilled_bytes`,
+`spilled_rows`, `build_spilled_rows`, `build_spilled_bytes`,
+`probe_spilled_rows`, `probe_spilled_bytes`, `spilled_partitions` and the
+gauge `spill_depth` (levels that wrote; 1 for the first level only). The
+joins of written partitions report into the first-level join's metrics.
+
+Not in this family (`add-join-spill` section 3): build chunks with probe
+replay for a partition that cannot be divided (one hot key fails at the
+depth limit; `hash_join_spill_max_replay_passes` is reserved), and role
+reversal of a written partition whose probe is the smaller side.
+
+Tests (`spill/tests.rs`, `exec.rs`, `core/tests/memory_limit`): every join
+type, both null equalities, with and without a join filter, in `CollectLeft`
+with one and three probe streams and `Partitioned` mode, against the
+unbounded join, under forced spilling and under a pool below the build; a
+second spill level; the depth limit; each ineligible reason; a join that
+fits registers no spill metric and charges the same build memory; streams
+that leave early or run in a split attempt do not hold the barrier; the
+partitions to join are decided after every stream registered its files; a
+spilled build publishes bounds only, in both modes, and filters no matching
+probe row; the `join_by_key_*` memory-limit queries spill and answer in three
+quarters of their build memory, where spilling off fails, and in half of it
+fail at the depth limit with that reason (one `service` value holds about
+half of the rows: the case of `add-join-spill` section 3).
+
+Evidence: Longbow lane `leto-mjj.90`,
+`~/data/longbow/benchmarks/MJJ90-20261119/`.
