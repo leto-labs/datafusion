@@ -31,24 +31,29 @@ impl PreparedParquetScan {
     /// Load optional page indexes only when a surviving group exceeds the
     /// caller's scheduling threshold. Ordinary row groups add no metadata I/O.
     pub async fn with_page_index_if_oversized(mut self, rows: usize) -> Result<Self> {
-        let has_offset_index = self
-            .file
-            .metadata
-            .metadata()
-            .page_index()
-            .is_some_and(|page_index| page_index.has_offset_indexes());
-        if !has_offset_index
+        // Longbow family OO: the offset indexes of the columns this scan
+        // reads, in its row groups; a shared metadata cache loads the file's
+        // complete page index once.
+        let request = PageIndexRequest {
+            column_policy: PageIndexPolicy::Skip,
+            column_mask: ColumnChunkMask::none(),
+            offset_policy: PageIndexPolicy::Optional,
+            offset_mask: ColumnChunkMask::row_groups_and_columns(
+                self.file.groups.iter().copied(),
+                (0..self.file.metadata.parquet_schema().num_columns())
+                    .filter(|&leaf| self.file.read_mask.leaf_included(leaf)),
+            ),
+        };
+        if !request.is_covered_by(self.file.metadata.metadata())
             && self.file.groups.iter().any(|&group| {
                 self.file.metadata.metadata().row_group(group).num_rows() as usize > rows
             })
         {
-            let metadata = load_page_index(
-                self.file.metadata.clone(),
+            let metadata = load_requested_page_index(
+                &self.file.metadata,
                 &mut self.reader,
-                self.file
-                    .options
-                    .clone()
-                    .with_page_index_policy(PageIndexPolicy::Optional),
+                &self.file.options,
+                &request,
             )
             .await?;
             let file = Arc::get_mut(&mut self.file).ok_or_else(|| {
@@ -102,6 +107,8 @@ pub struct PreparedParquetFile {
     partition: usize,
     file: PartitionedFile,
     plan_metrics: ExecutionPlanMetricsSet,
+    /// The metrics of the open that prepared this file (Longbow family OO).
+    file_metrics: ParquetFileMetrics,
     hint: Option<usize>,
     options: ArrowReaderOptions,
 }
@@ -116,9 +123,11 @@ impl PreparedParquetFile {
     /// Create an independent range reader using the opener's configured factory.
     /// Metadata is already prepared and is not loaded by this call.
     pub fn reader(&self) -> Result<Box<dyn AsyncFileReader + Send>> {
+        // Longbow family OO: every reader of the file records into the
+        // open's metrics.
         self.factory.create_reader(
             self.partition,
-            self.file.clone(),
+            reader_file(&self.file, &self.file_metrics),
             self.hint,
             &self.plan_metrics,
         )
@@ -529,6 +538,7 @@ fn prepared_scan(pruned: PrunedParquetOpen) -> Result<PreparedParquetScan> {
         partition: prepared.partition_index,
         file: prepared.partitioned_file,
         plan_metrics: prepared.metrics,
+        file_metrics: prepared.file_metrics,
         hint: prepared.metadata_size_hint,
         options,
     });

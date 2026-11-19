@@ -8,7 +8,7 @@
 //! low level control of parquet file readers
 
 use crate::ParquetFileMetrics;
-use crate::metadata::DFParquetMetadata;
+use crate::metadata::{DFParquetMetadata, PageIndexRequest};
 use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 use datafusion_common::HashMap;
@@ -131,6 +131,34 @@ pub trait ScanPlanAdvice: Send {
     fn advise(&mut self, plan: ScanPlan);
 }
 
+/// The [`ParquetFileMetrics`] of one file open, attached to the
+/// [`PartitionedFile`] that the opener passes to a reader factory (Longbow
+/// family OO).
+///
+/// The factories of this crate give their readers these metrics instead of
+/// registering a second set for the same open; factories that wrap them pass
+/// the file through unchanged. A file without the extension (a caller other
+/// than the opener) gets new metrics, as before.
+#[derive(Debug, Clone)]
+pub(crate) struct OpenFileMetrics(pub(crate) ParquetFileMetrics);
+
+/// The metrics a reader of `partitioned_file` records into: the opener's
+/// metrics of the open when it attached them, else a new set.
+fn reader_file_metrics(
+    partition_index: usize,
+    partitioned_file: &PartitionedFile,
+    metrics: &ExecutionPlanMetricsSet,
+) -> ParquetFileMetrics {
+    match partitioned_file.extensions.get::<OpenFileMetrics>() {
+        Some(open) => open.0.clone(),
+        None => ParquetFileMetrics::new(
+            partition_index,
+            partitioned_file.object_meta.location.as_ref(),
+            metrics,
+        ),
+    }
+}
+
 /// Default implementation of [`ParquetFileReaderFactory`]
 ///
 /// This implementation:
@@ -157,11 +185,8 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
         metadata_size_hint: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>> {
-        let file_metrics = ParquetFileMetrics::new(
-            partition_index,
-            partitioned_file.object_meta.location.as_ref(),
-            metrics,
-        );
+        let file_metrics =
+            reader_file_metrics(partition_index, &partitioned_file, metrics);
 
         let reader = ParquetFileReader::new(
             file_metrics,
@@ -205,11 +230,8 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         metadata_size_hint: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>> {
-        let file_metrics = ParquetFileMetrics::new(
-            partition_index,
-            partitioned_file.object_meta.location.as_ref(),
-            metrics,
-        );
+        let file_metrics =
+            reader_file_metrics(partition_index, &partitioned_file, metrics);
 
         let reader = ParquetFileReader::new(
             file_metrics,
@@ -239,10 +261,18 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
 /// a custom implementation of [`ParquetFileReaderFactory`].
 pub struct ParquetFileReader {
     file_metrics: ParquetFileMetrics,
+    /// Bytes this reader fetched. The metrics can be shared by the readers
+    /// of one open (Longbow family OO), so the scan efficiency ratio takes
+    /// each reader's own bytes, not the shared counter.
+    scanned: usize,
     store: Arc<dyn ObjectStore>,
     partitioned_file: PartitionedFile,
     metadata_cache: Option<Arc<FileMetadataCache>>,
     metadata_size_hint: Option<usize>,
+    /// The metadata this reader last returned when it does not share it
+    /// through a cache, so that a later request for page index entries loads
+    /// only those entries instead of the footer again (Longbow family OO).
+    footer: Option<Arc<ParquetMetaData>>,
 }
 
 impl ParquetFileReader {
@@ -261,10 +291,12 @@ impl ParquetFileReader {
     ) -> Self {
         Self {
             file_metrics,
+            scanned: 0,
             store,
             partitioned_file,
             metadata_cache: None,
             metadata_size_hint: None,
+            footer: None,
         }
     }
 
@@ -301,8 +333,9 @@ impl AsyncFileReader for ParquetFileReader {
         &mut self,
         range: Range<u64>,
     ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
-        let bytes_scanned = range.end - range.start;
-        self.file_metrics.bytes_scanned.add(bytes_scanned as usize);
+        let bytes_scanned = (range.end - range.start) as usize;
+        self.file_metrics.bytes_scanned.add(bytes_scanned);
+        self.scanned = self.scanned.saturating_add(bytes_scanned);
         // Longbow family D: read the generation the plan names.
         async move {
             crate::identity_io::get_range(
@@ -323,8 +356,9 @@ impl AsyncFileReader for ParquetFileReader {
     where
         Self: Send,
     {
-        let total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
-        self.file_metrics.bytes_scanned.add(total as usize);
+        let total = ranges.iter().map(|r| r.end - r.start).sum::<u64>() as usize;
+        self.file_metrics.bytes_scanned.add(total);
+        self.scanned = self.scanned.saturating_add(total);
         async move {
             crate::identity_io::get_ranges(
                 self.store.as_ref(),
@@ -353,21 +387,42 @@ impl AsyncFileReader for ParquetFileReader {
             #[cfg(not(feature = "parquet_encryption"))]
             let file_decryption_properties = None;
 
-            let page_index_policy = options.map(|o| o.column_index_policy());
+            let request = options.map(PageIndexRequest::from_options);
+            let shares_metadata =
+                metadata_cache.is_some() && file_decryption_properties.is_none();
+            let error = |e: datafusion_common::DataFusionError| {
+                ParquetError::General(format!(
+                    "Failed to fetch metadata for file {}: {e}",
+                    object_meta.location,
+                ))
+            };
 
-            DFParquetMetadata::new(&self.store, &object_meta)
+            // Longbow family OO: without a shared cache, a later request for
+            // page index entries adds them to the footer this reader already
+            // returned instead of reading the footer again.
+            if !shares_metadata
+                && let Some(request) = request.as_ref()
+                && let Some(footer) = self.footer.clone()
+            {
+                // Through this reader, so the bytes count as scanned.
+                let metadata =
+                    request.load_with(footer, &mut *self).await.map_err(error)?;
+                self.footer = Some(Arc::clone(&metadata));
+                return Ok(metadata);
+            }
+
+            let metadata = DFParquetMetadata::new(&self.store, &object_meta)
                 .with_decryption_properties(file_decryption_properties)
                 .with_file_metadata_cache(metadata_cache)
                 .with_metadata_size_hint(self.metadata_size_hint)
-                .with_page_index_policy(page_index_policy)
+                .with_page_index_request(request)
                 .fetch_metadata()
                 .await
-                .map_err(|e| {
-                    ParquetError::General(format!(
-                        "Failed to fetch metadata for file {}: {e}",
-                        object_meta.location,
-                    ))
-                })
+                .map_err(error)?;
+            if !shares_metadata {
+                self.footer = Some(Arc::clone(&metadata));
+            }
+            Ok(metadata)
         }
         .boxed()
     }
@@ -377,7 +432,7 @@ impl Drop for ParquetFileReader {
     fn drop(&mut self) {
         self.file_metrics
             .scan_efficiency_ratio
-            .add_part(self.file_metrics.bytes_scanned.value());
+            .add_part(self.scanned);
         // Multiple ParquetFileReaders may run, so we set_total to avoid adding the total multiple times
         self.file_metrics
             .scan_efficiency_ratio
