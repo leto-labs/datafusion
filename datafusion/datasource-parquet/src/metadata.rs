@@ -23,6 +23,7 @@ use datafusion_common::{
 use datafusion_execution::cache::cache_manager::{
     CachedFileMetadataEntry, FileMetadata, FileMetadataCache,
 };
+use datafusion_execution::object_store::StoreId;
 use datafusion_functions_aggregate_common::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
@@ -47,7 +48,7 @@ use parquet::file::metadata::{
 use parquet::file::statistics::Statistics as ParquetStatistics;
 use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
 use std::any::Any;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 
 /// Minimum fraction of row groups that must report NDV statistics for the
 /// merged result to be `Inexact` rather than `Absent`, as the estimate
@@ -211,7 +212,6 @@ pub(crate) fn has_nan_unsafe_float_stats<'a>(
 /// [`ParquetFileReaderFactory`].
 ///
 /// [`ParquetFileReaderFactory`]: crate::ParquetFileReaderFactory
-#[derive(Debug)]
 pub struct DFParquetMetadata<'a> {
     /// Source of the Parquet file's bytes.
     store: &'a dyn ObjectStore,
@@ -227,11 +227,11 @@ pub struct DFParquetMetadata<'a> {
     /// Optional cache of previously fetched [`ParquetMetaData`], keyed by
     /// object store and file location ([`file_metadata_cache_key`]).
     file_metadata_cache: Option<Arc<FileMetadataCache>>,
-    /// The allocation of the store this reads, which namespaces the cache
+    /// The registration of the store this reads, which namespaces the cache
     /// key (Longbow family OO). Without it the cache is not used: a path
     /// alone does not identify a file across stores, and a URL does not
     /// identify the store registered under it over time.
-    store_identity: Option<Weak<dyn ObjectStore>>,
+    store_id: Option<StoreId>,
     /// Counts the bytes of page index reads for the caller's scan metrics
     /// (Longbow family OO). Footer reads are not counted.
     page_index_bytes: Option<Count>,
@@ -252,6 +252,23 @@ pub struct DFParquetMetadata<'a> {
     enable_rle_to_dictionary: bool,
 }
 
+/// Formats neither the store, whose configuration can name its URL or hold
+/// credentials, nor the decryption properties (Longbow family OO).
+impl std::fmt::Debug for DFParquetMetadata<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DFParquetMetadata")
+            .field("location", &self.object_meta.location)
+            .field("size", &self.object_meta.size)
+            .field("metadata_size_hint", &self.metadata_size_hint)
+            .field("store_id", &self.store_id)
+            .field("cached", &self.file_metadata_cache.is_some())
+            .field("page_index_request", &self.page_index_request)
+            .field("derived_copies", &self.derived_copies)
+            .field("coerce_int96", &self.coerce_int96)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> DFParquetMetadata<'a> {
     /// Create a new `DFParquetMetadata` for the given file.
     ///
@@ -264,7 +281,7 @@ impl<'a> DFParquetMetadata<'a> {
             metadata_size_hint: None,
             decryption_properties: None,
             file_metadata_cache: None,
-            store_identity: None,
+            store_id: None,
             page_index_bytes: None,
             derived_copies: 0,
             page_index_request: None,
@@ -329,26 +346,14 @@ impl<'a> DFParquetMetadata<'a> {
         self
     }
 
-    /// Namespace the cache by the allocation of `store`: the store this
-    /// reads, or the registered store it wraps
-    /// (`ObjectStoreRegistry::get_store_identity`) (Longbow family OO). Its
-    /// entries keep the allocation weakly, so no other store can take its
-    /// address while they exist, and a store registered in its place has
-    /// another allocation and so other entries.
-    pub fn with_store_identity(mut self, store: &Arc<dyn ObjectStore>) -> Self {
-        self.store_identity = Some(Arc::downgrade(store));
+    /// Namespace the cache by `id`, the registration of the store this
+    /// reads, as `ObjectStoreRegistry::get_store_with_id` returns it with
+    /// the store (Longbow family OO). IDs are never reused, so a store
+    /// registered in its place has other entries. Without an ID the cache
+    /// is not used.
+    pub fn with_store_id(mut self, id: Option<StoreId>) -> Self {
+        self.store_id = id;
         self
-    }
-
-    /// [`Self::with_store_identity`] when `store` is given.
-    pub fn with_optional_store_identity(
-        self,
-        store: Option<&Arc<dyn ObjectStore>>,
-    ) -> Self {
-        match store {
-            Some(store) => self.with_store_identity(store),
-            None => self,
-        }
     }
 
     /// Counts the bytes of page index reads into `counter` (Longbow family
@@ -421,7 +426,7 @@ impl<'a> DFParquetMetadata<'a> {
         //       → load the requested index (complete when cached; counted)
         //       → write back if cached, validate the request, return
         //
-        // Longbow family OO: entries are keyed by store allocation and path
+        // Longbow family OO: entries are keyed by store registration and path
         // (`file_metadata_cache_key`) and validated against the listed
         // generation, so a footer of one store never meets another store's
         // index. A `Required` request is validated against the caller's own
@@ -442,7 +447,7 @@ impl<'a> DFParquetMetadata<'a> {
                 .file_metadata
                 .as_any()
                 .downcast_ref::<CachedParquetMetaData>()
-            && cached_parquet.is_of(self.store_identity.as_ref())
+            && cached_parquet.is_of(self.store_id)
         {
             let cached_metadata = Arc::clone(cached_parquet.parquet_metadata());
             // A required request that the footer rules out fails before any
@@ -490,9 +495,8 @@ impl<'a> DFParquetMetadata<'a> {
 
     /// The cache key of this file: its store and location.
     fn cache_key(&self) -> Option<Path> {
-        let store = self.store_identity.as_ref()?;
-        Some(store_cache_key(
-            Weak::as_ptr(store),
+        Some(file_metadata_cache_key(
+            self.store_id?,
             &self.object_meta.location,
         ))
     }
@@ -540,7 +544,7 @@ impl<'a> DFParquetMetadata<'a> {
                             footer_bytes,
                             self.derived_copies,
                         )
-                        .with_store(self.store_identity.clone()),
+                        .with_store(self.store_id),
                     ),
                 ),
             );
@@ -1488,16 +1492,12 @@ impl PageIndexRequest {
     }
 }
 
-/// The file metadata cache key of `location` in `store` (Longbow family
-/// OO): the store's allocation as the first path segment, then the location.
-/// A location alone names files in different stores alike, and a URL names
-/// whichever store is registered under it.
-pub fn file_metadata_cache_key(store: &Arc<dyn ObjectStore>, location: &Path) -> Path {
-    store_cache_key(Arc::as_ptr(store), location)
-}
-
-fn store_cache_key(store: *const dyn ObjectStore, location: &Path) -> Path {
-    let store = format!("store@{:x}", store.cast::<()>() as usize);
+/// The file metadata cache key of `location` in the store registration
+/// `store` (Longbow family OO): the [`StoreId`] as the first path segment,
+/// then the location. A location alone names files in different stores
+/// alike, and a URL names whichever store is registered under it.
+pub fn file_metadata_cache_key(store: StoreId, location: &Path) -> Path {
+    let store = store.to_string();
     Path::from_iter(
         std::iter::once(PathPart::from(store.as_str())).chain(location.parts()),
     )
@@ -1551,9 +1551,8 @@ impl<F: MetadataFetch + Send> MetadataFetch for CountedFetch<F> {
 /// entry, so they never outlive its eviction.
 pub struct CachedParquetMetaData {
     metadata: Arc<ParquetMetaData>,
-    /// The store allocation that keys this entry, kept so that no other
-    /// store can take its address while the entry exists.
-    store: Option<Weak<dyn ObjectStore>>,
+    /// The store registration that keys this entry.
+    store: Option<StoreId>,
     /// The footer's size without its page index.
     footer_bytes: usize,
     derived: Box<[OnceLock<Arc<ParquetMetaData>>]>,
@@ -1580,21 +1579,16 @@ impl CachedParquetMetaData {
         }
     }
 
-    /// This entry keyed by the allocation of `store`.
-    pub(crate) fn with_store(mut self, store: Option<Weak<dyn ObjectStore>>) -> Self {
+    /// This entry keyed by the store registration `store`.
+    pub fn with_store(mut self, store: Option<StoreId>) -> Self {
         self.store = store;
         self
     }
 
-    /// Whether this entry is of the store `identity`: entries are keyed by
-    /// a store's allocation, and are that store's only.
-    fn is_of(&self, identity: Option<&Weak<dyn ObjectStore>>) -> bool {
-        match (identity, &self.store) {
-            (Some(store), Some(own)) => {
-                std::ptr::addr_eq(Weak::as_ptr(store), Weak::as_ptr(own))
-            }
-            _ => false,
-        }
+    /// Whether this entry is of the store registration `id`: entries are
+    /// that registration's only.
+    fn is_of(&self, id: Option<StoreId>) -> bool {
+        id.is_some() && self.store == id
     }
 
     /// The number of derived copies this entry reserves.

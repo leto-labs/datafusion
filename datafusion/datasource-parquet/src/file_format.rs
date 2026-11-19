@@ -417,7 +417,6 @@ async fn fetch_stats_and_ordering(
         .with_metadata_size_hint(metadata_size_hint)
         .with_decryption_properties(file_decryption_properties)
         .with_file_metadata_cache(Some(file_metadata_cache))
-        .with_store_identity(store)
         .fetch_metadata()
         .await?;
     let statistics =
@@ -480,7 +479,6 @@ impl FileFormat for ParquetFormat {
                     .with_metadata_size_hint(self.metadata_size_hint())
                     .with_decryption_properties(file_decryption_properties)
                     .with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)))
-                    .with_store_identity(store)
                     .with_coerce_int96(coerce_int96)
                     .with_coerce_int96_tz(coerce_int96_tz.clone())
                     .with_enable_rle_to_dictionary(
@@ -568,7 +566,6 @@ impl FileFormat for ParquetFormat {
             .with_metadata_size_hint(self.metadata_size_hint())
             .with_decryption_properties(file_decryption_properties)
             .with_file_metadata_cache(Some(file_metadata_cache))
-            .with_store_identity(store)
             .fetch_statistics(&table_schema)
             .await
     }
@@ -589,7 +586,6 @@ impl FileFormat for ParquetFormat {
             .with_metadata_size_hint(self.metadata_size_hint())
             .with_decryption_properties(file_decryption_properties)
             .with_file_metadata_cache(Some(file_metadata_cache))
-            .with_store_identity(store)
             .fetch_metadata()
             .await?;
         crate::metadata::ordering_from_parquet_metadata(&metadata, &table_schema)
@@ -665,18 +661,13 @@ impl FileFormat for ParquetFormat {
 
         // Use the CachedParquetFileReaderFactory
         let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
-        let store = state
-            .runtime_env()
-            .object_store(conf.object_store_url.clone())?;
-        // Longbow family OO: keyed by the registered store's allocation.
-        let identity = state
-            .runtime_env()
-            .object_store_registry
-            .get_store_identity(conf.object_store_url.as_ref())?;
-        let cached_parquet_read_factory = Arc::new(
-            CachedParquetFileReaderFactory::new(store, metadata_cache)
-                .with_store_identity(identity),
-        );
+        // Longbow family OO: the store and its registration from one lookup.
+        let cached_parquet_read_factory =
+            Arc::new(CachedParquetFileReaderFactory::from_registry(
+                state.runtime_env().object_store_registry.as_ref(),
+                &conf.object_store_url,
+                metadata_cache,
+            )?);
         source = source.with_parquet_file_reader_factory(cached_parquet_read_factory);
 
         if let Some(metadata_size_hint) = metadata_size_hint {

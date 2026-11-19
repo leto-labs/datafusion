@@ -15,6 +15,7 @@ use datafusion_common::HashMap;
 use datafusion_datasource::PartitionedFile;
 use datafusion_execution::cache::cache_manager::FileMetadata;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
+use datafusion_execution::object_store::{ObjectStoreRegistry, ObjectStoreUrl, StoreId};
 use datafusion_physical_plan::metrics::Count;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::FutureExt;
@@ -76,6 +77,13 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
         &self,
         _copies: usize,
     ) -> Option<Arc<dyn ParquetFileReaderFactory>> {
+        None
+    }
+
+    /// The registration of the store this factory's readers read, which
+    /// keys the entries they share ([`ObjectStoreRegistry::get_store_with_id`],
+    /// Longbow family OO); `None` when they share none (the default).
+    fn store_id(&self) -> Option<StoreId> {
         None
     }
 
@@ -178,9 +186,17 @@ fn reader_file_metrics(
 /// 1. Reads parquet directly from an underlying [`ObjectStore`] instance.
 /// 2. Reads the footer and page metadata on demand.
 /// 3. Does not cache metadata or coalesce I/O operations.
-#[derive(Debug)]
 pub struct DefaultParquetFileReaderFactory {
     store: Arc<dyn ObjectStore>,
+}
+
+/// Does not format the store, whose configuration can name its URL or hold
+/// credentials (Longbow family OO).
+impl Debug for DefaultParquetFileReaderFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DefaultParquetFileReaderFactory")
+            .finish_non_exhaustive()
+    }
 }
 
 impl DefaultParquetFileReaderFactory {
@@ -220,36 +236,48 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
 #[derive(Clone)]
 pub struct CachedParquetFileReaderFactory {
     store: Arc<dyn ObjectStore>,
-    /// The store whose allocation namespaces the cache (Longbow family OO):
-    /// `store`, or the registered store that `store` wraps.
-    store_identity: Arc<dyn ObjectStore>,
+    /// The registration of `store`, which namespaces the cache (Longbow
+    /// family OO). Without it the cache is not used.
+    store_id: Option<StoreId>,
     metadata_cache: Arc<FileMetadataCache>,
     derived_copies: usize,
 }
 
 impl CachedParquetFileReaderFactory {
-    /// A factory of readers of `store` that share `metadata_cache`. Entries
-    /// are keyed by the allocation of `store` and the file's location, so
-    /// stores never share an entry and a store registered in another's
-    /// place starts with none (Longbow family OO).
+    /// A factory of readers of `store` that do not use `metadata_cache`
+    /// until [`Self::with_store_id`] names the store's registration
+    /// (Longbow family OO): a store alone does not identify which files it
+    /// reads over time. [`Self::from_registry`] does both.
     pub fn new(
         store: Arc<dyn ObjectStore>,
         metadata_cache: Arc<FileMetadataCache>,
     ) -> Self {
         Self {
-            store_identity: Arc::clone(&store),
             store,
+            store_id: None,
             metadata_cache,
             derived_copies: 0,
         }
     }
 
-    /// Key the cache by `identity`'s allocation instead: the registered
-    /// store that this factory's `store` wraps (for example per execution
-    /// attempt), as `ObjectStoreRegistry::get_store_identity` returns it.
-    /// `store` must read exactly `identity`'s objects.
-    pub fn with_store_identity(mut self, identity: Arc<dyn ObjectStore>) -> Self {
-        self.store_identity = identity;
+    /// A factory over the store registered for `url` in `registry`, with
+    /// the store and its registration from one lookup
+    /// ([`ObjectStoreRegistry::get_store_with_id`]), so that the entries
+    /// its readers share are that store's (Longbow family OO).
+    pub fn from_registry(
+        registry: &dyn ObjectStoreRegistry,
+        url: &ObjectStoreUrl,
+        metadata_cache: Arc<FileMetadataCache>,
+    ) -> datafusion_common::Result<Self> {
+        let (store, id) = registry.get_store_with_id(url.as_ref())?;
+        Ok(Self::new(store, metadata_cache).with_store_id(id))
+    }
+
+    /// Key the cache by `id`, the registration of this factory's store as
+    /// [`ObjectStoreRegistry::get_store_with_id`] returned it with the
+    /// store. Entries of a store registered in its place are never shared.
+    pub fn with_store_id(mut self, id: Option<StoreId>) -> Self {
+        self.store_id = id;
         self
     }
 
@@ -264,10 +292,7 @@ impl CachedParquetFileReaderFactory {
 impl Debug for CachedParquetFileReaderFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedParquetFileReaderFactory")
-            .field(
-                "store_identity",
-                &Arc::as_ptr(&self.store_identity).cast::<()>(),
-            )
+            .field("store_id", &self.store_id)
             .field("derived_copies", &self.derived_copies)
             .finish_non_exhaustive()
     }
@@ -281,6 +306,10 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         Some(Arc::new(
             CachedParquetFileReaderFactory::with_derived_copies(self.clone(), copies),
         ))
+    }
+
+    fn store_id(&self) -> Option<StoreId> {
+        self.store_id
     }
 
     fn create_reader(
@@ -300,7 +329,7 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         )
         .with_metadata_hint(metadata_size_hint)
         .with_metadata_cache(Some(Arc::clone(&self.metadata_cache)))
-        .with_store_identity(Some(Arc::clone(&self.store_identity)))
+        .with_store_id(self.store_id)
         .with_derived_copies(self.derived_copies);
 
         Ok(Box::new(reader))
@@ -330,9 +359,9 @@ pub struct ParquetFileReader {
     store: Arc<dyn ObjectStore>,
     partitioned_file: PartitionedFile,
     metadata_cache: Option<Arc<FileMetadataCache>>,
-    /// The store whose allocation namespaces `metadata_cache`; without it
-    /// the cache is not used (Longbow family OO).
-    store_identity: Option<Arc<dyn ObjectStore>>,
+    /// The registration of `store`, which namespaces `metadata_cache`;
+    /// without it the cache is not used (Longbow family OO).
+    store_id: Option<StoreId>,
     derived_copies: usize,
     metadata_size_hint: Option<usize>,
     /// The metadata this reader last returned when it does not share it
@@ -361,7 +390,7 @@ impl ParquetFileReader {
             store,
             partitioned_file,
             metadata_cache: None,
-            store_identity: None,
+            store_id: None,
             derived_copies: 0,
             metadata_size_hint: None,
             footer: None,
@@ -387,11 +416,10 @@ impl ParquetFileReader {
         self
     }
 
-    /// Set the store whose allocation keys the metadata cache: the reader's
-    /// store or the registered store it wraps. The cache is used only with
-    /// it (Longbow family OO).
-    pub fn with_store_identity(mut self, identity: Option<Arc<dyn ObjectStore>>) -> Self {
-        self.store_identity = identity;
+    /// Set the registration of the reader's store, which keys the metadata
+    /// cache. The cache is used only with it (Longbow family OO).
+    pub fn with_store_id(mut self, id: Option<StoreId>) -> Self {
+        self.store_id = id;
         self
     }
 
@@ -460,7 +488,7 @@ impl AsyncFileReader for ParquetFileReader {
     ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
         let object_meta = self.partitioned_file.object_meta.clone();
         let metadata_cache = self.metadata_cache.clone();
-        let store_identity = self.store_identity.clone();
+        let store_id = self.store_id;
 
         async move {
             #[cfg(feature = "parquet_encryption")]
@@ -473,7 +501,7 @@ impl AsyncFileReader for ParquetFileReader {
 
             let request = options.map(PageIndexRequest::from_options);
             let shares_metadata = metadata_cache.is_some()
-                && store_identity.is_some()
+                && store_id.is_some()
                 && file_decryption_properties.is_none();
             let error = |e: datafusion_common::DataFusionError| {
                 ParquetError::General(format!(
@@ -503,7 +531,7 @@ impl AsyncFileReader for ParquetFileReader {
             let fetched = DFParquetMetadata::new(&self.store, &object_meta)
                 .with_decryption_properties(file_decryption_properties)
                 .with_file_metadata_cache(metadata_cache)
-                .with_optional_store_identity(store_identity.as_ref())
+                .with_store_id(store_id)
                 .with_derived_copies(self.derived_copies)
                 .with_metadata_size_hint(self.metadata_size_hint)
                 .with_page_index_request(request)

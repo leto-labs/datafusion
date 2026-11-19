@@ -1094,22 +1094,25 @@ in `ArrowReaderOptions`).
 
 Review fixes (MJJ96 independent review, 2026-11-19):
 
-- **Store identity.** The file metadata cache key is the allocation of the
-  store that reads the file plus the location
+- **Store identity (final review, 2026-11-20).** Entries are keyed by
+  registration, never by address. `ObjectStoreRegistry::get_store_with_id`
+  returns the store and the `StoreId` of its registration from one lookup
+  (the default registry stores the ID beside the store and reads both under
+  one map guard; the trait default returns no ID). A `StoreId` comes from a
+  process-wide counter at registration and is never reused, so a store
+  registered in another's place at the same URL, even at a reused address,
+  has other entries. The key is `store-<id>/<location>`
   (`metadata::file_metadata_cache_key`), validated against the listed
-  generation (size, modification time, ETag, version); each entry keeps the
-  store weakly, so no other store can take its address while the entry
-  exists. The store is the one the registry resolves:
-  `ObjectStoreRegistry::get_store_identity` (default `get_store`) returns the
-  registered store even when `get_store` wraps it per call, and
-  `CachedParquetFileReaderFactory::with_store_identity` takes it. Planning
-  reads (`DFParquetMetadata::with_store_identity` with the registry's `Arc`)
-  and execution reads of one store therefore share one entry, and a store
-  registered in another's place at the same URL has another allocation and
-  so other entries; the old ones age out under the budget (re-review
-  finding 1). Without an identity the cache is skipped. No URL is keyed or
-  printed (`Debug` shows the identity's address). Upstream
-  apache/datafusion#27580 (open) keys by URL instead.
+  generation (size, modification time, ETag, version).
+  `CachedParquetFileReaderFactory::from_registry` makes every factory in
+  `ParquetFormat::create_physical_plan` and the `ParquetSource` decode from
+  that one call; `ParquetFileReaderFactory::store_id` tells a wrapper which
+  registration a factory reads. Without an ID the cache is skipped: planning
+  reads (`infer_schema`, `infer_stats`, orderings), which get a store and no
+  URL, now read footers uncached, and the core parquet tests count those
+  requests. No URL or store is formatted: `Debug` of `DFParquetMetadata`
+  and both factories omits the store. Upstream apache/datafusion#27580
+  (open) keys by URL instead.
 - **Required validation.** `PageIndexRequest::validate` applies Arrow's
   `Required` rule for the offset index (with any selected index range, every
   selected chunk needs an offset index) from the footer, on cache hits and

@@ -63,10 +63,7 @@ async fn oo_page_index_is_parsed_once_per_file_generation() {
         .with_predicate(predicate)
         .with_enable_page_index(true)
         .with_row_group_stats_pruning(false)
-        .with_parquet_file_reader_factory(Arc::new(CachedParquetFileReaderFactory::new(
-            Arc::clone(&store),
-            Arc::clone(&cache),
-        )))
+        .with_parquet_file_reader_factory(Arc::new(test_cached_factory(&store, &cache)))
         .build();
 
     let len = write_pages(&store, "t.parquet", (1..=100).collect()).await;
@@ -499,7 +496,7 @@ async fn a_cached_reader_charges_cold_page_index_bytes_to_the_open() {
     let cache: Arc<FileMetadataCache> =
         Arc::new(DefaultCache::<Path, CachedFileMetadataEntry>::new(1 << 20));
     let metrics = ExecutionPlanMetricsSet::new();
-    let mut reader = CachedParquetFileReaderFactory::new(store, cache)
+    let mut reader = test_cached_factory(&store, &cache)
         .create_reader(
             0,
             PartitionedFile::new(path.to_string(), size),
@@ -553,7 +550,7 @@ async fn oo_metadata_cache_keys_entries_by_object_store() {
         async move {
             DFParquetMetadata::new(store.as_ref(), &meta)
                 .with_file_metadata_cache(Some(cache))
-                .with_store_identity(&store)
+                .with_store_id(Some(test_store_id(&store)))
                 .with_page_index_policy(Some(policy))
                 .fetch_metadata()
                 .await
@@ -575,10 +572,8 @@ async fn oo_metadata_cache_keys_entries_by_object_store() {
     assert!(Arc::ptr_eq(&first_a, &again_a));
     let again_b = fetch(&b, PageIndexPolicy::Skip).await;
     assert!(Arc::ptr_eq(&indexed_b, &again_b));
-    // Keys are per store allocation.
-    let key = |store: &Arc<dyn ObjectStore>| {
-        crate::metadata::file_metadata_cache_key(store, &Path::from(path))
-    };
+    // Keys are per store registration.
+    let key = |store: &Arc<dyn ObjectStore>| test_cache_key(store, &Path::from(path));
     assert_ne!(key(&a), key(&b));
     assert_eq!(key(&a), key(&Arc::clone(&a)));
 }
@@ -640,7 +635,7 @@ async fn oo_a_required_request_on_a_cache_hit_is_validated_as_a_load_is() {
             file.object_meta.clone(),
             Arc::new(
                 CachedParquetMetaData::new(Arc::new(partial))
-                    .with_store(Some(Arc::downgrade(&store))),
+                    .with_store(Some(test_store_id(&store))),
             ),
         ),
     );
@@ -648,7 +643,7 @@ async fn oo_a_required_request_on_a_cache_hit_is_validated_as_a_load_is() {
     let fetch = async |policy| {
         DFParquetMetadata::new(store.as_ref(), &file.object_meta)
             .with_file_metadata_cache(Some(Arc::clone(&cache)))
-            .with_store_identity(&store)
+            .with_store_id(Some(test_store_id(&store)))
             .with_page_index_policy(Some(policy))
             .with_page_index_bytes(Some(index_bytes.clone()))
             .fetch_metadata()
@@ -672,7 +667,7 @@ async fn oo_a_required_request_on_a_cache_hit_is_validated_as_a_load_is() {
     };
     let metadata = DFParquetMetadata::new(store.as_ref(), &file.object_meta)
         .with_file_metadata_cache(Some(Arc::clone(&cache)))
-        .with_store_identity(&store)
+        .with_store_id(Some(test_store_id(&store)))
         .with_page_index_request(Some(first))
         .fetch_metadata()
         .await
@@ -681,7 +676,7 @@ async fn oo_a_required_request_on_a_cache_hit_is_validated_as_a_load_is() {
 }
 
 #[tokio::test]
-async fn oo_planning_reads_key_the_cache_by_store_allocation() {
+async fn oo_metadata_entries_are_keyed_by_store_id() {
     let a: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let b: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let path = "same.parquet";
@@ -704,7 +699,7 @@ async fn oo_planning_reads_key_the_cache_by_store_allocation() {
     let fetch = async |store: &Arc<dyn ObjectStore>| {
         DFParquetMetadata::new(store.as_ref(), &file.object_meta)
             .with_file_metadata_cache(Some(Arc::clone(&cache)))
-            .with_store_identity(store)
+            .with_store_id(Some(test_store_id(store)))
             .with_page_index_policy(Some(PageIndexPolicy::Skip))
             .fetch_metadata()
             .await
@@ -717,9 +712,16 @@ async fn oo_planning_reads_key_the_cache_by_store_allocation() {
     assert_eq!(cache.len(), 2);
     assert!(Arc::ptr_eq(&first_a, &fetch(&a).await));
     assert!(Arc::ptr_eq(&first_b, &fetch(&b).await));
-    // A clone of the same store is the same allocation; another wrapper is not.
-    let alias = Arc::clone(&a);
-    assert!(Arc::ptr_eq(&first_a, &fetch(&alias).await));
+    // A read without a store ID, as at planning, neither uses nor fills
+    // the cache.
+    let unkeyed = DFParquetMetadata::new(a.as_ref(), &file.object_meta)
+        .with_file_metadata_cache(Some(Arc::clone(&cache)))
+        .with_page_index_policy(Some(PageIndexPolicy::Skip))
+        .fetch_metadata()
+        .await
+        .unwrap();
+    assert!(!Arc::ptr_eq(&first_a, &unkeyed));
+    assert_eq!(cache.len(), 2);
 }
 
 /// Re-review MJJ96 finding 1: replacing the store registered under a URL
@@ -753,10 +755,14 @@ async fn oo_a_replaced_store_at_the_same_url_reads_its_own_footer() {
     let cache: Arc<FileMetadataCache> =
         Arc::new(DefaultCache::<Path, CachedFileMetadataEntry>::new(1 << 20));
     let footer = async |registry: &DefaultObjectStoreRegistry| {
-        let store = registry.get_store(url.as_ref()).unwrap();
-        let mut reader = cached_factory(store, Arc::clone(&cache))
-            .create_reader(0, file.clone(), None, &ExecutionPlanMetricsSet::new())
-            .unwrap();
+        let mut reader = CachedParquetFileReaderFactory::from_registry(
+            registry,
+            &url,
+            Arc::clone(&cache),
+        )
+        .unwrap()
+        .create_reader(0, file.clone(), None, &ExecutionPlanMetricsSet::new())
+        .unwrap();
         let skip =
             ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
         reader.get_metadata(Some(&skip)).await.unwrap()
@@ -772,9 +778,114 @@ async fn oo_a_replaced_store_at_the_same_url_reads_its_own_footer() {
     );
 }
 
-fn cached_factory(
-    store: Arc<dyn ObjectStore>,
-    cache: Arc<FileMetadataCache>,
-) -> CachedParquetFileReaderFactory {
-    CachedParquetFileReaderFactory::new(store, cache)
+/// A registry whose next lookup returns the store registered at that moment
+/// and then registers `next` in its place: a replacement that races with a
+/// factory's creation (final review finding 1).
+#[derive(Debug)]
+struct SwapRegistry {
+    inner: datafusion_execution::object_store::DefaultObjectStoreRegistry,
+    next: std::sync::Mutex<Option<Arc<dyn ObjectStore>>>,
+}
+
+impl SwapRegistry {
+    fn swap(&self, url: &url::Url) {
+        use datafusion_execution::object_store::ObjectStoreRegistry;
+        if let Some(next) = self.next.lock().unwrap().take() {
+            self.inner.register_store(url, next);
+        }
+    }
+}
+
+impl datafusion_execution::object_store::ObjectStoreRegistry for SwapRegistry {
+    fn register_store(
+        &self,
+        url: &url::Url,
+        store: Arc<dyn ObjectStore>,
+    ) -> Option<Arc<dyn ObjectStore>> {
+        self.inner.register_store(url, store)
+    }
+
+    fn deregister_store(&self, url: &url::Url) -> Result<Arc<dyn ObjectStore>> {
+        self.inner.deregister_store(url)
+    }
+
+    fn get_store(&self, url: &url::Url) -> Result<Arc<dyn ObjectStore>> {
+        let store = self.inner.get_store(url);
+        self.swap(url);
+        store
+    }
+
+    fn get_store_with_id(
+        &self,
+        url: &url::Url,
+    ) -> Result<(
+        Arc<dyn ObjectStore>,
+        Option<datafusion_execution::object_store::StoreId>,
+    )> {
+        let store = self.inner.get_store_with_id(url);
+        self.swap(url);
+        store
+    }
+}
+
+#[tokio::test]
+async fn oo_a_store_replaced_while_a_factory_is_created_keeps_its_own_footer() {
+    use datafusion_execution::object_store::{
+        DefaultObjectStoreRegistry, ObjectStoreRegistry,
+    };
+    let a: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let b: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "same.parquet";
+    let mut sizes = Vec::new();
+    for (store, column) in [(&a, "a"), (&b, "b")] {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new(column, DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int32Array::from_iter_values(0..100))],
+        )
+        .unwrap();
+        sizes.push(
+            write_parquet_batches(Arc::clone(store), path, vec![batch], None).await,
+        );
+    }
+    assert_eq!(sizes[0], sizes[1]);
+    let file = PartitionedFile::new(path.to_string(), sizes[0] as u64);
+    let url = ObjectStoreUrl::parse("memory://swap").unwrap();
+    let registry = SwapRegistry {
+        inner: DefaultObjectStoreRegistry::new(),
+        next: std::sync::Mutex::new(Some(Arc::clone(&b))),
+    };
+    registry.register_store(url.as_ref(), Arc::clone(&a));
+    let cache: Arc<FileMetadataCache> =
+        Arc::new(DefaultCache::<Path, CachedFileMetadataEntry>::new(1 << 20));
+    let footer = async |factory: CachedParquetFileReaderFactory| {
+        let mut reader = factory
+            .create_reader(0, file.clone(), None, &ExecutionPlanMetricsSet::new())
+            .unwrap();
+        let skip =
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
+        reader.get_metadata(Some(&skip)).await.unwrap()
+    };
+    // The factory resolves A; B replaces it during the creation.
+    let racing = CachedParquetFileReaderFactory::from_registry(
+        &registry,
+        &url,
+        Arc::clone(&cache),
+    )
+    .unwrap();
+    let first = footer(racing).await;
+    assert_eq!(first.file_metadata().schema_descr().column(0).name(), "a");
+    // A factory created after the replacement reads B's footer, not A's.
+    let after = CachedParquetFileReaderFactory::from_registry(
+        &registry,
+        &url,
+        Arc::clone(&cache),
+    )
+    .unwrap();
+    let replaced = footer(after).await;
+    assert_eq!(
+        replaced.file_metadata().schema_descr().column(0).name(),
+        "b"
+    );
 }
