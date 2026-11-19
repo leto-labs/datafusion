@@ -159,8 +159,10 @@ async fn null_key_that_fills_a_partition() -> Result<()> {
                 filter: true,
                 shape: Shape::CollectLeft(2),
             };
+            // 192 KiB: two streams' byte-admitted chunks in 64 KiB can reach
+            // the replay bound (see hot_key_build_chunks_keep_every_join_type).
             let config = no_reversal(spill_config(0, 4096, 3));
-            let metrics = check(&case, &build, &probe, config, 64 * 1024).await?;
+            let metrics = check(&case, &build, &probe, config, 192 * 1024).await?;
             let chunked = metric(&metrics, "spill_chunked_runs").unwrap_or(0);
             if null_equality == NullEquality::NullEqualsNull {
                 assert!(chunked > 0, "{}: not joined in chunks", label(&case));

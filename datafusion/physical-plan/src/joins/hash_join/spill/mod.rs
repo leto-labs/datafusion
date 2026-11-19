@@ -761,6 +761,18 @@ impl PartWriter {
     }
 }
 
+/// Whether a table is built on the join's floor. A floor table must stay
+/// within the floor's estimate (`BuildSpill::fits_floor`), so it is a hash
+/// table: the perfect-hash `ArrayMap`, chosen for any key range below
+/// `perfect_hash_join_small_build_threshold`, can need kilobytes for a few
+/// rows (review MJJ98: 4,112 bytes for 56 bytes of rows, 72 bytes beyond
+/// the workspace, grown without refusal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Floor {
+    No,
+    Yes,
+}
+
 /// One build partition: rows in memory, or a file.
 enum Part {
     Memory {
@@ -1258,12 +1270,16 @@ impl BuildSpill {
     pub(super) fn finish<T>(
         mut self,
         reservation: &mut MemoryReservation,
-        mut build: impl FnMut(&mut Vec<RecordBatch>, &mut MemoryReservation) -> Result<T>,
+        mut build: impl FnMut(
+            &mut Vec<RecordBatch>,
+            &mut MemoryReservation,
+            Floor,
+        ) -> Result<T>,
     ) -> Result<(T, Option<Arc<SpilledBuild>>, Option<MemoryReservation>)> {
         self.finish_writers()?;
         loop {
             let mut batches = self.take_in_memory();
-            match build(&mut batches, reservation) {
+            match build(&mut batches, reservation, Floor::No) {
                 Ok(table) => {
                     self.charged = 0;
                     let spilled = self.into_spilled(false);
@@ -1308,14 +1324,18 @@ impl BuildSpill {
     fn build_on_floor<T>(
         mut self,
         reservation: &mut MemoryReservation,
-        build: &mut impl FnMut(&mut Vec<RecordBatch>, &mut MemoryReservation) -> Result<T>,
+        build: &mut impl FnMut(
+            &mut Vec<RecordBatch>,
+            &mut MemoryReservation,
+            Floor,
+        ) -> Result<T>,
     ) -> Result<(T, Option<Arc<SpilledBuild>>, Option<MemoryReservation>)> {
         let mut batches = self.take_in_memory();
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let mut attempt = MemoryConsumer::new("HashJoinInput")
             .with_can_spill(true)
             .register(&pool);
-        let table = build(&mut batches, &mut attempt)?;
+        let table = build(&mut batches, &mut attempt, Floor::Yes)?;
         let extra = pool.reserved().saturating_sub(self.charged);
         let floor = take_held(&mut self.workspace, extra);
         // The estimate of `fits_floor` can be short (an empty table, a key

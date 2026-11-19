@@ -3749,7 +3749,18 @@ fn build_spilled(
     array_map_created_count: &Count,
 ) -> Result<JoinLeftData> {
     let (mut data, spilled, floor_charge) =
-        spill.finish(reservation, |batches, reservation| {
+        spill.finish(reservation, |batches, reservation, floor| {
+            // A floor table is a hash table (see `spill::Floor`).
+            let floor_config;
+            let config = if floor == spill::Floor::Yes {
+                let mut options = config.clone();
+                options.execution.perfect_hash_join_small_build_threshold = 0;
+                options.execution.perfect_hash_join_min_key_density = f64::MAX;
+                floor_config = options;
+                &floor_config
+            } else {
+                config
+            };
             let num_rows = batches.iter().map(RecordBatch::num_rows).sum();
             let max_batch_rows = batches.iter().map(RecordBatch::num_rows).max();
             let input_bytes = reservation.size();

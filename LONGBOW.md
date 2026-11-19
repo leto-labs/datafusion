@@ -1037,6 +1037,17 @@ Section 3 (lane `leto-mjj.98`):
   build falls back to chunks in the partition's own orientation.
 - `hash_join_spill_relief_divisor`: a relief releases the refused bytes and
   at least 1/N of what the build held (0: the refused bytes only).
+- Memory bound (fixes from the review `MJJ98-REVIEW-20261119`): written
+  build batches are bounded by bytes as well as rows, so that no batch needs
+  more than three quarters of the workspace with its table (a larger piece is
+  written in slices); a chunk admits its rows and their table estimate batch
+  by batch and splits before its build; the table, built on a private pool,
+  moves into charge the pool granted, and a rest beyond the estimate is
+  admitted (or charged without refusal up to the chunk unit); a batch given
+  back to the cursor keeps its charge; the matched bitmap is admitted (up to
+  a quarter of the workspace without refusal). A unit or bitmap above its
+  share that the pool refuses fails with `ResourcesExhausted` naming it. The
+  reversal decision uses each file's own size.
 - Metrics `spill_reliefs`, `spill_reversed_runs`, `spill_chunked_runs`,
   `spill_replay_passes`.
 
