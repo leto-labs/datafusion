@@ -16,7 +16,7 @@ use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::test_util::batches_to_sort_string;
-use datafusion_common::{JoinSide, JoinType, NullEquality, Result};
+use datafusion_common::{DataFusionError, JoinSide, JoinType, NullEquality, Result};
 use datafusion_execution::TaskContext;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
@@ -203,6 +203,14 @@ fn spill_config(force_rows: usize, workspace: usize, max_depth: usize) -> Sessio
     config
 }
 
+/// `config` with role reversal off, for tests of the joins of written
+/// partitions in their own orientation (reversal would build a small probe
+/// file instead).
+fn no_reversal(mut config: SessionConfig) -> SessionConfig {
+    config.options_mut().execution.hash_join_spill_role_reversal = false;
+    config
+}
+
 fn task_context(
     config: SessionConfig,
     memory_limit: Option<usize>,
@@ -355,7 +363,8 @@ async fn refused_written_partitions_spill_one_level_deeper() -> Result<()> {
         shape: Shape::CollectLeft(1),
     };
     let plan = join_plan(&case, &build, &probe)?;
-    let context = task_context(spill_config(0, 1024, 3), Some(48 * 1024), true);
+    let context =
+        task_context(no_reversal(spill_config(0, 1024, 3)), Some(48 * 1024), true);
     let actual = batches_to_sort_string(&run(&plan, context).await?);
     assert_eq!(actual, expected(&case, &build, &probe).await);
     let (_, _, depth) = spill_metrics(&plan);
@@ -366,33 +375,39 @@ async fn refused_written_partitions_spill_one_level_deeper() -> Result<()> {
     Ok(())
 }
 
-/// At the depth limit a refused build fails, and says why.
+/// At the depth limit a refused build is joined in build chunks (it failed
+/// with its reason before add-join-spill section 3).
 #[tokio::test]
-async fn depth_limit_fails_with_its_reason() -> Result<()> {
+async fn depth_limit_joins_in_build_chunks() -> Result<()> {
     let build = table("b", 20000, 9001, 0, 500);
     let probe = table("p", 2000, 9001, 1, 500);
-    let case = Case {
-        join_type: JoinType::Inner,
-        null_equality: NullEquality::NullEqualsNothing,
-        filter: false,
-        shape: Shape::CollectLeft(1),
-    };
-    let plan = join_plan(&case, &build, &probe)?;
-    let context = task_context(spill_config(0, 1024, 0), Some(48 * 1024), true);
-    let error = run(&plan, context).await.unwrap_err().to_string();
-    assert!(error.contains("Resources exhausted"), "{error}");
-    // The keys divide: the reason is the pool, not the data.
-    assert!(
-        error.contains("the memory pool had no room for its partition of"),
-        "{error}"
-    );
-    assert!(error.contains("at spill level 1"), "{error}");
+    for join_type in JOIN_TYPES {
+        let case = Case {
+            join_type,
+            null_equality: NullEquality::NullEqualsNothing,
+            filter: false,
+            shape: Shape::CollectLeft(1),
+        };
+        let plan = join_plan(&case, &build, &probe)?;
+        let context =
+            task_context(no_reversal(spill_config(0, 1024, 0)), Some(48 * 1024), true);
+        let actual = batches_to_sort_string(&run(&plan, Arc::clone(&context)).await?);
+        assert_eq!(actual, expected(&case, &build, &probe).await, "{join_type}");
+        let metrics = plan.metrics().unwrap();
+        assert!(
+            metric(&metrics, "spill_chunked_runs").unwrap_or(0) > 0,
+            "{join_type}: no run was joined in chunks"
+        );
+        assert_eq!(context.memory_pool().reserved(), 0, "{join_type}");
+    }
     Ok(())
 }
 
-/// A partition that one key fills is reported as such at the depth limit.
+/// A partition that one key fills is joined in build chunks, without
+/// writing it again at deeper levels (it failed at the depth limit before
+/// add-join-spill section 3).
 #[tokio::test]
-async fn hot_key_at_the_depth_limit_says_so() -> Result<()> {
+async fn hot_key_is_joined_in_build_chunks() -> Result<()> {
     // Every build row has key 7.
     let build = table("b", 20000, 1, 0, 500)
         .into_iter()
@@ -413,13 +428,15 @@ async fn hot_key_at_the_depth_limit_says_so() -> Result<()> {
         shape: Shape::CollectLeft(1),
     };
     let plan = join_plan(&case, &build, &probe)?;
-    let context = task_context(spill_config(0, 1024, 2), Some(48 * 1024), true);
-    let error = run(&plan, context).await.unwrap_err().to_string();
-    assert!(
-        error.contains("one key value fills its partition"),
-        "{error}"
-    );
-    assert!(error.contains("at spill level 3"), "{error}");
+    let context =
+        task_context(no_reversal(spill_config(0, 1024, 2)), Some(48 * 1024), true);
+    let actual = batches_to_sort_string(&run(&plan, context).await?);
+    assert_eq!(actual, expected(&case, &build, &probe).await);
+    let metrics = plan.metrics().unwrap();
+    assert!(metric(&metrics, "spill_chunked_runs").unwrap_or(0) > 0);
+    // The hot partition is not divided again.
+    let (_, _, depth) = spill_metrics(&plan);
+    assert_eq!(depth, 1);
     Ok(())
 }
 
@@ -836,7 +853,10 @@ async fn empty_table_is_charged_without_refusal() -> Result<()> {
             shape,
         };
         let plan = join_plan(&case, &build, &probe)?;
-        let context = task_context(spill_config(0, 8192, 3), Some(2048), true);
+        // Role reversal off: reversed joins of written partitions divide
+        // their probe rows at further levels, which this test does not count.
+        let context =
+            task_context(no_reversal(spill_config(0, 8192, 3)), Some(2048), true);
         let actual = run(&plan, context)
             .await
             .unwrap_or_else(|error| panic!("{shape:?}: {error}"));
@@ -1898,7 +1918,8 @@ mod review {
         }
 
         /// Finding 4. A hot key that shares its partitions with a few other
-        /// keys: the build cannot be divided, and the reason must say so.
+        /// keys: the build cannot be divided (leto-mjj.98: it is joined in
+        /// build chunks).
         #[tokio::test]
         async fn rereview_hot_key_among_other_keys_names_the_key() -> Result<()> {
             let schema = table("b", 1, 1, 0, 1)[0].schema();
@@ -1935,13 +1956,17 @@ mod review {
                 shape: Shape::CollectLeft(1),
             };
             let plan = join_plan(&case, &build, &probe)?;
-            let context = task_context(spill_config(0, 1024, 2), Some(48 * 1024), true);
-            let error = run(&plan, context).await.unwrap_err().to_string();
-            println!("{error}");
-            assert!(
-                error.contains("one key value fills its partition"),
-                "{error}"
+            let context = task_context(
+                no_reversal(spill_config(0, 1024, 2)),
+                Some(48 * 1024),
+                true,
             );
+            // leto-mjj.98: the partition is joined in build chunks; it failed
+            // with "one key value fills its partition" before section 3.
+            let actual = batches_to_sort_string(&run(&plan, context).await?);
+            assert_eq!(actual, expected(&case, &build, &probe).await);
+            let metrics = plan.metrics().unwrap();
+            assert!(metric(&metrics, "spill_chunked_runs").unwrap_or(0) > 0);
             Ok(())
         }
 
@@ -2137,3 +2162,10 @@ async fn bound_range_build_rows_follow_the_stock_count() -> Result<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// leto-mjj.98: hot keys, the build-chunk join and role reversal
+// (add-join-spill section 3).
+// ---------------------------------------------------------------------------
+
+mod skew;

@@ -34,6 +34,7 @@
 //!
 //! The hooks in `exec.rs` and `stream.rs` are marked "Longbow family JS".
 
+mod chunks;
 mod files;
 #[cfg(test)]
 mod tests;
@@ -65,8 +66,10 @@ use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::stream::BoxStream;
 use futures::{StreamExt, ready};
 
+pub(crate) use chunks::ChunkBuild;
+use chunks::ChunkRun;
 pub(crate) use files::SpillFilesExec;
-use files::{FileSource, Origin, Stage};
+use files::{ChunkSignal, Cursor, FileSource, Origin, Stage};
 
 use super::exec::{HashJoinExec, HashJoinExecBuilder, JoinLeftData};
 use crate::attempt_tasks::AttemptTasks;
@@ -126,6 +129,14 @@ pub(super) struct SpillOptions {
     workspace: usize,
     /// Highest level that may spill.
     max_depth: usize,
+    /// Build chunks of one partition that cannot be divided.
+    max_replay_passes: usize,
+    /// A relief releases at least 1/`relief_divisor` of what the build held;
+    /// 0 releases only the refused bytes.
+    relief_divisor: usize,
+    /// Reverse the roles of a written partition whose probe rows are
+    /// smaller.
+    role_reversal: bool,
     /// Test only: force spill mode at this many first-level build rows.
     force_rows: usize,
 }
@@ -152,6 +163,9 @@ impl SpillOptions {
             shift: 64 - partitions.trailing_zeros(),
             workspace: options.hash_join_spill_reservation_bytes,
             max_depth: options.hash_join_spill_max_depth,
+            max_replay_passes: options.hash_join_spill_max_replay_passes.max(1),
+            relief_divisor: options.hash_join_spill_relief_divisor,
+            role_reversal: options.hash_join_spill_role_reversal,
             force_rows: options.hash_join_spill_test_force_rows,
         })
     }
@@ -175,6 +189,15 @@ pub(crate) struct JoinSpillMetrics {
     probe_rows: Count,
     probe_bytes: Count,
     partitions: Count,
+    /// Refused build reservations that writing partitions answered.
+    reliefs: Count,
+    /// Written partitions joined with their roles reversed.
+    reversed: Count,
+    /// Runs of written partitions joined in build chunks.
+    chunked: Count,
+    /// Build chunks joined beyond the first of a partition that could not
+    /// be divided, each a replay of its probe rows.
+    replay_passes: Count,
     /// Levels that wrote a partition; 1 when only the first level did.
     depth: Gauge,
 }
@@ -190,6 +213,10 @@ impl JoinSpillMetrics {
             probe_rows: counter("probe_spilled_rows"),
             probe_bytes: counter("probe_spilled_bytes"),
             partitions: counter("spilled_partitions"),
+            reliefs: counter("spill_reliefs"),
+            reversed: counter("spill_reversed_runs"),
+            chunked: counter("spill_chunked_runs"),
+            replay_passes: counter("spill_replay_passes"),
             depth,
         }
     }
@@ -262,6 +289,9 @@ pub(super) enum JoinSpill {
     /// Spilling is on but this join cannot spill correctly.
     Ineligible(String),
     Eligible(Box<Eligible>),
+    /// One build chunk of a written partition that cannot be divided: the
+    /// build stops at a refusal and gives the rest back to its cursor.
+    Chunk(Arc<Cursor>),
 }
 
 pub(super) struct Eligible {
@@ -278,31 +308,40 @@ pub(super) struct Eligible {
     count: Expected,
     /// The `CollectLeft` build that the exec holds for its streams.
     shared_build: Option<Weak<OnceAsync<JoinLeftData>>>,
-    /// Above the depth limit: why the join writes no partition. It may
-    /// still build its table on its floor.
+    /// A partition that cannot be divided (above the depth limit, or a hot
+    /// key fills it): why the join writes no partition. It may still build
+    /// its table on its floor; a refusal beyond that raises `signal`.
     depth_limit: Option<String>,
+    /// Raised when the partition must be joined in build chunks.
+    signal: Option<Arc<ChunkSignal>>,
 }
 
-/// Why a join above the depth limit cannot go on: a hot key when its
-/// partition kept more than half of the rows its parent divided (a uniform
-/// key spread keeps one in `hash_join_spill_partitions`), the pool otherwise.
-fn depth_limit_reason(origin: Option<Origin>, level: usize, max_depth: usize) -> String {
+/// Why the join of a written partition does not divide it again, or `None`
+/// if it may: a hot key when its partition kept more than half of the rows
+/// its parent divided (a uniform key spread keeps one in
+/// `hash_join_spill_partitions`, so another level would write it again
+/// almost whole), or a level above the depth limit. Such a partition is
+/// joined in build chunks when its floor cannot hold it (design decision 5).
+fn indivisible_reason(
+    origin: Option<Origin>,
+    level: usize,
+    max_depth: usize,
+) -> Option<String> {
     let rows = origin.map_or(0, |origin| origin.rows);
     match origin {
-        Some(origin) if origin.hot() => format!(
+        Some(origin) if level > 0 && origin.hot() => Some(format!(
             "one key value fills its partition of {rows} build rows ({}% of the {} \
-             rows its parent join divided), which no spill level divides (the \
-             build-chunk join of add-join-spill section 3 is not implemented) and which \
-             is larger than its workspace floor; it is at spill level {level}, above \
-             datafusion.execution.hash_join_spill_max_depth ({max_depth})",
+             rows its parent join divided), which another spill level would not \
+             divide; it is joined in build chunks",
             rows * 100 / origin.parent_rows.max(1),
             origin.parent_rows,
-        ),
-        _ => format!(
-            "the memory pool had no room for its partition of {rows} build rows at \
-             spill level {level}, above datafusion.execution.hash_join_spill_max_depth \
-             ({max_depth}), and the partition is larger than its workspace floor"
-        ),
+        )),
+        _ if level > max_depth => Some(format!(
+            "its partition of {rows} build rows is at spill level {level}, above \
+             datafusion.execution.hash_join_spill_max_depth ({max_depth}); it is \
+             joined in build chunks"
+        )),
+        _ => None,
     }
 }
 
@@ -324,6 +363,9 @@ impl JoinSpill {
             return Ok(Self::Disabled);
         }
         let leaf = join.left().downcast_ref::<SpillFilesExec>();
+        if let Some(cursor) = leaf.and_then(SpillFilesExec::cursor) {
+            return Ok(Self::Chunk(Arc::clone(cursor)));
+        }
         let level = leaf.map_or(0, SpillFilesExec::level);
         let options = SpillOptions::try_new(&config.execution)?;
         let membership = shared.membership();
@@ -357,11 +399,13 @@ impl JoinSpill {
         if let Some(reason) = reason {
             return Ok(Self::Ineligible(reason));
         }
-        // Above the depth limit the join may still build on its floor, but
-        // it writes no partition (design decision 5, "Recursion").
-        let depth_limit = (level > options.max_depth).then(|| {
-            depth_limit_reason(leaf.map(SpillFilesExec::origin), level, options.max_depth)
-        });
+        // A partition that cannot be divided may still be built on its
+        // floor, but it writes no partition (design decision 5, "Recursion").
+        let depth_limit = indivisible_reason(
+            leaf.map(SpillFilesExec::origin),
+            level,
+            options.max_depth,
+        );
         let right_partitions = join.right().output_partitioning().partition_count();
         let count = match (join.mode, membership) {
             (PartitionMode::CollectLeft, Membership::Closed) => Expected::Fixed(
@@ -407,12 +451,21 @@ impl JoinSpill {
             shared_build: (join.mode == PartitionMode::CollectLeft)
                 .then(|| Arc::downgrade(shared_build)),
             depth_limit,
+            signal: leaf.and_then(SpillFilesExec::signal).cloned(),
         })))
     }
 
     /// Whether the build consumer is registered as spillable.
     pub(super) fn can_spill(&self) -> bool {
-        matches!(self, Self::Eligible(_))
+        matches!(self, Self::Eligible(_) | Self::Chunk(_))
+    }
+
+    /// The build-side state of a build chunk.
+    pub(super) fn chunk(&self) -> Option<ChunkBuild> {
+        match self {
+            Self::Chunk(cursor) => Some(ChunkBuild::new(Arc::clone(cursor))),
+            _ => None,
+        }
     }
 
     /// The build-side state for `collect_left_input`.
@@ -492,6 +545,7 @@ impl JoinSpill {
                 schema,
                 column_indices: column_indices.to_vec(),
                 join_type: eligible.template.join_type,
+                build_schema: Arc::clone(&eligible.template.build_schema),
                 probe_schema: Arc::clone(&eligible.template.probe_schema),
             }),
             phase: Phase::Waiting,
@@ -500,11 +554,12 @@ impl JoinSpill {
     }
 }
 
-/// A finished spill file and its row count.
+/// A finished spill file, its row count and its size.
 #[derive(Clone)]
 pub(crate) struct SpilledFile {
     file: Arc<dyn SpillFile>,
     rows: usize,
+    bytes: usize,
 }
 
 /// Spill manager of one side, scoped to the attempt.
@@ -541,6 +596,8 @@ struct PartWriter {
     buffered_rows: usize,
     buffered_bytes: usize,
     rows: usize,
+    /// Bytes written to the file.
+    bytes: usize,
 }
 
 impl PartWriter {
@@ -551,6 +608,7 @@ impl PartWriter {
             buffered_rows: 0,
             buffered_bytes: 0,
             rows: 0,
+            bytes: 0,
         })
     }
 
@@ -582,7 +640,9 @@ impl PartWriter {
             rows_metric.add(rows);
             start = end;
         }
-        bytes_metric.add(metrics.spill.spilled_bytes.value().saturating_sub(before));
+        let written = metrics.spill.spilled_bytes.value().saturating_sub(before);
+        bytes_metric.add(written);
+        self.bytes += written;
         Ok(())
     }
 
@@ -620,13 +680,12 @@ impl PartWriter {
         self.flush(metrics, side)?;
         let before = metrics.spill.spilled_bytes.value();
         let file = self.file.finish()?;
-        metrics
-            .side(side)
-            .1
-            .add(metrics.spill.spilled_bytes.value().saturating_sub(before));
+        let trailer = metrics.spill.spilled_bytes.value().saturating_sub(before);
+        metrics.side(side).1.add(trailer);
         Ok(file.map(|file| SpilledFile {
             file,
             rows: self.rows,
+            bytes: self.bytes + trailer,
         }))
     }
 }
@@ -672,8 +731,10 @@ pub(super) struct BuildSpill {
     count: Expected,
     shared_build: Option<Weak<OnceAsync<JoinLeftData>>>,
     lazy_metrics: LazyMetrics,
-    /// Above the depth limit: why no partition may be written.
+    /// A partition that cannot be divided: why no partition may be written.
     depth_limit: Option<String>,
+    /// Raised by a refusal that the floor of such a partition cannot cover.
+    signal: Option<Arc<ChunkSignal>>,
     active: bool,
     /// One part per partition, then the unmatchable part.
     parts: Vec<Part>,
@@ -749,6 +810,7 @@ impl BuildSpill {
                 LazyMetrics::Inherited(_) => 0,
             }),
             depth_limit: eligible.depth_limit.clone(),
+            signal: eligible.signal.clone(),
             active: false,
             parts,
             rows_seen: vec![0; eligible.options.partitions],
@@ -830,11 +892,15 @@ impl BuildSpill {
         Ok(())
     }
 
-    /// A refusal that the join cannot answer, with the reason when it is
-    /// above the depth limit.
+    /// A refusal that the join cannot answer by writing. For a partition
+    /// that cannot be divided it raises the signal: the join that wrote the
+    /// partition then joins it in build chunks (no row was produced yet).
     fn refused(&self, error: DataFusionError) -> DataFusionError {
         match &self.depth_limit {
             Some(reason) => {
+                if let Some(signal) = &self.signal {
+                    signal.raise();
+                }
                 error.context(format!("The hash join did not spill because {reason}"))
             }
             None => error,
@@ -980,13 +1046,18 @@ impl BuildSpill {
     }
 
     /// Writes whole partitions, largest first, until the refused `need` and
-    /// one eighth of what the parts held are released. Returns whether it
-    /// wrote any.
+    /// 1/`hash_join_spill_relief_divisor` of what the parts held are
+    /// released. Returns whether it wrote any.
     fn relieve(&mut self, need: usize, reservation: &MemoryReservation) -> Result<bool> {
         if self.depth_limit.is_some() {
             return Ok(false);
         }
-        let target = need.max(self.charged / 8);
+        let share = match self.options.relief_divisor {
+            0 => 0,
+            divisor => self.charged / divisor,
+        };
+        let target = need.max(share);
+        self.metrics.reliefs.add(1);
         let mut released = 0;
         let mut wrote = false;
         while released < target {
@@ -1232,6 +1303,7 @@ impl BuildSpill {
             _ => vec![],
         };
         let spilled = Arc::new(SpilledBuild {
+            options: self.options,
             level: self.level,
             shift: self.options.shift,
             partitions,
@@ -1255,6 +1327,7 @@ impl BuildSpill {
                 done: vec![0; partitions + 1],
                 final_hold,
                 joins: (0..partitions).map(|_| None).collect(),
+                chunked: vec![false; partitions],
                 next_id: 0,
                 violation: None,
             }),
@@ -1466,6 +1539,9 @@ struct Members {
     final_hold: Vec<bool>,
     /// The join of each partition while streams run it.
     joins: Vec<Option<SharedJoin>>,
+    /// Partitions that a stream found it must join in build chunks; later
+    /// own runs of them start in chunks.
+    chunked: Vec<bool>,
     next_id: u64,
     /// An impossible state found where no error can be returned (a drop);
     /// the next stream that asks fails with it.
@@ -1476,6 +1552,7 @@ struct Members {
 struct SharedJoin {
     join: Arc<HashJoinExec>,
     stage: Arc<Stage>,
+    signal: Arc<ChunkSignal>,
     users: usize,
     id: u64,
 }
@@ -1483,6 +1560,7 @@ struct SharedJoin {
 /// The written partitions of one build, shared by the streams that probe
 /// it (all of them in `CollectLeft` mode).
 pub(crate) struct SpilledBuild {
+    options: SpillOptions,
     level: usize,
     shift: u32,
     partitions: usize,
@@ -1739,6 +1817,7 @@ impl SpilledBuild {
                 id: shared.id,
                 join: Arc::clone(&shared.join),
                 stage: Arc::clone(&shared.stage),
+                signal: Arc::clone(&shared.signal),
             });
         }
         let Some(build_file) = self.files()[part].clone() else {
@@ -1748,12 +1827,14 @@ impl SpilledBuild {
             );
         };
         let stage = Arc::new(Stage::default());
+        let signal = Arc::new(ChunkSignal::default());
         let join_type = self.own_type.unwrap_or(self.template.join_type);
         let join = self.join_over(
             build_file,
             FileSource::Staged(Arc::clone(&stage)),
             join_type,
             self.template.projection.clone(),
+            &signal,
         )?;
         join.spill_shared().set_membership(Membership::Admitted);
         if !join.spill_shared().admit() {
@@ -1766,6 +1847,7 @@ impl SpilledBuild {
         members.joins[part] = Some(SharedJoin {
             join: Arc::clone(&join),
             stage: Arc::clone(&stage),
+            signal: Arc::clone(&signal),
             users: 1,
             id,
         });
@@ -1775,7 +1857,37 @@ impl SpilledBuild {
             id,
             join,
             stage,
+            signal,
         })
+    }
+
+    /// Whether a stream found that `part` must be joined in build chunks.
+    fn is_chunked(&self, part: usize) -> bool {
+        self.lock().chunked[part]
+    }
+
+    /// Own runs of `part` start in build chunks from now on.
+    fn set_chunked(&self, part: usize) {
+        self.lock().chunked[part] = true;
+    }
+
+    /// The build file of `part` for an own run that does not share a join.
+    fn build_file(&self, part: usize) -> Result<SpilledFile> {
+        match self.files()[part].clone() {
+            Some(file) => Ok(file),
+            None => internal_err!(
+                "hash join spill: the build file of written partition {part} is gone \
+                 while a member still joins it"
+            ),
+        }
+    }
+
+    /// Whether one join reads every probe row of this build's written
+    /// partitions: a build with one member (every `Partitioned` build, and
+    /// `CollectLeft` over one probe partition). Its own runs may reverse
+    /// roles without reading the build file once per stream.
+    fn one_member(&self) -> bool {
+        matches!(self.lock().count, Expected::Fixed(1))
     }
 
     /// Of the runs `pending`, the index of an own run whose join another
@@ -1825,33 +1937,38 @@ impl SpilledBuild {
         self.prune(&members, part);
     }
 
-    /// `Last`: the join that emits the build rows of `part`, over every
-    /// member's probe file. Its output is in the build schema when the rows
-    /// must go through `UnmatchedOutput` (Left and Full).
-    fn final_join(&self, part: usize) -> Result<(Arc<HashJoinExec>, bool)> {
+    /// `Last`: the build file and every member's probe file of `part`, for
+    /// the join that emits its build rows.
+    fn final_files(&self, part: usize) -> Result<(SpilledFile, Vec<SpilledFile>)> {
         let Some(build_file) = self.take_final(part)? else {
             return internal_err!(
                 "hash join spill: the build file of written partition {part} is gone \
                  before its build rows were emitted"
             );
         };
-        let probe = FileSource::Fixed(vec![self.probes.take_all(part)]);
-        let (join_type, projection, remap) = match self.template.join_type {
+        Ok((build_file, self.probes.take_all(part)))
+    }
+
+    /// `Last`: the join type and projection of the build-row pass, and
+    /// whether its output (in the build schema) must go through
+    /// `UnmatchedOutput` (Left and Full).
+    fn final_type(&self) -> (JoinType, Option<ProjectionRef>, bool) {
+        match self.template.join_type {
             JoinType::Left | JoinType::Full => (JoinType::LeftAnti, None, true),
             other => (other, self.template.projection.clone(), false),
-        };
-        let join = self.join_over(build_file, probe, join_type, projection)?;
-        Ok((join, remap))
+        }
     }
 
     /// A stock `CollectLeft` join of one written partition, one level
-    /// deeper.
+    /// deeper. A refusal that it cannot answer raises `signal` (see
+    /// [`chunks`]).
     fn join_over(
         &self,
         build_file: SpilledFile,
         probe: FileSource,
         join_type: JoinType,
         projection: Option<ProjectionRef>,
+        signal: &Arc<ChunkSignal>,
     ) -> Result<Arc<HashJoinExec>> {
         let level = self.level + 1;
         let template = &self.template;
@@ -1866,7 +1983,8 @@ impl SpilledBuild {
             level,
             origin,
             self.metrics.clone(),
-        );
+        )
+        .with_signal(Arc::clone(signal));
         let probe = SpillFilesExec::new(
             Arc::clone(&template.probe_schema),
             probe,
@@ -1876,6 +1994,67 @@ impl SpilledBuild {
             origin,
             self.metrics.clone(),
         );
+        self.sub_join(build, probe, join_type, projection)
+    }
+
+    /// Role reversal (design decision 5): the join of `build_file` and the
+    /// smaller `probe_files`, built over the probe files and probed by the
+    /// build file, which is read once. Its rows are those of the join
+    /// without reversal (`swap_inputs`). A refusal that the reversed join
+    /// cannot answer raises `signal`; the run then joins the partition in
+    /// chunks the usual way round.
+    fn reversed_join(
+        &self,
+        build_file: SpilledFile,
+        probe_files: Vec<SpilledFile>,
+        probe_divided: usize,
+        join_type: JoinType,
+        projection: Option<ProjectionRef>,
+        signal: &Arc<ChunkSignal>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let level = self.level + 1;
+        let template = &self.template;
+        let build_origin = Origin {
+            rows: build_file.rows,
+            parent_rows: self.parent_rows,
+        };
+        // The probe rows that the parent divided, for the hot-key test of
+        // the reversed join (`usize::MAX` when not known: no hot key).
+        let probe_origin = Origin {
+            rows: probe_files.iter().map(|file| file.rows).sum(),
+            parent_rows: probe_divided,
+        };
+        let build = SpillFilesExec::new(
+            Arc::clone(&template.build_schema),
+            FileSource::Fixed(vec![vec![build_file]]),
+            self.build_manager.clone(),
+            level,
+            build_origin,
+            self.metrics.clone(),
+        );
+        let probe = SpillFilesExec::new(
+            Arc::clone(&template.probe_schema),
+            FileSource::Fixed(vec![probe_files]),
+            self.build_manager
+                .with_schema(Arc::clone(&template.probe_schema)),
+            level,
+            probe_origin,
+            self.metrics.clone(),
+        )
+        .with_signal(Arc::clone(signal));
+        self.sub_join(build, probe, join_type, projection)?
+            .swap_inputs(PartitionMode::CollectLeft)
+    }
+
+    /// The stock `CollectLeft` join of two leaves of a written partition.
+    fn sub_join(
+        &self,
+        build: SpillFilesExec,
+        probe: SpillFilesExec,
+        join_type: JoinType,
+        projection: Option<ProjectionRef>,
+    ) -> Result<Arc<HashJoinExec>> {
+        let template = &self.template;
         let join = HashJoinExecBuilder::new(
             Arc::new(build),
             Arc::new(probe),
@@ -1922,6 +2101,7 @@ struct JoinUse {
     id: u64,
     join: Arc<HashJoinExec>,
     stage: Arc<Stage>,
+    signal: Arc<ChunkSignal>,
 }
 
 impl JoinUse {
@@ -2120,6 +2300,8 @@ enum Phase {
 struct Probed {
     seat: Seat,
     files: Vec<Option<SpilledFile>>,
+    /// The probe rows this stream divided over the partitions.
+    divided: usize,
 }
 
 /// The probe side of one output stream of a spilling join.
@@ -2146,6 +2328,7 @@ struct UnmatchedOutput {
     schema: SchemaRef,
     column_indices: Vec<ColumnIndex>,
     join_type: JoinType,
+    build_schema: SchemaRef,
     probe_schema: SchemaRef,
 }
 
@@ -2162,6 +2345,28 @@ impl UnmatchedOutput {
             JoinSide::Left,
             self.join_type,
             None,
+        )
+    }
+
+    /// Probe rows that no build row matched (Right, Full, RightAnti), or
+    /// every probe row with its `mark` (RightMark), as the join's rows: the
+    /// build columns are null.
+    fn emit_probe(
+        &self,
+        batch: &RecordBatch,
+        mark: Option<&ArrayRef>,
+    ) -> Result<RecordBatch> {
+        let rows = batch.num_rows();
+        build_batch_from_indices(
+            &self.schema,
+            &RecordBatch::new_empty(Arc::clone(&self.build_schema)),
+            batch,
+            &UInt64Array::new_null(rows),
+            &UInt32Array::from_iter_values(0..rows as u32),
+            &self.column_indices,
+            JoinSide::Left,
+            self.join_type,
+            mark,
         )
     }
 
@@ -2187,6 +2392,8 @@ struct Router {
     writers: Vec<Option<PartWriter>>,
     reservation: MemoryReservation,
     hashes: Vec<u64>,
+    /// Probe rows routed so far.
+    divided: usize,
 }
 
 impl StreamSpill {
@@ -2220,6 +2427,7 @@ impl StreamSpill {
             metrics,
             reservation,
             hashes: vec![],
+            divided: 0,
         }));
         Ok(true)
     }
@@ -2235,6 +2443,7 @@ impl StreamSpill {
             return Ok(Some(batch));
         };
         let build = Arc::clone(&router.seat.build);
+        router.divided += batch.num_rows();
         let ids = partition_ids(
             &batch,
             on_right,
@@ -2313,6 +2522,7 @@ impl StreamSpill {
             metrics,
             writers,
             reservation,
+            divided,
             ..
         } = *router;
         let files: Vec<Option<SpilledFile>> = writers
@@ -2330,7 +2540,11 @@ impl StreamSpill {
         if seat.build.mode == Mode::Last {
             seat.build.probes.register(self.slot, files.clone())?;
         }
-        self.phase = Phase::Probed(Box::new(Probed { seat, files }));
+        self.phase = Phase::Probed(Box::new(Probed {
+            seat,
+            files,
+            divided,
+        }));
         Ok(())
     }
 
@@ -2373,7 +2587,11 @@ impl StreamSpill {
         &self,
         probed: Probed,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        let Probed { mut seat, files } = probed;
+        let Probed {
+            mut seat,
+            files,
+            divided,
+        } = probed;
         seat.build.end_in_memory(self.last)?;
         let runs = seat.build.runs(&files, self.last);
         seat.state = SeatState::Written(runs.clone());
@@ -2381,6 +2599,7 @@ impl StreamSpill {
             seat,
             runs,
             files,
+            divided,
             output: Arc::clone(&self.output),
             context: Arc::clone(&self.context),
             current: None,
@@ -2409,6 +2628,7 @@ impl Drop for StreamSpill {
 }
 
 /// How a run's output becomes the join's output.
+#[derive(Debug, Clone, Copy)]
 enum Output {
     /// An own run: the join's schema.
     Own,
@@ -2426,10 +2646,40 @@ struct Written {
     runs: Vec<Run>,
     /// This stream's probe files, by partition.
     files: Vec<Option<SpilledFile>>,
+    /// The probe rows this stream divided over the partitions.
+    divided: usize,
     output: Arc<UnmatchedOutput>,
     context: Arc<TaskContext>,
-    current: Option<(SendableRecordBatchStream, Option<JoinUse>, Output)>,
+    current: Option<Current>,
     failed: bool,
+}
+
+/// The run being joined.
+struct Current {
+    stream: SendableRecordBatchStream,
+    using: Option<JoinUse>,
+    output: Output,
+    /// The same run in build chunks, if the join's build cannot be held.
+    fallback: Option<(Arc<ChunkSignal>, ChunkRun)>,
+    /// A row came out of `stream`: no fallback any more.
+    yielded: bool,
+}
+
+impl Current {
+    fn new(
+        stream: SendableRecordBatchStream,
+        using: Option<JoinUse>,
+        output: Output,
+        fallback: Option<(Arc<ChunkSignal>, ChunkRun)>,
+    ) -> Self {
+        Self {
+            stream,
+            using,
+            output,
+            fallback,
+            yielded: false,
+        }
+    }
 }
 
 impl Written {
@@ -2438,10 +2688,11 @@ impl Written {
             return None;
         }
         loop {
-            if let Some((stream, _, output)) = &mut self.current {
-                match stream.next().await {
+            if let Some(current) = &mut self.current {
+                match current.stream.next().await {
                     Some(Ok(batch)) => {
-                        let batch = match output {
+                        current.yielded = true;
+                        let batch = match current.output {
                             Output::Own => self.output.own(batch),
                             Output::Unmatched => self.output.emit(&batch),
                             Output::Same => Ok(batch),
@@ -2453,9 +2704,21 @@ impl Written {
                         return Some(batch);
                     }
                     Some(Err(error)) => {
-                        self.failed = true;
-                        self.current = None;
-                        return Some(Err(error));
+                        let current = self.current.take().expect("a current run");
+                        match self.fall_back(current) {
+                            Some(Ok(current)) => {
+                                self.current = Some(current);
+                                continue;
+                            }
+                            Some(Err(fallback_error)) => {
+                                self.failed = true;
+                                return Some(Err(fallback_error));
+                            }
+                            None => {
+                                self.failed = true;
+                                return Some(Err(error));
+                            }
+                        }
                     }
                     None => {
                         self.current = None;
@@ -2476,23 +2739,11 @@ impl Written {
             let next = build.next_run(&self.runs);
             self.runs.swap(0, next);
             let started = match self.runs[0] {
-                Run::Own(part) => build.shared_join(part).and_then(|using| {
-                    let files = self.files[part].take().into_iter().collect();
-                    let stream = using.execute(files, Arc::clone(&self.context))?;
-                    Ok((stream, Some(using), Output::Own))
-                }),
+                Run::Own(part) => self.start_own(part),
                 Run::Final(part) if part == build.partitions => build
                     .unmatched_rows(Arc::clone(&self.output))
-                    .map(|stream| (stream, None, Output::Same)),
-                Run::Final(part) => build.final_join(part).and_then(|(join, remap)| {
-                    let stream = join.execute(0, Arc::clone(&self.context))?;
-                    let output = if remap {
-                        Output::Unmatched
-                    } else {
-                        Output::Same
-                    };
-                    Ok((stream, None, output))
-                }),
+                    .map(|stream| Current::new(stream, None, Output::Same, None)),
+                Run::Final(part) => self.start_final(part),
             };
             match started {
                 Ok(current) => self.current = Some(current),
@@ -2502,5 +2753,154 @@ impl Written {
                 }
             }
         }
+    }
+
+    /// A run failed: if its join raised the chunk signal before it gave a
+    /// row, the same run in build chunks; `None` to report the error.
+    fn fall_back(&self, current: Current) -> Option<Result<Current>> {
+        let Current {
+            stream,
+            using,
+            fallback,
+            yielded,
+            ..
+        } = current;
+        let (signal, chunk) = fallback?;
+        if yielded || !signal.is_raised() {
+            return None;
+        }
+        drop(stream);
+        drop(using);
+        if let Run::Own(part) = self.runs[0] {
+            self.seat.build.set_chunked(part);
+        }
+        Some(
+            chunk
+                .stream()
+                .map(|stream| Current::new(stream, None, Output::Same, None)),
+        )
+    }
+
+    /// The run of `part` in build chunks, over `build_file` and `probe_files`.
+    #[expect(clippy::too_many_arguments)]
+    fn chunk_run(
+        &self,
+        part: usize,
+        run_type: JoinType,
+        projection: Option<ProjectionRef>,
+        build_file: SpilledFile,
+        probe_files: Vec<SpilledFile>,
+        kind: Output,
+    ) -> ChunkRun {
+        ChunkRun {
+            build: Arc::clone(&self.seat.build),
+            part,
+            run_type,
+            projection,
+            build_file,
+            probe_files,
+            output: Arc::clone(&self.output),
+            kind,
+            context: Arc::clone(&self.context),
+        }
+    }
+
+    /// An own run of `part`: in chunks if a stream found it needs them;
+    /// reversed if this build has one member and the probe file is
+    /// smaller; otherwise the partition's join, shared with the streams
+    /// that run it now.
+    fn start_own(&mut self, part: usize) -> Result<Current> {
+        let build = Arc::clone(&self.seat.build);
+        let probe: Vec<SpilledFile> = self.files[part].take().into_iter().collect();
+        let run_type = build.own_type.unwrap_or(build.template.join_type);
+        let projection = build.template.projection.clone();
+        let build_file = build.build_file(part)?;
+        let chunk = self.chunk_run(
+            part,
+            run_type,
+            projection.clone(),
+            build_file.clone(),
+            probe.clone(),
+            Output::Own,
+        );
+        if build.is_chunked(part) {
+            return Ok(Current::new(chunk.stream()?, None, Output::Same, None));
+        }
+        let probe_bytes: usize = probe.iter().map(|file| file.bytes).sum();
+        if build.options.role_reversal
+            && build.one_member()
+            && probe_bytes < build_file.bytes
+        {
+            let signal = Arc::new(ChunkSignal::default());
+            let join = build.reversed_join(
+                build_file,
+                probe,
+                self.divided,
+                run_type,
+                projection,
+                &signal,
+            )?;
+            build.metrics.reversed.add(1);
+            let stream = join.execute(0, Arc::clone(&self.context))?;
+            return Ok(Current::new(
+                stream,
+                None,
+                Output::Own,
+                Some((signal, chunk)),
+            ));
+        }
+        let using = build.shared_join(part)?;
+        let stream = using.execute(probe, Arc::clone(&self.context))?;
+        let signal = Arc::clone(&using.signal);
+        Ok(Current::new(
+            stream,
+            Some(using),
+            Output::Own,
+            Some((signal, chunk)),
+        ))
+    }
+
+    /// `Last`: the build-row pass of `part` over every member's probe file,
+    /// reversed if they are smaller than the build file.
+    fn start_final(&mut self, part: usize) -> Result<Current> {
+        let build = Arc::clone(&self.seat.build);
+        let (build_file, probe_files) = build.final_files(part)?;
+        let (join_type, projection, remap) = build.final_type();
+        let kind = if remap {
+            Output::Unmatched
+        } else {
+            Output::Same
+        };
+        let chunk = self.chunk_run(
+            part,
+            join_type,
+            projection.clone(),
+            build_file.clone(),
+            probe_files.clone(),
+            kind,
+        );
+        let signal = Arc::new(ChunkSignal::default());
+        let probe_bytes: usize = probe_files.iter().map(|file| file.bytes).sum();
+        let (join, output): (Arc<dyn ExecutionPlan>, Output) =
+            if build.options.role_reversal && probe_bytes < build_file.bytes {
+                build.metrics.reversed.add(1);
+                let join = build.reversed_join(
+                    build_file,
+                    probe_files,
+                    usize::MAX,
+                    join_type,
+                    projection,
+                    &signal,
+                )?;
+                // A reversed join may declare other nullability.
+                (join, if remap { kind } else { Output::Own })
+            } else {
+                let probe = FileSource::Fixed(vec![probe_files]);
+                let join: Arc<dyn ExecutionPlan> =
+                    build.join_over(build_file, probe, join_type, projection, &signal)?;
+                (join, kind)
+            };
+        let stream = join.execute(0, Arc::clone(&self.context))?;
+        Ok(Current::new(stream, None, output, Some((signal, chunk))))
     }
 }

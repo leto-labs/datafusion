@@ -1073,13 +1073,24 @@ config_namespace! {
         pub hash_join_spill_partitions: usize, default = 16
 
         /// Longbow family JS: spill levels below the first. A written
-        /// partition whose build is refused at this depth fails.
+        /// partition below this depth, or one that a hot key fills, is not
+        /// divided again: it is joined in build chunks.
         pub hash_join_spill_max_depth: usize, default = 3
 
-        /// Longbow family JS: reserved for build chunks of one partition that
-        /// cannot be divided (not implemented; such a partition fails at the
-        /// depth limit).
+        /// Longbow family JS: build chunks of one written partition that
+        /// cannot be divided; each chunk replays the partition's probe rows.
+        /// A partition that needs more fails with `ResourcesExhausted`.
         pub hash_join_spill_max_replay_passes: usize, default = 64
+
+        /// Longbow family JS: a refused build reservation writes partitions
+        /// until it released the refused bytes and at least 1/N of what the
+        /// build held. 0 releases only the refused bytes.
+        pub hash_join_spill_relief_divisor: usize, default = 8
+
+        /// Longbow family JS: a written partition whose probe rows are
+        /// smaller than its build rows is joined with the roles reversed,
+        /// when one join reads all of its probe rows.
+        pub hash_join_spill_role_reversal: bool, default = true
 
         /// Longbow family JS, tests only: a first-level eligible join enters
         /// spill mode once its build holds this many rows and writes every
