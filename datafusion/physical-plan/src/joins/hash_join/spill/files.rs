@@ -68,7 +68,17 @@ pub(super) fn spill_file_error(error: DataFusionError) -> DataFusionError {
         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
         while let Some(cause) = source {
             if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-                match io.raw_os_error() {
+                // tempfile adds the path to the error text and exposes the
+                // original error's source, losing the OS code in the chain.
+                let code = io.raw_os_error().or_else(|| {
+                    let message = io.to_string();
+                    [libc::EMFILE, libc::ENFILE].into_iter().find(|code| {
+                        let original = std::io::Error::from_raw_os_error(*code);
+                        io.kind() == original.kind()
+                            && message.starts_with(&original.to_string())
+                    })
+                });
+                match code {
                     Some(libc::EMFILE) => {
                         return resources_datafusion_err!(
                             "hash join spill exhausted the process open-file limit (RLIMIT_NOFILE)"
