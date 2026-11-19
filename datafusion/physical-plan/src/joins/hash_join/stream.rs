@@ -20,6 +20,7 @@ use crate::joins::hash_join::not_in::NotInProbe;
 use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
 };
+use crate::joins::hash_join::spill::StreamSpill;
 use crate::joins::join_hash_map::ProbeOffset;
 use crate::joins::join_hash_map::ProbeOffset::AtRow;
 use crate::joins::probe_completion::{Completion, ProbeSideSummary};
@@ -57,6 +58,9 @@ pub(super) enum BuildSide {
     Initial(BuildSideInitialState),
     /// Indicates that build-side data has been collected
     Ready(BuildSideReadyState),
+    /// Longbow family JS: the in-memory pass of a spilled build is over and
+    /// this stream let go of the table.
+    Released,
 }
 
 /// Container for BuildSide::Initial related data
@@ -403,6 +407,9 @@ pub(super) struct HashJoinStream {
     /// Output buffer for coalescing small batches into larger ones with optional fetch limit.
     /// Uses `LimitedBatchCoalescer` to efficiently combine batches and absorb limit with 'fetch'
     output_buffer: LimitedBatchCoalescer,
+    /// Longbow family JS: probe-side spill state of an eligible join, kept
+    /// only once its build spilled.
+    spill: Option<Box<StreamSpill>>,
 }
 
 impl RecordBatchStream for HashJoinStream {
@@ -558,6 +565,7 @@ impl HashJoinStream {
         build_accumulator: Option<Arc<SharedBuildAccumulator>>,
         mode: PartitionMode,
         fetch: Option<usize>,
+        spill: Option<Box<StreamSpill>>,
     ) -> Self {
         // Create output buffer with coalescing and optional fetch limit.
         let output_buffer =
@@ -585,6 +593,7 @@ impl HashJoinStream {
             build_report: BuildReportHandle::new(partition, build_accumulator),
             mode,
             output_buffer,
+            spill,
         }
     }
 
@@ -600,6 +609,11 @@ impl HashJoinStream {
         // join types whose every output row requires a build match, that still
         // guarantees an empty result, so we can skip scanning the probe side.
         let map_empty = !left_data.has_matchable_build_rows();
+
+        // Longbow family JS: written partitions are joined after the probe.
+        if left_data.spilled().is_some() {
+            return HashJoinStreamState::FetchProbeBatch;
+        }
 
         if (build_empty && join_type.empty_build_side_produces_empty_result())
             || (map_empty && join_type.empty_map_produces_empty_result())
@@ -633,10 +647,12 @@ impl HashJoinStream {
         // Use the logical null count: a dictionary key whose entry points at a
         // NULL dictionary value is a NULL key even though the key bitmap has no
         // physical nulls (`null_count() == 0` but `logical_null_count() > 0`).
-        let keys_have_null = left_data
-            .values()
-            .iter()
-            .any(|array| array.logical_null_count() > 0);
+        // Longbow family JS: written build rows are not in `values`.
+        let keys_have_null = left_data.spilled().is_some()
+            || left_data
+                .values()
+                .iter()
+                .any(|array| array.logical_null_count() > 0);
 
         let build_data = match self.mode {
             PartitionMode::Partitioned => PartitionBuildData::Partitioned {
@@ -677,6 +693,8 @@ impl HashJoinStream {
 
             // Check if the coalescer has finished (limit reached and flushed)
             if self.output_buffer.is_finished() {
+                // Longbow family JS: leave the written-partition barrier.
+                self.spill = None;
                 return Poll::Ready(None);
             }
 
@@ -698,6 +716,10 @@ impl HashJoinStream {
                 }
                 HashJoinStreamState::EmitUnmatchedBuildRows(_) => {
                     handle_state!(self.emit_unmatched_build_rows())
+                }
+                // Longbow family JS (hook 3): join the written partitions.
+                HashJoinStreamState::Completed if self.spill.is_some() => {
+                    handle_state!(ready!(self.join_written_partitions(cx)))
                 }
                 HashJoinStreamState::Completed if !self.output_buffer.is_empty() => {
                     // Flush any remaining buffered data
@@ -747,6 +769,14 @@ impl HashJoinStream {
         )?;
         build_timer.done();
 
+        // Longbow family JS: keep the probe-side spill state only if the
+        // build spilled.
+        if let Some(spill) = &mut self.spill
+            && !spill.on_build(left_data.spilled())
+        {
+            self.spill = None;
+        }
+
         // Note: For null-aware anti join, we need to check the probe side (right) for NULLs,
         // not the build side (left). The probe-side NULL check happens during process_probe_batch.
         // The probe_side_has_null flag will be set there if any probe batch contains NULL.
@@ -775,6 +805,19 @@ impl HashJoinStream {
                 self.state = HashJoinStreamState::ExhaustedProbeSide;
             }
             Some(Ok(batch)) => {
+                // Longbow family JS (hook 2): rows of written partitions go
+                // to this stream's probe files.
+                let batch = match &mut self.spill {
+                    Some(spill) => {
+                        match spill.route(batch, &self.on_right, &self.random_state)? {
+                            Some(batch) => batch,
+                            None => {
+                                return Poll::Ready(Ok(StatefulStreamResult::Continue));
+                            }
+                        }
+                    }
+                    None => batch,
+                };
                 // Precalculate hash values for fetched batch
                 let keys_values = evaluate_expressions_to_arrays(&self.on_right, &batch)?;
 
@@ -1039,6 +1082,34 @@ impl HashJoinStream {
         }
 
         Ok(StatefulStreamResult::Continue)
+    }
+
+    /// Longbow family JS (hook 3): after the in-memory pass, lets go of the
+    /// in-memory table and forwards the joins of the written partitions.
+    fn join_written_partitions(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+        if let BuildSide::Ready(_) = self.build_side {
+            self.build_side = BuildSide::Released;
+        }
+        let Some(spill) = self.spill.as_mut() else {
+            return Poll::Ready(Ok(StatefulStreamResult::Continue));
+        };
+        match ready!(spill.poll_written(cx)) {
+            Some(Ok(batch)) => {
+                if self.output_buffer.push_batch(batch)? == PushBatchStatus::LimitReached
+                {
+                    self.output_buffer.finish()?;
+                }
+            }
+            Some(Err(error)) => {
+                self.spill = None;
+                return Poll::Ready(Err(error));
+            }
+            None => self.spill = None,
+        }
+        Poll::Ready(Ok(StatefulStreamResult::Continue))
     }
 
     /// Decides whether this stream emits the final build-side rows (unmatched

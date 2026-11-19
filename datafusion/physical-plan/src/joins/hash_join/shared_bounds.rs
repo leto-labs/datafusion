@@ -183,6 +183,8 @@ fn create_membership_predicate(
         }
         // Empty partition - should not create a filter for this
         PushdownStrategy::Empty => Ok(None),
+        // Longbow family JS: the bounds predicate alone.
+        PushdownStrategy::BoundsOnly => Ok(None),
     }
 }
 
@@ -335,6 +337,9 @@ pub(crate) enum PushdownStrategy {
     Map(Arc<Map>, Option<Arc<KeyRangeBitmap>>, Option<MapBuildSide>),
     /// There was no data in this partition, do not build a dynamic filter for it
     Empty,
+    /// Longbow family JS: the build wrote partitions to disk, so no
+    /// membership form describes all of its rows; only its bounds filter.
+    BoundsOnly,
 }
 
 /// The key arrays a [`PushdownStrategy::Map`] was built from and an empty
@@ -907,7 +912,7 @@ impl SharedBuildAccumulator {
                             matches!(map.as_ref(), Map::HashMap(_))
                         }
                         PushdownStrategy::InList(_) => true,
-                        PushdownStrategy::Empty => false,
+                        PushdownStrategy::Empty | PushdownStrategy::BoundsOnly => false,
                     };
                     members = members.filter(|_| mergeable).map(|mut members| {
                         members.push((partition_id, pushdown.clone(), bounds.clone()));
@@ -1110,7 +1115,7 @@ impl SharedBuildAccumulator {
                         retained.push(columns);
                         map
                     }
-                    PushdownStrategy::Empty => {
+                    PushdownStrategy::Empty | PushdownStrategy::BoundsOnly => {
                         return internal_err!("empty partitions have no members");
                     }
                 });

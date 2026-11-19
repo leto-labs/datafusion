@@ -560,6 +560,83 @@ async fn join_by_key_single_partition() {
         .await
 }
 
+/// Longbow family JS: the self-join of `join_by_key_*` with hash join
+/// spilling on (and a disk manager). In a pool of three quarters of its
+/// build it spills and returns the unbounded answer, where spilling off
+/// fails. In half of its build it still fails: one `service` value holds
+/// about half of the rows, a partition no spill level can divide, which
+/// needs the build-chunk join of `add-join-spill` section 3.
+async fn join_by_key_spills(target_partitions: usize) {
+    let query = "select t1.* from t t1 JOIN t t2 ON t1.service = t2.service";
+    let table = Scenario::AccessLog.table();
+    let run = |limit: Option<usize>, spilling: bool| {
+        let table = Arc::clone(&table);
+        async move {
+            let mut config =
+                SessionConfig::new().with_target_partitions(target_partitions);
+            let execution = &mut config.options_mut().execution;
+            execution.enable_hash_join_spilling = spilling;
+            execution.hash_join_spill_reservation_bytes = 4096;
+            let mut runtime = RuntimeEnvBuilder::new()
+                .with_disk_manager_builder(DiskManagerBuilder::default());
+            if let Some(limit) = limit {
+                runtime = runtime.with_memory_limit(limit, 1.0);
+            }
+            let ctx = SessionContext::new_with_config_rt(config, runtime.build_arc()?);
+            ctx.register_table("t", table)?;
+            let plan = ctx.sql(query).await?.create_physical_plan().await?;
+            let batches = collect_batches(Arc::clone(&plan), ctx.task_ctx()).await?;
+            Ok::<_, datafusion_common::DataFusionError>((plan, batches))
+        }
+    };
+    let (plan, expected) = run(None, false).await.unwrap();
+    let build_mem_used = plan_metric(plan.as_ref(), "build_mem_used");
+    assert!(build_mem_used > 0);
+
+    let limit = build_mem_used * 3 / 4;
+    let error = run(Some(limit), false).await.unwrap_err().to_string();
+    assert_contains!(&error, "Resources exhausted");
+    let (plan, actual) = run(Some(limit), true).await.unwrap();
+    assert_eq!(
+        batches_to_sort_string(&actual),
+        batches_to_sort_string(&expected)
+    );
+    assert!(plan_metric(plan.as_ref(), "spilled_partitions") > 0);
+    assert!(plan_spill_count(plan.as_ref()) > 0);
+
+    let error = run(Some(build_mem_used / 2), true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_contains!(&error, "Resources exhausted");
+    assert_contains!(
+        &error,
+        "did not spill because its partition is at spill level 4"
+    );
+}
+
+/// The sum of the named metric over `plan` and its descendants.
+fn plan_metric(plan: &dyn ExecutionPlan, name: &str) -> usize {
+    plan.metrics()
+        .and_then(|metrics| metrics.sum_by_name(name))
+        .map_or(0, |value| value.as_usize())
+        + plan
+            .children()
+            .into_iter()
+            .map(|child| plan_metric(child.as_ref(), name))
+            .sum::<usize>()
+}
+
+#[tokio::test]
+async fn join_by_key_multiple_partitions_spills() {
+    join_by_key_spills(2).await
+}
+
+#[tokio::test]
+async fn join_by_key_single_partition_spills() {
+    join_by_key_spills(1).await
+}
+
 #[tokio::test]
 async fn join_by_expression() {
     TestCase::new()

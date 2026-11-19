@@ -63,6 +63,7 @@ impl PreparedHashJoinBuild {
             not_in: None,
             visited_indices_bitmap: VisitedBitmap::empty(),
             probe_completion: ProbeCompletion::new(probe_threads),
+            spilled: None,
         }
     }
 
@@ -185,6 +186,7 @@ impl HashJoinExec {
             None,
             count,
             BuildMode::Prepared,
+            None,
             None,
         )
         .await?;

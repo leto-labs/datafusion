@@ -372,6 +372,13 @@ impl<T: 'static> OnceAsync<T> {
             .clone()
             .map_err(DataFusionError::Shared)
     }
+
+    /// Longbow family JS: lets go of the result this holds for later
+    /// callers, which then get `error`. Callers that already hold a
+    /// [`OnceFut`] keep the result until they drop it.
+    pub(crate) fn release(&self, error: DataFusionError) {
+        *self.fut.lock() = Some(Err(Arc::new(error)));
+    }
 }
 
 /// The shared future type used internally within [`OnceAsync`]

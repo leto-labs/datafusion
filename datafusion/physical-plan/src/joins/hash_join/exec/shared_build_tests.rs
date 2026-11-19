@@ -1003,6 +1003,7 @@ async fn collect_build(
         Count::new(),
         BuildMode::Ordinary,
         parallel,
+        None,
     )
     .await
 }

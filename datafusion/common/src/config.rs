@@ -1053,6 +1053,37 @@ config_namespace! {
         /// unaffected and always keep the fallback.
         pub enable_nlj_coordinated_fallback: bool, default = true
 
+        /// Longbow family JS: lets an eligible `HashJoinExec` spill hash
+        /// partitions of its build side, and their probe rows, to disk when
+        /// a build reservation is refused, and join each written partition
+        /// later (a hybrid hash join). A join that is not eligible (null-aware,
+        /// ordered or unbounded probe input, prepared build, no disk manager)
+        /// fails as before. The join pays nothing until its first refusal.
+        pub enable_hash_join_spilling: bool, default = false
+
+        /// Longbow family JS: memory that a spilling hash join stream keeps
+        /// from its first spill on, for its write buffers, read buffers and
+        /// one batch in transit.
+        pub hash_join_spill_reservation_bytes: usize, default = 16 * 1024 * 1024
+
+        /// Longbow family JS: hash partitions of each spill level of a hash
+        /// join. A power of two from 2 to 256.
+        pub hash_join_spill_partitions: usize, default = 16
+
+        /// Longbow family JS: spill levels below the first. A written
+        /// partition whose build is refused at this depth fails.
+        pub hash_join_spill_max_depth: usize, default = 3
+
+        /// Longbow family JS: reserved for build chunks of one partition that
+        /// cannot be divided (not implemented; such a partition fails at the
+        /// depth limit).
+        pub hash_join_spill_max_replay_passes: usize, default = 64
+
+        /// Longbow family JS, tests only: a first-level eligible join enters
+        /// spill mode once its build holds this many rows and writes every
+        /// partition with an odd index. 0 turns it off.
+        pub hash_join_spill_test_force_rows: usize, default = 0
+
         /// Number of files to read in parallel when inferring schema and statistics
         pub meta_fetch_concurrency: ConfigNonZeroUsize, default = non_zero_usize_default(32)
 

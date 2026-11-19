@@ -21,5 +21,6 @@ mod inlist_builder;
 mod not_in;
 mod partitioned_hash_eval;
 mod shared_bounds;
+mod spill;
 mod stream;
 mod visited;
