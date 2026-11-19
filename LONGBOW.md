@@ -1079,6 +1079,12 @@ in `ArrowReaderOptions`).
    equals what a file opened at that generation would prepare. Pruning
    predicate creation errors of the build are added to every file's counter
    that uses the entry. At most 16 entries; the debug output prints none.
+   The file-level pruning predicate (file statistics against the logical
+   schema, before the footer is read) of a predicate whose dynamic filters
+   can no longer change comes from the same cache, keyed by the predicate,
+   the logical schema and the generation, and is evaluated once per open as
+   `FilePruner::should_prune` would; a predicate that can still change keeps
+   its per-file `FilePruner`, which early stopping watches.
 3. **One `ParquetFileMetrics` per open.** The opener passes its metrics to
    the reader factory as a `PartitionedFile` extension (`OpenFileMetrics`);
    the default and cached factories give them to the open's readers (the
