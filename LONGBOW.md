@@ -811,7 +811,8 @@ ineligible join's refused build fails as before, with the context
 Metrics, registered at the first relief: `spill_count`, `spilled_bytes`,
 `spilled_rows`, `build_spilled_rows`, `build_spilled_bytes`,
 `probe_spilled_rows`, `probe_spilled_bytes`, `spilled_partitions` and the
-gauge `spill_depth` (levels that wrote; 1 for the first level only). The
+gauge `spill_depth` (levels that wrote; 1 for the first level only), one
+gauge per join, so its aggregate over the streams is the deepest level. The
 joins of written partitions report into the first-level join's metrics.
 
 Review fixes from the Longbow oracle (`longbow-testkit` `join_spill`): the

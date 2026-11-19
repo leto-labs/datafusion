@@ -257,12 +257,9 @@ fn spill_metrics(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize, usize) {
     (
         metric(&metrics, "spilled_partitions").unwrap_or(0),
         metric(&metrics, "probe_spilled_rows").unwrap_or(0),
-        metrics
-            .iter()
-            .filter(|metric| metric.value().name() == "spill_depth")
-            .map(|metric| metric.value().as_usize())
-            .max()
-            .unwrap_or(0),
+        // Summed over the join's streams: one gauge per join, so the sum is
+        // the deepest level.
+        metric(&metrics, "spill_depth").unwrap_or(0),
     )
 }
 

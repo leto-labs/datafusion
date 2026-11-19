@@ -166,7 +166,7 @@ pub(crate) struct JoinSpillMetrics {
 }
 
 impl JoinSpillMetrics {
-    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize, depth: Gauge) -> Self {
         let counter =
             |name: &'static str| MetricBuilder::new(metrics).counter(name, partition);
         Self {
@@ -176,7 +176,7 @@ impl JoinSpillMetrics {
             probe_rows: counter("probe_spilled_rows"),
             probe_bytes: counter("probe_spilled_bytes"),
             partitions: counter("spilled_partitions"),
-            depth: MetricBuilder::new(metrics).gauge("spill_depth", partition),
+            depth,
         }
     }
 }
@@ -188,6 +188,9 @@ enum LazyMetrics {
         set: ExecutionPlanMetricsSet,
         partition: usize,
         cell: OnceLock<JoinSpillMetrics>,
+        /// One depth gauge for all of the join's streams, so that its
+        /// aggregate is the deepest level rather than a sum.
+        shared: Arc<SpillShared>,
     },
     Inherited(JoinSpillMetrics),
 }
@@ -199,7 +202,14 @@ impl LazyMetrics {
                 set,
                 partition,
                 cell,
-            } => cell.get_or_init(|| JoinSpillMetrics::new(set, *partition)),
+                shared,
+            } => cell.get_or_init(|| {
+                let depth = shared
+                    .depth
+                    .get_or_init(|| MetricBuilder::new(set).gauge("spill_depth", 0))
+                    .clone();
+                JoinSpillMetrics::new(set, *partition, depth)
+            }),
             Self::Inherited(metrics) => metrics,
         }
     }
@@ -207,10 +217,11 @@ impl LazyMetrics {
     /// The same metrics for another output partition of the join.
     fn for_partition(&self, partition: usize) -> Self {
         match self {
-            Self::Own { set, .. } => Self::Own {
+            Self::Own { set, shared, .. } => Self::Own {
                 set: set.clone(),
                 partition,
                 cell: OnceLock::new(),
+                shared: Arc::clone(shared),
             },
             Self::Inherited(metrics) => Self::Inherited(metrics.clone()),
         }
@@ -314,6 +325,7 @@ impl JoinSpill {
                 set: metrics.clone(),
                 partition,
                 cell: OnceLock::new(),
+                shared: Arc::clone(shared),
             },
         };
         Ok(Self::Eligible(Box::new(Eligible {
@@ -601,7 +613,11 @@ impl BuildSpill {
             random_state: eligible.random_state.clone(),
             context: Arc::clone(&eligible.context),
             // Replaced at activation; registering metrics is deferred to it.
-            metrics: JoinSpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            metrics: JoinSpillMetrics::new(
+                &ExecutionPlanMetricsSet::new(),
+                0,
+                Gauge::new(),
+            ),
             manager: None,
             template: eligible.template.clone(),
             shared: (eligible.mode == PartitionMode::CollectLeft)
@@ -1358,6 +1374,8 @@ pub(crate) struct SpillShared {
     partitions: OnceLock<Range<usize>>,
     /// Probe partitions of the join, recorded at its first execution.
     probe_partitions: OnceLock<usize>,
+    /// The join's `spill_depth` gauge, registered at its first relief.
+    depth: OnceLock<Gauge>,
     early: Mutex<Early>,
 }
 
