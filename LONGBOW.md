@@ -1117,20 +1117,27 @@ in `ArrowReaderOptions`).
 
 Review fixes (MJJ96 independent review, 2026-11-19):
 
-- **Store identity.** The file metadata cache key is the object store
-  (scheme and authority of its `ObjectStoreUrl`, without credentials) plus
-  the location (`metadata::file_metadata_cache_key`); entries are validated
-  against the listed generation (size, modification time, ETag, version).
-  `CachedParquetFileReaderFactory::new` takes the store's URL, and
-  `DFParquetMetadata` and `ParquetFileReader` use the cache only with one
-  (`with_object_store_url`), so planning-time reads without a URL skip it.
-  A footer of one store never meets another store's index. Upstream
-  apache/datafusion#27580 (open) keys the cache the same way with a new key
-  type and a registry lookup for planning.
+- **Store identity.** The file metadata cache key is the allocation of the
+  store that reads the file plus the location
+  (`metadata::file_metadata_cache_key`), validated against the listed
+  generation (size, modification time, ETag, version); each entry keeps the
+  store weakly, so no other store can take its address while the entry
+  exists. The store is the one the registry resolves:
+  `ObjectStoreRegistry::get_store_identity` (default `get_store`) returns the
+  registered store even when `get_store` wraps it per call, and
+  `CachedParquetFileReaderFactory::with_store_identity` takes it. Planning
+  reads (`DFParquetMetadata::with_store_identity` with the registry's `Arc`)
+  and execution reads of one store therefore share one entry, and a store
+  registered in another's place at the same URL has another allocation and
+  so other entries; the old ones age out under the budget (re-review
+  finding 1). Without an identity the cache is skipped. No URL is keyed or
+  printed (`Debug` shows the identity's address). Upstream
+  apache/datafusion#27580 (open) keys by URL instead.
 - **Required validation.** `PageIndexRequest::validate` applies Arrow's
   `Required` rule for the offset index (with any selected index range, every
   selected chunk needs an offset index) from the footer, on cache hits and
-  loads alike; coverage includes it. The complete load for the cache is
+  loads alike; coverage includes it. A warm request that the footer rules out fails before
+  any index read. The complete load for the cache is
   optional, so a required request is enforced only within its own selection.
 - **Index bytes.** On a cache miss the footer is read first and the index
   after it; index reads in the metadata layer go through a counting fetch

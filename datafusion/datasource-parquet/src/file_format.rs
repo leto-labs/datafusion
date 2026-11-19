@@ -668,11 +668,15 @@ impl FileFormat for ParquetFormat {
         let store = state
             .runtime_env()
             .object_store(conf.object_store_url.clone())?;
-        let cached_parquet_read_factory = Arc::new(CachedParquetFileReaderFactory::new(
-            store,
-            conf.object_store_url.clone(),
-            metadata_cache,
-        ));
+        // Longbow family OO: keyed by the registered store's allocation.
+        let identity = state
+            .runtime_env()
+            .object_store_registry
+            .get_store_identity(conf.object_store_url.as_ref())?;
+        let cached_parquet_read_factory = Arc::new(
+            CachedParquetFileReaderFactory::new(store, metadata_cache)
+                .with_store_identity(identity),
+        );
         source = source.with_parquet_file_reader_factory(cached_parquet_read_factory);
 
         if let Some(metadata_size_hint) = metadata_size_hint {

@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -162,6 +164,16 @@ pub trait ObjectStoreRegistry: Send + Sync + std::fmt::Debug + 'static {
     /// the `url` and [`ObjectStoreRegistry`] implementation. An [`ObjectStore`] may be lazily
     /// created and registered.
     fn get_store(&self, url: &Url) -> Result<Arc<dyn ObjectStore>>;
+
+    /// The registered store that [`Self::get_store`] resolves `url` to, for
+    /// caches keyed by store identity (Longbow family OO). A registry whose
+    /// `get_store` wraps the registered store per call (for example per
+    /// execution attempt) returns the registered store here, so that every
+    /// wrapper of one registration shares one identity, and a store
+    /// registered in its place has another. The default is `get_store`.
+    fn get_store_identity(&self, url: &Url) -> Result<Arc<dyn ObjectStore>> {
+        self.get_store(url)
+    }
 }
 
 /// The default [`ObjectStoreRegistry`]
