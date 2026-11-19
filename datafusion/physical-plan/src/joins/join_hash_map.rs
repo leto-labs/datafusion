@@ -891,7 +891,9 @@ impl SlotLayout {
         }
         let head_bits = (u64::BITS - (rows as u64).leading_zeros()).max(1);
         let tag_shift = head_bits + 1 + key_bits;
-        (tag_shift + MIN_TAG_BITS <= u64::BITS).then_some(Self {
+        // Review fix (leto-mjj.71 review): `then`, not `then_some`, so the
+        // tag's width is computed only when the fields fit.
+        (tag_shift + MIN_TAG_BITS <= u64::BITS).then(|| Self {
             head_bits,
             key_bits,
             tag_shift,

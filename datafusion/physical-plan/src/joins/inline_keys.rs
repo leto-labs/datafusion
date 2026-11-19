@@ -440,7 +440,8 @@ impl InlineKeys {
                 |values| values[row].as_i64(),
                 return None
             );
-            if column.span == u64::MAX {
+            // One column without a range is its value, as in `encode`.
+            if self.columns.len() == 1 && column.span == u64::MAX {
                 return Some(value as u64);
             }
             let delta = value.wrapping_sub(column.min) as u64;

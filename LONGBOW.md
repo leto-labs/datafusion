@@ -715,11 +715,17 @@ UPSTREAMABLE.
     fit and the bounds give their ranges. Its hash groups encode the keys in
     parallel (8 transient bytes per row).
   - A partitioned build (JT 3) of several key columns gets dense keys,
-    encoded in its hash pass. A pool that refuses their charge gets the key
-    comparison.
+    encoded in its hash pass. Dense keys are optional. A pool that refuses
+    their charge gets the key comparison. When any later charge of the
+    build is refused while they are held (the table, the copy of the build
+    rows, the key copies, the bitmaps), the build is retried once from the
+    rows that it still holds, without dense keys. So a build that fits with
+    the switch off also fits with it on (review finding, leto-mjj.71).
   - A partitioned build of one key column keeps hashes only.
   - The table of a spilling build's in-memory partitions (family JS) keeps
-    hashes only.
+    hashes only. The partitions read back from spill files are joined by
+    nested CollectLeft joins, which choose as any build does and with the
+    same retry.
   - Measured (worker-01, TPC-H SF100 Q9 pull, 48 threads): packed slots on
     per-partition builds cost their scatter more than their probe gained.
     For orders, the probe was flat while the build grew; for Q21's 73 M-row
@@ -757,7 +763,21 @@ Tests:
 - every join type and NULL equality end to end, inline on and off, natively
   and in parallel, with packed and dense keys;
 - dense-key filtering;
-- a refused inline partitioned build touches nothing.
+- a refused inline partitioned build touches nothing;
+- from the leto-mjj.71 review (`hash_join/exec/jt9_review_tests.rs`):
+  - a randomized differential test of `HashJoinExec` with inline keys
+    forced on and off against an oracle that shares no code with the join.
+    It covers 1 to 3 key columns of 24 types, packed slots with several
+    columns, dense keys, NULLs, all ten join types, both NULL equalities,
+    residual filters, dynamic filters, and CollectLeft (one future or
+    parallel) and Partitioned builds;
+  - a wide (46-bit) key in a parallel build keeps the hash-only table
+    (`SlotLayout::packed` computes the tag only when the fields fit);
+  - a build at the switch-off peak fits with the switch on;
+  - partitions read back from spill;
+  - `encode_row` agrees with `encode`;
+  - the property test's expected pairs compare the key columns
+    themselves.
 
 ## Family AJ: DuckDB's ASOF join forms
 

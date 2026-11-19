@@ -189,9 +189,12 @@ fn check(case: &Case, share: i64, limits: &[usize]) {
         })
         .into_iter()
         .filter(|&(p, b)| {
-            let p = p as usize;
-            encoded.valid.as_ref().is_none_or(|v| v.is_valid(p))
-                && keys.encode_row(&case.build, b as usize) == Some(encoded.keys[p])
+            case.build.iter().zip(&case.probe).all(|(left, right)| {
+                let (b, p) = (b as usize, p as usize);
+                !left.is_null(b)
+                    && !right.is_null(p)
+                    && left.slice(b, 1).to_data() == right.slice(p, 1).to_data()
+            })
         })
         .collect();
         let actual = drain(limit, |offset, input, matched| {
@@ -307,6 +310,12 @@ fn a_packed_slot_keeps_every_field_at_its_widths() {
     // The tag would keep fewer than its minimum bits.
     assert!(SlotLayout::packed(1 << 20, 64 - 21 - 1 - MIN_TAG_BITS + 1).is_none());
     assert!(SlotLayout::packed(u32::MAX as usize, 1).is_none());
+}
+
+#[test]
+fn wide_inline_keys_fall_back_without_panicking() {
+    assert!(SlotLayout::packed(300_000, 64).is_none());
+    assert!(SlotLayout::packed(300_000, 45).is_none());
 }
 
 #[test]

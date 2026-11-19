@@ -106,6 +106,8 @@ use super::partitioned_hash_eval::SeededRandomState;
 
 mod prepared;
 pub use prepared::PreparedHashJoinBuild;
+#[cfg(test)]
+mod jt9_review_tests;
 mod shared_build;
 #[cfg(test)]
 mod shared_build_tests;
@@ -3662,6 +3664,150 @@ fn build_spilled(
 /// callers that need to recover from a failed build.
 #[expect(clippy::too_many_arguments)]
 fn build_in_memory(
+    random_state: &RandomState,
+    schema: &SchemaRef,
+    batches: &mut Vec<RecordBatch>,
+    num_rows: usize,
+    max_batch_rows: usize,
+    input_bytes: usize,
+    copy_bytes: usize,
+    on_left: &[PhysicalExprRef],
+    metrics: &BuildProbeJoinMetrics,
+    reservation: &mut MemoryReservation,
+    bounds: Option<PartitionBounds>,
+    with_visited_indices_bitmap: bool,
+    probe_threads_count: usize,
+    should_compute_dynamic_filters: bool,
+    config: &ConfigOptions,
+    null_equality: NullEquality,
+    not_in: Option<NotIn>,
+    array_map_created_count: &Count,
+    prepared: bool,
+    path: BuildPath,
+    inline: Option<InlineKeys>,
+    dense: Option<InlineKeys>,
+) -> Result<JoinLeftData> {
+    // Longbow patch (JT 9): dense keys are optional. When a build that holds
+    // them is refused memory, it is built once more without them, from the
+    // rows it still holds, so a build that fits with inline keys off also
+    // fits with them on. Dense keys never come with a prebuilt (parallel)
+    // map, whose map the first attempt would consume.
+    let retry = match (&dense, &path) {
+        (Some(_), BuildPath::Native) => Some(BuildPath::Native),
+        (Some(_), BuildPath::Compacted) => Some(BuildPath::Compacted),
+        _ => None,
+    };
+    let Some(retry_path) = retry else {
+        return build_in_memory_once(
+            random_state,
+            schema,
+            batches,
+            num_rows,
+            max_batch_rows,
+            input_bytes,
+            copy_bytes,
+            on_left,
+            metrics,
+            reservation,
+            bounds,
+            with_visited_indices_bitmap,
+            probe_threads_count,
+            should_compute_dynamic_filters,
+            config,
+            null_equality,
+            not_in,
+            array_map_created_count,
+            prepared,
+            path,
+            inline,
+            dense,
+        );
+    };
+    let (held_before, used_before, batches_before) = (
+        reservation.size(),
+        metrics.build_mem_used.value(),
+        batches.len(),
+    );
+    let first = build_in_memory_once(
+        random_state,
+        schema,
+        batches,
+        num_rows,
+        max_batch_rows,
+        input_bytes,
+        copy_bytes,
+        on_left,
+        metrics,
+        reservation,
+        bounds.clone(),
+        with_visited_indices_bitmap,
+        probe_threads_count,
+        should_compute_dynamic_filters,
+        config,
+        null_equality,
+        not_in,
+        array_map_created_count,
+        prepared,
+        path,
+        inline.clone(),
+        dense,
+    );
+    match first {
+        Err(error) if spill::is_refusal(&error) => {
+            // Everything the attempt allocated is dropped; `batches` still
+            // holds every build row, possibly concatenated into one batch
+            // (whose charge the concatenation adopted). Charge exactly what
+            // the batches hold again, and nothing of the attempt.
+            let held_rows = if batches.len() == batches_before {
+                input_bytes
+            } else {
+                // As `concat_build_batches` charges the concatenated batch.
+                batches.iter().map(get_record_batch_memory_size).sum()
+            };
+            let held = held_before.saturating_sub(input_bytes) + held_rows;
+            if reservation.size() > held {
+                reservation.shrink(reservation.size() - held);
+            } else {
+                reservation.try_grow(held - reservation.size())?;
+            }
+            // The gauge of this build alone: back to before the attempt,
+            // with the rows as they are held now.
+            metrics
+                .build_mem_used
+                .set((used_before + held_rows).saturating_sub(input_bytes));
+            build_in_memory_once(
+                random_state,
+                schema,
+                batches,
+                num_rows,
+                max_batch_rows,
+                held_rows,
+                copy_bytes,
+                on_left,
+                metrics,
+                reservation,
+                bounds,
+                with_visited_indices_bitmap,
+                probe_threads_count,
+                should_compute_dynamic_filters,
+                config,
+                null_equality,
+                not_in,
+                array_map_created_count,
+                prepared,
+                retry_path,
+                inline,
+                None,
+            )
+        }
+        result => result,
+    }
+}
+
+/// One attempt of [`build_in_memory`] (Longbow patch JT 9: with or without
+/// dense keys).
+#[expect(clippy::too_many_arguments)]
+fn build_in_memory_once(
     random_state: &RandomState,
     schema: &SchemaRef,
     batches: &mut Vec<RecordBatch>,
