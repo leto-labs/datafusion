@@ -128,7 +128,7 @@ impl Cursor {
         }
         let reader = state.reader.as_mut().expect("a reader");
         let next = reader.poll_next_unpin(cx);
-        if let Poll::Ready(None) = next {
+        if matches!(next, Poll::Ready(None)) {
             state.ended = true;
             state.reader = None;
         }
@@ -217,7 +217,7 @@ pub(super) fn with_row_id(schema: &SchemaRef) -> SchemaRef {
 /// Appends the row numbers `start..` to `batch`, then leaves out the rows
 /// that `skip` marks.
 fn number_rows(
-    batch: RecordBatch,
+    batch: &RecordBatch,
     start: usize,
     schema: &SchemaRef,
     skip: Option<&MatchedBits>,
@@ -318,7 +318,7 @@ impl SpillFilesExec {
         metrics: JoinSpillMetrics,
     ) -> Self {
         let cache = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&schema)),
+            EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(source.partitions()),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -480,7 +480,7 @@ impl ExecutionPlan for SpillFilesExec {
             let batch = batch?;
             let first = start;
             start += batch.num_rows();
-            number_rows(batch, first, &numbered, row_ids.skip_matched.as_deref())
+            number_rows(&batch, first, &numbered, row_ids.skip_matched.as_deref())
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rows)))
     }

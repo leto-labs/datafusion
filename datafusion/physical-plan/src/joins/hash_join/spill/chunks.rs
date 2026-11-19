@@ -199,7 +199,7 @@ impl Chunks {
                 };
                 let first = *start;
                 *start += batch.num_rows();
-                match self.rest_rows(batch, first) {
+                match self.rest_rows(&batch, first) {
                     Ok(Some(batch)) => return Some(Ok(batch)),
                     Ok(None) => continue,
                     Err(error) => return Some(Err(error)),
@@ -378,7 +378,11 @@ impl Chunks {
     }
 
     /// Rows `start..` of the probe replay after the last chunk.
-    fn rest_rows(&self, batch: RecordBatch, start: usize) -> Result<Option<RecordBatch>> {
+    fn rest_rows(
+        &self,
+        batch: &RecordBatch,
+        start: usize,
+    ) -> Result<Option<RecordBatch>> {
         let Some(bits) = &self.bits else {
             return internal_err!("hash join spill: a probe pass without matched bits");
         };
@@ -387,7 +391,7 @@ impl Chunks {
         let rows = match self.plan.rest {
             Rest::Unmatched => {
                 let unmatched = arrow::compute::not(&matched)?;
-                let rows = filter_record_batch(&batch, &unmatched)?;
+                let rows = filter_record_batch(batch, &unmatched)?;
                 if rows.num_rows() == 0 {
                     return Ok(None);
                 }
@@ -395,7 +399,7 @@ impl Chunks {
             }
             Rest::Mark => {
                 let mark: ArrayRef = Arc::new(matched);
-                output.emit_probe(&batch, Some(&mark))?
+                output.emit_probe(batch, Some(&mark))?
             }
             Rest::None => return Ok(None),
         };

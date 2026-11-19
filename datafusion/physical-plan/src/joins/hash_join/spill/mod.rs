@@ -2782,7 +2782,6 @@ impl Written {
     }
 
     /// The run of `part` in build chunks, over `build_file` and `probe_files`.
-    #[expect(clippy::too_many_arguments)]
     fn chunk_run(
         &self,
         part: usize,

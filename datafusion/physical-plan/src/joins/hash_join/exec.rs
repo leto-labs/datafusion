@@ -3470,7 +3470,7 @@ async fn collect_left_input(
         (Err(error), _) if chunk.is_some() && spill::is_refusal(&error) => {
             let chunk = chunk.expect("a chunk");
             build_chunk(
-                chunk,
+                &chunk,
                 batches,
                 &mut reservation,
                 &random_state,
@@ -3514,7 +3514,7 @@ async fn collect_left_input(
 /// smallest unit of design decision 5, so that every chunk progresses.
 #[expect(clippy::too_many_arguments)]
 fn build_chunk(
-    chunk: ChunkBuild,
+    chunk: &ChunkBuild,
     mut batches: Vec<RecordBatch>,
     reservation: &mut MemoryReservation,
     random_state: &RandomState,
