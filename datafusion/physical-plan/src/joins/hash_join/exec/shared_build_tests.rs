@@ -316,7 +316,9 @@ async fn inline_keys_match_the_hash_only_build_for_every_join_type() -> Result<(
         JoinType::LeftMark,
         JoinType::RightMark,
     ];
-    for keys in [&[0][..], &[0, 2][..]] {
+    // `k` (with NULLs and duplicates), `v` (unique, every probe row
+    // matches) and both (rarely equal: an anti join of nearly every row).
+    for keys in [&[0][..], &[2][..], &[0, 2][..]] {
         for join_type in join_types {
             for null_equality in [
                 NullEquality::NullEqualsNothing,
@@ -338,7 +340,9 @@ async fn inline_keys_match_the_hash_only_build_for_every_join_type() -> Result<(
                         );
                     }
                     assert!(
-                        !outputs[0].rows.is_empty() || join_type == JoinType::RightAnti
+                        !outputs[0].rows.is_empty()
+                            || join_type == JoinType::RightAnti
+                            || keys.len() == 2
                     );
                     assert_eq!(outputs[0].shards, outputs[1].shards);
                     assert!(
