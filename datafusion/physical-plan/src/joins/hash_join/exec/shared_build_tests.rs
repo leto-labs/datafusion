@@ -1082,6 +1082,7 @@ async fn collect_build(
         BuildMode::Ordinary,
         parallel,
         None,
+        None,
     )
     .await
 }

@@ -27,7 +27,7 @@ use crate::joins::hash_join::shared_bounds::{
     ColumnBounds, MapBuildSide, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
 };
 use crate::joins::hash_join::spill::{
-    self, BuildSpill, JoinSpill, SpillShared, SpilledBuild,
+    self, BuildSpill, ChunkBuild, JoinSpill, SpillShared, SpilledBuild,
 };
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
@@ -87,7 +87,9 @@ use datafusion_common::{
     internal_datafusion_err, internal_err, plan_err, project_schema,
 };
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::memory_pool::{
+    GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation,
+};
 use datafusion_expr::Accumulator;
 use datafusion_functions_aggregate_common::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_physical_expr::equivalence::{
@@ -1892,6 +1894,7 @@ impl ExecutionPlan for HashJoinExec {
                     BuildMode::Ordinary,
                     ParallelBuild::from_task(&context, &self.metrics, partition),
                     spill.build(),
+                    spill.chunk(),
                 )
                 .map_err(explain))
             })?,
@@ -1920,6 +1923,7 @@ impl ExecutionPlan for HashJoinExec {
                         BuildMode::Ordinary,
                         None,
                         spill.build(),
+                        spill.chunk(),
                     )
                     .map_err(explain),
                 )
@@ -3350,9 +3354,13 @@ async fn collect_left_input(
     mode: BuildMode,
     parallel: Option<ParallelBuild>,
     mut spill: Option<BuildSpill>,
+    mut chunk: Option<ChunkBuild>,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
     let prepared = mode == BuildMode::Prepared;
+    // Longbow family JS: a build chunk uses the single-future build, which
+    // gives its rows back when the table is refused.
+    let parallel = parallel.filter(|_| chunk.is_none());
 
     let is_phj_candidate = is_perfect_hash_join_candidate(&on_left, &schema)?;
 
@@ -3366,11 +3374,29 @@ async fn collect_left_input(
 
     let mut max_batch_rows = 0;
     while let Some(batch) = left_stream.try_next().await? {
+        // Longbow family JS (build chunks): a chunk ends at the first batch
+        // that the pool refuses, which goes back to the chunk's cursor.
+        let chunk_size = match chunk.as_mut() {
+            Some(chunk) => match chunk.admit(&batch, state.batches.is_empty())? {
+                Some(size) => Some(size),
+                None => break,
+            },
+            None => None,
+        };
         max_batch_rows = max_batch_rows.max(batch.num_rows());
         if let Some(accumulators) = &mut state.bounds_accumulators {
             for accumulator in accumulators {
                 accumulator.update_batch(&batch)?;
             }
+        }
+        if let Some(size) = chunk_size {
+            // Charged to the chunk run (`ChunkBuild::admit`), not here.
+            state.metrics.build_mem_used.add(size);
+            state.metrics.build_input_batches.add(1);
+            state.metrics.build_input_rows.add(batch.num_rows());
+            state.num_rows += batch.num_rows();
+            state.batches.push(batch);
+            continue;
         }
         // Longbow family JS (hook 1): an eligible join answers a refused
         // reservation by writing partitions, and stays in spill mode.
@@ -3407,6 +3433,26 @@ async fn collect_left_input(
         state.batches.push(batch);
     }
     drop(left_stream);
+    // Longbow family JS (build chunks): the table over the admitted rows.
+    if let Some(mut chunk) = chunk.take() {
+        chunk.release_permit();
+        if state.num_rows == 0 {
+            chunk.admit_empty();
+        }
+        return build_chunk(
+            chunk,
+            std::mem::take(&mut state.batches),
+            &random_state,
+            &schema,
+            &on_left,
+            &state.metrics,
+            with_visited_indices_bitmap,
+            probe_threads_count,
+            &config,
+            null_equality,
+            &array_map_created_count,
+        );
+    }
     if prepared && state.batches.is_empty() {
         // Even empty UTF-8 output retains an offset buffer.
         let empty = RecordBatch::new_empty(Arc::clone(&schema));
@@ -3600,6 +3646,93 @@ async fn collect_left_input(
     }
 }
 
+/// Longbow family JS: the table of a build chunk. Its rows and an estimate
+/// of their table were admitted batch by batch (`ChunkBuild::admit`). The
+/// table is built against a pool capped at that grant, so every allocation
+/// of the build (copy, table, key expressions, bitmaps) is refused at the cap
+/// before it is made: nothing is allocated beyond memory the real pool
+/// already granted. A refused build gives the second half of its batches
+/// back (still charged in the run) and builds again; one batch that does not
+/// fit fails with `ResourcesExhausted`. The table's charge is then split off
+/// the run's charge and the unused grant goes back to the pool.
+#[expect(clippy::too_many_arguments)]
+fn build_chunk(
+    mut chunk: ChunkBuild,
+    mut batches: Vec<RecordBatch>,
+    random_state: &RandomState,
+    schema: &SchemaRef,
+    on_left: &[PhysicalExprRef],
+    metrics: &BuildProbeJoinMetrics,
+    with_visited_indices_bitmap: bool,
+    probe_threads_count: usize,
+    config: &ConfigOptions,
+    null_equality: NullEquality,
+    array_map_created_count: &Count,
+) -> Result<JoinLeftData> {
+    loop {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(chunk.granted()));
+        let mut attempt = MemoryConsumer::new("HashJoinChunkTable")
+            .with_can_spill(true)
+            .register(&pool);
+        attempt.try_grow(chunk.rows_bytes())?;
+        let originals = batches.clone();
+        let num_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let max_batch_rows = batches.iter().map(RecordBatch::num_rows).max();
+        let input_bytes = attempt.size();
+        let built = build_in_memory(
+            random_state,
+            schema,
+            &mut batches,
+            num_rows,
+            max_batch_rows.unwrap_or(0),
+            input_bytes,
+            0,
+            on_left,
+            metrics,
+            &mut attempt,
+            None,
+            with_visited_indices_bitmap,
+            probe_threads_count,
+            false,
+            config,
+            null_equality,
+            None,
+            array_map_created_count,
+            false,
+            BuildPath::Native,
+            // A build chunk's table keeps only hashes, as the other spill
+            // builds (family JT 9).
+            None,
+            None,
+        );
+        match built {
+            Ok(mut data) => {
+                let charge = chunk.take_charge(pool.reserved());
+                let left = Arc::get_mut(&mut data.build)
+                    .ok_or_else(|| internal_datafusion_err!("shared build chunk"))?;
+                left.reservation = charge;
+                return Ok(data);
+            }
+            Err(error) if spill::is_refusal(&error) && originals.len() > 1 => {
+                drop(batches);
+                drop(attempt);
+                let mut keep = originals;
+                let rest = keep.split_off(keep.len() / 2);
+                chunk.give_back(rest);
+                batches = keep;
+            }
+            Err(error) if spill::is_refusal(&error) => {
+                return Err(error.context(format!(
+                    "Hash join spill: the table of one build batch of {num_rows} rows \
+                     needs more than the {} bytes its chunk was granted",
+                    chunk.granted()
+                )));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Longbow family JS: the table over the partitions of a spilling build
 /// that stayed in memory, built again with fewer of them while refused.
 #[expect(clippy::too_many_arguments)]
@@ -3619,7 +3752,18 @@ async fn build_spilled(
     array_map_created_count: &Count,
 ) -> Result<JoinLeftData> {
     let (mut data, spilled, floor_charge) = spill
-        .finish(reservation, |batches, reservation| {
+        .finish(reservation, |batches, reservation, floor| {
+            // A floor table is a hash table (see `spill::Floor`).
+            let floor_config;
+            let config = if floor == spill::Floor::Yes {
+                let mut options = config.clone();
+                options.execution.perfect_hash_join_small_build_threshold = 0;
+                options.execution.perfect_hash_join_min_key_density = f64::MAX;
+                floor_config = options;
+                &floor_config
+            } else {
+                config
+            };
             let num_rows = batches.iter().map(RecordBatch::num_rows).sum();
             let max_batch_rows = batches.iter().map(RecordBatch::num_rows).max();
             let input_bytes = reservation.size();
@@ -5183,6 +5327,7 @@ mod tests {
             None,
             Count::new(),
             BuildMode::Ordinary,
+            None,
             None,
             None,
         )

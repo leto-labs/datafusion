@@ -13,17 +13,20 @@
 
 use std::fmt;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
+use arrow::array::{ArrayRef, BooleanArray, RecordBatch, UInt64Array};
+use arrow::compute::filter_record_batch;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     DataFusionError, Result, exec_datafusion_err, resources_datafusion_err,
 };
 use datafusion_common::{assert_or_internal_err, internal_err};
 use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_execution::spill_file::SpillFile;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
 use futures::future::BoxFuture;
@@ -31,6 +34,7 @@ use futures::{StreamExt, TryStreamExt};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use super::{JoinSpillMetrics, SpilledFile};
+use crate::SendableRecordBatchStream as Rows;
 use crate::execution_plan::{Boundedness, EmissionType, SchedulingType};
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::SpillManager;
@@ -274,13 +278,16 @@ pub(super) enum FileSource {
     /// One partition, executed once by each stream that shares the join:
     /// each execution reads the files that the stream staged for it.
     Staged(Arc<Stage>),
+    /// One partition, the build of one chunk of a partition that cannot be
+    /// divided: each execution continues where the chunk before stopped.
+    Cursor(Arc<Cursor>),
 }
 
 impl FileSource {
     fn partitions(&self) -> usize {
         match self {
             Self::Fixed(files) => files.len(),
-            Self::Staged(_) => 1,
+            Self::Staged(_) | Self::Cursor(_) => 1,
         }
     }
 
@@ -288,7 +295,263 @@ impl FileSource {
         match self {
             Self::Fixed(files) => Ok(files[partition].clone()),
             Self::Staged(stage) => stage.take(),
+            Self::Cursor(_) => {
+                internal_err!("hash join spill: a cursor has no file list")
+            }
         }
+    }
+}
+
+/// The read position in the build file of a partition joined in chunks,
+/// and the one charge of the run: the batches given back, and the rows and
+/// table estimate of the chunk being built, are all held by `charge`, so
+/// moving bytes between them never passes through the pool.
+pub(crate) struct Cursor {
+    file: SpilledFile,
+    spill_manager: SpillManager,
+    /// The largest chunk unit charged without refusal
+    /// (`SpillOptions::chunk_unit`).
+    unit: usize,
+    state: Mutex<CursorState>,
+}
+
+struct CursorState {
+    reader: Option<Rows>,
+    /// Batches given back, read before the file.
+    back: Vec<RecordBatch>,
+    /// The run's charge (see [`Cursor`]).
+    charge: MemoryReservation,
+    /// Bytes of `charge` that cover the batches given back.
+    back_bytes: usize,
+    /// The batch read last came back from a chunk (still charged).
+    carried: bool,
+    /// The chunk being built could not reserve room for another batch: its
+    /// build input ends here, before anything more is read.
+    stop: bool,
+    /// The file has been read to its end.
+    ended: bool,
+}
+
+impl Cursor {
+    pub(super) fn new(
+        file: SpilledFile,
+        spill_manager: SpillManager,
+        unit: usize,
+        charge: MemoryReservation,
+    ) -> Self {
+        Self {
+            file,
+            spill_manager,
+            unit,
+            state: Mutex::new(CursorState {
+                reader: None,
+                back: vec![],
+                charge,
+                back_bytes: 0,
+                carried: false,
+                stop: false,
+                ended: false,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CursorState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub(crate) fn unit(&self) -> usize {
+        self.unit
+    }
+
+    /// Whether the batch read last came back from a chunk; its `size` bytes
+    /// then move from the given-back bytes to the caller's (no pool change).
+    pub(crate) fn take_carried(&self, size: usize) -> bool {
+        let mut state = self.lock();
+        if !std::mem::take(&mut state.carried) {
+            return false;
+        }
+        state.back_bytes = state.back_bytes.saturating_sub(size);
+        true
+    }
+
+    /// Gives `batch` back; `size` bytes of the charge already cover it.
+    pub(crate) fn give_back(&self, batch: RecordBatch, size: usize) {
+        let mut state = self.lock();
+        state.back_bytes += size;
+        state.back.push(batch);
+    }
+
+    /// Ends the current chunk's build input before its next read.
+    pub(crate) fn stop_chunk(&self) {
+        self.lock().stop = true;
+    }
+
+    /// A new chunk's build input starts.
+    pub(super) fn start_chunk(&self) {
+        self.lock().stop = false;
+    }
+
+    /// Grows the run's charge by `bytes` if the pool admits them.
+    pub(crate) fn try_grow(&self, bytes: usize) -> Result<()> {
+        self.lock().charge.try_grow(bytes)
+    }
+
+    /// Grows the run's charge without refusal (the smallest unit).
+    pub(crate) fn grow(&self, bytes: usize) {
+        self.lock().charge.grow(bytes)
+    }
+
+    /// Returns `bytes` of the run's charge to the pool.
+    pub(crate) fn shrink(&self, bytes: usize) {
+        let state = self.lock();
+        state.charge.shrink(bytes.min(state.charge.size()));
+    }
+
+    /// Moves `bytes` of the run's charge into a reservation of their own
+    /// (a chunk table's charge), without a pool round trip.
+    pub(crate) fn split(&self, bytes: usize) -> MemoryReservation {
+        let state = self.lock();
+        state.charge.split(bytes.min(state.charge.size()))
+    }
+
+    /// Every row of the file was taken by a chunk.
+    pub(super) fn is_exhausted(&self) -> bool {
+        let state = self.lock();
+        state.ended && state.back.is_empty()
+    }
+
+    fn poll_next(&self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
+        let mut state = self.lock();
+        if state.stop {
+            return Poll::Ready(None);
+        }
+        if let Some(batch) = state.back.pop() {
+            // The chunk build takes its bytes over as it admits the batch
+            // (`ChunkBuild::admit`, right after the read).
+            state.carried = true;
+            return Poll::Ready(Some(Ok(batch)));
+        }
+        if state.ended {
+            return Poll::Ready(None);
+        }
+        if state.reader.is_none() {
+            match self
+                .spill_manager
+                .read_spill_as_stream_unbuffered(Arc::clone(&self.file.file), None)
+            {
+                Ok(reader) => state.reader = Some(reader),
+                Err(error) => return Poll::Ready(Some(Err(spill_file_error(error)))),
+            }
+        }
+        let reader = state.reader.as_mut().expect("a reader");
+        let next = reader.poll_next_unpin(cx);
+        if matches!(next, Poll::Ready(None)) {
+            state.ended = true;
+            state.reader = None;
+        }
+        next.map(|batch| batch.map(|batch| batch.map_err(spill_file_error)))
+    }
+}
+
+/// Set by the join of a written partition that cannot be divided when its
+/// build is refused before it produced a row: the partition is then joined
+/// in build chunks.
+#[derive(Debug, Default)]
+pub(crate) struct ChunkSignal(AtomicBool);
+
+impl ChunkSignal {
+    pub(super) fn raise(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub(super) fn is_raised(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Probe rows that have found a match in an earlier chunk, by their row
+/// number in the replay of a partition's probe files.
+#[derive(Debug)]
+pub(crate) struct MatchedBits {
+    words: Mutex<Vec<u64>>,
+}
+
+impl MatchedBits {
+    pub(super) fn new(rows: usize) -> Self {
+        Self {
+            words: Mutex::new(vec![0; rows.div_ceil(64)]),
+        }
+    }
+
+    /// Bytes of the bits, for their charge.
+    pub(super) fn size(rows: usize) -> usize {
+        rows.div_ceil(64) * 8
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<u64>> {
+        self.words.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Marks the rows numbered in `ids`.
+    pub(super) fn set(&self, ids: &UInt64Array) -> Result<()> {
+        let mut words = self.lock();
+        for id in ids.values() {
+            let index = (*id / 64) as usize;
+            let Some(word) = words.get_mut(index) else {
+                return internal_err!("hash join spill: probe row {id} out of range");
+            };
+            *word |= 1 << (id % 64);
+        }
+        Ok(())
+    }
+
+    /// For the rows `start..start + rows`: whether each has matched.
+    pub(super) fn get(&self, start: usize, rows: usize) -> BooleanArray {
+        let words = self.lock();
+        (start..start + rows)
+            .map(|row| Some(words[row / 64] & (1 << (row % 64)) != 0))
+            .collect()
+    }
+}
+
+/// How a probe leaf of a chunk join numbers its rows.
+#[derive(Clone)]
+pub(super) struct RowIds {
+    /// Leave out the rows that matched in an earlier chunk.
+    pub(super) skip_matched: Option<Arc<MatchedBits>>,
+}
+
+/// The name of the row-number column of a chunk join's probe leaf.
+const ROW_ID: &str = "__hash_join_spill_probe_row";
+
+/// `schema` with the row-number column appended.
+pub(super) fn with_row_id(schema: &SchemaRef) -> SchemaRef {
+    let mut fields = schema.fields().to_vec();
+    fields.push(Arc::new(Field::new(ROW_ID, DataType::UInt64, false)));
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// Appends the row numbers `start..` to `batch`, then leaves out the rows
+/// that `skip` marks.
+fn number_rows(
+    batch: &RecordBatch,
+    start: usize,
+    schema: &SchemaRef,
+    skip: Option<&MatchedBits>,
+) -> Result<RecordBatch> {
+    let rows = batch.num_rows();
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(UInt64Array::from_iter_values(
+        (start..start + rows).map(|row| row as u64),
+    )) as ArrayRef);
+    let numbered = RecordBatch::try_new(Arc::clone(schema), columns)?;
+    match skip {
+        Some(bits) => {
+            let matched = bits.get(start, rows);
+            let keep = arrow::compute::not(&matched)?;
+            Ok(filter_record_batch(&numbered, &keep)?)
+        }
+        None => Ok(numbered),
     }
 }
 
@@ -355,6 +618,10 @@ pub(crate) struct SpillFilesExec {
     /// Metrics of the first-level join, which the joins of written
     /// partitions report into.
     metrics: JoinSpillMetrics,
+    /// A build leaf: raised when its join must be run in chunks.
+    signal: Option<Arc<ChunkSignal>>,
+    /// A probe leaf of a chunk join: number the rows.
+    row_ids: Option<RowIds>,
     cache: Arc<PlanProperties>,
 }
 
@@ -380,7 +647,34 @@ impl SpillFilesExec {
             level,
             origin,
             metrics,
+            signal: None,
+            row_ids: None,
             cache: Arc::new(cache),
+        }
+    }
+
+    /// A build leaf whose join raises `signal` when it must run in chunks.
+    pub(super) fn with_signal(mut self, signal: Arc<ChunkSignal>) -> Self {
+        self.signal = Some(signal);
+        self
+    }
+
+    /// A probe leaf that numbers its rows; its schema must be the files'
+    /// schema with the row number appended ([`with_row_id`]).
+    pub(super) fn with_row_ids(mut self, row_ids: RowIds) -> Self {
+        self.row_ids = Some(row_ids);
+        self
+    }
+
+    pub(super) fn signal(&self) -> Option<&Arc<ChunkSignal>> {
+        self.signal.as_ref()
+    }
+
+    /// The cursor of a chunk join's build leaf.
+    pub(super) fn cursor(&self) -> Option<&Arc<Cursor>> {
+        match &self.source {
+            FileSource::Cursor(cursor) => Some(cursor),
+            _ => None,
         }
     }
 
@@ -473,7 +767,15 @@ impl ExecutionPlan for SpillFilesExec {
             "SpillFilesExec invalid partition {partition} of {}",
             self.source.partitions()
         );
-        let schema = Arc::clone(self.spill_manager.schema());
+        let schema = self.schema();
+        if let FileSource::Cursor(cursor) = &self.source {
+            let cursor = Arc::clone(cursor);
+            cursor.start_chunk();
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::poll_fn(move |cx| cursor.poll_next(cx)),
+            )));
+        }
         let streams = self
             .source
             .take(partition)?
@@ -487,12 +789,21 @@ impl ExecutionPlan for SpillFilesExec {
                     .map_err(spill_file_error)
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::iter(streams)
-                .flatten()
-                .map_err(spill_file_error),
-        )))
+        let rows = futures::stream::iter(streams)
+            .flatten()
+            .map_err(spill_file_error);
+        let Some(row_ids) = self.row_ids.clone() else {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rows)));
+        };
+        let numbered = Arc::clone(&schema);
+        let mut start = 0;
+        let rows = rows.map(move |batch| {
+            let batch = batch?;
+            let first = start;
+            start += batch.num_rows();
+            number_rows(&batch, first, &numbered, row_ids.skip_matched.as_deref())
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rows)))
     }
 }
 

@@ -563,9 +563,10 @@ async fn join_by_key_single_partition() {
 /// Longbow family JS: the self-join of `join_by_key_*` with hash join
 /// spilling on (and a disk manager). In a pool of three quarters of its
 /// build it spills and returns the unbounded answer, where spilling off
-/// fails. In half of its build it still fails: one `service` value holds
-/// about half of the rows, a partition no spill level can divide, which
-/// needs the build-chunk join of `add-join-spill` section 3.
+/// fails. In half and a quarter of its build one `service` value holds
+/// about half of the rows, a partition no spill level can divide: it is
+/// joined in build chunks (`add-join-spill` section 3; before it, the join
+/// failed with "one key value fills its partition").
 async fn join_by_key_spills(target_partitions: usize) {
     let query = "select t1.* from t t1 JOIN t t2 ON t1.service = t2.service";
     let table = Scenario::AccessLog.table();
@@ -604,15 +605,14 @@ async fn join_by_key_spills(target_partitions: usize) {
     assert!(plan_metric(plan.as_ref(), "spilled_partitions") > 0);
     assert!(plan_spill_count(plan.as_ref()) > 0);
 
-    let error = run(Some(build_mem_used / 2), true)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert_contains!(&error, "Resources exhausted");
-    assert_contains!(
-        &error,
-        "did not spill because one key value fills its partition"
-    );
+    for limit in [build_mem_used / 2, build_mem_used / 4] {
+        let (plan, actual) = run(Some(limit), true).await.unwrap();
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected)
+        );
+        assert!(plan_metric(plan.as_ref(), "spill_chunked_runs") > 0);
+    }
 }
 
 /// The sum of the named metric over `plan` and its descendants.
