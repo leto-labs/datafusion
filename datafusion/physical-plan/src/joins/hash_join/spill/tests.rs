@@ -1003,17 +1003,17 @@ mod review {
     /// A greedy pool that records its peak, and that can hand whatever a
     /// consumer releases to a competing consumer at once (as a concurrent
     /// operator's `try_grow` would take it).
-    struct PeakPool {
+    pub(super) struct PeakPool {
         inner: GreedyMemoryPool,
         limit: usize,
-        peak: AtomicUsize,
+        pub(super) peak: AtomicUsize,
         competing: AtomicBool,
         competitor: OnceLock<Mutex<MemoryReservation>>,
         taken: AtomicUsize,
     }
 
     impl PeakPool {
-        fn new(limit: usize) -> Arc<Self> {
+        pub(super) fn new(limit: usize) -> Arc<Self> {
             Arc::new(Self {
                 inner: GreedyMemoryPool::new(limit),
                 limit,
@@ -1079,7 +1079,7 @@ mod review {
         }
     }
 
-    fn pool_context(
+    pub(super) fn pool_context(
         config: SessionConfig,
         pool: Arc<dyn MemoryPool>,
     ) -> Arc<TaskContext> {

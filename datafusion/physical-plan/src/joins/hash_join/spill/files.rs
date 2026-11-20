@@ -302,10 +302,10 @@ impl FileSource {
     }
 }
 
-/// The read position in the build file of a partition joined in chunks.
-/// The chunk join's build stops at a refusal and gives back the batch it
-/// could not hold, with the charge that covers it; the next chunk starts
-/// with it and takes the charge over.
+/// The read position in the build file of a partition joined in chunks,
+/// and the one charge of the run: the batches given back, and the rows and
+/// table estimate of the chunk being built, are all held by `charge`, so
+/// moving bytes between them never passes through the pool.
 pub(crate) struct Cursor {
     file: SpilledFile,
     spill_manager: SpillManager,
@@ -315,14 +315,16 @@ pub(crate) struct Cursor {
     state: Mutex<CursorState>,
 }
 
-#[derive(Default)]
 struct CursorState {
     reader: Option<Rows>,
-    /// Batches given back, read before the file, each with its charge.
-    back: Vec<(RecordBatch, MemoryReservation)>,
-    /// The charge of the batch given back that was read last, until the
-    /// chunk build takes it over.
-    transit: Option<MemoryReservation>,
+    /// Batches given back, read before the file.
+    back: Vec<RecordBatch>,
+    /// The run's charge (see [`Cursor`]).
+    charge: MemoryReservation,
+    /// Bytes of `charge` that cover the batches given back.
+    back_bytes: usize,
+    /// The batch read last came back from a chunk (still charged).
+    carried: bool,
     /// The file has been read to its end.
     ended: bool,
 }
@@ -332,12 +334,20 @@ impl Cursor {
         file: SpilledFile,
         spill_manager: SpillManager,
         unit: usize,
+        charge: MemoryReservation,
     ) -> Self {
         Self {
             file,
             spill_manager,
             unit,
-            state: Mutex::default(),
+            state: Mutex::new(CursorState {
+                reader: None,
+                back: vec![],
+                charge,
+                back_bytes: 0,
+                carried: false,
+                ended: false,
+            }),
         }
     }
 
@@ -349,16 +359,45 @@ impl Cursor {
         self.unit
     }
 
-    /// Gives `batch` back with `charge`, which covers it: the next chunk
-    /// reads it first.
-    pub(crate) fn give_back(&self, batch: RecordBatch, charge: MemoryReservation) {
-        self.lock().back.push((batch, charge));
+    /// Whether the batch read last came back from a chunk; its `size` bytes
+    /// then move from the given-back bytes to the caller's (no pool change).
+    pub(crate) fn take_carried(&self, size: usize) -> bool {
+        let mut state = self.lock();
+        if !std::mem::take(&mut state.carried) {
+            return false;
+        }
+        state.back_bytes = state.back_bytes.saturating_sub(size);
+        true
     }
 
-    /// The charge of the batch given back that was read last, if the last
-    /// batch read came back from a chunk.
-    pub(crate) fn take_transit(&self) -> Option<MemoryReservation> {
-        self.lock().transit.take()
+    /// Gives `batch` back; `size` bytes of the charge already cover it.
+    pub(crate) fn give_back(&self, batch: RecordBatch, size: usize) {
+        let mut state = self.lock();
+        state.back_bytes += size;
+        state.back.push(batch);
+    }
+
+    /// Grows the run's charge by `bytes` if the pool admits them.
+    pub(crate) fn try_grow(&self, bytes: usize) -> Result<()> {
+        self.lock().charge.try_grow(bytes)
+    }
+
+    /// Grows the run's charge without refusal (the smallest unit).
+    pub(crate) fn grow(&self, bytes: usize) {
+        self.lock().charge.grow(bytes)
+    }
+
+    /// Returns `bytes` of the run's charge to the pool.
+    pub(crate) fn shrink(&self, bytes: usize) {
+        let state = self.lock();
+        state.charge.shrink(bytes.min(state.charge.size()));
+    }
+
+    /// Moves `bytes` of the run's charge into a reservation of their own
+    /// (a chunk table's charge), without a pool round trip.
+    pub(crate) fn split(&self, bytes: usize) -> MemoryReservation {
+        let state = self.lock();
+        state.charge.split(bytes.min(state.charge.size()))
     }
 
     /// Every row of the file was taken by a chunk.
@@ -369,10 +408,10 @@ impl Cursor {
 
     fn poll_next(&self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
         let mut state = self.lock();
-        if let Some((batch, charge)) = state.back.pop() {
-            // The chunk build takes the charge over as it admits the batch
+        if let Some(batch) = state.back.pop() {
+            // The chunk build takes its bytes over as it admits the batch
             // (`ChunkBuild::admit`, right after the read).
-            state.transit = Some(charge);
+            state.carried = true;
             return Poll::Ready(Some(Ok(batch)));
         }
         if state.ended {

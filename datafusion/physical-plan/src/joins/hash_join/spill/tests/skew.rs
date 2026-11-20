@@ -428,3 +428,61 @@ async fn review_drop_during_chunk_replay() -> Result<()> {
     assert_eq!(context.runtime_env().disk_manager.used_disk_space(), 0);
     Ok(())
 }
+
+/// Review MJJ98-REREVIEW-20261120, finding 1: a key expression that
+/// expands compact input (an integer key cast to a string) in a small pool.
+/// The chunk tables are built against a pool capped at their grant, so the
+/// real pool's peak stays within limit + (streams + 1) x workspace, measured
+/// at every reservation change, not after the output.
+#[tokio::test]
+async fn variable_width_key_expression_stays_within_the_bound() -> Result<()> {
+    use datafusion_physical_expr::expressions::CastExpr;
+    let build = skewed("b", 20000, 70, false, 3001, 500);
+    let probe = sparse_probe(3000, false);
+    let widen = |schema: &SchemaRef| -> PhysicalExprRef {
+        Arc::new(CastExpr::new(key(schema), DataType::LargeUtf8, None))
+    };
+    for join_type in [JoinType::Inner, JoinType::Right, JoinType::LeftAnti] {
+        let (limit, workspace) = (64 * 1024, 4096);
+        let pool = review::PeakPool::new(limit);
+        let dyn_pool: Arc<dyn datafusion_execution::memory_pool::MemoryPool> =
+            Arc::clone(&pool) as _;
+        let context = review::pool_context(
+            no_reversal(spill_config(0, workspace, 3)),
+            dyn_pool,
+        );
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+            memory_input(&build, 1),
+            memory_input(&probe, 1),
+            vec![(widen(&build[0].schema()), widen(&probe[0].schema()))],
+            None,
+            &join_type,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?);
+        let result = run(&plan, Arc::clone(&context)).await;
+        let peak = pool.peak.load(std::sync::atomic::Ordering::SeqCst);
+        println!("{join_type}: peak {peak}, ok {}", result.is_ok());
+        match result {
+            Ok(_) => assert!(
+                metric(&plan.metrics().unwrap(), "spill_chunked_runs").unwrap_or(0) > 0,
+                "{join_type}: not joined in chunks"
+            ),
+            // The named refusal of a unit that does not fit is allowed; any
+            // other error is not.
+            Err(error) => assert!(
+                matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+                "{join_type}: {error}"
+            ),
+        }
+        drop(plan);
+        assert!(
+            peak <= limit + 2 * workspace,
+            "{join_type}: peak {peak} above {limit} + 2 x {workspace}"
+        );
+        assert_eq!(context.memory_pool().reserved(), 0, "{join_type}");
+    }
+    Ok(())
+}

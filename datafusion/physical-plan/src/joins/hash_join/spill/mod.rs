@@ -85,7 +85,7 @@ use crate::joins::utils::{
 use crate::metrics::{
     Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, SpillMetrics,
 };
-use crate::spill::spill_manager::SpillManager;
+use crate::spill::spill_manager::{GetSlicedSize, SpillManager};
 use crate::stream::{EmptyRecordBatchStream, RecordBatchStreamAdapter};
 use crate::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion_common::JoinSide;
@@ -623,6 +623,34 @@ struct PartWriter {
     unit: Option<usize>,
 }
 
+/// Splits `batch` into slices whose own footprint fits `unit` with their
+/// table, halving until each does; one row that does not fit fails with
+/// `ResourcesExhausted` before anything is written (a wide value, or a
+/// dictionary kept whole).
+fn split_to_unit(
+    batch: &RecordBatch,
+    unit: usize,
+    out: &mut std::collections::VecDeque<RecordBatch>,
+) -> Result<()> {
+    let rows = batch.num_rows();
+    let size = batch.get_sliced_size()?;
+    if unit_bytes(size, rows) <= unit {
+        out.push_back(batch.clone());
+        return Ok(());
+    }
+    if rows <= 1 {
+        return Err(DataFusionError::ResourcesExhausted(format!(
+            "Hash join spill: one row of {size} bytes needs {} bytes with its table, \
+             more than three quarters of \
+             datafusion.execution.hash_join_spill_reservation_bytes ({unit} bytes)",
+            unit_bytes(size, rows)
+        )));
+    }
+    let half = rows / 2;
+    split_to_unit(&batch.slice(0, half), unit, out)?;
+    split_to_unit(&batch.slice(half, rows - half), unit, out)
+}
+
 /// The bytes a build chunk holds for `rows` rows of `bytes` bytes: the
 /// rows, their copy, 48 bytes of table and keys per row, and the fixed
 /// parts (`chunks::table_estimate` plus the rows).
@@ -661,8 +689,11 @@ impl PartWriter {
         let (rows_metric, bytes_metric) = metrics.side(side);
         let before = metrics.spill.spilled_bytes.value();
         let unit = self.unit.unwrap_or(usize::MAX);
-        let sizes: Vec<usize> =
-            batches.iter().map(get_record_batch_memory_size).collect();
+        // Each piece's own footprint (a slice shares its parent's buffers).
+        let sizes = batches
+            .iter()
+            .map(|batch| batch.get_sliced_size())
+            .collect::<Result<Vec<_>>>()?;
         let mut start = 0;
         // Slices of a piece above the unit, written before the next group.
         let mut slices: std::collections::VecDeque<RecordBatch> = Default::default();
@@ -674,19 +705,12 @@ impl PartWriter {
                 None => {
                     let piece = &batches[start];
                     let piece_rows = piece.num_rows();
-                    if piece_rows > 1 && unit_bytes(sizes[start], piece_rows) > unit {
-                        // Rows per slice from the piece's mean row width.
-                        let row_bytes = sizes[start].div_ceil(piece_rows);
-                        let fit =
-                            (unit.saturating_sub(256) / (2 * row_bytes + 48)).max(1);
-                        let mut offset = 0;
-                        while offset < piece_rows {
-                            let length = fit.min(piece_rows - offset);
-                            slices.push_back(piece.slice(offset, length));
-                            offset += length;
-                        }
+                    if unit_bytes(sizes[start], piece_rows) > unit {
                         start += 1;
-                        Ok(slices.pop_front().expect("a slice"))
+                        match split_to_unit(piece, unit, &mut slices) {
+                            Ok(()) => Ok(slices.pop_front().expect("a slice")),
+                            Err(error) => Err(error),
+                        }
                     } else {
                         let mut end = start;
                         let (mut rows, mut group_bytes) = (0, 0);
@@ -2644,7 +2668,9 @@ impl StreamSpill {
                 slot => slot.insert(PartWriter::new(
                     &router.manager,
                     "HashJoin probe partition",
-                    None,
+                    // A probe file is the build input of a reversed join:
+                    // the same unit as a build file.
+                    Some(self.options.chunk_unit()),
                 )?),
             };
             // A buffered piece is charged; one the pool refuses is written

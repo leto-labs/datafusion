@@ -152,10 +152,14 @@ impl ChunkRun {
             (None, None)
         };
         self.build.metrics.chunked.add(1);
+        let run_charge = MemoryConsumer::new(format!("HashJoinChunk[{}]", self.part))
+            .with_can_spill(true)
+            .register(self.context.memory_pool());
         let cursor = Arc::new(Cursor::new(
             self.build_file.clone(),
             self.build.build_manager.clone(),
             self.build.options.chunk_unit(),
+            run_charge,
         ));
         let state = Chunks {
             run: self,
@@ -422,16 +426,20 @@ impl Chunks {
 
 /// The build of one chunk (the hook in `collect_left_input`): it admits
 /// batches from its cursor while the pool grants each batch and an estimate
-/// of its table, and gives back the first batch the pool refuses, with the
-/// charge that covers it. The first batch of a chunk and its estimate may be
-/// charged without refusal only if they fit the chunk unit (three quarters
-/// of the workspace; build files are written in batches that do); a larger one
-/// fails with `ResourcesExhausted` naming it.
+/// of its table, and gives back the first batch the pool refuses. Every byte
+/// lives in the run's one charge, held by the cursor: a batch given back
+/// keeps its bytes there, and the table's charge is split off it, so no
+/// transfer grows one reservation before another shrinks. The first batch
+/// of a chunk may be charged without refusal only within the chunk unit
+/// (three quarters of the workspace); a larger one refused fails with
+/// `ResourcesExhausted` naming it.
 pub(crate) struct ChunkBuild {
     cursor: Arc<Cursor>,
-    /// The admitted estimate of the table over the rows taken, held until
-    /// the table is built and then moved into its charge.
-    headroom: Vec<MemoryReservation>,
+    /// Bytes of the run's charge that this chunk holds: its rows and the
+    /// table estimate.
+    granted: usize,
+    /// Of those, the bytes of the rows.
+    rows: usize,
 }
 
 /// Bytes kept for the table of `rows` rows of `bytes` bytes: their copy,
@@ -445,38 +453,43 @@ impl ChunkBuild {
     pub(crate) fn new(cursor: Arc<Cursor>) -> Self {
         Self {
             cursor,
-            headroom: vec![],
+            granted: 0,
+            rows: 0,
         }
     }
 
-    /// The largest unit that may be charged without refusal.
-    pub(crate) fn unit(&self) -> usize {
-        self.cursor.unit()
+    /// The bytes this chunk's table may use: the cap of its build.
+    pub(crate) fn granted(&self) -> usize {
+        self.granted
     }
 
-    /// Takes `batch` into the chunk and returns the bytes charged for it to
-    /// `reservation`, or gives it back and returns `None` when the pool
-    /// refuses it and the chunk already holds a batch (`first` is false).
+    /// The bytes of the chunk's rows.
+    pub(crate) fn rows_bytes(&self) -> usize {
+        self.rows
+    }
+
+    /// Takes `batch` into the chunk and returns its bytes, or gives it back
+    /// and returns `None` when the pool refuses it and the chunk already
+    /// holds a batch (`first` is false).
     pub(crate) fn admit(
         &mut self,
         batch: &RecordBatch,
-        reservation: &MemoryReservation,
         first: bool,
     ) -> Result<Option<usize>> {
         let size = datafusion_common::utils::memory::get_record_batch_memory_size(batch);
         let rows = batch.num_rows();
         let extra = table_estimate(size, rows);
-        // A batch given back by the chunk before is still charged.
-        let carried = self.cursor.take_transit();
-        let need = if carried.is_some() {
-            extra
-        } else {
-            size + extra
-        };
-        match reservation.try_grow(need) {
+        // A batch given back before is still charged: its bytes move over.
+        let carried = self.cursor.take_carried(size);
+        if carried {
+            self.granted += size;
+            self.rows += size;
+        }
+        let need = if carried { extra } else { size + extra };
+        match self.cursor.try_grow(need) {
             Ok(()) => {}
             Err(error) if super::is_refusal(&error) && first => {
-                if size + extra > self.unit() {
+                if size + extra > self.cursor.unit() {
                     return Err(DataFusionError::ResourcesExhausted(format!(
                         "Hash join spill: a build chunk's smallest unit, one batch of \
                          {rows} rows ({size} bytes, {} bytes with its table), is larger \
@@ -484,38 +497,57 @@ impl ChunkBuild {
                          hash_join_spill_reservation_bytes ({} bytes), and the pool \
                          refused it: {error}",
                         size + extra,
-                        self.unit(),
+                        self.cursor.unit(),
                     )));
                 }
                 // The smallest unit, inside the stream's workspace share.
-                reservation.grow(need);
+                self.cursor.grow(need);
             }
             Err(error) if super::is_refusal(&error) => {
-                let charge = carried.unwrap_or_else(|| {
-                    // Read from the file: it is in memory, so it is charged
-                    // while it waits (one batch, at most the chunk unit).
-                    let charge = reservation.new_empty();
-                    charge.grow(size);
-                    charge
-                });
-                self.cursor.give_back(batch.clone(), charge);
+                if carried {
+                    self.granted -= size;
+                    self.rows -= size;
+                } else if self.granted - self.rows >= size {
+                    // Held until the next chunk: its bytes come out of this
+                    // chunk's table estimate (no pool change).
+                    self.granted -= size;
+                } else if let Err(refused) = self.cursor.try_grow(size) {
+                    return Err(refused.context(format!(
+                        "Hash join spill: a build batch of {rows} rows ({size} bytes) \
+                         that a chunk must hold until the next chunk"
+                    )));
+                }
+                self.cursor.give_back(batch.clone(), size);
                 return Ok(None);
             }
             Err(error) => return Err(error),
         }
-        // `reservation` now holds the estimate and, for a fresh batch, the
-        // rows; the estimate moves to the headroom without a pool round trip,
-        // and a carried charge is taken over (grown before it goes).
-        self.headroom.push(reservation.split(extra));
-        if let Some(carried) = carried {
-            reservation.grow(size);
-            drop(carried);
+        self.granted += need;
+        if !carried {
+            self.rows += size;
         }
         Ok(Some(size))
     }
 
-    /// The admitted estimate of the table, for `build_chunk`.
-    pub(crate) fn take_headroom(&mut self) -> Vec<MemoryReservation> {
-        std::mem::take(&mut self.headroom)
+    /// Gives back batches that the chunk's table could not hold; their bytes
+    /// stay charged in the run.
+    pub(crate) fn give_back(&mut self, batches: Vec<RecordBatch>) {
+        for batch in batches {
+            let size =
+                datafusion_common::utils::memory::get_record_batch_memory_size(&batch);
+            self.granted = self.granted.saturating_sub(size);
+            self.rows = self.rows.saturating_sub(size);
+            self.cursor.give_back(batch, size);
+        }
+    }
+
+    /// The table, of `table` bytes, is built: its charge is split off the
+    /// run's charge and the rest of the grant goes back to the pool.
+    pub(crate) fn take_charge(&mut self, table: usize) -> MemoryReservation {
+        let charge = self.cursor.split(table.min(self.granted));
+        self.cursor.shrink(self.granted.saturating_sub(table));
+        self.granted = 0;
+        self.rows = 0;
+        charge
     }
 }
