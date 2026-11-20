@@ -406,14 +406,14 @@ async fn get_file_decryption_properties(
 /// Fetch the footer of `object` and compute its statistics and ordering for
 /// [`ParquetFormat::infer_stats_and_ordering`].
 async fn fetch_stats_and_ordering(
-    store: &dyn ObjectStore,
+    store: &Arc<dyn ObjectStore>,
     object: &ObjectMeta,
     metadata_size_hint: Option<usize>,
     file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
     file_metadata_cache: Arc<FileMetadataCache>,
     table_schema: &SchemaRef,
 ) -> Result<datafusion_datasource::file_format::FileMeta> {
-    let metadata = DFParquetMetadata::new(store, object)
+    let metadata = DFParquetMetadata::new(store.as_ref(), object)
         .with_metadata_size_hint(metadata_size_hint)
         .with_decryption_properties(file_decryption_properties)
         .with_file_metadata_cache(Some(file_metadata_cache))
@@ -562,7 +562,7 @@ impl FileFormat for ParquetFormat {
                 .await?;
         let file_metadata_cache =
             state.runtime_env().cache_manager.get_file_metadata_cache();
-        DFParquetMetadata::new(store, object)
+        DFParquetMetadata::new(store.as_ref(), object)
             .with_metadata_size_hint(self.metadata_size_hint())
             .with_decryption_properties(file_decryption_properties)
             .with_file_metadata_cache(Some(file_metadata_cache))
@@ -582,7 +582,7 @@ impl FileFormat for ParquetFormat {
                 .await?;
         let file_metadata_cache =
             state.runtime_env().cache_manager.get_file_metadata_cache();
-        let metadata = DFParquetMetadata::new(store, object)
+        let metadata = DFParquetMetadata::new(store.as_ref(), object)
             .with_metadata_size_hint(self.metadata_size_hint())
             .with_decryption_properties(file_decryption_properties)
             .with_file_metadata_cache(Some(file_metadata_cache))
@@ -615,7 +615,7 @@ impl FileFormat for ParquetFormat {
         let object = object.clone();
         let fetch = async move {
             fetch_stats_and_ordering(
-                store.as_ref(),
+                &store,
                 &object,
                 metadata_size_hint,
                 file_decryption_properties,
@@ -661,11 +661,13 @@ impl FileFormat for ParquetFormat {
 
         // Use the CachedParquetFileReaderFactory
         let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
-        let store = state
-            .runtime_env()
-            .object_store(conf.object_store_url.clone())?;
+        // Longbow family OO: the store and its registration from one lookup.
         let cached_parquet_read_factory =
-            Arc::new(CachedParquetFileReaderFactory::new(store, metadata_cache));
+            Arc::new(CachedParquetFileReaderFactory::from_registry(
+                state.runtime_env().object_store_registry.as_ref(),
+                &conf.object_store_url,
+                metadata_cache,
+            )?);
         source = source.with_parquet_file_reader_factory(cached_parquet_read_factory);
 
         if let Some(metadata_size_hint) = metadata_size_hint {

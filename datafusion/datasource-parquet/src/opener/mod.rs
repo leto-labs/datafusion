@@ -9,6 +9,7 @@
 mod early_stop;
 #[cfg(feature = "parquet_encryption")]
 mod encryption;
+pub(crate) mod filter_cache;
 mod prepared;
 pub use prepared::{PreparedParquetFile, PreparedParquetScan};
 
@@ -17,6 +18,7 @@ use self::early_stop::EarlyStoppingStream;
 use self::encryption::EncryptionContext;
 use crate::access_plan::PreparedAccessPlan;
 use crate::decoder_projection::DecoderProjection;
+use crate::metadata::PageIndexRequest;
 use crate::metrics::{ByteProgress, RowFilterSkippedFullyMatchedMetric};
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::push_decoder::{
@@ -40,6 +42,7 @@ use datafusion_physical_expr_adapter::rewrite::rewrite_input_file_name_in_projec
 use datafusion_physical_expr_adapter::{
     replace_columns_with_literals, replace_columns_with_literals_keeping_metadata,
 };
+use filter_cache::{FilterInputs, PreparedFilterCache, PreparedFilters};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
@@ -82,7 +85,7 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::parquet_column;
 use parquet::basic::Type;
 use parquet::bloom_filter::Sbbf;
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader, RowGroupMetaData};
+use parquet::file::metadata::{ColumnChunkMask, PageIndexPolicy, RowGroupMetaData};
 
 /// Morselizer-level state for virtual columns, precomputed once per scan
 /// partition so each file skips the validator walks, `null_replacements`
@@ -311,6 +314,9 @@ pub(super) struct ParquetMorselizer {
     /// Longbow family S: the execution's source for sharing unopened row
     /// groups with idle siblings after pruning.
     pub(crate) shared_work_source: Option<SharedWorkSource>,
+    /// Longbow family OO: filters prepared once per scan and physical
+    /// schema, shared with the other partitions of the scan.
+    pub(crate) filter_cache: Arc<PreparedFilterCache>,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -464,6 +470,10 @@ struct PreparedParquetOpen {
     file_metrics: ParquetFileMetrics,
     baseline_metrics: BaselineMetrics,
     file_pruner: Option<FilePruner>,
+    /// Longbow family OO: the scan's file-level pruning predicate when the
+    /// predicate's dynamic filters can no longer change (then `file_pruner`
+    /// is `None`).
+    settled_file_pruning: Option<Arc<PruningPredicate>>,
     metadata_size_hint: Option<usize>,
     metrics: ExecutionPlanMetricsSet,
     parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
@@ -524,6 +534,8 @@ struct PreparedParquetOpen {
     shared_work_source: Option<SharedWorkSource>,
     /// Longbow family V: advice about the stream's remaining read plan.
     scan_plan_advice: Option<Box<dyn crate::ScanPlanAdvice>>,
+    /// Longbow family OO: the scan's prepared filters.
+    filter_cache: Arc<PreparedFilterCache>,
     #[cfg(feature = "parquet_encryption")]
     file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
 }
@@ -545,6 +557,9 @@ struct FiltersPreparedParquetOpen {
     loaded: MetadataLoadedParquetOpen,
     pruning_predicate: Option<Arc<PruningPredicate>>,
     page_pruning_predicate: Option<Arc<PagePruningAccessPlanFilter>>,
+    /// The scan's shared preparation these predicates came from, with the
+    /// inversion for full-match detection (Longbow family OO).
+    prepared_filters: Option<Arc<PreparedFilters>>,
 }
 
 /// State of [`ParquetOpenState`]
@@ -878,11 +893,12 @@ impl ParquetMorselizer {
             .metadata_size_hint
             .or(self.metadata_size_hint);
 
+        // Longbow family OO: the reader records into this open's metrics.
         let (async_file_reader, scan_plan_advice) = self
             .parquet_file_reader_factory
             .create_reader_with_scan_plan_advice(
                 self.partition_index,
-                partitioned_file.clone(),
+                reader_file(&partitioned_file, &file_metrics),
                 metadata_size_hint,
                 &self.metrics,
             )?;
@@ -997,14 +1013,34 @@ impl ParquetMorselizer {
         // filter that can prune via partition-value folding) and returns `None`
         // otherwise. For a static predicate the pruner's tracker reports no
         // changes, so it runs once and adds no ongoing cost.
-        let file_pruner = predicate.as_ref().and_then(|p| {
-            FilePruner::try_new(
-                Arc::clone(p),
-                &logical_file_schema,
-                &partitioned_file,
-                predicate_creation_errors.clone(),
-            )
-        });
+        //
+        // Longbow family OO: a predicate whose dynamic filters can no longer
+        // change is checked once, so its file-level pruning predicate is the
+        // same for every file of the scan; it comes from the scan's filter
+        // cache instead of a `FilePruner` per file. A predicate that can
+        // still change keeps its `FilePruner`, which early stopping watches.
+        let mut file_pruner = None;
+        let mut settled_file_pruning = None;
+        if let Some(p) = predicate.as_ref() {
+            let tracking = DynamicFilterTracking::classify(p);
+            if matches!(tracking, DynamicFilterTracking::Watching(_)) {
+                file_pruner = FilePruner::try_new(
+                    Arc::clone(p),
+                    &logical_file_schema,
+                    &partitioned_file,
+                    predicate_creation_errors.clone(),
+                );
+            } else if partitioned_file.statistics.is_some()
+                && (partitioned_file.has_statistics()
+                    || tracking.contains_dynamic_filter())
+            {
+                settled_file_pruning = self.filter_cache.file_pruning(
+                    p,
+                    &logical_file_schema,
+                    &predicate_creation_errors,
+                );
+            }
+        }
 
         let byte_progress = ByteProgress::new(
             if donated {
@@ -1029,6 +1065,7 @@ impl ParquetMorselizer {
             file_metrics,
             baseline_metrics,
             file_pruner,
+            settled_file_pruning,
             metadata_size_hint,
             metrics: self.metrics.clone(),
             parquet_file_reader_factory: Arc::clone(&self.parquet_file_reader_factory),
@@ -1063,6 +1100,7 @@ impl ParquetMorselizer {
             preserve_order: self.preserve_order,
             shared_work_source,
             scan_plan_advice,
+            filter_cache: Arc::clone(&self.filter_cache),
             #[cfg(feature = "parquet_encryption")]
             file_decryption_properties: None,
         })
@@ -1100,11 +1138,44 @@ impl PreparedParquetOpen {
             // with every byte of it without having read any.
             return Ok(None);
         }
+        if let Some(pruning) = &self.settled_file_pruning
+            && let Some(statistics) = self.partitioned_file.statistics.as_ref()
+            && self.settled_prune(pruning, statistics)
+        {
+            self.file_metrics
+                .files_ranges_pruned_statistics
+                .add_pruned(1);
+            // Dropping `self` here credits the whole range: the scan is done
+            // with every byte of it without having read any.
+            return Ok(None);
+        }
 
         self.file_metrics
             .files_ranges_pruned_statistics
             .add_matched(1);
         Ok(Some(self))
+    }
+
+    /// Whether the file statistics prove that no row of the file matches:
+    /// the one-shot check of a `FilePruner` with a predicate that can no
+    /// longer change (Longbow family OO).
+    fn settled_prune(
+        &self,
+        pruning: &PruningPredicate,
+        statistics: &Arc<Statistics>,
+    ) -> bool {
+        let file_stats = datafusion_common::pruning::PrunableStatistics::new(
+            vec![Arc::clone(statistics)],
+            Arc::clone(&self.logical_file_schema),
+        );
+        match pruning.prune(&file_stats) {
+            Ok(values) => values.iter().all(|value| !value),
+            Err(e) => {
+                debug!("Ignoring error building pruning predicate for file: {e}");
+                self.predicate_creation_errors.add(1);
+                false
+            }
+        }
     }
 
     /// Load parquet metadata after file-level pruning is complete.
@@ -1244,6 +1315,7 @@ impl MetadataLoadedParquetOpen {
         // tree walk entirely in that case.
         let needs_rewrite = prepared.predicate.is_some()
             || prepared.logical_file_schema != physical_file_schema;
+        let mut prepared_filters = None;
         if needs_rewrite {
             // When virtual columns are requested, augment the logical and
             // physical schemas passed to the rewriter/simplifier with those
@@ -1266,18 +1338,49 @@ impl MetadataLoadedParquetOpen {
                         Arc::clone(&physical_file_schema),
                     )
                 };
-            let rewriter = prepared.expr_adapter_factory.create(
-                Arc::clone(&logical_for_rewrite),
-                Arc::clone(&physical_for_rewrite),
-            )?;
-            let simplifier = PhysicalExprSimplifier::new(&physical_for_rewrite);
-            prepared.predicate = prepared
-                .predicate
-                .map(|p| simplifier.simplify(rewriter.rewrite(p)?))
-                .transpose()?;
-            prepared.projection = prepared
-                .projection
-                .try_map_exprs(|p| simplifier.simplify(rewriter.rewrite(p)?))?;
+            // Longbow family OO: the adaptation and the pruning predicates
+            // built from it are shared by every file of the scan with this
+            // physical schema and by every unit donated from one.
+            let inputs = FilterInputs {
+                predicate: prepared.predicate.as_ref(),
+                projection: &prepared.projection,
+                logical: &logical_for_rewrite,
+                physical: &physical_for_rewrite,
+                file_schema: &physical_file_schema,
+                virtual_state: prepared.virtual_state.as_ref(),
+                adapter: &prepared.expr_adapter_factory,
+                max_in_list_size: prepared.max_in_list_size,
+                enable_page_index: prepared.enable_page_index,
+            };
+            let filters = prepared.filter_cache.get_or_build(&inputs, || {
+                let rewriter = prepared.expr_adapter_factory.create(
+                    Arc::clone(&logical_for_rewrite),
+                    Arc::clone(&physical_for_rewrite),
+                )?;
+                let simplifier = PhysicalExprSimplifier::new(&physical_for_rewrite);
+                let predicate = prepared
+                    .predicate
+                    .clone()
+                    .map(|p| simplifier.simplify(rewriter.rewrite(p)?))
+                    .transpose()?;
+                let projection = prepared
+                    .projection
+                    .clone()
+                    .try_map_exprs(|p| simplifier.simplify(rewriter.rewrite(p)?))?;
+                Ok(PreparedFilters::build(
+                    predicate,
+                    projection,
+                    &physical_file_schema,
+                    prepared.max_in_list_size,
+                    prepared.enable_page_index,
+                ))
+            })?;
+            prepared.predicate = filters.predicate.clone();
+            prepared.projection = filters.projection.clone();
+            prepared
+                .predicate_creation_errors
+                .add(filters.creation_errors);
+            prepared_filters = Some(filters);
         }
         prepared.physical_file_schema = Arc::clone(&physical_file_schema);
 
@@ -1299,26 +1402,14 @@ impl MetadataLoadedParquetOpen {
             prepared.stats_prove_unsatisfiable = false;
         }
 
-        // Build predicates for this specific file
-        let pruning_predicate = build_pruning_predicates(
-            prepared.predicate.as_ref(),
-            &physical_file_schema,
-            &prepared.predicate_creation_errors,
-            prepared.max_in_list_size,
-        );
-
-        // Only build page pruning predicate if page index is enabled
-        let page_pruning_predicate = if prepared.enable_page_index {
-            prepared.predicate.as_ref().and_then(|predicate| {
-                let p = build_page_pruning_predicate(
-                    predicate,
-                    &physical_file_schema,
-                    prepared.max_in_list_size,
-                );
-                (p.filter_number() > 0).then_some(p)
-            })
-        } else {
-            None
+        // Pruning predicates for this file; without a predicate there are
+        // none.
+        let (pruning_predicate, page_pruning_predicate) = match &prepared_filters {
+            Some(filters) => (
+                filters.pruning_predicate.clone(),
+                filters.page_pruning_predicate.clone(),
+            ),
+            None => (None, None),
         };
 
         Ok(FiltersPreparedParquetOpen {
@@ -1329,6 +1420,7 @@ impl MetadataLoadedParquetOpen {
             },
             pruning_predicate,
             page_pruning_predicate,
+            prepared_filters,
         })
     }
 }
@@ -1393,10 +1485,13 @@ impl FiltersPreparedParquetOpen {
         // If there is a predicate that can be evaluated against the metadata
         if let Some(predicate) = self.pruning_predicate.as_ref().map(|p| p.as_ref()) {
             if prepared.enable_row_group_stats_pruning {
-                row_groups.prune_by_statistics_with_metadata(
+                row_groups.prune_by_statistics_with_inverted(
                     &prepared.physical_file_schema,
                     &file_metadata,
                     predicate,
+                    self.prepared_filters
+                        .as_ref()
+                        .map(|filters| &filters.inverted),
                     &prepared.file_metrics,
                 );
             } else {
@@ -1519,26 +1614,69 @@ impl RowGroupsPrunedParquetOpen {
         }))
     }
 
-    /// Load the page index if pruning requires it and metadata did not include it.
+    /// The page index entries this open needs (Longbow family OO): column
+    /// indexes of the page-pruning predicate's columns, and offset indexes
+    /// of every column it reads or prunes plus the first column (page
+    /// counts), each in the row groups that statistics did not prune.
+    fn page_index_request(&mut self) -> Result<PageIndexRequest> {
+        if self.decoder_read_plans.is_none() {
+            self.decoder_read_plans = Some(DecoderReadPlans::try_new(
+                &self.prepared.loaded.prepared,
+                &self.prepared.loaded.reader_metadata,
+            )?);
+        }
+        let read_plans = self.decoder_read_plans.as_ref().expect("built above");
+        let metadata = self.prepared.loaded.reader_metadata.metadata();
+        let parquet_schema = metadata.file_metadata().schema_descr();
+        let arrow_schema = &self.prepared.loaded.prepared.physical_file_schema;
+        let predicate_leaves: Vec<usize> = self
+            .prepared
+            .page_pruning_predicate
+            .iter()
+            .flat_map(|predicate| predicate.predicate_column_names())
+            .filter_map(|name| {
+                parquet_column(parquet_schema, arrow_schema, name).map(|(leaf, _)| leaf)
+            })
+            .collect();
+        let row_groups: Vec<usize> = self.row_groups.row_group_indexes().collect();
+        let offset_leaves = (0..parquet_schema.num_columns()).filter(|&leaf| {
+            leaf == 0 || read_plans.reads_leaf(leaf) || predicate_leaves.contains(&leaf)
+        });
+        let (column_policy, column_mask) =
+            if self.prepared.page_pruning_predicate.is_some() {
+                (
+                    PageIndexPolicy::Optional,
+                    ColumnChunkMask::row_groups_and_columns(
+                        row_groups.iter().copied(),
+                        predicate_leaves.iter().copied(),
+                    ),
+                )
+            } else {
+                (PageIndexPolicy::Skip, ColumnChunkMask::none())
+            };
+        Ok(PageIndexRequest {
+            column_policy,
+            column_mask,
+            offset_policy: PageIndexPolicy::Optional,
+            offset_mask: ColumnChunkMask::row_groups_and_columns(
+                row_groups,
+                offset_leaves,
+            ),
+        })
+    }
+
+    /// Load the page index entries that pruning and decoding need when the
+    /// metadata does not hold them yet.
     async fn load_page_index(mut self) -> Result<Self> {
-        self.prepared.loaded.reader_metadata = load_page_index(
-            self.prepared.loaded.reader_metadata.clone(),
-            &mut self.prepared.loaded.prepared.async_file_reader,
-            self.prepared
-                .loaded
-                .options
-                .clone()
-                .with_offset_index_policy(PageIndexPolicy::Optional)
-                .with_column_index_policy(
-                    if self.prepared.page_pruning_predicate.is_some() {
-                        PageIndexPolicy::Optional
-                    } else {
-                        PageIndexPolicy::Skip
-                    },
-                ),
+        let request = self.page_index_request()?;
+        let loaded = &mut self.prepared.loaded;
+        loaded.reader_metadata = load_requested_page_index(
+            &loaded.reader_metadata,
+            &mut loaded.prepared.async_file_reader,
+            &loaded.options,
+            &request,
         )
         .await?;
-
         Ok(self)
     }
 
@@ -1569,7 +1707,7 @@ impl RowGroupsPrunedParquetOpen {
                 let prepared = &self.prepared.loaded.prepared;
                 prepared.parquet_file_reader_factory.create_reader(
                     prepared.partition_index,
-                    prepared.partitioned_file.clone(),
+                    reader_file(&prepared.partitioned_file, &prepared.file_metrics),
                     prepared.metadata_size_hint,
                     &prepared.metrics,
                 )?
@@ -1696,6 +1834,7 @@ impl RowGroupsPrunedParquetOpen {
             loaded,
             pruning_predicate: _,
             page_pruning_predicate,
+            prepared_filters: _,
         } = prepared;
         let MetadataLoadedParquetOpen {
             prepared,
@@ -2283,42 +2422,40 @@ pub(crate) fn build_pruning_predicates(
         .build(Arc::clone(predicate))
 }
 
-/// Returns a `ArrowReaderMetadata` with the page index loaded, loading
-/// it from the underlying `AsyncFileReader` if necessary.
-async fn load_page_index<T: AsyncFileReader>(
-    reader_metadata: ArrowReaderMetadata,
+/// The file open's [`PartitionedFile`] for a reader factory, carrying the
+/// open's metrics so that the reader records into them (Longbow family OO).
+fn reader_file(file: &PartitionedFile, metrics: &ParquetFileMetrics) -> PartitionedFile {
+    file.clone()
+        .with_extension(crate::reader::OpenFileMetrics(metrics.clone()))
+}
+
+/// `reader_metadata` with the page index entries of `request` (Longbow
+/// family OO).
+///
+/// Metadata that holds them is returned unchanged. Otherwise the entries
+/// are requested from `input` through [`AsyncFileReader::get_metadata`]: a
+/// reader of a shared metadata cache (`CachedParquetFileReaderFactory`)
+/// loads the complete page index of the file generation once and writes it
+/// back, and one without a cache loads only the requested entries onto the
+/// footer it returned before. A reader that ignores the request is followed
+/// by a load of only the requested entries from `input`.
+pub(crate) async fn load_requested_page_index<T: AsyncFileReader>(
+    reader_metadata: &ArrowReaderMetadata,
     input: &mut T,
-    options: ArrowReaderOptions,
+    options: &ArrowReaderOptions,
+    request: &PageIndexRequest,
 ) -> Result<ArrowReaderMetadata> {
-    let parquet_metadata = reader_metadata.metadata();
-    let missing_column_index = options.column_index_policy() != PageIndexPolicy::Skip
-        && !parquet_metadata
-            .page_index()
-            .is_some_and(|page_index| page_index.has_column_indexes());
-    let missing_offset_index = options.offset_index_policy() != PageIndexPolicy::Skip
-        && !parquet_metadata
-            .page_index()
-            .is_some_and(|page_index| page_index.has_offset_indexes());
-    // You may ask yourself: why are we even checking if the page index is already loaded here?
-    // Didn't we explicitly *not* load it above?
-    // Well it's possible that a custom implementation of `AsyncFileReader` gives you
-    // the page index even if you didn't ask for it (e.g. because it's cached)
-    // so it's important to check that here to avoid extra work.
-    if missing_column_index || missing_offset_index {
-        let m = Arc::try_unwrap(Arc::clone(parquet_metadata))
-            .unwrap_or_else(|e| e.as_ref().clone());
-        let mut reader = ParquetMetaDataReader::new_with_metadata(m)
-            .with_column_index_policy(options.column_index_policy())
-            .with_offset_index_policy(options.offset_index_policy());
-        reader.load_page_index(input).await?;
-        let new_parquet_metadata = reader.finish()?;
-        let new_arrow_reader =
-            ArrowReaderMetadata::try_new(Arc::new(new_parquet_metadata), options)?;
-        Ok(new_arrow_reader)
-    } else {
-        // No need to load the page index again, just return the existing metadata
-        Ok(reader_metadata)
+    if request.is_covered_by(reader_metadata.metadata()) {
+        return Ok(reader_metadata.clone());
     }
+    let requested = request.apply(options.clone());
+    let metadata = input.get_metadata(Some(&requested)).await?;
+    let metadata = if request.is_covered_by(metadata.as_ref()) {
+        metadata
+    } else {
+        request.load_with(metadata, &mut *input).await?
+    };
+    Ok(ArrowReaderMetadata::try_new(metadata, options.clone())?)
 }
 
 #[cfg(test)]
@@ -2376,6 +2513,7 @@ mod test {
     use parquet::encryption::encrypt::FileEncryptionProperties;
     use parquet::file::metadata::{
         ColumnChunkMetaData, FileMetaData, KeyValue, ParquetMetaData,
+        ParquetMetaDataReader,
     };
     use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
     use parquet::file::writer::SerializedFileWriter;
@@ -2662,6 +2800,7 @@ mod test {
                 },
                 pruning_predicate: None,
                 page_pruning_predicate,
+                prepared_filters: None,
             },
             row_groups: RowGroupAccessPlanFilter::new(plan),
             decoder_read_plans: None,
@@ -2905,6 +3044,7 @@ mod test {
                 sort_order_for_reorder: None,
                 virtual_state,
                 shared_work_source: None,
+                filter_cache: Default::default(),
             })
         }
     }
@@ -3156,6 +3296,40 @@ mod test {
                 _ => 0,
             })
             .unwrap_or(0)
+    }
+
+    /// The registration ID of `store` in these tests (Longbow family OO):
+    /// one per store, which the table keeps alive.
+    fn test_store_id(
+        store: &Arc<dyn ObjectStore>,
+    ) -> datafusion_execution::object_store::StoreId {
+        use datafusion_execution::object_store::StoreId;
+        thread_local! {
+            static IDS: std::cell::RefCell<Vec<(Arc<dyn ObjectStore>, StoreId)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        IDS.with_borrow_mut(|ids| {
+            if let Some((_, id)) = ids.iter().find(|(kept, _)| Arc::ptr_eq(kept, store)) {
+                return *id;
+            }
+            let id = StoreId::next().expect("a store ID");
+            ids.push((Arc::clone(store), id));
+            id
+        })
+    }
+
+    /// The metadata cache key of `location` in `store` (Longbow family OO).
+    fn test_cache_key(store: &Arc<dyn ObjectStore>, location: &Path) -> Path {
+        crate::metadata::file_metadata_cache_key(test_store_id(store), location)
+    }
+
+    /// A cached factory of `store`'s readers, keyed by its test ID.
+    fn test_cached_factory(
+        store: &Arc<dyn ObjectStore>,
+        cache: &Arc<FileMetadataCache>,
+    ) -> CachedParquetFileReaderFactory {
+        CachedParquetFileReaderFactory::new(Arc::clone(store), Arc::clone(cache))
+            .with_store_id(Some(test_store_id(store)))
     }
 
     fn make_dynamic_expr(expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
@@ -4503,12 +4677,9 @@ mod test {
         let provider = Arc::new(EnumSchemaProvider::default());
         let source = ParquetSource::new(Arc::clone(&schema))
             .with_schema_provider(provider.clone())
-            .with_parquet_file_reader_factory(Arc::new(
-                CachedParquetFileReaderFactory::new(
-                    Arc::clone(&store),
-                    Arc::clone(&cache),
-                ),
-            ))
+            .with_parquet_file_reader_factory(Arc::new(test_cached_factory(
+                &store, &cache,
+            )))
             .with_predicate(logical2physical(
                 &get_field(col("nested"), "e").eq(lit("b")),
                 &schema,
@@ -4557,8 +4728,10 @@ mod test {
         )
         .await;
         let cache: Arc<FileMetadataCache> = Arc::new(DefaultCache::new(1024 * 1024));
+        // The same store as the scan's (Longbow family OO keys by store).
         let original = DFParquetMetadata::new(store.as_ref(), &file.object_meta)
             .with_file_metadata_cache(Some(Arc::clone(&cache)))
+            .with_store_id(Some(test_store_id(&store)))
             .with_page_index_policy(Some(PageIndexPolicy::Optional))
             .fetch_metadata()
             .await
@@ -4571,12 +4744,9 @@ mod test {
         let mut opener = ParquetMorselizerBuilder::new()
             .with_store(Arc::clone(&store))
             .with_schema(Arc::clone(&schema))
-            .with_parquet_file_reader_factory(Arc::new(
-                CachedParquetFileReaderFactory::new(
-                    Arc::clone(&store),
-                    Arc::clone(&cache),
-                ),
-            ))
+            .with_parquet_file_reader_factory(Arc::new(test_cached_factory(
+                &store, &cache,
+            )))
             .build();
         // The default scan still rejects an invalid advisory Arrow hint.
         assert!(
@@ -4603,7 +4773,9 @@ mod test {
                 prepared.loaded.reader_metadata.metadata()
             ));
         }
-        let cached = cache.get(&file.object_meta.location).unwrap();
+        let cached = cache
+            .get(&test_cache_key(&store, &file.object_meta.location))
+            .unwrap();
         let cached = cached
             .file_metadata
             .as_any()
@@ -4698,12 +4870,9 @@ mod test {
                 .with_predicate(logical2physical(&col("id").eq(lit(2i32)), &schema))
                 .with_pushdown_filters(true)
                 .with_enable_page_index(true)
-                .with_parquet_file_reader_factory(Arc::new(
-                    CachedParquetFileReaderFactory::new(
-                        Arc::clone(&store),
-                        Arc::clone(&cache),
-                    ),
-                ))
+                .with_parquet_file_reader_factory(Arc::new(test_cached_factory(
+                    &store, &cache,
+                )))
                 .build();
             opener.file_decryption_properties = Some(decrypt);
             opener.schema_provider = Some(Arc::new(EnumSchemaProvider::default()));
@@ -4730,7 +4899,9 @@ mod test {
             };
             assert_eq!(pruning_metrics.pruned(), 2);
             assert!(
-                cache.get(&file.object_meta.location).is_none(),
+                cache
+                    .get(&test_cache_key(&store, &file.object_meta.location))
+                    .is_none(),
                 "encrypted metadata must not enter the shared cache"
             );
         }
@@ -5456,15 +5627,18 @@ mod test {
             .load()
             .await
             .unwrap();
-        let options = loaded
-            .options
-            .clone()
-            .with_column_index_policy(PageIndexPolicy::Skip)
-            .with_offset_index_policy(PageIndexPolicy::Optional);
-        let metadata = load_page_index(
-            loaded.reader_metadata,
+        let options = loaded.options.clone();
+        let offsets = PageIndexRequest {
+            column_policy: PageIndexPolicy::Skip,
+            column_mask: ColumnChunkMask::none(),
+            offset_policy: PageIndexPolicy::Optional,
+            offset_mask: ColumnChunkMask::all(),
+        };
+        let metadata = load_requested_page_index(
+            &loaded.reader_metadata,
             &mut loaded.prepared.async_file_reader,
-            options.clone(),
+            &options,
+            &offsets,
         )
         .await
         .unwrap();
@@ -5472,10 +5646,11 @@ mod test {
         assert!(page_index.has_offset_indexes());
         assert!(!page_index.has_column_indexes());
         let bytes_scanned = counter_metric_value(&metrics, "bytes_scanned");
-        let cached = load_page_index(
-            metadata.clone(),
+        let cached = load_requested_page_index(
+            &metadata,
             &mut loaded.prepared.async_file_reader,
-            options.clone(),
+            &options,
+            &offsets,
         )
         .await
         .unwrap();
@@ -5486,10 +5661,11 @@ mod test {
         );
 
         // A later predicate scan must still load the missing column index.
-        let metadata = load_page_index(
-            cached,
+        let metadata = load_requested_page_index(
+            &cached,
             &mut loaded.prepared.async_file_reader,
-            options.with_column_index_policy(PageIndexPolicy::Optional),
+            &options,
+            &PageIndexRequest::all(PageIndexPolicy::Optional),
         )
         .await
         .unwrap();
@@ -5734,12 +5910,10 @@ mod test {
             .with_row_group_stats_pruning(true)
             .with_pushdown_filters(false)
             .with_metrics(metrics.clone())
-            .with_parquet_file_reader_factory(Arc::new(
-                CachedParquetFileReaderFactory::new(
-                    Arc::clone(&store),
-                    Arc::clone(&metadata_cache),
-                ),
-            ))
+            .with_parquet_file_reader_factory(Arc::new(test_cached_factory(
+                &store,
+                &metadata_cache,
+            )))
             .build();
 
         let (_, rows) =
@@ -5748,7 +5922,7 @@ mod test {
         assert_eq!(counter_metric_value(&metrics, "page_index_load_skipped"), 1);
 
         let cached = metadata_cache
-            .get(&Path::from("test.parquet"))
+            .get(&test_cache_key(&store, &Path::from("test.parquet")))
             .expect("metadata cache should contain the file");
         let extra_info = cached.file_metadata.extra_info();
         let page_index_cached = extra_info.get("page_index").map(String::as_str);
@@ -6714,5 +6888,10 @@ mod test {
             batches[0].schema().field(0).data_type(),
             &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Binary))
         );
+    }
+
+    /// Longbow family OO.
+    mod open_once {
+        include!("open_once_tests.rs");
     }
 }

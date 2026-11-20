@@ -1111,3 +1111,99 @@ The regression compares the bits, capacity and bitmap eligibility with
 the single-array path for nullable, sliced keys across 96 chunks.
 
 See Longbow lane `leto-mjj.101`.
+
+## Family OO: open a Parquet file once per generation and scan
+
+Purpose: stop repeating per-file setup that depends only on the file
+generation or the scan (lane leto-mjj.96, task 5.29d). Dependent Longbow
+feature: SCAN-OPEN-ONCE. Audit classification: UPSTREAMABLE. Upstream
+references: apache/datafusion#27488 (open) writes a deferred page-index load
+back to `CachedParquetFileReaderFactory`'s cache by downcasting the factory,
+which a wrapping factory hides; #24288 (open) asks for masked loading and
+caching. Arrow 60.1 already decodes masked page indexes (`ColumnChunkMask`
+in `ArrowReaderOptions`).
+
+1. **Page index once per file generation.** The opener asks for the page
+   index entries it needs through `AsyncFileReader::get_metadata`, with the
+   column-index mask (page-pruning predicate leaves) and the offset-index
+   mask (read leaves, predicate leaves and leaf 0 for page counts), each in
+   the row groups that statistics kept (`PageIndexRequest`). A reader of a
+   shared metadata cache (`DFParquetMetadata::fetch_metadata`) returns cached
+   metadata that covers the request; otherwise it loads the complete page
+   index of the generation once and writes it back, so later opens and
+   queries parse nothing. A reader without a cache keeps the footer it
+   returned and loads only the requested entries onto it, through itself;
+   the footer is cloned only when it is shared. A reader that ignores the
+   request is followed by a masked load from the reader. A changed file has
+   another `ObjectMeta`, so `is_valid_for` rejects its cached footer and the
+   new generation is parsed again. Prepared scans (family PQ) request the
+   offset indexes of their read columns the same way. Page-index bytes that
+   the cached path reads go to the store directly and are not in
+   `bytes_scanned`.
+2. **Filters once per scan and physical schema.** `ParquetSource` holds a
+   `PreparedFilterCache` that its clones and every partition's morselizer
+   share. An entry holds the adapted predicate and projection, the
+   row-group pruning predicate with its lazily built inversion for full-match
+   detection, and the page pruning predicate. Its key is every input of the
+   preparation: the per-file predicate and projection expressions (pointer
+   equality, so a per-file literal rewrite is a new key), the logical,
+   rewrite and pruning schemas (equal values), virtual columns, the adapter
+   factory, `max_in_list_size` and `enable_page_index`. A predicate with a
+   dynamic filter is also keyed by its snapshot generation, and an entry is
+   kept only when the generation did not change during its build, so a hit
+   equals what a file opened at that generation would prepare. Pruning
+   predicate creation errors of the build are added to every file's counter
+   that uses the entry. At most 16 entries; the debug output prints none.
+   The file-level pruning predicate (file statistics against the logical
+   schema, before the footer is read) of a predicate whose dynamic filters
+   can no longer change comes from the same cache, keyed by the predicate,
+   the logical schema and the generation, and is evaluated once per open as
+   `FilePruner::should_prune` would; a predicate that can still change keeps
+   its per-file `FilePruner`, which early stopping watches.
+3. **One `ParquetFileMetrics` per open.** The opener passes its metrics to
+   the reader factory as a `PartitionedFile` extension (`OpenFileMetrics`);
+   the default and cached factories give them to the open's readers (the
+   first reader, the replacement after Bloom-filter I/O and a prepared
+   scan's extra readers) instead of registering a new set. Each reader adds
+   its own bytes to the scan efficiency ratio.
+
+Review fixes (MJJ96 independent review, 2026-11-19):
+
+- **Store identity (final review, 2026-11-20).** Entries are keyed by
+  registration, never by address. `ObjectStoreRegistry::get_store_with_id`
+  returns the store and the `StoreId` of its registration from one lookup
+  (the default registry stores the ID beside the store and reads both under
+  one map guard; the trait default returns no ID). A `StoreId` comes from a
+  process-wide counter at registration and is never reused (the counter
+  uses a checked add; once exhausted it issues no ID, and the cache is
+  skipped, v5 review), so a store
+  registered in another's place at the same URL, even at a reused address,
+  has other entries. The key is `store-<id>/<location>`
+  (`metadata::file_metadata_cache_key`), validated against the listed
+  generation (size, modification time, ETag, version).
+  `CachedParquetFileReaderFactory::from_registry` makes every factory in
+  `ParquetFormat::create_physical_plan` and the `ParquetSource` decode from
+  that one call; `ParquetFileReaderFactory::store_id` tells a wrapper which
+  registration a factory reads. Without an ID the cache is skipped: planning
+  reads (`infer_schema`, `infer_stats`, orderings), which get a store and no
+  URL, now read footers uncached, and the core parquet tests count those
+  requests. No URL or store is formatted: `Debug` of `DFParquetMetadata`
+  and both factories omits the store. Upstream apache/datafusion#27580
+  (open) keys by URL instead.
+- **Required validation.** `PageIndexRequest::validate` applies Arrow's
+  `Required` rule for the offset index (with any selected index range, every
+  selected chunk needs an offset index) from the footer, on cache hits and
+  loads alike; coverage includes it. A warm request that the footer rules out fails before
+  any index read. The complete load for the cache is
+  optional, so a required request is enforced only within its own selection.
+- **Index bytes.** On a cache miss the footer is read first and the index
+  after it; index reads in the metadata layer go through a counting fetch
+  (`with_page_index_bytes`), and the reader adds them to `bytes_scanned` and
+  its scan-efficiency part. A warm hit adds nothing.
+- **Derived copies.** `CachedParquetMetaData::with_derived_copies` reserves
+  slots for copies derived from the entry's metadata (for example an
+  engine's copies with page-cache handles), charged at the footer's size in
+  the entry's fixed memory size and dropped with the entry
+  (`CachedParquetMetaData::derived`). `ParquetFileReaderFactory::with_derived_copies`
+  (default `None`; the cached factory returns a configured clone) lets a
+  wrapping factory reserve them.

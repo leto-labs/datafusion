@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -162,12 +164,60 @@ pub trait ObjectStoreRegistry: Send + Sync + std::fmt::Debug + 'static {
     /// the `url` and [`ObjectStoreRegistry`] implementation. An [`ObjectStore`] may be lazily
     /// created and registered.
     fn get_store(&self, url: &Url) -> Result<Arc<dyn ObjectStore>>;
+
+    /// [`Self::get_store`] together with the [`StoreId`] of the registration
+    /// it resolved, from one lookup, for caches keyed by store (Longbow
+    /// family OO). A registry that wraps the registered store per call
+    /// returns the wrapper with the registration's ID. `None` (the default)
+    /// means the registry assigns no IDs, and such caches are skipped.
+    fn get_store_with_id(
+        &self,
+        url: &Url,
+    ) -> Result<(Arc<dyn ObjectStore>, Option<StoreId>)> {
+        Ok((self.get_store(url)?, None))
+    }
+}
+
+/// The identity of one store registration (Longbow family OO): assigned from
+/// a process-wide counter when a store is registered, never reused, and new
+/// when another store is registered under the same URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StoreId(u64);
+
+impl StoreId {
+    /// A new, never used ID; `None` once the counter is exhausted, so that
+    /// an ID is never issued twice (caches keyed by it are then skipped).
+    pub fn next() -> Option<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self::next_from(&NEXT)
+    }
+
+    /// The next ID of `counter`, with a checked add: the counter never wraps.
+    fn next_from(counter: &std::sync::atomic::AtomicU64) -> Option<Self> {
+        use std::sync::atomic::Ordering::Relaxed;
+        counter
+            .try_update(Relaxed, Relaxed, |n| n.checked_add(1))
+            .ok()
+            .map(Self)
+    }
+
+    /// The ID's number.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for StoreId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "store-{}", self.0)
+    }
 }
 
 /// The default [`ObjectStoreRegistry`]
 pub struct DefaultObjectStoreRegistry {
     /// A map from scheme to object store that serve list / read operations for the store
-    object_stores: DashMap<String, Arc<dyn ObjectStore>>,
+    /// Each with the ID of its registration (Longbow family OO).
+    object_stores: DashMap<String, (Arc<dyn ObjectStore>, Option<StoreId>)>,
 }
 
 impl std::fmt::Debug for DefaultObjectStoreRegistry {
@@ -195,15 +245,20 @@ impl DefaultObjectStoreRegistry {
     /// This will register [`LocalFileSystem`] to handle `file://` paths
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Self {
-        let object_stores: DashMap<String, Arc<dyn ObjectStore>> = DashMap::new();
-        object_stores.insert("file://".to_string(), Arc::new(LocalFileSystem::new()));
+        let object_stores: DashMap<String, (Arc<dyn ObjectStore>, Option<StoreId>)> =
+            DashMap::new();
+        object_stores.insert(
+            "file://".to_string(),
+            (Arc::new(LocalFileSystem::new()), StoreId::next()),
+        );
         Self { object_stores }
     }
 
     /// Default without any backend registered.
     #[cfg(target_arch = "wasm32")]
     pub fn new() -> Self {
-        let object_stores: DashMap<String, Arc<dyn ObjectStore>> = DashMap::new();
+        let object_stores: DashMap<String, (Arc<dyn ObjectStore>, Option<StoreId>)> =
+            DashMap::new();
         Self { object_stores }
     }
 }
@@ -225,12 +280,14 @@ impl ObjectStoreRegistry for DefaultObjectStoreRegistry {
         store: Arc<dyn ObjectStore>,
     ) -> Option<Arc<dyn ObjectStore>> {
         let s = get_url_key(url);
-        self.object_stores.insert(s, store)
+        self.object_stores
+            .insert(s, (store, StoreId::next()))
+            .map(|(store, _)| store)
     }
 
     fn deregister_store(&self, url: &Url) -> Result<Arc<dyn ObjectStore>> {
         let s = get_url_key(url);
-        let (_, object_store) = self.object_stores
+        let (_, (object_store, _)) = self.object_stores
             .remove(&s)
             .ok_or_else(|| {
                 internal_datafusion_err!("Failed to deregister object store. No suitable object store found for {url}. See `RuntimeEnv::register_object_store`")
@@ -240,10 +297,17 @@ impl ObjectStoreRegistry for DefaultObjectStoreRegistry {
     }
 
     fn get_store(&self, url: &Url) -> Result<Arc<dyn ObjectStore>> {
+        Ok(self.get_store_with_id(url)?.0)
+    }
+
+    fn get_store_with_id(
+        &self,
+        url: &Url,
+    ) -> Result<(Arc<dyn ObjectStore>, Option<StoreId>)> {
         let s = get_url_key(url);
         self.object_stores
             .get(&s)
-            .map(|o| Arc::clone(o.value()))
+            .map(|o| (Arc::clone(&o.value().0), o.value().1))
             .ok_or_else(|| {
                 internal_datafusion_err!("No suitable object store found for {url}. See `RuntimeEnv::register_object_store`")
             })
@@ -263,6 +327,27 @@ fn get_url_key(url: &Url) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Longbow family OO (MJJ96 v5 review): the counter never wraps, so an
+    /// exhausted counter issues no ID instead of reusing one.
+    #[test]
+    fn store_ids_are_never_reissued_at_exhaustion() {
+        let counter = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            StoreId::next_from(&counter).map(StoreId::get),
+            Some(u64::MAX - 1)
+        );
+        assert_eq!(StoreId::next_from(&counter), None);
+        assert_eq!(StoreId::next_from(&counter), None);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), u64::MAX);
+        // Registrations get distinct IDs.
+        let registry = DefaultObjectStoreRegistry::new();
+        let url = Url::parse("memory://ids").unwrap();
+        registry.register_store(&url, Arc::new(object_store::memory::InMemory::new()));
+        let first = registry.get_store_with_id(&url).unwrap().1.unwrap();
+        registry.register_store(&url, Arc::new(object_store::memory::InMemory::new()));
+        assert!(registry.get_store_with_id(&url).unwrap().1.unwrap() > first);
+    }
 
     #[test]
     fn test_object_store_url() {

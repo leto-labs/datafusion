@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -133,6 +135,15 @@ mod tests {
     use datafusion_physical_plan::{ExecutionPlan, collect};
 
     use crate::test_util::bounded_stream;
+    use datafusion_execution::object_store::StoreId;
+
+    /// The registration that keys the tests' metadata cache entries
+    /// (Longbow family OO). Each test has its own cache.
+    fn test_store_id() -> Option<StoreId> {
+        static ID: std::sync::LazyLock<Option<StoreId>> =
+            std::sync::LazyLock::new(StoreId::next);
+        *ID
+    }
     use arrow::array::{
         Array, ArrayRef, DictionaryArray, Int32Array, Int64Array, StringArray,
         types::Int32Type,
@@ -187,6 +198,7 @@ mod tests {
             ctx.runtime_env().cache_manager.get_file_metadata_cache();
         let stats = DFParquetMetadata::new(&store, &meta[0])
             .with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)))
+            .with_store_id(test_store_id())
             .fetch_statistics(&schema)
             .await?;
 
@@ -198,6 +210,7 @@ mod tests {
 
         let stats = DFParquetMetadata::new(&store, &meta[1])
             .with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)))
+            .with_store_id(test_store_id())
             .fetch_statistics(&schema)
             .await?;
 
@@ -374,8 +387,9 @@ mod tests {
         df_meta.fetch_metadata().await?;
         assert_eq!(store.request_count(), 2);
 
-        let df_meta =
-            df_meta.with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)));
+        let df_meta = df_meta
+            .with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)))
+            .with_store_id(test_store_id());
 
         // Increases by 3 because cache has no entries yet
         df_meta.fetch_metadata().await?;
@@ -397,18 +411,20 @@ mod tests {
         let format = ParquetFormat::default()
             .with_metadata_size_hint(Some(9))
             .with_force_view_types(force_views);
-        // Increase by 3, partial cache being used.
+        // Longbow family OO: planning reads name no store registration, so
+        // they skip the cache. Increase by 2 per file.
         let _schema = format.infer_schema(&ctx, &store.upcast(), &meta).await?;
-        assert_eq!(store.request_count(), 10);
-        // No increase, full cache being used.
+        assert_eq!(store.request_count(), 11);
+        // Increase by 2 per file again.
         let schema = format.infer_schema(&ctx, &store.upcast(), &meta).await?;
-        assert_eq!(store.request_count(), 10);
+        assert_eq!(store.request_count(), 15);
 
         // No increase, cache being used
-        let df_meta =
-            df_meta.with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)));
+        let df_meta = df_meta
+            .with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)))
+            .with_store_id(test_store_id());
         let stats = df_meta.fetch_statistics(&schema).await?;
-        assert_eq!(store.request_count(), 10);
+        assert_eq!(store.request_count(), 15);
 
         assert_eq!(stats.num_rows, Precision::Exact(3));
         let c1_stats = &stats.column_statistics[0];
@@ -433,8 +449,9 @@ mod tests {
         let ctx = session.state();
         let file_metadata_cache =
             ctx.runtime_env().cache_manager.get_file_metadata_cache();
-        let df_meta =
-            df_meta.with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)));
+        let df_meta = df_meta
+            .with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)))
+            .with_store_id(test_store_id());
         // Increases by 1 because cache has no entries yet and new session context
         df_meta.fetch_metadata().await?;
         assert_eq!(store.request_count(), 2);
@@ -451,17 +468,18 @@ mod tests {
         let format = ParquetFormat::default()
             .with_metadata_size_hint(Some(size_hint))
             .with_force_view_types(force_views);
-        // Increase by 1, partial cache being used.
+        // Increase by 1 per file: planning reads skip the cache.
         let _schema = format.infer_schema(&ctx, &store.upcast(), &meta).await?;
-        assert_eq!(store.request_count(), 4);
-        // No increase, full cache being used.
+        assert_eq!(store.request_count(), 5);
+        // Increase by 1 per file again.
         let schema = format.infer_schema(&ctx, &store.upcast(), &meta).await?;
-        assert_eq!(store.request_count(), 4);
+        assert_eq!(store.request_count(), 7);
         // No increase, cache being used
-        let df_meta =
-            df_meta.with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)));
+        let df_meta = df_meta
+            .with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)))
+            .with_store_id(test_store_id());
         let stats = df_meta.fetch_statistics(&schema).await?;
-        assert_eq!(store.request_count(), 4);
+        assert_eq!(store.request_count(), 7);
 
         assert_eq!(stats.num_rows, Precision::Exact(3));
         let c1_stats = &stats.column_statistics[0];
@@ -482,8 +500,9 @@ mod tests {
         assert_eq!(store.request_count(), 1);
 
         // No increase because cache has an entry
-        let df_meta =
-            df_meta.with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)));
+        let df_meta = df_meta
+            .with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)))
+            .with_store_id(test_store_id());
         df_meta.fetch_metadata().await?;
         assert_eq!(store.request_count(), 1);
 
@@ -532,16 +551,18 @@ mod tests {
         // Make metadata size hint None to keep original behavior
         let format = ParquetFormat::default().with_metadata_size_hint(None);
         let _schema = format.infer_schema(&state, &store.upcast(), &files).await?;
-        assert_eq!(store.request_count(), 3);
-        // No increase, cache being used.
+        assert_eq!(store.request_count(), 2);
+        // Longbow family OO: planning reads name no store registration, so
+        // they skip the cache: increase by 2 again.
         let schema = format.infer_schema(&state, &store.upcast(), &files).await?;
-        assert_eq!(store.request_count(), 3);
+        assert_eq!(store.request_count(), 4);
 
         // No increase in request count because cache is not empty
         let file_metadata_cache =
             state.runtime_env().cache_manager.get_file_metadata_cache();
         let stats = DFParquetMetadata::new(store.as_ref(), &files[0])
             .with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)))
+            .with_store_id(test_store_id())
             .fetch_statistics(&schema)
             .await?;
         assert_eq!(stats.num_rows, Precision::Exact(4));
@@ -608,7 +629,8 @@ mod tests {
             .with_force_view_types(force_views)
             .with_metadata_size_hint(None);
         let schema = format.infer_schema(&state, &store.upcast(), &files).await?;
-        assert_eq!(store.request_count(), 6);
+        // Longbow family OO: planning reads skip the cache; 2 per file.
+        assert_eq!(store.request_count(), 4);
 
         let null_i64 = ScalarValue::Int64(None);
         let null_utf8 = if force_views {
@@ -617,14 +639,15 @@ mod tests {
             Utf8(None)
         };
 
-        // No increase in request count because cache is not empty
+        // Increase by 3: planning filled no entry
         let file_metadata_cache =
             state.runtime_env().cache_manager.get_file_metadata_cache();
         let stats = DFParquetMetadata::new(store.as_ref(), &files[0])
             .with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)))
+            .with_store_id(test_store_id())
             .fetch_statistics(&schema)
             .await?;
-        assert_eq!(store.request_count(), 6);
+        assert_eq!(store.request_count(), 7);
         assert_eq!(stats.num_rows, Precision::Exact(3));
         // column c1
         let c1_stats = &stats.column_statistics[0];
@@ -648,12 +671,13 @@ mod tests {
         assert_eq!(c2_stats.max_value, Precision::Exact(null_i64.clone()));
         assert_eq!(c2_stats.min_value, Precision::Exact(null_i64.clone()));
 
-        // No increase in request count because cache is not empty
+        // Increase by 3: planning filled no entry
         let stats = DFParquetMetadata::new(store.as_ref(), &files[1])
             .with_file_metadata_cache(Some(Arc::clone(&file_metadata_cache)))
+            .with_store_id(test_store_id())
             .fetch_statistics(&schema)
             .await?;
-        assert_eq!(store.request_count(), 6);
+        assert_eq!(store.request_count(), 10);
         assert_eq!(stats.num_rows, Precision::Exact(3));
         // column c1: missing from the file so the table treats all 3 rows as null
         let c1_stats = &stats.column_statistics[0];
