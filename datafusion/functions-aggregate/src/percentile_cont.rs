@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::mem::{size_of, size_of_val};
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -53,6 +54,7 @@ use datafusion_functions_aggregate_common::aggregate::groups_accumulator::accumu
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::nulls::filtered_null_mask;
 use datafusion_functions_aggregate_common::utils::Hashable;
 use datafusion_macros::user_doc;
+use datafusion_physical_expr::aggregate::{SlidingFrame, SlidingFrameAccumulator};
 
 use crate::utils::PercentileParam;
 
@@ -284,9 +286,8 @@ pub fn create_percentile_accumulator(
                     $dt.clone(),
                 )))
             } else {
-                Ok(Box::new(PercentileContAccumulator::<$t, $i>::new(
-                    percentile,
-                    $dt.clone(),
+                Ok(Box::new(SlidingFrameAccumulator::new(
+                    PercentileContAccumulator::<$t, $i>::new(percentile, $dt.clone()),
                 )))
             }
         };
@@ -403,6 +404,119 @@ fn simplify_percentile_cont_aggregate(
     Ok(rewritten)
 }
 
+const FRAME_BLOCK_SIZE: usize = 512;
+
+/// Blocks are ordered by value, with duplicates allowed across boundaries.
+#[derive(Debug)]
+struct SortedFrame<T> {
+    blocks: Vec<Vec<T>>,
+    len: usize,
+}
+
+impl<T: ArrowNativeTypeOp> SortedFrame<T> {
+    fn from_values(mut values: Vec<T>) -> Self {
+        values.sort_unstable_by(|a, b| a.compare(*b));
+        let len = values.len();
+        let blocks = if len <= 2 * FRAME_BLOCK_SIZE {
+            if len == 0 { Vec::new() } else { vec![values] }
+        } else {
+            values.chunks(FRAME_BLOCK_SIZE).map(<[_]>::to_vec).collect()
+        };
+        Self { blocks, len }
+    }
+
+    fn block_index(&self, value: T) -> usize {
+        self.blocks
+            .partition_point(|block| block[block.len() - 1].compare(value).is_lt())
+    }
+
+    fn insert(&mut self, value: T) {
+        if self.blocks.is_empty() {
+            self.blocks.push(vec![value]);
+            self.len = 1;
+            return;
+        }
+        let index = self.block_index(value).min(self.blocks.len() - 1);
+        let block = &mut self.blocks[index];
+        let offset = block.partition_point(|item| item.compare(value).is_lt());
+        block.insert(offset, value);
+        self.len += 1;
+        if block.len() > 2 * FRAME_BLOCK_SIZE {
+            let tail = block.split_off(FRAME_BLOCK_SIZE);
+            self.blocks.insert(index + 1, tail);
+        }
+    }
+
+    fn remove(&mut self, value: T) -> bool {
+        let index = self.block_index(value);
+        let Some(block) = self.blocks.get_mut(index) else {
+            return false;
+        };
+        let Ok(offset) = block.binary_search_by(|item| item.compare(value)) else {
+            return false;
+        };
+        block.remove(offset);
+        self.len -= 1;
+        if block.is_empty() {
+            self.blocks.remove(index);
+        } else if let Some(next) = self.blocks.get(index + 1)
+            && self.blocks[index].len() + next.len() <= FRAME_BLOCK_SIZE
+        {
+            // Leave room between the merge and split thresholds.
+            let next = self.blocks.remove(index + 1);
+            self.blocks[index].extend(next);
+        }
+        true
+    }
+
+    /// Update a single block with one move of its intervening values.
+    fn replace_in_single_block(&mut self, old: T, new: T) -> Result<()> {
+        let block = &mut self.blocks[0];
+        let from = block.partition_point(|value| value.compare(old).is_lt());
+        if from == block.len() || !block[from].is_eq(old) {
+            return missing_frame_value();
+        }
+        let to = block.partition_point(|value| value.compare(new).is_lt());
+        if to > from {
+            block.copy_within(from + 1..to, from);
+            block[to - 1] = new;
+        } else {
+            block.copy_within(to..from, to + 1);
+            block[to] = new;
+        }
+        Ok(())
+    }
+
+    fn ranks(&self, mut lower: usize, mut upper: usize) -> (T, T) {
+        let mut blocks = self.blocks.iter();
+        while let Some(block) = blocks.next() {
+            if lower < block.len() {
+                let first = block[lower];
+                if upper < block.len() {
+                    return (first, block[upper]);
+                }
+                upper -= block.len();
+                for block in blocks {
+                    if upper < block.len() {
+                        return (first, block[upper]);
+                    }
+                    upper -= block.len();
+                }
+                break;
+            }
+            lower -= block.len();
+            upper -= block.len();
+        }
+        unreachable!("percentile ranks must be inside the frame")
+    }
+}
+
+fn missing_frame_value<T>() -> Result<T> {
+    internal_err!(
+        "percentile_cont retract_batch: retracted value(s) not present in the window"
+    )
+}
+
 /// The percentile_cont accumulator accumulates the raw input values
 /// as native types.
 ///
@@ -416,6 +530,7 @@ struct PercentileContAccumulator<
     I: PercentileInterpolator<T>,
 > {
     all_values: Vec<T::Native>,
+    frame: Option<SortedFrame<T::Native>>,
     percentile: PercentileParam,
     data_type: DataType,
     _interpolator: PhantomData<I>,
@@ -427,6 +542,7 @@ impl<T: ArrowNumericType + Debug, I: PercentileInterpolator<T>>
     fn new(percentile: PercentileParam, data_type: DataType) -> Self {
         Self {
             all_values: vec![],
+            frame: None,
             percentile,
             data_type,
             _interpolator: PhantomData,
@@ -440,6 +556,9 @@ where
     I: PercentileInterpolator<T> + 'static,
 {
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        if let Some(frame) = self.frame.take() {
+            self.all_values = frame.blocks.into_iter().flatten().collect();
+        }
         // Convert `all_values` to `ListArray` and return a single List ScalarValue
 
         // Build offsets
@@ -473,6 +592,18 @@ where
         }
 
         let values = values[0].as_primitive::<T>();
+        if let Some(frame) = &mut self.frame {
+            if values.null_count() == 0 {
+                for &value in values.values() {
+                    frame.insert(value);
+                }
+            } else {
+                for value in values.iter().flatten() {
+                    frame.insert(value);
+                }
+            }
+            return Ok(());
+        }
         let additional = values.len() - values.null_count();
         self.all_values.try_reserve(additional).map_err(|e| {
             exec_datafusion_err!(
@@ -501,6 +632,20 @@ where
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
+        if let Some(frame) = &self.frame {
+            let value = match frame.len {
+                0 => None,
+                1 => Some(frame.blocks[0][0]),
+                len => Some(I::percentile_from_ranks(
+                    len,
+                    self.percentile.get()?,
+                    self.percentile.is_desc,
+                    &self.data_type,
+                    |lower, upper| frame.ranks(lower, upper),
+                )?),
+            };
+            return I::frame_scalar(value, &self.data_type);
+        }
         if self.all_values.is_empty() {
             return ScalarValue::new_primitive::<T>(None, &self.data_type);
         }
@@ -514,60 +659,83 @@ where
     }
 
     fn size(&self) -> usize {
-        size_of_val(self) + self.all_values.capacity() * size_of::<T::Native>()
+        size_of_val(self)
+            + self.all_values.capacity() * size_of::<T::Native>()
+            + self.frame.as_ref().map_or(0, |frame| {
+                frame.blocks.capacity() * size_of::<Vec<T::Native>>()
+                    + frame.blocks.iter().map(Vec::capacity).sum::<usize>()
+                        * size_of::<T::Native>()
+            })
     }
 
     fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
-        let arr = values[0].as_primitive::<T>();
-        let mut to_remove: HashMap<Hashable<T::Native>, usize, RandomState> =
-            HashMap::with_capacity_and_hasher(
-                arr.len() - arr.null_count(),
-                RandomState::default(),
-            );
-
-        if arr.null_count() > 0 {
-            for value in arr.iter().flatten() {
-                *to_remove.entry(Hashable(value)).or_default() += 1;
+        let values = values[0].as_primitive::<T>();
+        // Physical windows enable the sorted layout at construction.
+        // Direct accumulator callers can enter the sliding layout here.
+        self.enable_sliding();
+        let frame = self.frame.as_mut().unwrap();
+        for value in values.iter().flatten() {
+            if !frame.remove(value) {
+                return missing_frame_value();
             }
-        } else {
-            // Fast path: no nulls, so skip the per-element validity check.
-            for value in arr.values().iter() {
-                *to_remove.entry(Hashable(*value)).or_default() += 1;
-            }
-        }
-
-        let mut i = 0;
-        while i < self.all_values.len() {
-            let k = Hashable(self.all_values[i]);
-            if let Some(count) = to_remove.get_mut(&k)
-                && *count > 0
-            {
-                self.all_values.swap_remove(i);
-                *count -= 1;
-                if *count == 0 {
-                    to_remove.remove(&k);
-                    if to_remove.is_empty() {
-                        break;
-                    }
-                }
-            } else {
-                i += 1;
-            }
-        }
-
-        // Retracting values that are not tracked means the accumulator state
-        // has diverged from the window frame; continuing would silently
-        // produce wrong results, so surface it as an error.
-        if !to_remove.is_empty() {
-            return internal_err!(
-                "percentile_cont retract_batch: retracted value(s) not present in the window"
-            );
         }
         Ok(())
     }
 
     fn supports_retract_batch(&self) -> bool {
         true
+    }
+}
+
+impl<T, I> SlidingFrame for PercentileContAccumulator<T, I>
+where
+    T: ArrowNumericType + Debug,
+    I: PercentileInterpolator<T> + 'static,
+{
+    fn enable_sliding(&mut self) {
+        self.frame.get_or_insert_with(|| {
+            SortedFrame::from_values(std::mem::take(&mut self.all_values))
+        });
+    }
+
+    fn advance(
+        &mut self,
+        values: &ArrayRef,
+        leaving: Range<usize>,
+        entering: Range<usize>,
+    ) -> Result<ScalarValue> {
+        let values = values.as_primitive::<T>();
+        let frame = self.frame.as_mut().expect("sliding frame was initialized");
+        if values.null_count() == 0 {
+            let values = values.values();
+            if leaving.len() == 1 && entering.len() == 1 && frame.blocks.len() == 1 {
+                frame.replace_in_single_block(
+                    values[leaving.start],
+                    values[entering.start],
+                )?;
+            } else {
+                for &value in &values[leaving] {
+                    if !frame.remove(value) {
+                        return missing_frame_value();
+                    }
+                }
+                for &value in &values[entering] {
+                    frame.insert(value);
+                }
+            }
+        } else {
+            for index in leaving {
+                if values.is_valid(index) && !frame.remove(values.value(index)) {
+                    return missing_frame_value();
+                }
+            }
+            for index in entering {
+                if values.is_valid(index) {
+                    frame.insert(values.value(index));
+                }
+            }
+        }
+        self.evaluate()
     }
 }
 
@@ -1036,6 +1204,13 @@ where
 /// A trait to abstract the rank selection and interpolation of a continuous
 /// percentile for floats and decimals.
 trait PercentileInterpolator<T: ArrowNumericType>: Debug + Sync + Send {
+    fn frame_scalar(
+        value: Option<T::Native>,
+        data_type: &DataType,
+    ) -> Result<ScalarValue> {
+        ScalarValue::new_primitive::<T>(value, data_type)
+    }
+
     /// Returns the continuous percentile of `values`, which holds at least
     /// two values. `percentile` is the requested fraction in `[0, 1]` before
     /// the flip for `WITHIN GROUP (ORDER BY ... DESC)`, which `descending`
@@ -1045,6 +1220,22 @@ trait PercentileInterpolator<T: ArrowNumericType>: Debug + Sync + Send {
         percentile: f64,
         descending: bool,
         data_type: &DataType,
+    ) -> Result<T::Native> {
+        Self::percentile_from_ranks(
+            values.len(),
+            percentile,
+            descending,
+            data_type,
+            |lower, upper| select_ranks::<T>(values, lower, upper),
+        )
+    }
+
+    fn percentile_from_ranks(
+        len: usize,
+        percentile: f64,
+        descending: bool,
+        data_type: &DataType,
+        ranks: impl FnOnce(usize, usize) -> (T::Native, T::Native),
     ) -> Result<T::Native>;
 }
 
@@ -1055,6 +1246,16 @@ fn select_ranks<T: ArrowPrimitiveType>(
     upper: usize,
 ) -> (T::Native, T::Native) {
     let cmp = |x: &T::Native, y: &T::Native| x.compare(*y);
+    if lower == upper {
+        if lower == 0 {
+            let value = *values.iter().min_by(|a, b| cmp(a, b)).unwrap();
+            return (value, value);
+        }
+        if lower == values.len() - 1 {
+            let value = *values.iter().max_by(|a, b| cmp(a, b)).unwrap();
+            return (value, value);
+        }
+    }
     // First, partition at lower to get the lower value
     let (_, lower_value, _) = values.select_nth_unstable_by(lower, cmp);
     let lower_value = *lower_value;
@@ -1076,38 +1277,33 @@ where
     T: ArrowNumericType,
     T::Native: AsPrimitive<f64>,
     f64: AsPrimitive<T::Native>,
+    ScalarValue: From<Option<T::Native>>,
 {
-    fn percentile_of(
-        values: &mut [T::Native],
+    fn frame_scalar(
+        value: Option<T::Native>,
+        _data_type: &DataType,
+    ) -> Result<ScalarValue> {
+        // A direct scalar avoids a one-row Arrow allocation on every frame.
+        Ok(value.into())
+    }
+
+    fn percentile_from_ranks(
+        len: usize,
         percentile: f64,
         descending: bool,
         _data_type: &DataType,
+        ranks: impl FnOnce(usize, usize) -> (T::Native, T::Native),
     ) -> Result<T::Native> {
-        let cmp = |x: &T::Native, y: &T::Native| x.compare(*y);
         let percentile = if descending {
             1.0 - percentile
         } else {
             percentile
         };
-        if percentile == 0.0 {
-            // Get minimum value
-            return Ok(*values
-                .iter()
-                .min_by(|a, b| cmp(a, b))
-                .expect("percentile_of receives at least two values"));
-        }
-        if percentile == 1.0 {
-            // Get maximum value
-            return Ok(*values
-                .iter()
-                .max_by(|a, b| cmp(a, b))
-                .expect("percentile_of receives at least two values"));
-        }
         // Calculate the index using the formula: p * (n - 1)
-        let index = percentile * ((values.len() - 1) as f64);
+        let index = percentile * ((len - 1) as f64);
         let lower_index = index.floor() as usize;
         let upper_index = index.ceil() as usize;
-        let (lower, upper) = select_ranks::<T>(values, lower_index, upper_index);
+        let (lower, upper) = ranks(lower_index, upper_index);
         if lower_index == upper_index {
             // Exact index, return the value at that position
             return Ok(lower);
@@ -1244,11 +1440,12 @@ where
     T: DecimalType,
     T::Native: DecimalCast,
 {
-    fn percentile_of(
-        values: &mut [T::Native],
+    fn percentile_from_ranks(
+        len: usize,
         percentile: f64,
         descending: bool,
         data_type: &DataType,
+        ranks: impl FnOnce(usize, usize) -> (T::Native, T::Native),
     ) -> Result<T::Native> {
         let precision = match data_type {
             DataType::Decimal32(p, _)
@@ -1257,7 +1454,7 @@ where
             | DataType::Decimal256(p, _) => *p,
             dt => return internal_err!("percentile_cont: {dt} is not a decimal"),
         };
-        let last = values.len() - 1;
+        let last = len - 1;
         // DuckDB's binary64 rank in the requested order; p <= 1 keeps it
         // within [0, n - 1].
         let rank = percentile * (last as f64);
@@ -1272,7 +1469,7 @@ where
         } else {
             (floor, ceil)
         };
-        let (lower_value, upper_value) = select_ranks::<T>(values, lower, upper);
+        let (lower_value, upper_value) = ranks(lower, upper);
         if floor == ceil {
             return Ok(lower_value);
         }
@@ -1300,7 +1497,7 @@ where
 }
 
 /// Calculate the percentile value for a given set of values.
-/// This function performs an exact calculation by sorting all values.
+/// This function selects the exact ranks from an unsorted buffer.
 ///
 /// The percentile is calculated using linear interpolation between closest ranks.
 /// For percentile p and n values:
@@ -1353,6 +1550,7 @@ mod tests {
         T: ArrowNumericType,
         T::Native: AsPrimitive<f64>,
         f64: AsPrimitive<T::Native>,
+        ScalarValue: From<Option<T::Native>>,
     {
         calculate_percentile::<T, FloatInterpolator>(
             values,
@@ -1409,6 +1607,121 @@ mod tests {
             float_percentile::<Float32Type>(&mut values, 0.9),
             Some(6_300_000.0)
         );
+    }
+
+    #[test]
+    fn blocked_frame_agrees_with_selection() -> Result<()> {
+        let values: ArrayRef = Arc::new(Float64Array::from(
+            (0..5000)
+                .map(|i| (i % 19 != 0).then_some(((i * 1031) % 2017) as f64))
+                .collect::<Vec<_>>(),
+        ));
+        for percentile in [0.0, 0.13, 0.5, 0.91, 1.0] {
+            let mut sliding = create_accumulator();
+            sliding.percentile.state = PercentileParamState::Resolved(percentile);
+            sliding.update_batch(&[values.slice(0, 1700)])?;
+            for start in 1..=3300 {
+                sliding.retract_batch(&[values.slice(start - 1, 1)])?;
+                sliding.update_batch(&[values.slice(start + 1699, 1)])?;
+                let mut reference = create_accumulator();
+                reference.percentile.state = PercentileParamState::Resolved(percentile);
+                reference.update_batch(&[values.slice(start, 1700)])?;
+                assert_eq!(sliding.evaluate()?, reference.evaluate()?, "row {start}");
+            }
+            sliding.retract_batch(&[values.slice(3300, 1700)])?;
+            assert_eq!(sliding.evaluate()?, ScalarValue::Float64(None));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn single_block_replacement_matches_remove_then_insert() -> Result<()> {
+        let initial = vec![f64::NEG_INFINITY, -0.0, 0.0, 1.0, 1.0, f64::NAN];
+        for &old in &initial {
+            for new in [-2.0, -0.0, 0.0, 1.0, 10.0, f64::INFINITY, f64::NAN] {
+                let mut actual = SortedFrame::from_values(initial.clone());
+                let mut expected = SortedFrame::from_values(initial.clone());
+                assert!(expected.remove(old));
+                expected.insert(new);
+                actual.replace_in_single_block(old, new)?;
+                assert!(
+                    actual.blocks[0]
+                        .iter()
+                        .zip(&expected.blocks[0])
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rolling_median_range_gaps_match_duckdb() -> Result<()> {
+        use arrow::array::Int64Array;
+        use arrow::record_batch::RecordBatch;
+        use datafusion_expr::{WindowFrame, WindowFrameBound, WindowFrameUnits};
+        use datafusion_physical_expr::PhysicalSortExpr;
+        use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+        use datafusion_physical_expr::expressions::Column;
+        use datafusion_physical_expr::window::{SlidingAggregateWindowExpr, WindowExpr};
+
+        let batch = RecordBatch::try_from_iter([
+            (
+                "k",
+                Arc::new(Int64Array::from(vec![0, 1, 1, 2, 5, 6, 8, 9, 10])) as ArrayRef,
+            ),
+            (
+                "v",
+                Arc::new(Float64Array::from(vec![
+                    None,
+                    Some(2.0),
+                    Some(2.0),
+                    Some(10.0),
+                    Some(4.0),
+                    None,
+                    Some(8.0),
+                    Some(12.0),
+                    Some(6.0),
+                ])) as ArrayRef,
+            ),
+        ])?;
+        let agg = AggregateExprBuilder::new(
+            crate::median::median_udaf(),
+            vec![Arc::new(Column::new("v", 1))],
+        )
+        .schema(batch.schema())
+        .alias("median")
+        .build()?;
+        let expr = SlidingAggregateWindowExpr::new(
+            Arc::new(agg),
+            &[],
+            &[PhysicalSortExpr {
+                expr: Arc::new(Column::new("k", 0)),
+                options: Default::default(),
+            }],
+            Arc::new(WindowFrame::new_bounds(
+                WindowFrameUnits::Range,
+                WindowFrameBound::Preceding(ScalarValue::Int64(Some(2))),
+                WindowFrameBound::Preceding(ScalarValue::Int64(Some(1))),
+            )),
+            None,
+        );
+        // DuckDB 2.0.0: median(v) OVER (ORDER BY k RANGE BETWEEN
+        // 2 PRECEDING AND 1 PRECEDING) on the same ordered rows.
+        let expected = Float64Array::from(vec![
+            None,
+            None,
+            None,
+            Some(2.0),
+            None,
+            Some(4.0),
+            None,
+            Some(8.0),
+            Some(10.0),
+        ]);
+        let actual = expr.evaluate(&batch)?;
+        assert_eq!(actual.as_primitive::<Float64Type>(), &expected);
+        Ok(())
     }
 
     #[test]
