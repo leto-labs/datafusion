@@ -1322,3 +1322,448 @@ async fn jt9_review_read_back_partitions_fit_at_the_switch_off_peak() -> Result<
     assert!(actual == expected);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Re-review of JT 9 (leto-mjj.115). A pool that
+// refuses chosen `try_grow` calls of the build's consumer, so that every
+// charge of `build_in_memory` is refused in turn, once or twice.
+// ---------------------------------------------------------------------------
+
+const NO_FAULT: usize = usize::MAX;
+
+#[derive(Debug)]
+struct FaultPool {
+    pool: GreedyMemoryPool,
+    /// `try_grow` calls of the `HashJoinInput` consumers so far.
+    calls: AtomicUsize,
+    /// The calls (by index) that are refused.
+    refuse: [usize; 2],
+    refused: AtomicUsize,
+    peak: AtomicUsize,
+    /// The most held after the first refusal.
+    peak_after_fault: AtomicUsize,
+    /// Shrinks beyond what is held.
+    wrapped: AtomicUsize,
+    /// Bytes of each refused call.
+    refused_bytes: std::sync::Mutex<Vec<usize>>,
+}
+
+impl FaultPool {
+    fn new(refuse: [usize; 2]) -> Self {
+        Self {
+            pool: GreedyMemoryPool::new(usize::MAX),
+            calls: AtomicUsize::new(0),
+            refuse,
+            refused: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            peak_after_fault: AtomicUsize::new(0),
+            wrapped: AtomicUsize::new(0),
+            refused_bytes: std::sync::Mutex::new(vec![]),
+        }
+    }
+
+    fn note(&self) {
+        let reserved = self.pool.reserved();
+        if reserved > usize::MAX / 2 {
+            self.wrapped.fetch_add(1, Ordering::SeqCst);
+        }
+        self.peak.fetch_max(reserved, Ordering::SeqCst);
+        if self.refused.load(Ordering::SeqCst) > 0 {
+            self.peak_after_fault.fetch_max(reserved, Ordering::SeqCst);
+        }
+    }
+}
+
+impl fmt::Display for FaultPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "fault({})", self.pool)
+    }
+}
+
+impl MemoryPool for FaultPool {
+    fn name(&self) -> &str {
+        "fault"
+    }
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.pool.grow(reservation, additional);
+        self.note();
+    }
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        if shrink > self.pool.reserved() {
+            self.wrapped.fetch_add(1, Ordering::SeqCst);
+        }
+        self.pool.shrink(reservation, shrink);
+        self.note();
+    }
+    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
+        if reservation.consumer().name().starts_with("HashJoinInput") {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.refuse.contains(&call) {
+                self.refused.fetch_add(1, Ordering::SeqCst);
+                self.refused_bytes.lock().unwrap().push(additional);
+                return Err(datafusion_common::DataFusionError::ResourcesExhausted(
+                    format!(
+                        "re-review fault: HashJoinInput charge {call} of {additional} bytes"
+                    ),
+                ));
+            }
+        }
+        self.pool.try_grow(reservation, additional)?;
+        self.note();
+        Ok(())
+    }
+    fn reserved(&self) -> usize {
+        self.pool.reserved()
+    }
+    fn memory_limit(&self) -> MemoryLimit {
+        self.pool.memory_limit()
+    }
+}
+
+fn rereview_context(
+    pool: Arc<dyn MemoryPool>,
+    spill: bool,
+    parallel_rows: usize,
+) -> Arc<TaskContext> {
+    let mut config = SessionConfig::new()
+        .with_batch_size(4096)
+        .with_target_partitions(8);
+    config
+        .options_mut()
+        .extensions
+        .insert(ParallelRows(parallel_rows));
+    let options = config.options_mut();
+    options.execution.perfect_hash_join_small_build_threshold = 0;
+    options.execution.perfect_hash_join_min_key_density = f64::MAX;
+    options.execution.enable_hash_join_spilling = spill;
+    options.optimizer.enable_dynamic_filter_pushdown = true;
+    options.optimizer.enable_join_dynamic_filter_pushdown = true;
+    Arc::new(
+        TaskContext::default()
+            .with_session_config(config)
+            .with_runtime(
+                RuntimeEnvBuilder::new()
+                    .with_memory_pool(pool)
+                    .build_arc()
+                    .unwrap(),
+            ),
+    )
+}
+
+struct Run {
+    /// The probe paths of a join that answered, or the first line of its error.
+    outcome: std::result::Result<[usize; 3], String>,
+    calls: usize,
+    refused: Vec<usize>,
+    peak: usize,
+    peak_after_fault: usize,
+}
+
+/// Runs the join; panics on wrong rows, on an error that is not a refusal,
+/// on a shrink beyond what was held, and on bytes still held at the end.
+async fn rereview_run(
+    case: &Case,
+    expected: &[Row],
+    inline: bool,
+    refuse: [usize; 2],
+    spill: bool,
+    parallel_rows: usize,
+) -> Run {
+    let pool = Arc::new(FaultPool::new(refuse));
+    let context = rereview_context(
+        Arc::clone(&pool) as Arc<dyn MemoryPool>,
+        spill,
+        parallel_rows,
+    );
+    let label = format!(
+        "{}, inline {inline}, refuse {refuse:?}, spill {spill}, parallel rows {parallel_rows}",
+        case.describe
+    );
+    let outcome = match join(case, inline, context).await {
+        Ok((rows, taken)) => {
+            assert!(
+                rows == expected,
+                "{label}: wrong rows: {}",
+                difference(case, &rows, expected)
+            );
+            Ok(taken)
+        }
+        Err(error) => {
+            assert!(
+                matches!(
+                    error.find_root(),
+                    datafusion_common::DataFusionError::ResourcesExhausted(_)
+                ),
+                "{label}: not a refusal: {error}"
+            );
+            Err(format!("{error}")
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string())
+        }
+    };
+    for _ in 0..200 {
+        if pool.reserved() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(pool.reserved(), 0, "{label}: bytes held after the join");
+    assert_eq!(
+        pool.wrapped.load(Ordering::SeqCst),
+        0,
+        "{label}: over-release"
+    );
+    Run {
+        outcome,
+        calls: pool.calls.load(Ordering::SeqCst),
+        refused: pool.refused_bytes.lock().unwrap().clone(),
+        peak: pool.peak.load(Ordering::SeqCst),
+        peak_after_fault: pool.peak_after_fault.load(Ordering::SeqCst),
+    }
+}
+
+fn rereview_case(rows: i128, mode: Mode, join_type: JoinType) -> Case {
+    let int32 = key_types()
+        .into_iter()
+        .find(|key| key.data_type == DataType::Int32)
+        .unwrap();
+    let mut case = fixed_case(
+        vec![int32.clone(), int32],
+        vec![
+            (0..rows).collect(),
+            (0..rows).map(|row| row % 1000).collect(),
+        ],
+        mode,
+        false,
+    );
+    case.describe = format!("{mode:?} {join_type:?}");
+    case.config.join_type = join_type;
+    // `lf <= rf` refuses a third of the pairs; a third of the probe rows
+    // have no build row.
+    case.config.filter = true;
+    for (row, filter) in case.build.filter.iter_mut().enumerate() {
+        *filter = (row % 3) as i32;
+    }
+    for (row, filter) in case.probe.filter.iter_mut().enumerate() {
+        *filter = 1;
+        if row % 3 == 0 {
+            case.probe.keys[1][row] += 1;
+        }
+    }
+    case
+}
+
+fn rereview_report(name: &str, lines: &[String]) {
+    let report = lines.join("\n");
+    println!("{report}");
+    if let Ok(dir) = std::env::var("JT9_REVIEW_OUT") {
+        std::fs::write(format!("{dir}/{name}.txt"), &report).unwrap();
+    }
+}
+
+fn rereview_line(tag: &str, run: &Run) -> String {
+    format!(
+        "{tag}: {}; charges {}, refused bytes {:?}, peak {}, peak after the refusal {}",
+        match &run.outcome {
+            Ok(taken) => format!("ok, rows equal the oracle, paths {taken:?}"),
+            Err(error) => format!("refused: {error}"),
+        },
+        run.calls,
+        run.refused,
+        run.peak,
+        run.peak_after_fault
+    )
+}
+
+/// Every charge of the build refused once, for a native and a compacted
+/// (parallel option set, one future) CollectLeft build and a Partitioned
+/// build, with inline keys on and off.
+async fn rereview_single(
+    name: &str,
+    rows: i128,
+    mode: Mode,
+    join_type: JoinType,
+    parallel_rows: usize,
+    last: usize,
+) -> Result<()> {
+    let case = rereview_case(rows, mode, join_type);
+    let expected = oracle(&case);
+    let mut lines = vec![format!("{name}: {rows} build rows, {}", case.describe)];
+    let mut clean = vec![];
+    for inline in [false, true] {
+        let run = rereview_run(
+            &case,
+            &expected,
+            inline,
+            [NO_FAULT; 2],
+            false,
+            parallel_rows,
+        )
+        .await;
+        lines.push(rereview_line(&format!("inline {inline}, no refusal"), &run));
+        assert!(run.outcome.is_ok());
+        clean.push(run);
+    }
+    assert!(
+        clean[1].outcome.as_ref().unwrap()[1] > 0,
+        "the clean join with inline keys on did not use dense keys"
+    );
+    for inline in [false, true] {
+        let calls = clean[usize::from(inline)].calls;
+        let (mut ok, mut refused) = (vec![], vec![]);
+        for call in calls.saturating_sub(last)..calls {
+            let run = rereview_run(
+                &case,
+                &expected,
+                inline,
+                [call, NO_FAULT],
+                false,
+                parallel_rows,
+            )
+            .await;
+            lines.push(rereview_line(
+                &format!("inline {inline}, refuse {call}"),
+                &run,
+            ));
+            if run.outcome.is_ok() {
+                ok.push(call)
+            } else {
+                refused.push(call)
+            }
+        }
+        lines.push(format!(
+            "inline {inline}: answered with refusal at {ok:?}; failed at {refused:?}"
+        ));
+    }
+    inline_keys::set_inline_keys_for_test(None);
+    rereview_report(name, &lines);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jt9_rereview_single_refusal_native_full() -> Result<()> {
+    rereview_single(
+        "rereview-single-native-full",
+        270_000,
+        Mode::Native,
+        JoinType::Full,
+        0,
+        24,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jt9_rereview_single_refusal_native_left_mark() -> Result<()> {
+    rereview_single(
+        "rereview-single-native-left-mark",
+        270_000,
+        Mode::Native,
+        JoinType::LeftMark,
+        0,
+        24,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jt9_rereview_single_refusal_compacted_left_anti() -> Result<()> {
+    rereview_single(
+        "rereview-single-compacted-left-anti",
+        270_000,
+        Mode::Native,
+        JoinType::LeftAnti,
+        100_000_000,
+        24,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jt9_rereview_single_refusal_partitioned_full() -> Result<()> {
+    rereview_single(
+        "rereview-single-partitioned-full",
+        600_000,
+        Mode::Partitioned,
+        JoinType::Full,
+        0,
+        40,
+    )
+    .await
+}
+
+/// Two refusals: the second lands in the retry (or after it). Without join
+/// spilling the join must fail cleanly or answer; with it, the same.
+async fn rereview_double(name: &str, spill: bool) -> Result<()> {
+    let case = rereview_case(270_000, Mode::Native, JoinType::Full);
+    let expected = oracle(&case);
+    let mut lines = vec![format!("{name}: {}, join spilling {spill}", case.describe)];
+    let clean = rereview_run(&case, &expected, true, [NO_FAULT; 2], spill, 0).await;
+    lines.push(rereview_line("inline true, no refusal", &clean));
+    assert!(clean.outcome.is_ok());
+    let (mut ok, mut refused) = (0, 0);
+    for first in clean.calls.saturating_sub(14)..clean.calls {
+        for gap in 1..=10 {
+            let run =
+                rereview_run(&case, &expected, true, [first, first + gap], spill, 0)
+                    .await;
+            lines.push(rereview_line(
+                &format!("inline true, refuse {first} and {}", first + gap),
+                &run,
+            ));
+            if run.outcome.is_ok() {
+                ok += 1
+            } else {
+                refused += 1
+            }
+        }
+    }
+    lines.push(format!("answered {ok}, failed with a refusal {refused}"));
+    inline_keys::set_inline_keys_for_test(None);
+    rereview_report(name, &lines);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jt9_rereview_double_refusal_no_spill() -> Result<()> {
+    rereview_double("rereview-double-no-spill", false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jt9_rereview_double_refusal_spill() -> Result<()> {
+    rereview_double("rereview-double-spill", true).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jt9_rereview_memory_priority() {
+    let case = rereview_case(270_000, Mode::Native, JoinType::Full);
+    let expected = oracle(&case);
+    // Build charges after the input: dense keys (33), map (34),
+    // partitioning arrays (35), copy (36), keys (37), visited bitmap (38).
+    let no_dense = rereview_run(&case, &expected, true, [33, 34], false, 0).await;
+    assert_eq!(no_dense.refused[0], 270_000 * size_of::<u64>());
+    assert!(
+        no_dense.outcome.is_err(),
+        "repeated a build without dense keys"
+    );
+    assert_eq!(no_dense.calls, 35);
+
+    let partitioned =
+        rereview_run(&case, &expected, true, [35, NO_FAULT], false, 0).await;
+    assert_eq!(partitioned.refused, [270_000 * 20]);
+    assert_eq!(partitioned.outcome.unwrap()[1], 0, "kept dense keys");
+
+    // Refuse the visited bitmap after concatenation, then the retry's
+    // partitioning arrays. The retry must charge its one-batch hash scratch.
+    let retry = rereview_run(&case, &expected, true, [38, 40], false, 0).await;
+    assert_eq!(
+        retry.refused,
+        [VisitedBitmap::size_bytes(270_000), 270_000 * 20]
+    );
+    assert!(retry.outcome.is_ok());
+    assert!(retry.peak_after_fault >= 15_393_056 + 270_000 * size_of::<u64>());
+
+    inline_keys::set_inline_keys_for_test(None);
+}

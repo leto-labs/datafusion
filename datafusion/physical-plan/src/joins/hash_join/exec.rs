@@ -3881,6 +3881,7 @@ fn build_in_memory(
             path,
             inline,
             dense,
+            &mut false,
         );
     };
     let (held_before, used_before, batches_before) = (
@@ -3888,6 +3889,7 @@ fn build_in_memory(
         metrics.build_mem_used.value(),
         batches.len(),
     );
+    let mut dense_held = false;
     let first = build_in_memory_once(
         random_state,
         schema,
@@ -3911,9 +3913,10 @@ fn build_in_memory(
         path,
         inline.clone(),
         dense,
+        &mut dense_held,
     );
     match first {
-        Err(error) if spill::is_refusal(&error) => {
+        Err(error) if dense_held && spill::is_refusal(&error) => {
             // Everything the attempt allocated is dropped; `batches` still
             // holds every build row, possibly concatenated into one batch
             // (whose charge the concatenation adopted). Charge exactly what
@@ -3958,6 +3961,7 @@ fn build_in_memory(
                 retry_path,
                 inline,
                 None,
+                &mut false,
             )
         }
         result => result,
@@ -3990,6 +3994,7 @@ fn build_in_memory_once(
     path: BuildPath,
     inline: Option<InlineKeys>,
     dense: Option<InlineKeys>,
+    dense_held: &mut bool,
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
 
@@ -3997,13 +4002,13 @@ fn build_in_memory_once(
     // Longbow patch (JT 9): dense keys are charged before any is encoded (a
     // partitioned build encodes them while it hashes); a pool that refuses
     // them gets the key comparison instead.
-    let dense = dense.filter(|_| {
-        let bytes = DenseKeys::bytes_for(num_rows);
-        let admitted = reservation.try_grow(bytes).is_ok();
-        if admitted {
-            metrics.build_mem_used.add(bytes);
+    let dense_bytes = DenseKeys::bytes_for(num_rows);
+    let mut dense = dense.filter(|_| {
+        *dense_held = reservation.try_grow(dense_bytes).is_ok();
+        if *dense_held {
+            metrics.build_mem_used.add(dense_bytes);
         }
-        admitted
+        *dense_held
     });
     let mut dense_rows: Option<Vec<u64>> = None;
     // Longbow patch (JT): the reservation's size while a partitioned build
@@ -4089,7 +4094,7 @@ fn build_in_memory_once(
         {
             let mut map = new_join_hashmap_u32(num_rows, reservation, metrics)?;
             let mut rows = dense.as_ref().map(|_| Vec::with_capacity(num_rows));
-            if let Some(peak) = build_partitioned(
+            let mut peak = build_partitioned(
                 &mut map,
                 on_left,
                 batches,
@@ -4099,7 +4104,27 @@ fn build_in_memory_once(
                 None,
                 dense.as_ref().zip(rows.as_mut()),
                 reservation,
-            )? {
+            )?;
+            if peak.is_none() && dense.take().is_some() {
+                // Prefer the partitioned build to faster probes with dense keys.
+                // Refusal happens before the partitioned build touches the map.
+                drop(rows.take());
+                reservation.shrink(dense_bytes);
+                metrics.build_mem_used.sub(dense_bytes);
+                *dense_held = false;
+                peak = build_partitioned(
+                    &mut map,
+                    on_left,
+                    batches,
+                    num_rows,
+                    random_state,
+                    null_equality,
+                    None,
+                    None,
+                    reservation,
+                )?;
+            }
+            if let Some(peak) = peak {
                 partitioned_peak = Some(peak);
                 partitioned = true;
                 dense_rows = rows.filter(|rows| rows.len() == num_rows);
@@ -4109,36 +4134,42 @@ fn build_in_memory_once(
             new_join_hashmap(num_rows, reservation, metrics)?
         };
 
-        let scratch_reservation = reservation.new_empty();
-        if prepared && !partitioned {
-            scratch_reservation.try_grow(prepared::prepared_scratch_bytes(
-                max_batch_rows,
-                on_left.len(),
-                null_equality,
-            )?)?;
-        }
-        // The maximum is known: avoid geometric growth and its excess capacity.
-        let mut hashes_buffer = Vec::with_capacity(max_batch_rows);
-        let mut offset = num_rows;
+        if !partitioned {
+            let scratch_reservation = reservation.new_empty();
+            // A retry may have inherited a single concatenated batch. Charge
+            // the larger hash buffer before allocating it.
+            let hash_rows = max_batch_rows
+                .max(batches.iter().map(RecordBatch::num_rows).max().unwrap_or(0));
+            if prepared {
+                scratch_reservation.try_grow(prepared::prepared_scratch_bytes(
+                    hash_rows,
+                    on_left.len(),
+                    null_equality,
+                )?)?;
+            } else if hash_rows > max_batch_rows {
+                scratch_reservation.try_grow(hash_rows * size_of::<u64>())?;
+            }
+            let mut hashes_buffer = Vec::with_capacity(hash_rows);
+            let mut offset = num_rows;
 
-        // Update the hashmap starting from the last batch, so rows with smaller
-        // indices end up on top of the chains. Each batch is indexed at its
-        // position in the forward concatenation below.
-        for batch in batches.iter().rev().filter(|_| !partitioned) {
-            offset -= batch.num_rows();
-            hashes_buffer.clear();
-            hashes_buffer.resize(batch.num_rows(), 0);
-            update_hash(
-                on_left,
-                batch,
-                &mut *hashmap,
-                offset,
-                random_state,
-                &mut hashes_buffer,
-                0,
-                true,
-                null_equality,
-            )?;
+            // Update the hashmap starting from the last batch, so rows with
+            // smaller indices end up on top of the chains.
+            for batch in batches.iter().rev() {
+                offset -= batch.num_rows();
+                hashes_buffer.clear();
+                hashes_buffer.resize(batch.num_rows(), 0);
+                update_hash(
+                    on_left,
+                    batch,
+                    &mut *hashmap,
+                    offset,
+                    random_state,
+                    &mut hashes_buffer,
+                    0,
+                    true,
+                    null_equality,
+                )?;
+            }
         }
 
         // Merge all batches into a single batch, so we can directly index into the arrays
@@ -4171,7 +4202,7 @@ fn build_in_memory_once(
 
     // Longbow patch (JT 9): the encoded keys of a hash-only map (charged
     // above), from the partitioned build or else from the build keys.
-    let dense_keys = match (dense, dense_rows) {
+    let mut dense_keys = match (dense, dense_rows) {
         (Some(encoding), Some(rows)) => Some(DenseKeys::from_parts(encoding, rows)),
         (Some(encoding), None) => Some(DenseKeys::try_new(encoding, &left_values)?),
         (None, _) => None,
@@ -4272,7 +4303,16 @@ fn build_in_memory_once(
             // Held for the join's lifetime, so charge it like the maps; it is
             // optional, so skip it rather than fail when the pool is full.
             let pruning_bitmap = pruning_bitmap.filter(|bitmap| {
-                let ok = reservation.try_grow(bitmap.size()).is_ok();
+                let mut ok = reservation.try_grow(bitmap.size()).is_ok();
+                if !ok && let Some(keys) = dense_keys.take() {
+                    // Preserve scan pruning before accelerating key comparison.
+                    // Currently the bitmap is single-key and dense keys multi-key.
+                    drop(keys);
+                    reservation.shrink(dense_bytes);
+                    metrics.build_mem_used.sub(dense_bytes);
+                    *dense_held = false;
+                    ok = reservation.try_grow(bitmap.size()).is_ok();
+                }
                 if ok {
                     metrics.build_mem_used.add(bitmap.size());
                 }
