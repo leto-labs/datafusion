@@ -2455,6 +2455,7 @@ dependencies = [
  "arrow-schema",
  "criterion",
  "datafusion-common",
+ "datafusion-execution",
  "datafusion-expr",
  "datafusion-expr-common",
  "datafusion-functions",

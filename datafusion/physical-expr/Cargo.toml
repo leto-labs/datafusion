@@ -1,3 +1,5 @@
+# Modified by the Longbow authors; see third_party/README.md.
+
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -53,6 +55,7 @@ proto = [
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
 datafusion-common = { workspace = true }
+datafusion-execution = { workspace = true, default-features = false }
 datafusion-expr = { workspace = true }
 datafusion-expr-common = { workspace = true }
 datafusion-functions-aggregate-common = { workspace = true }

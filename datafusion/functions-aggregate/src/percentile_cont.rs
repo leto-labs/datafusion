@@ -39,6 +39,7 @@ use datafusion_common::{
     Result, ScalarValue, exec_datafusion_err, internal_datafusion_err,
     utils::{SingleRowListArrayBuilder, take_function_args},
 };
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Coercion, Documentation, Expr, Signature,
@@ -411,6 +412,8 @@ const FRAME_BLOCK_SIZE: usize = 512;
 struct SortedFrame<T> {
     blocks: Vec<Vec<T>>,
     len: usize,
+    // The blocks and directory drop before their charge is released.
+    reservation: Option<MemoryReservation>,
 }
 
 impl<T: ArrowNativeTypeOp> SortedFrame<T> {
@@ -422,7 +425,11 @@ impl<T: ArrowNativeTypeOp> SortedFrame<T> {
         } else {
             values.chunks(FRAME_BLOCK_SIZE).map(<[_]>::to_vec).collect()
         };
-        Self { blocks, len }
+        Self {
+            blocks,
+            len,
+            reservation: None,
+        }
     }
 
     fn block_index(&self, value: T) -> usize {
@@ -430,21 +437,44 @@ impl<T: ArrowNativeTypeOp> SortedFrame<T> {
             .partition_point(|block| block[block.len() - 1].compare(value).is_lt())
     }
 
-    fn insert(&mut self, value: T) {
+    fn insert(&mut self, value: T) -> Result<()> {
         if self.blocks.is_empty() {
-            self.blocks.push(vec![value]);
+            grow_frame_vec(&mut self.blocks, 1, self.reservation.as_ref())?;
+            let mut block = Vec::new();
+            grow_frame_vec(&mut block, 1, self.reservation.as_ref())?;
+            block.push(value);
+            self.blocks.push(block);
             self.len = 1;
-            return;
+            return Ok(());
         }
         let index = self.block_index(value).min(self.blocks.len() - 1);
         let block = &mut self.blocks[index];
         let offset = block.partition_point(|item| item.compare(value).is_lt());
-        block.insert(offset, value);
-        self.len += 1;
-        if block.len() > 2 * FRAME_BLOCK_SIZE {
-            let tail = block.split_off(FRAME_BLOCK_SIZE);
+        if block.len() < 2 * FRAME_BLOCK_SIZE {
+            grow_frame_vec(block, block.len() + 1, self.reservation.as_ref())?;
+            block.insert(offset, value);
+        } else {
+            // Admit the directory and tail before modifying the full block.
+            // Moving one extra value when inserting on the left leaves the
+            // split at the same rank without growing the old block.
+            let required = self.blocks.len() + 1;
+            grow_frame_vec(&mut self.blocks, required, self.reservation.as_ref())?;
+            let mut tail = Vec::new();
+            grow_frame_vec(&mut tail, FRAME_BLOCK_SIZE + 1, self.reservation.as_ref())?;
+            let block = &mut self.blocks[index];
+            let insert_left = offset < FRAME_BLOCK_SIZE;
+            let split = FRAME_BLOCK_SIZE - usize::from(insert_left);
+            tail.extend_from_slice(&block[split..]);
+            block.truncate(split);
+            if insert_left {
+                block.insert(offset, value);
+            } else {
+                tail.insert(offset - split, value);
+            }
             self.blocks.insert(index + 1, tail);
         }
+        self.len += 1;
+        Ok(())
     }
 
     fn remove(&mut self, value: T) -> bool {
@@ -458,15 +488,29 @@ impl<T: ArrowNativeTypeOp> SortedFrame<T> {
         block.remove(offset);
         self.len -= 1;
         if block.is_empty() {
-            self.blocks.remove(index);
+            let block = self.blocks.remove(index);
+            self.release_block(block);
         } else if let Some(next) = self.blocks.get(index + 1)
             && self.blocks[index].len() + next.len() <= FRAME_BLOCK_SIZE
         {
             // Leave room between the merge and split thresholds.
             let next = self.blocks.remove(index + 1);
-            self.blocks[index].extend(next);
+            // Split blocks retain at least FRAME_BLOCK_SIZE capacity.
+            debug_assert!(
+                self.blocks[index].len() + next.len() <= self.blocks[index].capacity()
+            );
+            self.blocks[index].extend_from_slice(&next);
+            self.release_block(next);
         }
         true
+    }
+
+    fn release_block(&self, block: Vec<T>) {
+        let bytes = block.capacity() * size_of::<T>();
+        drop(block);
+        if let Some(reservation) = &self.reservation {
+            reservation.shrink(bytes);
+        }
     }
 
     /// Update a single block with one move of its intervening values.
@@ -509,6 +553,42 @@ impl<T: ArrowNativeTypeOp> SortedFrame<T> {
         }
         unreachable!("percentile ranks must be inside the frame")
     }
+}
+
+/// Reserve both allocations during growth, since the allocator can move the
+/// original buffer. Spare capacity remains charged until the buffer is freed.
+fn grow_frame_vec<T>(
+    values: &mut Vec<T>,
+    required: usize,
+    reservation: Option<&MemoryReservation>,
+) -> Result<()> {
+    let old = values.capacity();
+    if required <= old {
+        return Ok(());
+    }
+    let capacity = required.max(old.saturating_mul(2)).max(4);
+    let bytes = capacity.checked_mul(size_of::<T>()).ok_or_else(|| {
+        datafusion_common::resources_datafusion_err!(
+            "percentile sliding frame memory overflow"
+        )
+    })?;
+    if let Some(reservation) = reservation {
+        reservation.try_grow(bytes)?;
+    }
+    let result = values.try_reserve_exact(capacity - values.len());
+    debug_assert!(result.is_err() || values.capacity() == capacity);
+    if let Some(reservation) = reservation {
+        reservation.shrink(if result.is_ok() {
+            old * size_of::<T>()
+        } else {
+            bytes
+        });
+    }
+    result.map_err(|error| {
+        datafusion_common::resources_datafusion_err!(
+            "cannot allocate percentile sliding frame: {error}"
+        )
+    })
 }
 
 fn missing_frame_value<T>() -> Result<T> {
@@ -556,8 +636,17 @@ where
     I: PercentileInterpolator<T> + 'static,
 {
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        let mut frame_charge = None;
         if let Some(frame) = self.frame.take() {
-            self.all_values = frame.blocks.into_iter().flatten().collect();
+            if let Some(reservation) = &frame.reservation {
+                reservation.try_grow(frame.len * size_of::<T::Native>())?;
+            }
+            let mut values = Vec::with_capacity(frame.len);
+            for block in frame.blocks {
+                values.extend_from_slice(&block);
+            }
+            self.all_values = values;
+            frame_charge = frame.reservation;
         }
         // Convert `all_values` to `ListArray` and return a single List ScalarValue
 
@@ -580,6 +669,8 @@ where
             None,
         );
 
+        // The returned state now owns its flattened buffer.
+        drop(frame_charge);
         Ok(vec![
             ScalarValue::List(Arc::new(list_array)),
             ScalarValue::Float64(self.percentile.get().ok()),
@@ -595,11 +686,11 @@ where
         if let Some(frame) = &mut self.frame {
             if values.null_count() == 0 {
                 for &value in values.values() {
-                    frame.insert(value);
+                    frame.insert(value)?;
                 }
             } else {
                 for value in values.iter().flatten() {
-                    frame.insert(value);
+                    frame.insert(value)?;
                 }
             }
             return Ok(());
@@ -698,6 +789,15 @@ where
         });
     }
 
+    fn set_frame_reservation(&mut self, reservation: MemoryReservation) {
+        // Cumulative windows also use this accumulator, with the ordinary
+        // selection buffer. Only the blocked layout uses this reservation.
+        if let Some(frame) = &mut self.frame {
+            assert!(frame.blocks.capacity() == 0 && frame.reservation.is_none());
+            frame.reservation = Some(reservation);
+        }
+    }
+
     fn advance(
         &mut self,
         values: &ArrayRef,
@@ -720,7 +820,7 @@ where
                     }
                 }
                 for &value in &values[entering] {
-                    frame.insert(value);
+                    frame.insert(value)?;
                 }
             }
         } else {
@@ -731,7 +831,7 @@ where
             }
             for index in entering {
                 if values.is_valid(index) {
-                    frame.insert(values.value(index));
+                    frame.insert(values.value(index))?;
                 }
             }
         }
@@ -1642,7 +1742,7 @@ mod tests {
                 let mut actual = SortedFrame::from_values(initial.clone());
                 let mut expected = SortedFrame::from_values(initial.clone());
                 assert!(expected.remove(old));
-                expected.insert(new);
+                expected.insert(new)?;
                 actual.replace_in_single_block(old, new)?;
                 assert!(
                     actual.blocks[0]
@@ -1652,6 +1752,93 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn blocked_frame_reserves_capacity_before_growth_and_releases_it() -> Result<()> {
+        use datafusion_execution::memory_pool::{
+            GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        };
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(32 * 1024));
+        let reservation = MemoryConsumer::new("test sliding frame").register(&pool);
+        let mut frame = SortedFrame::from_values(Vec::<f64>::new());
+        frame.reservation = Some(reservation.new_empty());
+        for value in 0..1025 {
+            frame.insert(f64::from(value))?;
+        }
+        let charge = |frame: &SortedFrame<f64>| {
+            frame.blocks.capacity() * size_of::<Vec<f64>>()
+                + frame.blocks.iter().map(Vec::capacity).sum::<usize>() * size_of::<f64>()
+        };
+        assert_eq!(pool.reserved(), charge(&frame));
+        for value in 0..1025 {
+            assert!(frame.remove(f64::from(value)));
+        }
+        assert_eq!(pool.reserved(), charge(&frame));
+        drop(frame);
+        assert_eq!(pool.reserved(), 0);
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(7 * 1024));
+        let reservation =
+            MemoryConsumer::new("test sliding frame refusal").register(&pool);
+        let mut frame = SortedFrame::from_values(Vec::<f64>::new());
+        frame.reservation = Some(reservation.new_empty());
+        for value in 0..512 {
+            frame.insert(f64::from(value))?;
+        }
+        let before = pool.reserved();
+        let error = frame.insert(512.0).unwrap_err();
+        assert!(matches!(
+            error,
+            datafusion_common::DataFusionError::ResourcesExhausted(_)
+        ));
+        assert_eq!(frame.len, 512);
+        assert_eq!(pool.reserved(), before);
+        drop(frame);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_distinct_string_agg_is_refused() -> Result<()> {
+        use arrow::array::StringArray;
+        use arrow::record_batch::RecordBatch;
+        use datafusion_expr::{WindowFrame, WindowFrameBound, WindowFrameUnits};
+        use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+        use datafusion_physical_expr::expressions::{Column, lit};
+        use datafusion_physical_expr::window::{SlidingAggregateWindowExpr, WindowExpr};
+
+        let batch = RecordBatch::try_from_iter([(
+            "v",
+            Arc::new(StringArray::from(vec!["a", "a", "b"])) as ArrayRef,
+        )])?;
+        let agg = AggregateExprBuilder::new(
+            crate::string_agg::string_agg_udaf(),
+            vec![Arc::new(Column::new("v", 0)), lit(",")],
+        )
+        .distinct()
+        .schema(batch.schema())
+        .alias("string_agg(DISTINCT v, ',')")
+        .build()?;
+        assert!(agg.create_accumulator().is_ok());
+        let expr = SlidingAggregateWindowExpr::new(
+            Arc::new(agg),
+            &[],
+            &[],
+            Arc::new(WindowFrame::new_bounds(
+                WindowFrameUnits::Rows,
+                WindowFrameBound::Preceding(2_u64.into()),
+                WindowFrameBound::CurrentRow,
+            )),
+            None,
+        );
+        let error = expr.evaluate(&batch).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Aggregate can not be used as a sliding accumulator because `retract_batch` is not implemented: string_agg(DISTINCT v, ',')"
+        );
         Ok(())
     }
 

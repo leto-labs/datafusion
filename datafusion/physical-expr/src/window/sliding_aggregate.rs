@@ -22,6 +22,7 @@ use arrow::array::{ArrayRef, BooleanArray};
 use arrow::datatypes::FieldRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, ScalarValue};
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::{Accumulator, WindowFrame};
 
 /// A window expr that takes the form of an aggregate function that
@@ -53,6 +54,15 @@ impl SlidingAggregateWindowExpr {
             window_frame,
             filter,
         }
+    }
+
+    /// Evaluate the physical window with its query-pool memory reservation.
+    pub fn evaluate_with_reservation(
+        &self,
+        batch: &RecordBatch,
+        reservation: &MemoryReservation,
+    ) -> Result<ArrayRef> {
+        self.aggregate_evaluate_with_reservation(batch, Some(reservation))
     }
 
     /// Get the [AggregateFunctionExpr] of this object.

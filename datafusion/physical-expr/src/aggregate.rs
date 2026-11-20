@@ -37,8 +37,9 @@ use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::{
-    DFSchema, Result, ScalarValue, assert_or_internal_err, internal_err,
+    DFSchema, Result, ScalarValue, assert_or_internal_err, internal_err, not_impl_err,
 };
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::expr::{
     AggregateFunction, AggregateFunctionParams, NullTreatment, physical_name,
@@ -867,15 +868,14 @@ impl AggregateFunctionExpr {
             frame.inner.enable_sliding();
         }
 
-        if accumulator.supports_retract_batch() {
-            Ok(accumulator)
-        } else {
-            Ok(Box::new(MergeSlidingAccumulator {
-                aggregate: self.clone(),
-                front: Vec::new(),
-                back: Vec::new(),
-            }))
+        if !accumulator.supports_retract_batch() {
+            return not_impl_err!(
+                "Aggregate can not be used as a sliding accumulator because \
+                     `retract_batch` is not implemented: {}",
+                self.name
+            );
         }
+        Ok(accumulator)
     }
 
     /// If the aggregate expression has a specialized
@@ -1163,6 +1163,9 @@ pub trait SlidingFrame: Accumulator {
     /// Initialize the sliding representation before the first row arrives.
     fn enable_sliding(&mut self);
 
+    /// Attach a child of the window operator reservation before any input.
+    fn set_frame_reservation(&mut self, reservation: MemoryReservation);
+
     /// Apply the frame delta for a single unfiltered input and return its result.
     fn advance(
         &mut self,
@@ -1190,6 +1193,17 @@ impl SlidingFrameAccumulator {
 
     pub(crate) fn as_sliding(acc: &mut Box<dyn Accumulator>) -> Option<&mut Self> {
         (acc.as_mut() as &mut dyn Any).downcast_mut()
+    }
+
+    pub(crate) fn attach_reservation(
+        accumulator: &mut Box<dyn Accumulator>,
+        reservation: Option<&MemoryReservation>,
+    ) {
+        if let Some(reservation) = reservation
+            && let Some(frame) = Self::as_sliding(accumulator)
+        {
+            frame.inner.set_frame_reservation(reservation.new_empty());
+        }
     }
 
     pub(crate) fn advance(
@@ -1232,136 +1246,6 @@ impl Accumulator for SlidingFrameAccumulator {
     }
 }
 
-/// A FIFO frame represented by two stacks. The back stack holds prefix
-/// states in input order. On transfer, the front stack builds suffix states
-/// so each pop exposes the state for the rows that remain.
-#[derive(Debug)]
-struct MergeSlidingAccumulator {
-    aggregate: AggregateFunctionExpr,
-    front: Vec<Vec<ArrayRef>>,
-    back: Vec<MergeSlidingEntry>,
-}
-
-#[derive(Debug)]
-struct MergeSlidingEntry {
-    row: Vec<ArrayRef>,
-    prefix: Option<Vec<ArrayRef>>,
-}
-
-impl MergeSlidingAccumulator {
-    fn merged(&self) -> Result<Box<dyn Accumulator>> {
-        let mut acc = self.aggregate.create_accumulator()?;
-        if let Some(suffix) = self.front.last() {
-            acc.merge_batch(suffix)?;
-        }
-        if let Some(entry) = self.back.last() {
-            acc.merge_batch(entry.prefix.as_deref().unwrap_or(&entry.row))?;
-        }
-        Ok(acc)
-    }
-
-    fn pop_front(&mut self) -> Result<()> {
-        if self.front.is_empty() {
-            while let Some(entry) = self.back.pop() {
-                // Create each state in frame order, even though we walk
-                // the rows in reverse when constructing the suffix stack.
-                let suffix = if let Some(previous) = self.front.last() {
-                    let mut acc = self.aggregate.create_accumulator()?;
-                    acc.merge_batch(&entry.row)?;
-                    acc.merge_batch(previous)?;
-                    utils::get_accum_scalar_values_as_arrays(acc.as_mut())?
-                } else {
-                    entry.row
-                };
-                self.front.push(suffix);
-            }
-        }
-        self.front.pop().ok_or_else(|| {
-            datafusion_common::internal_datafusion_err!(
-                "sliding aggregate retracted a row outside the frame"
-            )
-        })?;
-        Ok(())
-    }
-}
-
-impl Accumulator for MergeSlidingAccumulator {
-    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
-        for index in 0..values.first().map_or(0, |array| array.len()) {
-            let mut acc = self.aggregate.create_accumulator()?;
-            let values: Vec<_> =
-                values.iter().map(|array| array.slice(index, 1)).collect();
-            acc.update_batch(&values)?;
-            let row = utils::get_accum_scalar_values_as_arrays(acc.as_mut())?;
-            let prefix = self
-                .back
-                .last()
-                .map(|entry| {
-                    let mut acc = self.aggregate.create_accumulator()?;
-                    acc.merge_batch(entry.prefix.as_deref().unwrap_or(&entry.row))?;
-                    acc.merge_batch(&row)?;
-                    utils::get_accum_scalar_values_as_arrays(acc.as_mut())
-                })
-                .transpose()?;
-            let entry = MergeSlidingEntry { row, prefix };
-            self.back.push(entry);
-        }
-        Ok(())
-    }
-
-    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
-        let count = values.first().map_or(0, |array| array.len());
-        if count == self.front.len() + self.back.len() {
-            self.front.clear();
-            self.back.clear();
-        } else {
-            for _ in 0..count {
-                self.pop_front()?;
-            }
-        }
-        Ok(())
-    }
-
-    fn supports_retract_batch(&self) -> bool {
-        true
-    }
-
-    fn evaluate(&mut self) -> Result<ScalarValue> {
-        self.merged()?.evaluate()
-    }
-
-    fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        self.merged()?.state()
-    }
-
-    fn merge_batch(&mut self, _states: &[ArrayRef]) -> Result<()> {
-        // A partial aggregate cannot identify individual rows for retraction.
-        internal_err!("cannot merge partial states into a sliding aggregate")
-    }
-
-    fn size(&self) -> usize {
-        fn state_size(state: &Vec<ArrayRef>) -> usize {
-            state.capacity() * size_of::<ArrayRef>()
-                + state
-                    .iter()
-                    .map(|array| array.get_array_memory_size())
-                    .sum::<usize>()
-        }
-
-        size_of_val(self)
-            + self.front.capacity() * size_of::<Vec<ArrayRef>>()
-            + self.front.iter().map(state_size).sum::<usize>()
-            + self.back.capacity() * size_of::<MergeSlidingEntry>()
-            + self
-                .back
-                .iter()
-                .map(|entry| {
-                    state_size(&entry.row) + entry.prefix.as_ref().map_or(0, state_size)
-                })
-                .sum::<usize>()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1369,7 +1253,7 @@ mod tests {
     use std::collections::HashMap;
 
     use arrow::datatypes::Field;
-    use datafusion_common::{metadata::FieldMetadata, not_impl_err};
+    use datafusion_common::metadata::FieldMetadata;
     use datafusion_expr::{
         AggregateUDFImpl, Signature, Volatility, col, test::function_stub::sum,
     };
@@ -1489,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn sliding_aggregate_without_retract_matches_recomputation() -> Result<()> {
+    fn sliding_aggregate_without_retract_is_refused() -> Result<()> {
         let fun = datafusion_expr::create_udaf(
             "ordered_digits",
             vec![DataType::Int64],
@@ -1507,29 +1391,12 @@ mod tests {
                 .schema(schema)
                 .alias("ordered_digits")
                 .build()?;
-        let mut sliding = expr.create_sliding_accumulator()?;
-        let values: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![
-            Some(1),
-            None,
-            Some(2),
-            Some(3),
-            Some(4),
-            Some(5),
-            Some(6),
-        ]));
-        for start in 0..=values.len() {
-            if start < values.len() {
-                sliding.update_batch(&[values.slice(start, 1)])?;
-            }
-            if start >= 3 {
-                sliding.retract_batch(&[values.slice(start - 3, 1)])?;
-            }
-            let left = (start + 1).saturating_sub(3);
-            let right = (start + 1).min(values.len());
-            let mut reference = expr.create_accumulator()?;
-            reference.update_batch(&[values.slice(left, right - left)])?;
-            assert_eq!(sliding.evaluate()?, reference.evaluate()?, "at row {start}");
-        }
+        assert!(expr.create_accumulator().is_ok());
+        let error = expr.create_sliding_accumulator().unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Aggregate can not be used as a sliding accumulator because `retract_batch` is not implemented: ordered_digits"
+        );
         Ok(())
     }
 
