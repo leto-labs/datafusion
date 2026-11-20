@@ -1122,7 +1122,9 @@ Review fixes (MJJ96 independent review, 2026-11-19):
   returns the store and the `StoreId` of its registration from one lookup
   (the default registry stores the ID beside the store and reads both under
   one map guard; the trait default returns no ID). A `StoreId` comes from a
-  process-wide counter at registration and is never reused, so a store
+  process-wide counter at registration and is never reused (the counter
+  uses a checked add; once exhausted it issues no ID, and the cache is
+  skipped, v5 review), so a store
   registered in another's place at the same URL, even at a reused address,
   has other entries. The key is `store-<id>/<location>`
   (`metadata::file_metadata_cache_key`), validated against the listed

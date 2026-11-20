@@ -140,8 +140,9 @@ mod tests {
     /// The registration that keys the tests' metadata cache entries
     /// (Longbow family OO). Each test has its own cache.
     fn test_store_id() -> Option<StoreId> {
-        static ID: std::sync::LazyLock<StoreId> = std::sync::LazyLock::new(StoreId::next);
-        Some(*ID)
+        static ID: std::sync::LazyLock<Option<StoreId>> =
+            std::sync::LazyLock::new(StoreId::next);
+        *ID
     }
     use arrow::array::{
         Array, ArrayRef, DictionaryArray, Int32Array, Int64Array, StringArray,

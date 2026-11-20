@@ -3312,7 +3312,7 @@ mod test {
             if let Some((_, id)) = ids.iter().find(|(kept, _)| Arc::ptr_eq(kept, store)) {
                 return *id;
             }
-            let id = StoreId::next();
+            let id = StoreId::next().expect("a store ID");
             ids.push((Arc::clone(store), id));
             id
         })
