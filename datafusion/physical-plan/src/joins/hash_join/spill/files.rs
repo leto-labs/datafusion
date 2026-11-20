@@ -30,8 +30,8 @@ use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_execution::spill_file::SpillFile;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
+use futures::StreamExt;
 use futures::future::BoxFuture;
-use futures::{StreamExt, TryStreamExt};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use super::{JoinSpillMetrics, SpilledFile};
@@ -944,6 +944,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::config::SpillCompression;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+    use futures::TryStreamExt;
 
     use crate::metrics::{ExecutionPlanMetricsSet, SpillMetrics};
 
