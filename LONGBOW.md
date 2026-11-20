@@ -388,7 +388,7 @@ Regressions (fail on stock 56 with 6_299_999 for 0.9 of `0..8 * 1e6`; the
 decimal ones fail on the first QI commit 0fee7b30c):
 `scripts/vendored-tests.py datafusion-functions-aggregate -E 'test(percentile_cont::tests)'`.
 
-## Family SW: blocked sliding percentile frames
+## Family SW: sliding percentile and Boolean frames
 
 Family SW maintains exact rolling `percentile_cont` and `MEDIAN` in sorted
 blocks for forward-moving frames. The dependent Longbow feature is **pull
@@ -401,6 +401,15 @@ classification is **UPSTREAMABLE**.
   without `retract_batch`. The opt-in `SlidingFrame` trait lets both pull
   window operators charge the block directory and value buffers to their
   query memory reservations before allocation.
+- Lane leto-mjj.129 adds `RecomputeFrame` for aggregates that can reproduce
+  fresh accumulation with inline state and fixed-size scratch. `BOOL_AND`
+  and `BOOL_OR` use Arrow's reducers on borrowed slices. A filtered frame
+  reads the filter and value validity in place. Each active partition owns
+  one adapter and one inline Boolean accumulator, both charged to a child
+  of the window reservation before any frame is evaluated or state retained.
+  There are no saved partial results. Evaluation takes at most one scan per
+  frame. The fallback requires an explicit opt-in and a non-DISTINCT
+  physical aggregate. It does not extend existing float or DISTINCT support.
 
 ## Family RBC: owned boundary prefix on upstream Top-K heaps
 
