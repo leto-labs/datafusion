@@ -165,16 +165,21 @@ pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
 
 impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
     pub fn new(data_type: DataType) -> Self {
+        Self::with_capacity(data_type, 128)
+    }
+
+    /// A table with room for `capacity` groups before it grows.
+    pub fn with_capacity(data_type: DataType, capacity: usize) -> Self {
         assert!(PrimitiveArray::<T>::is_compatible(&data_type));
         let map = if size_of::<T::Native>() <= size_of::<u64>() {
-            PrimitiveMap::Inline(HashTable::with_capacity(128))
+            PrimitiveMap::Inline(HashTable::with_capacity(capacity))
         } else {
-            PrimitiveMap::Indirect(HashTable::with_capacity(128))
+            PrimitiveMap::Indirect(HashTable::with_capacity(capacity))
         };
         Self {
             data_type,
             map,
-            values: Vec::with_capacity(128),
+            values: Vec::with_capacity(capacity),
             null_group: None,
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
         }

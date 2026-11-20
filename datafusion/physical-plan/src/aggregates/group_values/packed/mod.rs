@@ -20,6 +20,8 @@
 
 mod bytes;
 mod columns;
+#[cfg(test)]
+mod single_tests;
 pub mod table;
 #[cfg(test)]
 mod tests;
@@ -64,6 +66,22 @@ pub(super) fn supported(schema: &SchemaRef) -> bool {
             bits.checked_add(make_column(field.data_type())?.width())
         })
         .is_some_and(|bits| bits <= KEY_BITS)
+}
+
+/// Whether `schema` is one integer-coded column (integers, dates, times,
+/// timestamps, durations and decimals). Its codes are offsets from the
+/// observed minimum: a small domain indexes a direct table, a domain below
+/// 2^32 uses 8-byte hash slots, and wider ones use the general interner.
+pub(super) fn single_column(schema: &SchemaRef) -> bool {
+    match schema.fields().iter().collect::<Vec<_>>().as_slice() {
+        [field] => {
+            !matches!(
+                field.data_type(),
+                DataType::Boolean | DataType::Utf8View | DataType::BinaryView
+            ) && make_column(field.data_type()).is_some()
+        }
+        _ => false,
+    }
 }
 
 fn make_column(data_type: &DataType) -> Option<Box<dyn KeyColumn>> {
@@ -117,6 +135,11 @@ pub struct GroupValuesPacked {
     keys: Vec<u64>,
     fallback: Option<Box<dyn GroupValues>>,
     make_fallback: Fallback,
+    /// The widest layout before the groups move to the general interner.
+    /// One column stops at 8-byte slots: in 16-byte slots, the packed keys
+    /// and codes cost more memory than the single-column interner's table
+    /// and saved no time (`group_values_interning` bench, ClickBench UserID).
+    max_bits: u32,
 }
 
 impl GroupValuesPacked {
@@ -132,6 +155,7 @@ impl GroupValuesPacked {
         if columns.iter().map(|column| column.width()).sum::<u32>() > KEY_BITS {
             return internal_err!("packed group keys exceed {KEY_BITS} fixed bits");
         }
+        let columns_len = columns.len();
         let mut packed = Self {
             widths: vec![0; columns.len()],
             shifts: vec![0; columns.len()],
@@ -141,6 +165,11 @@ impl GroupValuesPacked {
             keys: Vec::new(),
             fallback: None,
             make_fallback,
+            max_bits: if columns_len == 1 {
+                table::NARROW_BITS
+            } else {
+                KEY_BITS
+            },
         };
         packed.initial_layout();
         Ok(packed)
@@ -197,7 +226,7 @@ impl GroupValuesPacked {
     }
 
     /// Widen the layout to cover every observed value. Returns false when no
-    /// layout fits in 64 bits.
+    /// layout fits in `max_bits`.
     fn relayout(&mut self, rows: usize) -> bool {
         let choose = |spare: bool, all: bool| -> (Vec<Option<Proposal>>, u32) {
             let proposals: Vec<_> = self
@@ -217,7 +246,10 @@ impl GroupValuesPacked {
         // Prefer spare room, unless exact widths reach a cheaper table: a
         // direct index (16 bits), then 8-byte hash slots (32 bits).
         let mut chosen = None;
-        for limit in [table::DIRECT_BITS, table::NARROW_BITS, KEY_BITS] {
+        for limit in [table::DIRECT_BITS, table::NARROW_BITS, KEY_BITS]
+            .into_iter()
+            .filter(|&limit| limit <= self.max_bits)
+        {
             if spare.1 <= limit {
                 chosen = Some(spare.clone());
             } else if exact.1 <= limit {
@@ -231,7 +263,7 @@ impl GroupValuesPacked {
             Some(chosen) => chosen,
             None => {
                 let all = choose(false, true);
-                if all.1 > KEY_BITS {
+                if all.1 > self.max_bits {
                     return false;
                 }
                 all

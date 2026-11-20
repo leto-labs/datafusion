@@ -8,7 +8,7 @@
 
 use arrow::array::{ArrayRef, downcast_primitive};
 use arrow::datatypes::{DataType, SchemaRef};
-use datafusion_common::{Result, not_impl_err};
+use datafusion_common::{Result, internal_err, not_impl_err};
 
 use datafusion_expr::{EmitTo, GroupSelection};
 
@@ -167,44 +167,16 @@ pub fn new_group_values(
     {
         return Ok(Box::new(GroupValuesClustered::try_new(schema)?));
     }
-    if schema.fields.len() == 1 {
-        let d = schema.fields[0].data_type();
-
-        macro_rules! downcast_helper {
-            ($t:ty, $d:ident) => {
-                return Ok(Box::new(GroupValuesPrimitive::<$t>::new($d.clone())))
-            };
-        }
-
-        downcast_primitive! {
-            d => (downcast_helper, d),
-            DataType::Utf8 => {
-                return Ok(Box::new(GroupValuesBytes::<i32>::new(OutputType::Utf8)));
-            }
-            DataType::LargeUtf8 => {
-                return Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Utf8)));
-            }
-            DataType::Utf8View => {
-                return Ok(Box::new(inline_cache::InlineCache::<1>::new(Box::new(
-                    batch_codes::BatchCodes::new(Box::new(
-                        GroupValuesBytesView::new(OutputType::Utf8View),
-                    )),
-                ))));
-            }
-            DataType::Binary => {
-                return Ok(Box::new(GroupValuesBytes::<i32>::new(OutputType::Binary)));
-            }
-            DataType::LargeBinary => {
-                return Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Binary)));
-            }
-            DataType::BinaryView => {
-                return Ok(Box::new(GroupValuesBytesView::new(OutputType::BinaryView)));
-            }
-            DataType::Boolean => {
-                return Ok(Box::new(GroupValuesBoolean::new()));
-            }
-            _ => {}
-        }
+    if matches!(group_clustering, GroupClustering::None) && packed::single_column(&schema)
+    {
+        return Ok(Box::new(packed::GroupValuesPacked::try_new(
+            schema,
+            unordered_single_column,
+        )?));
+    }
+    let clustered = !matches!(group_clustering, GroupClustering::None);
+    if let Some(single) = single_column(&schema, clustered) {
+        return single;
     }
 
     if !matches!(group_clustering, GroupClustering::None) {
@@ -221,6 +193,71 @@ pub fn new_group_values(
         )?));
     }
     unordered_multi_column(schema)
+}
+
+/// The specialized interner of one key column, if its type has one.
+///
+/// A primitive table for clustered keys starts empty: it holds only the
+/// groups of the current input, and its non-spillable replay of sorted spill
+/// runs would otherwise reserve 128 slots (4.9 KB for `UInt32`), more than
+/// the packed unordered table that spilled (Longbow).
+fn single_column(
+    schema: &SchemaRef,
+    clustered: bool,
+) -> Option<Result<Box<dyn GroupValues>>> {
+    if schema.fields.len() != 1 {
+        return None;
+    }
+    let d = schema.fields[0].data_type();
+
+    macro_rules! downcast_helper {
+        ($t:ty, $d:ident) => {
+            return Some(Ok(if clustered {
+                Box::new(GroupValuesPrimitive::<$t>::with_capacity($d.clone(), 0))
+            } else {
+                Box::new(GroupValuesPrimitive::<$t>::new($d.clone()))
+            }))
+        };
+    }
+
+    downcast_primitive! {
+        d => (downcast_helper, d),
+        DataType::Utf8 => {
+            return Some(Ok(Box::new(GroupValuesBytes::<i32>::new(OutputType::Utf8))));
+        }
+        DataType::LargeUtf8 => {
+            return Some(Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Utf8))));
+        }
+        DataType::Utf8View => {
+            return Some(Ok(Box::new(inline_cache::InlineCache::<1>::new(Box::new(
+                batch_codes::BatchCodes::new(Box::new(
+                    GroupValuesBytesView::new(OutputType::Utf8View),
+                )),
+            )))));
+        }
+        DataType::Binary => {
+            return Some(Ok(Box::new(GroupValuesBytes::<i32>::new(OutputType::Binary))));
+        }
+        DataType::LargeBinary => {
+            return Some(Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Binary))));
+        }
+        DataType::BinaryView => {
+            return Some(Ok(Box::new(GroupValuesBytesView::new(OutputType::BinaryView))));
+        }
+        DataType::Boolean => {
+            return Some(Ok(Box::new(GroupValuesBoolean::new())));
+        }
+        _ => {}
+    }
+    None
+}
+
+/// The interner of one unordered key column when packed codes do not fit.
+fn unordered_single_column(schema: SchemaRef) -> Result<Box<dyn GroupValues>> {
+    match single_column(&schema, false) {
+        Some(single) => single,
+        None => internal_err!("no single-column interner for {schema}"),
+    }
 }
 
 /// The general interner of unordered keys with several columns.

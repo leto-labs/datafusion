@@ -5788,9 +5788,22 @@ mod tests {
             (0..num_groups).map(f64::from).collect(),
             num_input_batches,
         )?;
-        // Fits only the initial table, so every input batch triggers an early emit.
+        // Fits only the initial table, so every input batch triggers an early
+        // emit, plus one flushed state batch, so the flush can be sliced. (The
+        // slice headroom used to come from the 128 slots that the initial
+        // primitive table reserved; Longbow's packed table starts smaller.)
+        let flushed_state = RecordBatch::try_new(
+            partial_reduce.input().schema(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..num_groups)),
+                Arc::new(Float64Array::from_iter_values(
+                    (0..num_groups).map(f64::from),
+                )),
+            ],
+        )?
+        .get_array_memory_size();
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_limit(initial_reservation(&partial_reduce)?, 1.0)
+            .with_memory_limit(initial_reservation(&partial_reduce)? + flushed_state, 1.0)
             .build_arc()?;
         // A batch size smaller than the number of flushed groups also covers
         // splitting one flush across several output batches.
