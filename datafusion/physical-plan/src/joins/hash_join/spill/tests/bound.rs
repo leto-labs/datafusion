@@ -171,91 +171,25 @@ fn wide_keys(
         .collect()
 }
 
-/// Review MJJ98-REVIEW3, finding 1: a key expression that builds a wide
-/// key (a 200-character string concatenated with itself). Before, the build
-/// evaluated it again while hashing each batch and once more over the
-/// concatenated rows, outside its capped pool, so a build allocated about
-/// twice the keys beyond its grant before the pool could refuse. Now the
-/// keys are evaluated once per batch under the read permit and charged with
-/// the batch, and the measured allocations of every chunk build stay inside
-/// its grant.
-#[rstest::rstest]
-#[case::expression(false)]
-#[case::structure(true)]
+/// Measure the incremental build grant over wide column keys.
 #[tokio::test]
-async fn chunk_build_allocates_within_its_grant(#[case] nested: bool) -> Result<()> {
-    let as_struct_key = |batch: RecordBatch| -> Result<RecordBatch> {
-        let fields = vec![
-            Arc::new(Field::new("i", DataType::Int32, false)),
-            Arc::new(Field::new("s", DataType::Utf8, true)),
-        ];
-        let numbers = Arc::new(Int32Array::from_value(1, batch.num_rows()));
-        let structure = StructArray::try_new(
-            fields.into(),
-            vec![numbers, Arc::clone(batch.column(0))],
-            None,
-        )?;
-        Ok(RecordBatch::try_from_iter([
-            (
-                batch.schema_ref().field(0).name(),
-                Arc::new(structure) as ArrayRef,
-            ),
-            (
-                batch.schema_ref().field(1).name(),
-                Arc::clone(batch.column(1)),
-            ),
-        ])?)
-    };
-    let test_input = |prefix, rows, hot_percent, batch_rows| {
-        wide_keys(prefix, rows, hot_percent, batch_rows)
-            .into_iter()
-            .map(|batch| {
-                if nested {
-                    as_struct_key(batch)
-                } else {
-                    Ok(batch)
-                }
-            })
-            .collect::<Result<Vec<_>>>()
-    };
-    let (build, probe, join_types) = if nested {
-        (
-            test_input("b", 2000, 85, 250)?,
-            test_input("p", 100, 2, 100)?,
-            &[JoinType::Inner][..],
-        )
-    } else {
-        (
-            test_input("b", 4000, 70, 250)?,
-            test_input("p", 600, 2, 100)?,
-            &[
-                JoinType::Inner,
-                JoinType::Right,
-                JoinType::LeftAnti,
-                JoinType::Full,
-            ][..],
-        )
-    };
-    let key_expr = |schema: &SchemaRef| -> PhysicalExprRef {
-        if nested {
-            return key(schema);
-        }
-        // `k || k`: 400 new bytes per row (a cast to LargeUtf8 would share
-        // the string data and only widen the offsets).
-        Arc::new(BinaryExpr::new(
-            key(schema),
-            Operator::StringConcat,
-            key(schema),
-        ))
-    };
+async fn chunk_build_allocates_within_its_grant() -> Result<()> {
+    let build = wide_keys("b", 4000, 70, 250);
+    let probe = wide_keys("p", 600, 2, 100);
+    let join_types = [
+        JoinType::Inner,
+        JoinType::Right,
+        JoinType::LeftAnti,
+        JoinType::Full,
+    ];
     for join_type in join_types {
         let plan = || -> Result<Arc<dyn ExecutionPlan>> {
             Ok(Arc::new(HashJoinExec::try_new(
                 memory_input(&build, 1),
                 memory_input(&probe, 1),
-                vec![(key_expr(&build[0].schema()), key_expr(&probe[0].schema()))],
+                vec![(key(&build[0].schema()), key(&probe[0].schema()))],
                 None,
-                join_type,
+                &join_type,
                 None,
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNothing,
@@ -649,7 +583,7 @@ impl PhysicalExpr for OriginalBatchKey {
 }
 
 #[tokio::test]
-async fn chunk_does_not_evaluate_original_keys_for_bounds() -> Result<()> {
+async fn opaque_key_keeps_the_legacy_spill_path() -> Result<()> {
     let build = table("b", 4096, 1, 0, 128);
     let probe = table("p", 17, 2, 0, 17);
     let plan = || -> Result<Arc<dyn ExecutionPlan>> {
@@ -670,14 +604,45 @@ async fn chunk_does_not_evaluate_original_keys_for_bounds() -> Result<()> {
     };
     let expected = run(&plan()?, task_context(SessionConfig::new(), None, true)).await?;
     let spilling = plan()?;
-    let context =
-        task_context(no_reversal(spill_config(0, 4096, 1)), Some(32 * 1024), true);
+    let context = task_context(spill_config(1, 4096, 1), None, true);
     let actual = run(&spilling, Arc::clone(&context)).await?;
     assert_eq!(
         batches_to_sort_string(&actual),
         batches_to_sort_string(&expected)
     );
-    assert!(metric(&spilling.metrics().unwrap(), "spill_chunked_runs").unwrap_or(0) > 0);
+    let metrics = spilling.metrics().unwrap();
+    assert!(metric(&metrics, "spilled_partitions").unwrap_or_default() > 0);
+    assert_eq!(
+        metric(&metrics, "spill_chunked_runs").unwrap_or_default(),
+        0
+    );
+    assert_eq!(
+        metric(&metrics, "spill_reversed_runs").unwrap_or_default(),
+        0
+    );
+    drop(spilling);
+    assert_eq!(context.memory_pool().reserved(), 0);
+    // A hot partition outside the chunk budget still recurses to the
+    // configured depth. A small pool then returns the legacy refusal.
+    let spilling = plan()?;
+    let context = task_context(spill_config(0, 4096, 2), Some(32 * 1024), true);
+    let error = run(&spilling, Arc::clone(&context))
+        .await
+        .expect_err("a hot partition exceeded the legacy depth and floor");
+    assert!(
+        matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("hash_join_spill_max_depth (2)"),
+        "{error}"
+    );
+    let metrics = spilling.metrics().unwrap();
+    assert_eq!(metric(&metrics, "spill_depth"), Some(3));
+    assert_eq!(
+        metric(&metrics, "spill_chunked_runs").unwrap_or_default(),
+        0
+    );
     drop(spilling);
     assert_eq!(context.memory_pool().reserved(), 0);
     Ok(())
@@ -763,7 +728,7 @@ async fn reader_dictionaries_stay_charged_between_chunks() -> Result<()> {
     let batch = read_cursor(&cursor).await.expect("a batch")?;
     let (keyed, _) = chunk.admit(batch)?;
     assert!(!cursor.is_exhausted(), "the file has more than one batch");
-    let dictionaries = footprint::dictionary_bound(&keyed)?;
+    let dictionaries = footprint::dictionary_resident_bytes(&keyed);
     assert!(dictionaries > 0);
     let table = chunk.take_charge(chunk.granted());
     // The next read's permit and the reader's dictionaries remain.
@@ -782,3 +747,5 @@ async fn reader_dictionaries_stay_charged_between_chunks() -> Result<()> {
     assert_eq!(cursor.charged(), chunk.granted());
     Ok(())
 }
+
+mod round4;

@@ -1043,6 +1043,12 @@ share; the refusal context by flag.
 
 Section 3 (lane `leto-mjj.98`):
 
+- Chunk and reversal eligibility. Each join key on both sides is a column
+  or a single fixed-width-to-fixed-width cast of a column. The build schema
+  has only primitive columns (including Boolean), Utf8, LargeUtf8, Binary,
+  Utf8View or BinaryView. Dictionary, Union and other nested columns in the
+  build use the existing partitioned spill path and depth limit. Reversal
+  also requires the probe schema to qualify because it becomes the build.
 - Build chunks (`spill/chunks.rs`). A run of a written partition is tried
   whole. If its indivisible join is refused beyond its floor it raises the
   run's `ChunkSignal` and fails before it produced a row; the run then
@@ -1050,7 +1056,8 @@ Section 3 (lane `leto-mjj.98`):
   whose build reads the build file from a `Cursor`, each batch under a read
   permit of one chunk unit (the first of a chunk charged without refusal, so
   every chunk progresses), until the pool refuses the permit of the next
-  read; the cursor ends at the file's last row. A refused table gives half
+  read. Every spill read stops at the recorded row count and rejects early
+  EOF or a batch that crosses the count. A refused table gives half
   of its batches back (still charged) and builds again. The probe replays
   the partition's probe files. Inner, Left, LeftSemi, LeftAnti and LeftMark
   are the union of their chunks (each build row is in one chunk and sees
@@ -1078,34 +1085,23 @@ Section 3 (lane `leto-mjj.98`):
   build falls back to chunks in the partition's own orientation.
 - `hash_join_spill_relief_divisor`: a relief releases the refused bytes and
   at least 1/N of what the build held (0: the refused bytes only).
-- Memory bound: charged once-per-batch key evaluation (`spill/footprint.rs`,
-  reviews `MJJ98-REVIEW-20261119`, `MJJ98-REREVIEW-20261120` and
-  `MJJ98-REVIEW3-20261120`). A chunk evaluates each batch's join keys once,
-  under the batch's read permit, normalizes float keys, and appends them to
-  the batch (`ChunkKeys`; a column key without floats is used where it is).
-  It charges `admission_need`: the decoded batch and its new key bytes, their
-  copy in the table, the dictionaries the IPC reader keeps, nested hash
-  scratch, 56 B per row (table and hash buffer) and 256 B. The table is built over the key columns
-  against a pool capped at the chunk's grant, in which the admitted rows
-  stay pinned while the attempt can retry. The build charges the hash
-  buffer and the largest batch's nested hash scratch before it starts.
-  The hash table uses the charged key columns and skips collecting
-  bounds. Every written build and probe batch is checked as written
-  (groups after concatenation; oversized pieces split and compacted)
-  against `write_need`, an upper bound of `admission_need`: IPC
-  buffers plus 64 B of padding each and a header bound based on the
-  number of buffers and field nodes (doubled with compression), and the
-  keys evaluated over the written rows. A row whose
-  need exceeds the chunk unit (three quarters of the workspace) fails with
-  `ResourcesExhausted` before it is written. The matched bitmap is admitted
-  (up to a quarter of the workspace without refusal). A batch given back to
-  the cursor keeps its charge; the table's charge is split off the run's.
-  The reversal decision uses each file's own size. Outside the pool remain
-  the IPC readers' I/O buffers (128 KiB per open local file, at most the
-  build cursor and one probe replay per chunking stream, as for every
-  DataFusion spill reader), writer compaction and encoding, small build
-  objects and sparse-union hashing's Arrow `take` buffers. Pending
-  halves of a piece can retain their parents' compacted buffers.
+- The chunk memory budget covers build-side residency, including the
+  decoded build batches, evaluation of eligible keys, the reader permits,
+  and the chunk's build table and scratch. A plain column key is reused
+  unless it needs float normalization. The table uses the admitted key
+  columns and skips collecting bounds. The writer sizes each build batch
+  as written, including concatenation, padding, compression and evaluated
+  keys. It splits and compacts oversized pieces. A single row that exceeds
+  three quarters of the workspace fails before the write. Probe files
+  receive the same check when they can become build input through reversal.
+  Build rows given back to the cursor stay charged. The table's charge
+  transfers from the run's grant.
+- Probe replay and output batch bytes are outside the build budget.
+  Replay can allocate for decoding, key evaluation, row numbering and
+  filtering while the chunk table is live. The output batch size is set
+  in rows, so wide or repeated values can produce large batches. IPC I/O
+  buffers, writer compaction and encoding, and small build objects are
+  also outside the build budget.
 - Metrics `spill_reliefs`, `spill_reversed_runs`, `spill_chunked_runs`,
   `spill_replay_passes`.
 

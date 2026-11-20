@@ -72,7 +72,7 @@ use chunks::ChunkRun;
 pub(crate) use files::SpillFilesExec;
 use files::{
     ChunkSignal, Cursor, FileSource, Origin, PartitionFileWriter, PollShortWrite,
-    SPILL_WRITER_SLOTS, Stage, short_write_permit, spill_file_error,
+    SPILL_WRITER_SLOTS, Stage, short_write_permit,
 };
 #[cfg(test)]
 pub(crate) use tests::bound::BuildWindow;
@@ -304,6 +304,28 @@ struct SubJoinTemplate {
     probe_schema: SchemaRef,
 }
 
+/// Build-side shapes whose allocations fit the chunk budget. Reversal
+/// also needs the probe schema to qualify because it becomes the build.
+#[derive(Clone, Copy)]
+struct SkewSupport {
+    chunks: bool,
+    reversal: bool,
+}
+
+impl SkewSupport {
+    fn new(template: &SubJoinTemplate) -> Self {
+        let chunks = footprint::chunk_schema(&template.build_schema)
+            && template.on.iter().all(|(left, right)| {
+                footprint::chunk_key(left, &template.build_schema)
+                    && footprint::chunk_key(right, &template.probe_schema)
+            });
+        Self {
+            chunks,
+            reversal: chunks && footprint::chunk_schema(&template.probe_schema),
+        }
+    }
+}
+
 /// Whether and how one execution of a join may spill, decided in
 /// `HashJoinExec::execute`.
 pub(super) enum JoinSpill {
@@ -323,6 +345,7 @@ pub(super) struct Eligible {
     context: Arc<TaskContext>,
     metrics: LazyMetrics,
     template: SubJoinTemplate,
+    skew: SkewSupport,
     on_left: Vec<PhysicalExprRef>,
     random_state: RandomState,
     shared: Arc<SpillShared>,
@@ -343,26 +366,33 @@ pub(super) struct Eligible {
 /// if it may: a hot key when its partition kept more than half of the rows
 /// its parent divided (a uniform key spread keeps one in
 /// `hash_join_spill_partitions`, so another level would write it again
-/// almost whole), or a level above the depth limit. Such a partition is
-/// joined in build chunks when its floor cannot hold it (design decision 5).
+/// almost whole), or a level above the depth limit. A partition that
+/// supports chunks uses them if its floor is too small (design decision 5).
+/// Other shapes continue to divide until the depth limit.
 fn indivisible_reason(
     origin: Option<Origin>,
     level: usize,
     max_depth: usize,
+    chunks: bool,
 ) -> Option<String> {
     let rows = origin.map_or(0, |origin| origin.rows);
     match origin {
-        Some(origin) if level > 0 && origin.hot() => Some(format!(
+        Some(origin) if chunks && level > 0 && origin.hot() => Some(format!(
             "one key value fills its partition of {rows} build rows ({}% of the {} \
              rows its parent join divided), which another spill level would not \
              divide; it is joined in build chunks",
             rows * 100 / origin.parent_rows.max(1),
             origin.parent_rows,
         )),
-        _ if level > max_depth => Some(format!(
+        _ if chunks && level > max_depth => Some(format!(
             "its partition of {rows} build rows is at spill level {level}, above \
              datafusion.execution.hash_join_spill_max_depth ({max_depth}); it is \
              joined in build chunks"
+        )),
+        _ if level > max_depth => Some(format!(
+            "the memory pool had no room for its partition of {rows} build rows at \
+             spill level {level}, above datafusion.execution.hash_join_spill_max_depth \
+             ({max_depth}), and the partition is larger than its workspace floor"
         )),
         _ => None,
     }
@@ -422,12 +452,23 @@ impl JoinSpill {
         if let Some(reason) = reason {
             return Ok(Self::Ineligible(reason));
         }
+        let template = SubJoinTemplate {
+            on: join.on.clone(),
+            filter: join.filter.clone(),
+            join_type: join.join_type,
+            projection: join.projection.clone(),
+            null_equality: join.null_equality,
+            build_schema: join.left().schema(),
+            probe_schema: join.right().schema(),
+        };
+        let skew = SkewSupport::new(&template);
         // A partition that cannot be divided may still be built on its
         // floor, but it writes no partition (design decision 5, "Recursion").
         let depth_limit = indivisible_reason(
             leaf.map(SpillFilesExec::origin),
             level,
             options.max_depth,
+            skew.chunks,
         );
         let right_partitions = join.right().output_partitioning().partition_count();
         let count = match (join.mode, membership) {
@@ -457,15 +498,8 @@ impl JoinSpill {
             level,
             context: Arc::clone(context),
             metrics,
-            template: SubJoinTemplate {
-                on: join.on.clone(),
-                filter: join.filter.clone(),
-                join_type: join.join_type,
-                projection: join.projection.clone(),
-                null_equality: join.null_equality,
-                build_schema: join.left().schema(),
-                probe_schema: join.right().schema(),
-            },
+            template,
+            skew,
             on_left: join.on.iter().map(|(left, _)| Arc::clone(left)).collect(),
             random_state: random_state.clone(),
             shared: Arc::clone(shared),
@@ -474,7 +508,10 @@ impl JoinSpill {
             shared_build: (join.mode == PartitionMode::CollectLeft)
                 .then(|| Arc::downgrade(shared_build)),
             depth_limit,
-            signal: leaf.and_then(SpillFilesExec::signal).cloned(),
+            signal: leaf
+                .and_then(SpillFilesExec::signal)
+                .filter(|_| skew.chunks)
+                .cloned(),
         })))
     }
 
@@ -637,7 +674,14 @@ struct WriteUnit {
 }
 
 impl WriteUnit {
-    /// The need of `batch` written as is; `None` without a unit.
+    fn new(bytes: usize, schema: &SchemaRef, on: &[PhysicalExprRef]) -> Result<Self> {
+        Ok(Self {
+            bytes,
+            keys: footprint::ChunkKeys::try_new(schema, on)?,
+        })
+    }
+
+    /// The need of `batch` written as is, or zero without a unit.
     fn need(unit: Option<&Self>, batch: &RecordBatch, compressed: bool) -> Result<usize> {
         match unit {
             Some(unit) => footprint::write_need(batch, &unit.keys, compressed),
@@ -752,22 +796,21 @@ impl WriteBatches<'_> {
             if self.start == self.batches.len() {
                 return Ok(None);
             }
-            // Up to WRITE_BATCH_ROWS rows of pieces in one batch, as long as
-            // their logical bytes (a lower bound of the need) could fit.
-            let budget = self.unit.map_or(usize::MAX, |unit| unit.bytes);
             let mut end = self.start;
             let (mut rows, mut bytes) = (0, 0);
-            while end < self.batches.len() {
+            while end < self.batches.len() && rows < WRITE_BATCH_ROWS {
                 let piece = &self.batches[end];
-                let piece_bytes = piece.get_sliced_size()?;
-                if end > self.start
-                    && (rows + piece.num_rows() > WRITE_BATCH_ROWS
-                        || 2 * (bytes + piece_bytes) > budget)
-                {
-                    break;
+                if let Some(unit) = self.unit {
+                    let piece_bytes = piece.get_sliced_size()?;
+                    if end > self.start
+                        && (rows + piece.num_rows() > WRITE_BATCH_ROWS
+                            || 2 * (bytes + piece_bytes) > unit.bytes)
+                    {
+                        break;
+                    }
+                    bytes += piece_bytes;
                 }
                 rows += piece.num_rows();
-                bytes += piece_bytes;
                 end += 1;
             }
             let group = &self.batches[self.start..end];
@@ -942,6 +985,7 @@ pub(super) struct BuildSpill {
     metrics: JoinSpillMetrics,
     manager: Option<SpillManager>,
     template: SubJoinTemplate,
+    skew: SkewSupport,
     shared: Option<Arc<SpillShared>>,
     count: Expected,
     shared_build: Option<Weak<OnceAsync<JoinLeftData>>>,
@@ -1017,6 +1061,7 @@ impl BuildSpill {
             ),
             manager: None,
             template: eligible.template.clone(),
+            skew: eligible.skew,
             shared: (eligible.mode == PartitionMode::CollectLeft)
                 .then(|| Arc::clone(&eligible.shared)),
             count: eligible.count,
@@ -1313,15 +1358,18 @@ impl BuildSpill {
         let manager = self.manager.as_ref().ok_or_else(|| {
             datafusion_common::internal_datafusion_err!("no spill manager")
         })?;
-        let unit = WriteUnit {
-            bytes: self.options.chunk_unit(),
-            keys: footprint::ChunkKeys::try_new(
-                &self.template.build_schema,
-                &self.on_left,
-            )?,
-        };
-        let mut writer =
-            PartWriter::new(manager, "HashJoin build partition", Some(unit))?;
+        let unit = self
+            .skew
+            .chunks
+            .then(|| {
+                WriteUnit::new(
+                    self.options.chunk_unit(),
+                    &self.template.build_schema,
+                    &self.on_left,
+                )
+            })
+            .transpose()?;
+        let mut writer = PartWriter::new(manager, "HashJoin build partition", unit)?;
         writer.write(&batches, &self.metrics, Side::Build)?;
         drop(batches);
         self.parts[part] = Part::Writing(Box::new(writer));
@@ -1550,6 +1598,7 @@ impl BuildSpill {
             parent_rows,
             build_files: Mutex::new(build_files),
             template: self.template,
+            skew: self.skew,
             build_manager: manager,
             metrics: self.metrics,
             mode,
@@ -1809,6 +1858,7 @@ pub(crate) struct SpilledBuild {
     /// One file per partition, then the unmatchable partition's.
     build_files: Mutex<Vec<Option<SpilledFile>>>,
     template: SubJoinTemplate,
+    skew: SkewSupport,
     build_manager: SpillManager,
     metrics: JoinSpillMetrics,
     mode: Mode,
@@ -2319,17 +2369,9 @@ impl SpilledBuild {
         let file = self.take_final(self.partitions)?;
         let schema = Arc::clone(&output.schema);
         let rows = match file {
-            Some(file) => self
-                .build_manager
-                .read_spill_as_stream_unbuffered(Arc::clone(&file.file), None)
-                .map_err(spill_file_error)?
-                .map(move |batch| {
-                    // The file lives until its rows are read.
-                    let _file = &file;
-                    batch
-                        .map_err(spill_file_error)
-                        .and_then(|batch| output.emit(&batch))
-                })
+            Some(file) => file
+                .read(&self.build_manager)?
+                .map(move |batch| batch.and_then(|batch| output.emit(&batch)))
                 .boxed(),
             None => futures::stream::empty().boxed(),
         };
@@ -2769,25 +2811,26 @@ impl StreamSpill {
             let writer = match &mut router.writers[part] {
                 Some(writer) => writer,
                 slot => {
-                    // A probe file is the build input of a reversed join:
-                    // the same unit as a build file, with the probe keys.
-                    let on_right: Vec<PhysicalExprRef> = build
-                        .template
-                        .on
-                        .iter()
-                        .map(|(_, right)| Arc::clone(right))
-                        .collect();
-                    let unit = WriteUnit {
-                        bytes: self.options.chunk_unit(),
-                        keys: footprint::ChunkKeys::try_new(
+                    // Only a probe file that can become the build needs the build unit.
+                    let unit = if build.skew.reversal && build.options.role_reversal {
+                        let on_right: Vec<_> = build
+                            .template
+                            .on
+                            .iter()
+                            .map(|(_, right)| Arc::clone(right))
+                            .collect();
+                        Some(WriteUnit::new(
+                            self.options.chunk_unit(),
                             &build.template.probe_schema,
                             &on_right,
-                        )?,
+                        )?)
+                    } else {
+                        None
                     };
                     slot.insert(PartWriter::new(
                         &router.manager,
                         "HashJoin probe partition",
-                        Some(unit),
+                        unit,
                     )?)
                 }
             };
@@ -3097,21 +3140,21 @@ impl Written {
         part: usize,
         run_type: JoinType,
         projection: Option<ProjectionRef>,
-        build_file: SpilledFile,
-        probe_files: Vec<SpilledFile>,
+        build_file: &SpilledFile,
+        probe_files: &[SpilledFile],
         kind: Output,
-    ) -> ChunkRun {
-        ChunkRun {
+    ) -> Option<ChunkRun> {
+        self.seat.build.skew.chunks.then(|| ChunkRun {
             build: Arc::clone(&self.seat.build),
             part,
             run_type,
             projection,
-            build_file,
-            probe_files,
+            build_file: build_file.clone(),
+            probe_files: probe_files.to_vec(),
             output: Arc::clone(&self.output),
             kind,
             context: Arc::clone(&self.context),
-        }
+        })
     }
 
     /// An own run of `part`: in chunks if a stream found it needs them;
@@ -3128,15 +3171,18 @@ impl Written {
             part,
             run_type,
             projection.clone(),
-            build_file.clone(),
-            probe.clone(),
+            &build_file,
+            &probe,
             Output::Own,
         );
-        if build.is_chunked(part) {
+        if build.is_chunked(part)
+            && let Some(chunk) = chunk
+        {
             return Ok(Current::new(chunk.stream()?, None, Output::Same, None));
         }
         let probe_bytes: usize = probe.iter().map(|file| file.bytes).sum();
         if build.options.role_reversal
+            && build.skew.reversal
             && build.one_member()
             && probe_bytes < build_file.bytes
         {
@@ -3155,7 +3201,7 @@ impl Written {
                 stream,
                 None,
                 Output::Own,
-                Some((signal, chunk)),
+                chunk.map(|chunk| (signal, chunk)),
             ));
         }
         let using = build.shared_join(part)?;
@@ -3165,7 +3211,7 @@ impl Written {
             stream,
             Some(using),
             Output::Own,
-            Some((signal, chunk)),
+            chunk.map(|chunk| (signal, chunk)),
         ))
     }
 
@@ -3184,14 +3230,17 @@ impl Written {
             part,
             join_type,
             projection.clone(),
-            build_file.clone(),
-            probe_files.clone(),
+            &build_file,
+            &probe_files,
             kind,
         );
         let signal = Arc::new(ChunkSignal::default());
         let probe_bytes: usize = probe_files.iter().map(|file| file.bytes).sum();
         let (join, output): (Arc<dyn ExecutionPlan>, Output) =
-            if build.options.role_reversal && probe_bytes < build_file.bytes {
+            if build.options.role_reversal
+                && build.skew.reversal
+                && probe_bytes < build_file.bytes
+            {
                 build.metrics.reversed.add(1);
                 let join = build.reversed_join(
                     build_file,
@@ -3210,6 +3259,11 @@ impl Written {
                 (join, kind)
             };
         let stream = join.execute(0, Arc::clone(&self.context))?;
-        Ok(Current::new(stream, None, output, Some((signal, chunk))))
+        Ok(Current::new(
+            stream,
+            None,
+            output,
+            chunk.map(|chunk| (signal, chunk)),
+        ))
     }
 }

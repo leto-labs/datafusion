@@ -535,7 +535,7 @@ impl ChunkBuild {
                 let decoded = get_record_batch_memory_size(&batch);
                 let dictionaries = self
                     .cursor
-                    .keep_dictionaries(footprint::dictionary_bound(&batch)?);
+                    .keep_dictionaries(footprint::dictionary_resident_bytes(&batch));
                 let keyed = self.keys()?.materialize(&batch)?;
                 drop(batch);
                 let resident = decoded + keyed.new_bytes;

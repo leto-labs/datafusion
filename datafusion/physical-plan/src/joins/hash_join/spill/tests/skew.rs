@@ -432,18 +432,14 @@ async fn review_drop_during_chunk_replay() -> Result<()> {
     Ok(())
 }
 
-/// Review MJJ98-REREVIEW-20261120, finding 1: a key expression that
-/// expands compact input (an integer key cast to a string) in a small pool.
-/// The chunk tables are built against a pool capped at their grant, so the
-/// real pool's peak stays within limit + (streams + 1) x workspace, measured
-/// at every reservation change, not after the output.
+/// Fixed-width casts evaluate under the same build grant as a plain column.
 #[tokio::test]
-async fn variable_width_key_expression_stays_within_the_bound() -> Result<()> {
+async fn fixed_width_cast_stays_within_the_bound() -> Result<()> {
     use datafusion_physical_expr::expressions::CastExpr;
     let build = skewed("b", 20000, 70, false, 3001, 500);
     let probe = sparse_probe(3000, false);
     let widen = |schema: &SchemaRef| -> PhysicalExprRef {
-        Arc::new(CastExpr::new(key(schema), DataType::LargeUtf8, None))
+        Arc::new(CastExpr::new(key(schema), DataType::Int64, None))
     };
     for join_type in [JoinType::Inner, JoinType::Right, JoinType::LeftAnti] {
         let (limit, workspace) = (64 * 1024, 4096);
@@ -466,18 +462,11 @@ async fn variable_width_key_expression_stays_within_the_bound() -> Result<()> {
         let result = run(&plan, Arc::clone(&context)).await;
         let peak = pool.peak.load(std::sync::atomic::Ordering::SeqCst);
         println!("{join_type}: peak {peak}, ok {}", result.is_ok());
-        match result {
-            Ok(_) => assert!(
-                metric(&plan.metrics().unwrap(), "spill_chunked_runs").unwrap_or(0) > 0,
-                "{join_type}: not joined in chunks"
-            ),
-            // The named refusal of a unit that does not fit is allowed; any
-            // other error is not.
-            Err(error) => assert!(
-                matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
-                "{join_type}: {error}"
-            ),
-        }
+        result?;
+        assert!(
+            metric(&plan.metrics().unwrap(), "spill_chunked_runs").unwrap_or(0) > 0,
+            "{join_type}: not joined in chunks"
+        );
         drop(plan);
         assert!(
             peak <= limit + 2 * workspace,
@@ -485,5 +474,109 @@ async fn variable_width_key_expression_stays_within_the_bound() -> Result<()> {
         );
         assert_eq!(context.memory_pool().reserved(), 0, "{join_type}");
     }
+    Ok(())
+}
+
+/// Single-probe Left and Full preserve both sides' unmatched rows after
+/// the reversed build is refused and the original build runs in chunks.
+#[rstest::rstest]
+#[case::left(JoinType::Left)]
+#[case::full(JoinType::Full)]
+#[tokio::test]
+async fn round4_single_probe_outer_reverses_then_chunks(
+    #[case] join_type: JoinType,
+) -> Result<()> {
+    // One written partition, with both orientations too large for the pool.
+    // Half the probe payloads are disjoint from the build even for this key.
+    let build_rows = 6000;
+    let probe_rows = 2400;
+    let build = skewed("b", build_rows, 100, false, 3001, 256);
+    let probe = skewed("p", probe_rows, 100, false, 3001, 256)
+        .into_iter()
+        .map(|batch| {
+            let payload = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let payload =
+                Int32Array::from_iter_values(payload.values().iter().map(|&row| {
+                    if row % 2 == 0 {
+                        row
+                    } else {
+                        row + build_rows as i32
+                    }
+                }));
+            RecordBatch::try_new(
+                batch.schema(),
+                vec![Arc::clone(batch.column(0)), Arc::new(payload)],
+            )
+        })
+        .collect::<arrow::error::Result<Vec<_>>>()?;
+    let plan = || -> Result<Arc<dyn ExecutionPlan>> {
+        let left = build[0].schema();
+        let right = probe[0].schema();
+        let filter = JoinFilter::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("build", 0)),
+                Operator::Eq,
+                Arc::new(Column::new("probe", 1)),
+            )),
+            vec![
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Right,
+                },
+            ],
+            Arc::new(Schema::new(vec![
+                left.field(1).clone(),
+                right.field(1).clone(),
+            ])),
+        );
+        Ok(Arc::new(HashJoinExec::try_new(
+            memory_input(&build, 1),
+            memory_input(&probe, 1),
+            vec![(key(&left), key(&right))],
+            Some(filter),
+            &join_type,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?))
+    };
+    let expected = run(&plan()?, task_context(SessionConfig::new(), None, true)).await?;
+    let spilled = plan()?;
+    let context = task_context(spill_config(0, 4096, 0), Some(32 * 1024), true);
+    let actual = run(&spilled, Arc::clone(&context)).await?;
+    let metrics = spilled.metrics().unwrap();
+    assert_eq!(metric(&metrics, "spilled_partitions"), Some(1));
+    let unmatched_probe = if join_type == JoinType::Full {
+        probe_rows / 2
+    } else {
+        0
+    };
+    assert_eq!(
+        actual.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        build_rows + unmatched_probe,
+    );
+    assert!(
+        metric(&metrics, "spill_reversed_runs").unwrap_or_default() > 0,
+        "{join_type}"
+    );
+    assert!(
+        metric(&metrics, "spill_chunked_runs").unwrap_or_default() > 0,
+        "{join_type}"
+    );
+    assert_eq!(
+        batches_to_sort_string(&actual),
+        batches_to_sort_string(&expected),
+        "{join_type}"
+    );
+    assert_eq!(context.memory_pool().reserved(), 0);
     Ok(())
 }

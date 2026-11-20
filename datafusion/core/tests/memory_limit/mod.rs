@@ -569,7 +569,48 @@ async fn join_by_key_single_partition() {
 /// failed with "one key value fills its partition").
 async fn join_by_key_spills(target_partitions: usize) {
     let query = "select t1.* from t t1 JOIN t t2 ON t1.service = t2.service";
-    let table = Scenario::AccessLog.table();
+    // Keep the access-log values and skew, but materialize dictionary
+    // columns before planning so this fixture can enter build chunks.
+    let batches = access_log_batches();
+    let schema = Arc::new(Schema::new(
+        batches[0]
+            .schema_ref()
+            .fields()
+            .iter()
+            .map(|field| {
+                if let DataType::Dictionary(_, value) = field.data_type() {
+                    Arc::new(
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_data_type(value.as_ref().clone()),
+                    )
+                } else {
+                    Arc::clone(field)
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let batches = batches
+        .into_iter()
+        .map(|batch| {
+            let columns = batch
+                .columns()
+                .iter()
+                .zip(schema.fields())
+                .map(|(array, field)| {
+                    if array.data_type() == field.data_type() {
+                        Ok(Arc::clone(array))
+                    } else {
+                        arrow::compute::cast(array, field.data_type())
+                    }
+                })
+                .collect::<arrow::error::Result<Vec<_>>>()?;
+            RecordBatch::try_new(Arc::clone(&schema), columns)
+        })
+        .collect::<arrow::error::Result<Vec<_>>>()
+        .unwrap();
+    let table = Arc::new(MemTable::try_new(schema, vec![batches]).unwrap());
     let run = |limit: Option<usize>, spilling: bool| {
         let table = Arc::clone(&table);
         async move {
@@ -578,7 +619,7 @@ async fn join_by_key_spills(target_partitions: usize) {
             let execution = &mut config.options_mut().execution;
             execution.enable_hash_join_spilling = spilling;
             // The wide access-log schema needs more than a 3 KiB permit
-            // for one IPC row, even after compacting the dictionaries.
+            // for one IPC row with its build charge.
             execution.hash_join_spill_reservation_bytes = 24 * 1024;
             let mut runtime = RuntimeEnvBuilder::new()
                 .with_disk_manager_builder(DiskManagerBuilder::default());

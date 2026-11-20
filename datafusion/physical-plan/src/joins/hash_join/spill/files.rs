@@ -308,6 +308,74 @@ impl FileSource {
     }
 }
 
+impl SpilledFile {
+    fn reader(&self, manager: &SpillManager) -> Result<FileRows> {
+        let reader = (self.rows != 0)
+            .then(|| {
+                manager.read_spill_as_stream_unbuffered(Arc::clone(&self.file), None)
+            })
+            .transpose()
+            .map_err(spill_file_error)?;
+        Ok(FileRows {
+            reader,
+            expected: self.rows,
+            read: 0,
+        })
+    }
+
+    pub(super) fn read(&self, manager: &SpillManager) -> Result<Rows> {
+        let mut reader = self.reader(manager)?;
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(manager.schema()),
+            futures::stream::poll_fn(move |cx| reader.poll_next(cx)),
+        )))
+    }
+}
+
+/// Check complete batches against the writer's recorded row count. The
+/// count is also the read limit, so a chunk needs no permit for an EOF poll.
+struct FileRows {
+    reader: Option<Rows>,
+    expected: usize,
+    read: usize,
+}
+
+impl FileRows {
+    fn finished(&self) -> bool {
+        self.reader.is_none()
+    }
+
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
+        let Some(reader) = &mut self.reader else {
+            return Poll::Ready(None);
+        };
+        let error = match std::task::ready!(reader.poll_next_unpin(cx)) {
+            Some(Ok(batch)) if batch.num_rows() <= self.expected - self.read => {
+                self.read += batch.num_rows();
+                if self.read == self.expected {
+                    self.reader = None;
+                }
+                return Poll::Ready(Some(Ok(batch)));
+            }
+            Some(Ok(batch)) => exec_datafusion_err!(
+                "hash join spill file row count exceeded: expected {} rows, read {} \
+                 before a batch of {} rows",
+                self.expected,
+                self.read,
+                batch.num_rows()
+            ),
+            Some(Err(error)) => spill_file_error(error),
+            None => exec_datafusion_err!(
+                "hash join spill file row count mismatch: expected {} rows, read {}",
+                self.expected,
+                self.read
+            ),
+        };
+        self.reader = None;
+        Poll::Ready(Some(Err(error)))
+    }
+}
+
 /// The read position in the build file of a partition joined in chunks,
 /// and the one charge of the run: the batches given back, the read permit,
 /// the reader's dictionaries, and the rows and table estimate of the chunk
@@ -329,7 +397,7 @@ pub(crate) struct Cursor {
 }
 
 struct CursorState {
-    reader: Option<Rows>,
+    reader: Option<FileRows>,
     /// Batches given back, read before the file, with the bytes of
     /// `charge` that cover each.
     back: Vec<(RecordBatch, usize)>,
@@ -345,9 +413,7 @@ struct CursorState {
     /// The chunk being built could not reserve room for another batch: its
     /// build input ends here, before anything more is read.
     stop: bool,
-    /// Rows read from the file so far.
-    read_rows: usize,
-    /// The file has been read to its end.
+    /// The file reached its recorded row count or failed.
     ended: bool,
 }
 
@@ -370,7 +436,6 @@ impl Cursor {
                 dictionaries: 0,
                 carried: None,
                 stop: false,
-                read_rows: 0,
                 ended: false,
             }),
         }
@@ -506,34 +571,20 @@ impl Cursor {
             )));
         }
         if state.reader.is_none() {
-            match self
-                .spill_manager
-                .read_spill_as_stream_unbuffered(Arc::clone(&self.file.file), None)
-            {
+            match self.file.reader(&self.spill_manager) {
                 Ok(reader) => state.reader = Some(reader),
-                Err(error) => return Poll::Ready(Some(Err(spill_file_error(error)))),
+                Err(error) => return Poll::Ready(Some(Err(error))),
             }
         }
         let reader = state.reader.as_mut().expect("a reader");
-        let next = reader.poll_next_unpin(cx);
-        let finished = match &next {
-            Poll::Ready(None) => true,
-            Poll::Ready(Some(Ok(batch))) => {
-                state.read_rows += batch.num_rows();
-                // The file's last row (review MJJ98-REVIEW3, finding 3): the
-                // cursor ends here, so a chunk that cannot reserve another
-                // permit does not leave an empty replay behind.
-                state.read_rows >= self.file.rows
-            }
-            _ => false,
-        };
-        if finished {
+        let next = reader.poll_next(cx);
+        if reader.finished() {
             state.ended = true;
             state.reader = None;
             let dictionaries = std::mem::take(&mut state.dictionaries);
             state.charge.shrink(dictionaries.min(state.charge.size()));
         }
-        next.map(|batch| batch.map(|batch| batch.map_err(spill_file_error)))
+        next
     }
 }
 
@@ -868,15 +919,9 @@ impl ExecutionPlan for SpillFilesExec {
             // Unbuffered: the read runs in the consumer's poll. A buffered
             // read's producer task ends its stream as if the file ended when
             // the attempt stops it, and holds uncharged batches ahead.
-            .map(|file| {
-                self.spill_manager
-                    .read_spill_as_stream_unbuffered(Arc::clone(&file.file), None)
-                    .map_err(spill_file_error)
-            })
+            .map(|file| file.read(&self.spill_manager))
             .collect::<Result<Vec<_>>>()?;
-        let rows = futures::stream::iter(streams)
-            .flatten()
-            .map_err(spill_file_error);
+        let rows = futures::stream::iter(streams).flatten();
         let Some(row_ids) = self.row_ids.clone() else {
             return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rows)));
         };

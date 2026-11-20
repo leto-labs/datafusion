@@ -37,14 +37,14 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, make_array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UnionMode};
 use arrow_data::ArrayData;
 use datafusion_common::Result;
 use datafusion_common::float_semantics::{has_float_leaf, normalize_floats};
 use datafusion_common::utils::memory::RecordBatchMemoryCounter;
 use datafusion_physical_expr::PhysicalExprRef;
-use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::expressions::{CastExpr, Column};
 
 /// Padding and alignment the IPC writer may add to one buffer, and the
 /// rounding of a decompressed buffer's allocation.
@@ -191,6 +191,74 @@ pub(crate) fn dictionary_bound(batch: &RecordBatch) -> Result<usize> {
         bytes += walk(&column.to_data())?;
     }
     Ok(bytes)
+}
+
+/// Bytes actually held by the decoded dictionaries. The IPC reader can
+/// retain many view buffers that are slices of one allocation, and nested
+/// dictionaries can share buffers with their parent values.
+pub(crate) fn dictionary_resident_bytes(batch: &RecordBatch) -> usize {
+    fn count(data: &ArrayData, counter: &mut RecordBatchMemoryCounter) {
+        if matches!(data.data_type(), DataType::Dictionary(..)) {
+            for values in data.child_data() {
+                counter.count_array(make_array(values.clone()).as_ref());
+            }
+        } else {
+            for child in data.child_data() {
+                count(child, counter);
+            }
+        }
+    }
+
+    let mut counter = RecordBatchMemoryCounter::new();
+    for column in batch.columns() {
+        let data_type = column.data_type();
+        if data_type.is_nested()
+            || matches!(
+                data_type,
+                DataType::Dictionary(..) | DataType::RunEndEncoded(..)
+            )
+        {
+            count(&column.to_data(), &mut counter);
+        }
+    }
+    counter.memory_usage()
+}
+
+/// A chunk concatenates only flat columns with predictable copy costs.
+pub(super) fn chunk_schema(schema: &Schema) -> bool {
+    schema.fields().iter().all(|field| {
+        let data_type = field.data_type();
+        data_type.is_primitive()
+            || matches!(
+                data_type,
+                DataType::Boolean
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View
+                    | DataType::Binary
+                    | DataType::BinaryView
+            )
+    })
+}
+
+/// Only a column or a single fixed-width cast of a column fits the key
+/// evaluation budget. A cast can otherwise hide work in its input.
+pub(super) fn chunk_key(key: &PhysicalExprRef, schema: &Schema) -> bool {
+    fn fixed_width(data_type: &DataType) -> bool {
+        data_type.primitive_width().is_some()
+            || matches!(data_type, DataType::Boolean | DataType::FixedSizeBinary(_))
+    }
+
+    key.is::<Column>()
+        || key.downcast_ref::<CastExpr>().is_some_and(|cast| {
+            cast.expr().is::<Column>()
+                && cast
+                    .expr()
+                    .data_type(schema)
+                    .is_ok_and(|ty| fixed_width(&ty))
+                && (cast.cast_type().is_primitive()
+                    || matches!(cast.cast_type(), DataType::Boolean))
+        })
 }
 
 /// The join keys of a build chunk as columns of its batches. A key that is
