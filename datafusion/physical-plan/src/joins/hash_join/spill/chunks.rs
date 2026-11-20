@@ -440,6 +440,8 @@ pub(crate) struct ChunkBuild {
     granted: usize,
     /// Of those, the bytes of the rows.
     rows: usize,
+    /// Bytes of the run's charge reserved for the next batch read.
+    permit: usize,
 }
 
 /// Bytes kept for the table of `rows` rows of `bytes` bytes: their copy,
@@ -455,6 +457,7 @@ impl ChunkBuild {
             cursor,
             granted: 0,
             rows: 0,
+            permit: 0,
         }
     }
 
@@ -468,9 +471,13 @@ impl ChunkBuild {
         self.rows
     }
 
-    /// Takes `batch` into the chunk and returns its bytes, or gives it back
-    /// and returns `None` when the pool refuses it and the chunk already
-    /// holds a batch (`first` is false).
+    /// Takes `batch` into the chunk and returns its bytes. A batch after the
+    /// first was read only under a read permit (one chunk unit, the most a
+    /// written batch needs with its table), which now covers it; the first
+    /// is admitted by the pool, or charged without refusal within the chunk
+    /// unit. Then a permit for the next batch is reserved; if the pool
+    /// refuses it, the chunk's input ends before the next read, so no batch
+    /// is ever read that the chunk cannot hold.
     pub(crate) fn admit(
         &mut self,
         batch: &RecordBatch,
@@ -486,47 +493,66 @@ impl ChunkBuild {
             self.rows += size;
         }
         let need = if carried { extra } else { size + extra };
-        match self.cursor.try_grow(need) {
-            Ok(()) => {}
-            Err(error) if super::is_refusal(&error) && first => {
-                if size + extra > self.cursor.unit() {
-                    return Err(DataFusionError::ResourcesExhausted(format!(
-                        "Hash join spill: a build chunk's smallest unit, one batch of \
-                         {rows} rows ({size} bytes, {} bytes with its table), is larger \
-                         than three quarters of datafusion.execution.\
-                         hash_join_spill_reservation_bytes ({} bytes), and the pool \
-                         refused it: {error}",
-                        size + extra,
-                        self.cursor.unit(),
-                    )));
-                }
-                // The smallest unit, inside the stream's workspace share.
-                self.cursor.grow(need);
+        let permit = std::mem::take(&mut self.permit);
+        if permit >= need {
+            self.cursor.shrink(permit - need);
+        } else {
+            if permit > 0 {
+                self.cursor.shrink(permit);
             }
-            Err(error) if super::is_refusal(&error) => {
-                if carried {
-                    self.granted -= size;
-                    self.rows -= size;
-                } else if self.granted - self.rows >= size {
-                    // Held until the next chunk: its bytes come out of this
-                    // chunk's table estimate (no pool change).
-                    self.granted -= size;
-                } else if let Err(refused) = self.cursor.try_grow(size) {
-                    return Err(refused.context(format!(
+            match self.cursor.try_grow(need) {
+                Ok(()) => {}
+                Err(error) if super::is_refusal(&error) && first => {
+                    if size + extra > self.cursor.unit() {
+                        return Err(DataFusionError::ResourcesExhausted(format!(
+                            "Hash join spill: a build chunk's smallest unit, one batch \
+                             of {rows} rows ({size} bytes, {} bytes with its table), is \
+                             larger than three quarters of datafusion.execution.\
+                             hash_join_spill_reservation_bytes ({} bytes), and the pool \
+                             refused it: {error}",
+                            size + extra,
+                            self.cursor.unit(),
+                        )));
+                    }
+                    // The smallest unit, inside the stream's workspace share.
+                    self.cursor.grow(need);
+                }
+                Err(error) => {
+                    return Err(error.context(format!(
                         "Hash join spill: a build batch of {rows} rows ({size} bytes) \
-                         that a chunk must hold until the next chunk"
+                         above the chunk unit"
                     )));
                 }
-                self.cursor.give_back(batch.clone(), size);
-                return Ok(None);
             }
-            Err(error) => return Err(error),
         }
         self.granted += need;
         if !carried {
             self.rows += size;
         }
+        match self.cursor.try_grow(self.cursor.unit()) {
+            Ok(()) => self.permit = self.cursor.unit(),
+            Err(_) => self.cursor.stop_chunk(),
+        }
         Ok(Some(size))
+    }
+
+    /// The build input ended without a row (the chunk before stopped just
+    /// before the end of the file): an empty table's fixed parts, admitted
+    /// by the pool or charged without refusal (far below the chunk unit).
+    pub(crate) fn admit_empty(&mut self) {
+        const EMPTY_TABLE: usize = 1024;
+        if self.cursor.try_grow(EMPTY_TABLE).is_err() {
+            self.cursor.grow(EMPTY_TABLE);
+        }
+        self.granted += EMPTY_TABLE;
+    }
+
+    /// The build input ended: the unused read permit goes back to the pool.
+    pub(crate) fn release_permit(&mut self) {
+        let permit = std::mem::take(&mut self.permit);
+        if permit > 0 {
+            self.cursor.shrink(permit);
+        }
     }
 
     /// Gives back batches that the chunk's table could not hold; their bytes

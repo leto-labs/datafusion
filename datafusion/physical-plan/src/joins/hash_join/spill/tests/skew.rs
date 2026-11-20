@@ -447,10 +447,8 @@ async fn variable_width_key_expression_stays_within_the_bound() -> Result<()> {
         let pool = review::PeakPool::new(limit);
         let dyn_pool: Arc<dyn datafusion_execution::memory_pool::MemoryPool> =
             Arc::clone(&pool) as _;
-        let context = review::pool_context(
-            no_reversal(spill_config(0, workspace, 3)),
-            dyn_pool,
-        );
+        let context =
+            review::pool_context(no_reversal(spill_config(0, workspace, 3)), dyn_pool);
         let plan: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
             memory_input(&build, 1),
             memory_input(&probe, 1),

@@ -3428,7 +3428,11 @@ async fn collect_left_input(
     }
     drop(left_stream);
     // Longbow family JS (build chunks): the table over the admitted rows.
-    if let Some(chunk) = chunk.take() {
+    if let Some(mut chunk) = chunk.take() {
+        chunk.release_permit();
+        if state.num_rows == 0 {
+            chunk.admit_empty();
+        }
         return build_chunk(
             chunk,
             std::mem::take(&mut state.batches),

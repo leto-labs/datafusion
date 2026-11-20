@@ -624,7 +624,8 @@ struct PartWriter {
 }
 
 /// Splits `batch` into slices whose own footprint fits `unit` with their
-/// table, halving until each does; one row that does not fit fails with
+/// table (after compacting view buffers and dictionary values), halving until
+/// each does; one row that does not fit fails with
 /// `ResourcesExhausted` before anything is written (a wide value, or a
 /// dictionary kept whole).
 fn split_to_unit(
@@ -632,6 +633,10 @@ fn split_to_unit(
     unit: usize,
     out: &mut std::collections::VecDeque<RecordBatch>,
 ) -> Result<()> {
+    // A slice keeps its parent's view data buffers and dictionary values:
+    // compact them before measuring, so that what is written is what fits.
+    let columns: Vec<usize> = (0..batch.num_columns()).collect();
+    let batch = &compact_views(&crate::spill::gc_columns(batch, &columns)?)?;
     let rows = batch.num_rows();
     let size = batch.get_sliced_size()?;
     if unit_bytes(size, rows) <= unit {
@@ -649,6 +654,38 @@ fn split_to_unit(
     let half = rows / 2;
     split_to_unit(&batch.slice(0, half), unit, out)?;
     split_to_unit(&batch.slice(half, rows - half), unit, out)
+}
+
+/// Copies the referenced bytes of every top-level view column into compact
+/// buffers. `gc_columns` skips views with small data buffers, whose
+/// allocation can still be far above what a slice of them references.
+fn compact_views(batch: &RecordBatch) -> Result<RecordBatch> {
+    use arrow::array::{Array, BinaryViewArray, StringViewArray};
+    let mut changed = false;
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| {
+            if let Some(views) = column.as_any().downcast_ref::<StringViewArray>() {
+                changed = true;
+                Arc::new(views.gc()) as ArrayRef
+            } else if let Some(views) = column.as_any().downcast_ref::<BinaryViewArray>()
+            {
+                changed = true;
+                Arc::new(views.gc()) as ArrayRef
+            } else {
+                Arc::clone(column)
+            }
+        })
+        .collect();
+    if !changed {
+        return Ok(batch.clone());
+    }
+    Ok(RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )?)
 }
 
 /// The bytes a build chunk holds for `rows` rows of `bytes` bytes: the

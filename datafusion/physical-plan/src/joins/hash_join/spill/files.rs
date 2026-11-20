@@ -325,6 +325,9 @@ struct CursorState {
     back_bytes: usize,
     /// The batch read last came back from a chunk (still charged).
     carried: bool,
+    /// The chunk being built could not reserve room for another batch: its
+    /// build input ends here, before anything more is read.
+    stop: bool,
     /// The file has been read to its end.
     ended: bool,
 }
@@ -346,6 +349,7 @@ impl Cursor {
                 charge,
                 back_bytes: 0,
                 carried: false,
+                stop: false,
                 ended: false,
             }),
         }
@@ -375,6 +379,16 @@ impl Cursor {
         let mut state = self.lock();
         state.back_bytes += size;
         state.back.push(batch);
+    }
+
+    /// Ends the current chunk's build input before its next read.
+    pub(crate) fn stop_chunk(&self) {
+        self.lock().stop = true;
+    }
+
+    /// A new chunk's build input starts.
+    pub(super) fn start_chunk(&self) {
+        self.lock().stop = false;
     }
 
     /// Grows the run's charge by `bytes` if the pool admits them.
@@ -408,6 +422,9 @@ impl Cursor {
 
     fn poll_next(&self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
         let mut state = self.lock();
+        if state.stop {
+            return Poll::Ready(None);
+        }
         if let Some(batch) = state.back.pop() {
             // The chunk build takes its bytes over as it admits the batch
             // (`ChunkBuild::admit`, right after the read).
@@ -753,6 +770,7 @@ impl ExecutionPlan for SpillFilesExec {
         let schema = self.schema();
         if let FileSource::Cursor(cursor) = &self.source {
             let cursor = Arc::clone(cursor);
+            cursor.start_chunk();
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 schema,
                 futures::stream::poll_fn(move |cx| cursor.poll_next(cx)),
