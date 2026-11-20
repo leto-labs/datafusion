@@ -6291,6 +6291,94 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn join_output_gather_zero_column_projection_and_fetch(
+        #[values(
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::LeftSemi,
+            JoinType::LeftAnti,
+            JoinType::RightSemi,
+            JoinType::RightAnti,
+            JoinType::LeftMark,
+            JoinType::RightMark
+        )]
+        join_type: JoinType,
+        #[values(None, Some(2))] fetch: Option<usize>,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(2, false);
+        let left = build_table_two_cols(
+            ("lk", &vec![Some(1), Some(2), Some(4)]),
+            ("lv", &vec![None, Some(20), Some(40)]),
+        );
+        let right = build_table_two_cols(
+            ("rk", &vec![Some(2), Some(2), Some(1), None]),
+            ("rv", &vec![Some(200), None, Some(100), Some(300)]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("lk", &left.schema())?) as PhysicalExprRef,
+            Arc::new(Column::new_with_schema("rk", &right.schema())?) as PhysicalExprRef,
+        )];
+
+        // Each execution needs its own visited bitmap and probe completion state.
+        let make_join = |projection| {
+            HashJoinExecBuilder::new(
+                Arc::clone(&left),
+                Arc::clone(&right),
+                on.clone(),
+                join_type,
+            )
+            .with_partition_mode(PartitionMode::CollectLeft)
+            .with_fetch(fetch)
+            .with_projection(projection)
+            .build()
+        };
+        let join = make_join(None)?;
+        let zero_column = make_join(Some(vec![]))?;
+
+        let expected_rows = match join_type {
+            JoinType::Inner | JoinType::LeftMark | JoinType::RightSemi => 3,
+            JoinType::Left | JoinType::Right | JoinType::RightMark => 4,
+            JoinType::Full => 5,
+            JoinType::LeftSemi => 2,
+            JoinType::LeftAnti | JoinType::RightAnti => 1,
+        };
+        let expected_rows = fetch.map_or(expected_rows, |n| n.min(expected_rows));
+        let batches = common::collect(join.execute(0, Arc::clone(&task_ctx))?).await?;
+        let projected = common::collect(zero_column.execute(0, task_ctx)?).await?;
+
+        for output in [&batches, &projected] {
+            assert_eq!(
+                output.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                expected_rows
+            );
+            assert!(output.iter().all(|batch| batch.num_rows() <= 2));
+        }
+        assert!(projected.iter().all(|batch| batch.num_columns() == 0));
+
+        if matches!(
+            join_type,
+            JoinType::Inner | JoinType::Right | JoinType::RightSemi
+        ) {
+            let right_payload: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("rv")
+                        .unwrap()
+                        .as_primitive::<Int32Type>()
+                        .iter()
+                })
+                .collect();
+            let expected_order = [Some(200), None, Some(100), Some(300)];
+            assert_eq!(right_payload, expected_order[..expected_rows]);
+        }
+        Ok(())
+    }
+
     /// `fetch` stops each output partition separately, so the overall
     /// statistics must allow for the rows of every partition.
     #[tokio::test]
