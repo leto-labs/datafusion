@@ -19,13 +19,13 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::{EmitTo, GroupSelection};
 
 use super::table::{DIRECT_BITS, PackedKeyTable};
-use super::{GroupValuesPacked, supported};
+use super::{Fallback, GroupValuesPacked, supported};
 use crate::aggregates::group_values::{
-    GroupValues, GroupValuesRows, unordered_multi_column,
+    GroupValues, GroupValuesRows, unordered_multi_column, unordered_single_column,
 };
 
 /// A deterministic generator (SplitMix64).
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 impl Rng {
     fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -34,7 +34,7 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
     }
-    fn below(&mut self, n: u64) -> u64 {
+    pub(super) fn below(&mut self, n: u64) -> u64 {
         self.next() % n.max(1)
     }
     fn chance(&mut self, percent: u64) -> bool {
@@ -44,7 +44,7 @@ impl Rng {
 
 /// How one generated column draws its values.
 #[derive(Clone, Copy)]
-enum Gen {
+pub(super) enum Gen {
     /// Integers `offset + [0, card)`, with NULLs at `nulls` percent.
     Int {
         card: u64,
@@ -62,7 +62,7 @@ enum Gen {
     },
 }
 
-fn schema(types: &[DataType]) -> SchemaRef {
+pub(super) fn schema(types: &[DataType]) -> SchemaRef {
     Arc::new(Schema::new(
         types
             .iter()
@@ -82,7 +82,12 @@ fn text(id: u64, long: bool) -> String {
     }
 }
 
-fn column(rng: &mut Rng, data_type: &DataType, generator: Gen, rows: usize) -> ArrayRef {
+pub(super) fn column(
+    rng: &mut Rng,
+    data_type: &DataType,
+    generator: Gen,
+    rows: usize,
+) -> ArrayRef {
     match generator {
         Gen::Int {
             card,
@@ -203,28 +208,29 @@ fn assert_same_arrays(actual: &[ArrayRef], expected: &[ArrayRef], context: &str)
 /// emissions; every group id, length and emitted value must agree. Both
 /// number new groups in first-seen row order. (`GroupValuesColumn` can number
 /// hash-colliding new groups later, so it is not an id oracle.)
-struct Differential {
-    packed: GroupValuesPacked,
-    general: Box<dyn GroupValues>,
+pub(super) struct Differential {
+    pub(super) packed: GroupValuesPacked,
+    pub(super) general: Box<dyn GroupValues>,
     batches: usize,
 }
 
 impl Differential {
-    fn new(types: &[DataType]) -> Self {
+    pub(super) fn new(types: &[DataType]) -> Self {
         let schema = schema(types);
         assert!(supported(&schema));
+        let fallback: Fallback = if types.len() == 1 {
+            unordered_single_column
+        } else {
+            unordered_multi_column
+        };
         Self {
-            packed: GroupValuesPacked::try_new(
-                Arc::clone(&schema),
-                unordered_multi_column,
-            )
-            .unwrap(),
+            packed: GroupValuesPacked::try_new(Arc::clone(&schema), fallback).unwrap(),
             general: Box::new(GroupValuesRows::try_new(schema).unwrap()),
             batches: 0,
         }
     }
 
-    fn intern(&mut self, cols: &[ArrayRef]) {
+    pub(super) fn intern(&mut self, cols: &[ArrayRef]) {
         let (mut actual, mut expected) = (Vec::new(), Vec::new());
         self.packed.intern(cols, &mut actual).unwrap();
         self.general.intern(cols, &mut expected).unwrap();
@@ -245,7 +251,7 @@ impl Differential {
         self.batches += 1;
     }
 
-    fn emit(&mut self, emit_to: EmitTo) {
+    pub(super) fn emit(&mut self, emit_to: EmitTo) {
         let actual = self.packed.emit(emit_to).unwrap();
         let expected = self.general.emit(emit_to).unwrap();
         assert_same_arrays(&actual, &expected, &format!("{emit_to:?}"));
@@ -259,7 +265,13 @@ impl Differential {
     }
 }
 
-fn run(types: &[DataType], gens: &[Gen], seed: u64, batches: usize, rows: usize) {
+pub(super) fn run(
+    types: &[DataType],
+    gens: &[Gen],
+    seed: u64,
+    batches: usize,
+    rows: usize,
+) {
     let mut rng = Rng(seed);
     let mut check = Differential::new(types);
     for batch in 0..batches {
