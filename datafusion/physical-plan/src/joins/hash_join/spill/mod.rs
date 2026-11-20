@@ -177,6 +177,8 @@ pub(crate) struct JoinSpillMetrics {
     probe_rows: Count,
     probe_bytes: Count,
     partitions: Count,
+    #[cfg(test)]
+    partition_passes: Count,
     /// Levels that wrote a partition; 1 when only the first level did.
     depth: Gauge,
 }
@@ -192,6 +194,8 @@ impl JoinSpillMetrics {
             probe_rows: counter("probe_spilled_rows"),
             probe_bytes: counter("probe_spilled_bytes"),
             partitions: counter("spilled_partitions"),
+            #[cfg(test)]
+            partition_passes: counter("spill_partition_passes"),
             depth,
         }
     }
@@ -704,26 +708,27 @@ fn held(pieces: &[MemoryReservation]) -> usize {
     pieces.iter().map(MemoryReservation::size).sum()
 }
 
-/// Moves `bytes` out of `pieces` into new reservations (at most all).
-fn take_held(
+/// Moves up to `bytes` from the workspace into this consumer's reservation
+/// and returns how much was moved.
+fn transfer_held(
     pieces: &mut Vec<MemoryReservation>,
-    mut bytes: usize,
-) -> Vec<MemoryReservation> {
-    let mut out = vec![];
-    while bytes > 0 {
-        let Some(piece) = pieces.last_mut() else {
+    bytes: usize,
+    reservation: &MemoryReservation,
+) -> usize {
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let Some(piece) = pieces.last() else {
             break;
         };
         let size = piece.size();
-        if size <= bytes {
-            bytes -= size;
-            out.push(pieces.pop().expect("a last piece"));
-        } else {
-            out.push(piece.split(bytes));
-            bytes = 0;
+        let moved = size.min(remaining);
+        reservation.transfer_from(piece, moved);
+        remaining -= moved;
+        if moved == size {
+            pieces.pop();
         }
     }
-    out
+    bytes - remaining
 }
 
 impl BuildSpill {
@@ -978,13 +983,13 @@ impl BuildSpill {
         rows == 0 || borrow + counted + rows * 48 + 256 <= held(&self.workspace)
     }
 
-    /// Covers `bytes` of the rows' charge with workspace: the charge grows
-    /// before the workspace shrinks, so the pool never sees them free. The
-    /// workspace is owed the bytes again: charge that a later write releases
-    /// refills it before it goes back to the pool.
+    /// Moves the rows' charge from the workspace without changing its pool
+    /// charge. A later write refills the workspace from the released charge.
     fn borrow(&mut self, bytes: usize, reservation: &MemoryReservation) {
-        reservation.grow(bytes);
-        let moved = held(&take_held(&mut self.workspace, bytes));
+        let moved = transfer_held(&mut self.workspace, bytes, reservation);
+        if moved < bytes {
+            reservation.grow(bytes - moved);
+        }
         self.workspace_debt += moved;
     }
 
@@ -1184,17 +1189,14 @@ impl BuildSpill {
             .register(&pool);
         let table = build(&mut batches, &mut attempt)?;
         let extra = pool.reserved().saturating_sub(self.charged);
-        let floor = take_held(&mut self.workspace, extra);
-        // The estimate of `fits_floor` can be short (an empty table, a key
-        // copy of float keys, a membership form): the rest grows without
-        // refusal, as the smallest unit of design decision 8.
-        let short = extra.saturating_sub(held(&floor));
-        self.charged = 0;
-        // One charge for the table, released with it: the rows' charge
-        // grows by the floor before the floor's pieces go.
         let charge = reservation.take();
-        charge.grow(held(&floor) + short);
-        drop(floor);
+        let covered = transfer_held(&mut self.workspace, extra, &charge);
+        // An empty table, copied float keys or a membership form can exceed
+        // the estimate in fits_floor. Only this shortfall grows the pool.
+        if covered < extra {
+            charge.grow(extra - covered);
+        }
+        self.charged = 0;
         let spilled = self.into_spilled(true);
         Ok((table, spilled, Some(charge)))
     }
@@ -1231,6 +1233,10 @@ impl BuildSpill {
             Mode::PerStream
         };
         let own_type = match join_type {
+            // With only one probe partition, the final run can emit every
+            // row in one pass. A restricted range of a multi-partition
+            // CollectLeft join still uses the stock completion count.
+            JoinType::Left | JoinType::Full if slots == 1 => None,
             JoinType::Left => Some(JoinType::Inner),
             JoinType::Full => Some(JoinType::Right),
             JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => None,
@@ -1362,15 +1368,15 @@ enum Mode {
     /// that run it at the same time. No stream waits for another.
     PerStream,
     /// Left, LeftSemi, LeftAnti, LeftMark, Full: the join also emits build
-    /// rows. A Left or Full stream makes own runs with the probe-preserving
-    /// form of the join (Inner, Right), so a stream gives the rows its probe
+    /// rows. With multiple probe partitions, a Left or Full stream makes
+    /// own runs as Inner or Right, so each stream gives the rows its probe
     /// rows produce whatever the other streams do, as in the stock join. The
     /// stream that the in-memory table's completion count chooses to emit the
     /// build rows (the stock join's last probe partition) also emits those of
     /// every written partition, with a join over every stream's probe file of
-    /// it (LeftAnti for Left and Full, the join type itself otherwise). With
-    /// no such stream (a stream stopped early or never ran) no build row is
-    /// emitted, as in the stock join.
+    /// it (LeftAnti for multi-member Left and Full, the original join type
+    /// otherwise). With no such stream (a stream stopped early or never ran)
+    /// no build row is emitted, as in the stock join.
     Last,
 }
 
@@ -1850,7 +1856,9 @@ impl SpilledBuild {
         };
         let probe = FileSource::Fixed(vec![self.probes.take_all(part)]);
         let (join_type, projection, remap) = match self.template.join_type {
-            JoinType::Left | JoinType::Full => (JoinType::LeftAnti, None, true),
+            JoinType::Left | JoinType::Full if self.own_type.is_some() => {
+                (JoinType::LeftAnti, None, true)
+            }
             other => (other, self.template.projection.clone(), false),
         };
         let join = self.join_over(build_file, probe, join_type, projection)?;
@@ -2537,6 +2545,8 @@ impl Written {
             // The run to start moves to the front: `runs[0]` is current.
             let next = build.next_run(&self.runs);
             self.runs.swap(0, next);
+            #[cfg(test)]
+            build.metrics.partition_passes.add(1);
             let started = match self.runs[0] {
                 Run::Own(part) => build.shared_join(part).and_then(|using| {
                     let files = self.files[part].take().into_iter().collect();

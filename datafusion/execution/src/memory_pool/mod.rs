@@ -1,3 +1,5 @@
+// Modified by the Longbow authors (family JS); see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -492,6 +494,27 @@ impl MemoryReservation {
             size: atomic::AtomicUsize::new(capacity),
             registration: Arc::clone(&self.registration),
         }
+    }
+
+    /// Moves reserved bytes from another reservation of the same consumer
+    /// without notifying the pool. The pool continues to hold the charge
+    /// throughout the transfer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reservations do not share a registration, or if the
+    /// source holds fewer than `capacity` bytes.
+    pub fn transfer_from(&self, source: &Self, capacity: usize) {
+        assert!(Arc::ptr_eq(&self.registration, &source.registration));
+        source
+            .size
+            .try_update(
+                atomic::Ordering::Relaxed,
+                atomic::Ordering::Relaxed,
+                |prev| prev.checked_sub(capacity),
+            )
+            .expect("source reservation is too small for the transfer");
+        self.size.fetch_add(capacity, atomic::Ordering::Relaxed);
     }
 
     /// Returns a new empty [`MemoryReservation`] with the same [`MemoryConsumer`]

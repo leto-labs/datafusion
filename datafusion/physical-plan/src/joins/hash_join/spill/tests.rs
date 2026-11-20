@@ -873,6 +873,74 @@ fn partitions_of(shape: Shape) -> usize {
 // strict where the fixes allow.
 // ---------------------------------------------------------------------------
 
+/// With a closed CollectLeft build, opening a partition consumes its spill
+/// slot even if the stream is dropped without being polled.
+#[tokio::test]
+async fn spilled_collect_left_partition_cannot_be_reopened() -> Result<()> {
+    let build = table("b", 1500, 211, 0, 100);
+    let probe = table("p", 1600, 307, 4, 100);
+    for join_type in [JoinType::Inner, JoinType::Left] {
+        let case = Case {
+            join_type,
+            null_equality: NullEquality::NullEqualsNothing,
+            filter: false,
+            shape: Shape::CollectLeft(4),
+        };
+        let stock = join_plan(&case, &build, &probe)?;
+        let context = task_context(SessionConfig::new().with_batch_size(256), None, true);
+        drop(stock.execute(0, Arc::clone(&context))?);
+        assert_eq!(
+            batches_to_sort_string(&run(&stock, context).await?),
+            expected(&case, &build, &probe).await,
+        );
+
+        let spilled = join_plan(&case, &build, &probe)?;
+        let context = task_context(spill_config(1, 4096, 3), None, true);
+        drop(spilled.execute(0, Arc::clone(&context))?);
+        let error = collect(spilled.execute(0, context)?).await.unwrap_err();
+        assert!(
+            error.to_string().contains("probes the build twice"),
+            "{error}"
+        );
+        assert!(spill_metrics(&spilled).0 > 0);
+    }
+    Ok(())
+}
+
+/// A one-member build uses the original join type on the written partition.
+/// In addition to checking rows, count each run, including the unmatched
+/// rows read directly from the unmatchable partition.
+#[tokio::test]
+async fn single_member_left_and_full_join_written_partitions_once() -> Result<()> {
+    let build = table("b", 1500, 211, 0, 100);
+    let probe = table("p", 1600, 211, 0, 100);
+    for shape in [Shape::CollectLeft(1), Shape::Partitioned(4)] {
+        for join_type in [JoinType::Left, JoinType::Full] {
+            let case = Case {
+                join_type,
+                null_equality: NullEquality::NullEqualsNothing,
+                filter: true,
+                shape,
+            };
+            let plan = join_plan(&case, &build, &probe)?;
+            let context = task_context(spill_config(1, 4096, 3), None, true);
+            let actual = run(&plan, context).await?;
+            assert_eq!(
+                batches_to_sort_string(&actual),
+                expected(&case, &build, &probe).await
+            );
+            let written = spill_metrics(&plan).0;
+            assert!(written > 0);
+            assert_eq!(
+                metric(&plan.metrics().unwrap(), "spill_partition_passes"),
+                Some(written),
+                "{shape:?} {join_type}"
+            );
+        }
+    }
+    Ok(())
+}
+
 mod review {
     use std::fmt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -978,6 +1046,85 @@ mod review {
         }
         assert!(failures.is_empty(), "{failures:#?}");
         Ok(())
+    }
+
+    /// Hold every stream's workspace before moving any charge, with one
+    /// additional workspace already in use. Both transfers must leave the
+    /// pool within its original bound throughout, even when called together.
+    #[test]
+    fn concurrent_floor_transfers_do_not_grow_the_pool() {
+        use super::super::{JoinSpill, OnceAsync, RandomState};
+        use crate::metrics::ExecutionPlanMetricsSet;
+
+        const STREAMS: usize = 4;
+        const WORKSPACE: usize = 4096;
+        const LIMIT: usize = 64 * 1024;
+
+        let pool = PeakPool::new(LIMIT);
+        let dyn_pool = Arc::clone(&pool) as Arc<dyn MemoryPool>;
+        let other = MemoryConsumer::new("Other").register(&dyn_pool);
+        other.try_grow(LIMIT).unwrap();
+        other.grow(WORKSPACE);
+        let ready = std::sync::Barrier::new(STREAMS);
+        std::thread::scope(|scope| {
+            for partition in 0..STREAMS {
+                let ready = &ready;
+                let dyn_pool = &dyn_pool;
+                scope.spawn(move || {
+                    let case = Case {
+                        join_type: JoinType::Inner,
+                        null_equality: NullEquality::NullEqualsNothing,
+                        filter: false,
+                        shape: Shape::Partitioned(STREAMS),
+                    };
+                    let plan = join_plan(
+                        &case,
+                        &table("b", 8, 11, 0, 2),
+                        &table("p", 8, 11, 0, 2),
+                    )
+                    .unwrap();
+                    let join = plan.downcast_ref::<HashJoinExec>().unwrap();
+                    let context =
+                        pool_context(spill_config(0, WORKSPACE, 3), Arc::clone(dyn_pool));
+                    let spill = JoinSpill::decide(
+                        join,
+                        false,
+                        &ExecutionPlanMetricsSet::new(),
+                        join.spill_shared(),
+                        partition,
+                        &context,
+                        &RandomState::default(),
+                        &Arc::new(OnceAsync::default()),
+                    )
+                    .unwrap();
+                    let mut build = spill.build().unwrap();
+                    let mut rows = MemoryConsumer::new("HashJoinInput")
+                        .with_can_spill(true)
+                        .register(dyn_pool);
+                    build.workspace_debt = WORKSPACE;
+                    build.settle_workspace(&rows);
+                    ready.wait();
+
+                    build.borrow(WORKSPACE / 2, &rows);
+                    build.charged = WORKSPACE / 2;
+                    ready.wait();
+
+                    let (_, _, table) = build
+                        .build_on_floor(&mut rows, &mut |_, attempt| {
+                            attempt.try_grow(WORKSPACE)
+                        })
+                        .unwrap();
+                    ready.wait();
+                    assert_eq!(rows.size(), 0);
+                    assert_eq!(table.unwrap().size(), WORKSPACE);
+                });
+            }
+        });
+        assert_eq!(
+            pool.peak.load(Ordering::SeqCst),
+            LIMIT + (STREAMS + 1) * WORKSPACE
+        );
+        assert_eq!(pool.reserved(), LIMIT + WORKSPACE);
     }
 
     /// A greedy pool that records its peak, and that can hand whatever a
@@ -1143,9 +1290,8 @@ mod review {
                 // Without a competitor the pool stays within 10% of its
                 // limit. With one that takes every released byte, a build
                 // may still grow the part of its workspace that released
-                // charge did not cover (design decision 8), one per stream,
-                // plus the instant a borrow grows before the workspace
-                // shrinks: never more.
+                // charge did not cover (design decision 8), one per stream.
+                // A floor transfer keeps the existing charge in the pool.
                 let streams = match shape {
                     Shape::CollectLeft(streams) | Shape::Partitioned(streams) => streams,
                 };

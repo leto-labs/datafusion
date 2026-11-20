@@ -911,10 +911,11 @@ Change (`datafusion/physical-plan/src/joins/hash_join/`):
   spill mode the same way, with the rows still charged.
 - The floor: when the rows in memory and their table fit in what the join
   holds (its charge and its workspace), a refused growth is covered by the
-  workspace (grown before the workspace shrinks; the workspace is refilled
-  from charge that later writes release) and a refused table is built on a
-  private pool, its size moved from the workspace into the table's charge,
-  which the table releases when it goes. A written partition's join in a
+  workspace, which later writes refill from their released charge. A
+  refused table is built on a private pool, and its size is moved from
+  the workspace into the table's charge, which the table releases when it
+  goes. Both transfers move bytes within the same memory registration.
+  Only a shortfall beyond the workspace increases the pool's reservation. A written partition's join in a
   full pool therefore builds a small table instead of spilling to the depth
   limit; an empty table always fits.
 - Hook 2, `fetch_probe_batch` (`stream.rs`): rows of written partitions go
@@ -938,13 +939,18 @@ Change (`datafusion/physical-plan/src/joins/hash_join/`):
   stream that the table's completion count chooses (the stock join's last
   probe partition) emits the in-memory build rows and then those of each
   written partition, with a join over every stream's probe file of it
-  (LeftAnti, its rows emitted as unmatched build rows, for Left and Full;
-  the join type itself otherwise). Without such a stream (a stream stopped
+  (LeftAnti, its rows emitted as unmatched build rows, for Left and Full
+  with multiple probe partitions; the join type itself otherwise).
+  Each `Partitioned` build and a `CollectLeft` join with one probe
+  partition use just the original Left or Full join for each written
+  partition, including written partitions without probe rows. Without such a stream (a stream stopped
   early, never ran, or a split attempt bound fewer partitions than the probe
   has) no build row is emitted, as in the stock join.
 - Members: a `CollectLeft` build's members are a split attempt's bound
   partitions (`set_dynamic_filter_partitions`) or every probe partition;
-  each executes once. A stream of a partition outside the range, a
+  each opens once per spilled plan instance, even when its stream is
+  dropped before its first poll. Retry with a fresh instance.
+  A stream of a partition outside the range, a
   partition that probes twice, or more streams than members are internal
   errors, as is a written partition's build file that is gone while a
   member still joins it. Once every member ended its in-memory pass the

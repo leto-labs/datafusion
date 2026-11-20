@@ -829,7 +829,13 @@ impl From<&HashJoinExec> for HashJoinExecBuilder {
 ///
 /// Note this structure includes a [`OnceAsync`] that is used to coordinate the
 /// loading of the left side with the processing in each output stream.
-/// Therefore it can not be [`Clone`]
+/// Therefore it can not be [`Clone`].
+///
+/// Longbow family JS: when a closed `CollectLeft` build spills, each
+/// assigned probe partition may be opened once on this plan instance.
+/// Dropping the stream before polling it also consumes that slot. Use a
+/// fresh plan instance to retry. See [`Self::set_open_probe_streams`] for
+/// callers with an independent probe input for each stream.
 pub struct HashJoinExec {
     /// left (build) side which gets hashed
     pub left: Arc<dyn ExecutionPlan>,
