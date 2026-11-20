@@ -531,7 +531,7 @@ fn position(key: u64, shift: u32) -> usize {
 }
 
 #[inline(always)]
-fn prefetch_slot<S>(slots: &[S], at: usize) {
+pub(in crate::aggregates::group_values) fn prefetch_slot<S>(slots: &[S], at: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};

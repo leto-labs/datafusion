@@ -3780,14 +3780,16 @@ mod tests {
     // space; small group-value tests cover forced hash-collision correctness.
     #[cfg(not(feature = "force_hash_collisions"))]
     #[rstest::rstest]
-    #[case::final_hash(AggregateMode::Final, false)]
-    #[case::single_hash(AggregateMode::Single, false)]
-    #[case::ordered_final(AggregateMode::Final, true)]
-    #[case::ordered_single(AggregateMode::Single, true)]
+    #[case::final_hash(AggregateMode::Final, false, false)]
+    #[case::single_hash(AggregateMode::Single, false, false)]
+    #[case::ordered_final(AggregateMode::Final, true, false)]
+    #[case::ordered_single(AggregateMode::Single, true, false)]
+    #[case::wide_final_hash(AggregateMode::Final, false, true)]
     #[tokio::test]
     async fn migrated_aggregate_spill_merge_leaves_memory_for_replay(
         #[case] mode: AggregateMode,
         #[case] ordered: bool,
+        #[case] wide_keys: bool,
         #[values(false, true)] with_peer: bool,
     ) -> Result<()> {
         use arrow::array::{ListArray, StringArray};
@@ -3822,6 +3824,17 @@ mod tests {
                 AggregateMode::Partial,
             )?)
         };
+        // Alternate the two ends of the signed domain to force the
+        // multi-column interner even in the first spill input batch.
+        let encode_key = |key: i64| {
+            if !wide_keys {
+                key
+            } else if key % 2 == 0 {
+                i64::MIN + key
+            } else {
+                i64::MAX - key
+            }
+        };
         let mut batches = vec![];
         for prefix in 0..2 {
             // Repeat every key across spill runs. Only the prefix is ordered;
@@ -3855,7 +3868,9 @@ mod tests {
                         vec![
                             Arc::new(Int64Array::from(vec![prefix; BATCH_SIZE])),
                             Arc::new(Int64Array::from_iter_values(
-                                (start..start + BATCH_SIZE).rev().map(|key| key as i64),
+                                (start..start + BATCH_SIZE)
+                                    .rev()
+                                    .map(|key| encode_key(key as i64)),
                             )),
                             values,
                         ],
@@ -3938,7 +3953,15 @@ mod tests {
                 let prefix = columns[0].value(row);
                 let key = columns[1].value(row);
                 assert!((0..2).contains(&prefix));
-                assert!((0..KEYS_PER_PREFIX as i64).contains(&key));
+                let ordinal = if !wide_keys {
+                    key
+                } else if key < 0 {
+                    key - i64::MIN
+                } else {
+                    i64::MAX - key
+                };
+                assert!((0..KEYS_PER_PREFIX as i64).contains(&ordinal));
+                assert_eq!(key, encode_key(ordinal));
                 let values = values.value(row);
                 assert_eq!(values.len(), 2);
                 assert_eq!(values.null_count(), 0);

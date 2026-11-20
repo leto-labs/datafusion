@@ -12,6 +12,7 @@ pub mod bytes_view;
 mod clustered;
 mod dictionary;
 mod fixed_size_binary;
+mod hash_index;
 mod list;
 pub(super) use clustered::GroupValuesClustered;
 pub mod primitive;
@@ -42,7 +43,8 @@ use datafusion_execution::memory_pool::proxy::{HashTableAllocExt, VecAllocExt};
 use datafusion_expr::{EmitTo, GroupSelection};
 use datafusion_physical_expr::binary_map::OutputType;
 
-use hashbrown::hash_table::HashTable;
+use hash_index::{HashIndex, PREFETCH_DISTANCE, VACANT_VIEW};
+use hashbrown::HashTable;
 
 const NON_INLINED_FLAG: u64 = 0x8000000000000000;
 const VALUE_MASK: u64 = 0x7FFFFFFFFFFFFFFF;
@@ -162,6 +164,71 @@ impl GroupIndexView {
     }
 }
 
+// A clustered aggregate may retain an open run while a peer spills and
+// replays. Keep its existing table layout and growth policy.
+enum GroupIndex {
+    Streaming(HashTable<(u64, GroupIndexView)>, usize),
+    Flat(HashIndex),
+}
+
+impl GroupIndex {
+    fn flat(&self) -> &HashIndex {
+        match self {
+            Self::Flat(index) => index,
+            Self::Streaming(..) => unreachable!("unordered group index"),
+        }
+    }
+
+    fn flat_mut(&mut self) -> &mut HashIndex {
+        match self {
+            Self::Flat(index) => index,
+            Self::Streaming(..) => unreachable!("unordered group index"),
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            Self::Streaming(_, bytes) => *bytes,
+            Self::Flat(index) => index.size(),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Streaming(table, _) => table.clear(),
+            Self::Flat(index) => index.clear(),
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&mut GroupIndexView) -> bool) {
+        match self {
+            Self::Streaming(table, _) => table.retain(|(_, view)| keep(view)),
+            Self::Flat(index) => index.retain(keep),
+        }
+    }
+
+    fn shrink_to_fit(&mut self) {
+        match self {
+            Self::Streaming(table, bytes) => {
+                table.shrink_to_fit(|(hash, _)| *hash);
+                *bytes = table.capacity() * size_of::<(u64, GroupIndexView)>();
+            }
+            Self::Flat(index) => index.shrink_to_fit(),
+        }
+    }
+
+    fn clear_shrink(&mut self, num_rows: usize) {
+        match self {
+            Self::Streaming(table, bytes) => {
+                table.clear();
+                table.shrink_to(num_rows, |_| 0);
+                *bytes = table.capacity() * size_of::<(u64, GroupIndexView)>();
+            }
+            Self::Flat(index) => index.clear_shrink(num_rows),
+        }
+    }
+}
+
 /// A [`GroupValues`] that stores multiple columns of group values,
 /// and supports vectorized operators for them
 pub struct GroupValuesColumn<const STREAMING: bool> {
@@ -171,8 +238,6 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     /// Logically maps group values to a group_index in
     /// [`Self::group_values`] and in each accumulator
     ///
-    /// It is a `hashtable` based on `hashbrown`.
-    ///
     /// Key and value in the `hashtable`:
     ///   - The `key` is `hash value(u64)` of the `group value`
     ///   - The `value` is the `group values` with the same `hash value`
@@ -181,10 +246,10 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     /// instead we store the `group indices` pointing to values in `GroupValues`.
     /// And we use [`GroupIndexView`] to represent such `group indices` in table.
     ///
-    map: HashTable<(u64, GroupIndexView)>,
+    map: GroupIndex,
 
-    /// The size of `map` in bytes
-    map_size: usize,
+    /// Home slots for the current batch when the index is large enough to prefetch.
+    probe_positions: Vec<u32>,
 
     /// The lists for group indices with the same hash value
     ///
@@ -198,9 +263,9 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     /// When emitting first n, we need to decrease/erase group indices in
     /// `map` and `group_index_lists`.
     ///
-    /// This buffer is used to temporarily store the remaining group indices in
-    /// a specific list in `group_index_lists`.
-    emit_group_index_list_buffer: Vec<usize>,
+    /// Indexed by the old collision-list offset. Each entry describes the
+    /// corresponding view after the lists have been compacted.
+    emit_collision_remap: Vec<GroupIndexView>,
 
     /// Buffers for `vectorized_append` and `vectorized_equal_to`
     vectorized_operation_buffers: VectorizedOperationBuffers,
@@ -288,15 +353,18 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
 
     /// Create a new instance of GroupValuesColumn if supported for the specified schema
     pub fn try_new(schema: SchemaRef) -> Result<Self> {
-        let map = HashTable::with_capacity(0);
         let group_values = Self::build_group_columns(&schema)?;
         Ok(Self {
             schema,
-            map,
+            map: if STREAMING {
+                GroupIndex::Streaming(HashTable::new(), 0)
+            } else {
+                GroupIndex::Flat(HashIndex::default())
+            },
+            probe_positions: Vec::new(),
             group_index_lists: Vec::new(),
-            emit_group_index_list_buffer: Vec::new(),
+            emit_collision_remap: Vec::new(),
             vectorized_operation_buffers: VectorizedOperationBuffers::default(),
-            map_size: 0,
             group_values,
             hashes_buffer: Default::default(),
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
@@ -377,43 +445,44 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
         batch_hashes.resize(n_rows, 0);
         create_hashes(cols, &self.random_state, batch_hashes)?;
 
+        let GroupIndex::Streaming(map, map_size) = &mut self.map else {
+            unreachable!("streaming group index")
+        };
         for (row, &target_hash) in batch_hashes.iter().enumerate() {
-            let entry = self
-                .map
-                .find_mut(target_hash, |(exist_hash, group_idx_view)| {
-                    // It is ensured to be inlined in `scalarized_intern`
-                    debug_assert!(!group_idx_view.is_non_inlined());
+            let entry = map.find_mut(target_hash, |(exist_hash, group_idx_view)| {
+                // It is ensured to be inlined in `scalarized_intern`
+                debug_assert!(!group_idx_view.is_non_inlined());
 
-                    // Somewhat surprisingly, this closure can be called even if the
-                    // hash doesn't match, so check the hash first with an integer
-                    // comparison first avoid the more expensive comparison with
-                    // group value. https://github.com/apache/datafusion/pull/11718
-                    if target_hash != *exist_hash {
+                // Somewhat surprisingly, this closure can be called even if the
+                // hash doesn't match, so check the hash first with an integer
+                // comparison first avoid the more expensive comparison with
+                // group value. https://github.com/apache/datafusion/pull/11718
+                if target_hash != *exist_hash {
+                    return false;
+                }
+
+                fn check_row_equal(
+                    array_row: &dyn GroupColumn,
+                    lhs_row: usize,
+                    array: &ArrayRef,
+                    rhs_row: usize,
+                ) -> bool {
+                    array_row.equal_to(lhs_row, array, rhs_row)
+                }
+
+                for (i, group_val) in self.group_values.iter().enumerate() {
+                    if !check_row_equal(
+                        group_val.as_ref(),
+                        group_idx_view.value() as usize,
+                        &cols[i],
+                        row,
+                    ) {
                         return false;
                     }
+                }
 
-                    fn check_row_equal(
-                        array_row: &dyn GroupColumn,
-                        lhs_row: usize,
-                        array: &ArrayRef,
-                        rhs_row: usize,
-                    ) -> bool {
-                        array_row.equal_to(lhs_row, array, rhs_row)
-                    }
-
-                    for (i, group_val) in self.group_values.iter().enumerate() {
-                        if !check_row_equal(
-                            group_val.as_ref(),
-                            group_idx_view.value() as usize,
-                            &cols[i],
-                            row,
-                        ) {
-                            return false;
-                        }
-                    }
-
-                    true
-                });
+                true
+            });
 
             let group_idx = match entry {
                 // Existing group_index for this group value
@@ -437,10 +506,10 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                     }
 
                     // for hasher function, use precomputed hash value
-                    self.map.insert_accounted(
+                    map.insert_accounted(
                         (target_hash, GroupIndexView::new_inlined(group_idx as u64)),
                         |(hash, _group_index)| *hash,
-                        &mut self.map_size,
+                        map_size,
                     );
                     group_idx
                 }
@@ -542,36 +611,38 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             .equal_to_group_indices
             .clear();
 
+        let map = self.map.flat_mut();
+        map.reserve(batch_hashes.len());
+        map.prepare_positions(batch_hashes, &mut self.probe_positions);
+        let prefetch = !self.probe_positions.is_empty();
         for (row, &target_hash) in batch_hashes.iter().enumerate() {
-            let entry = self
-                .map
-                .find(target_hash, |(exist_hash, _)| target_hash == *exist_hash);
+            let home = if !prefetch {
+                map.position(target_hash)
+            } else {
+                if let Some(&ahead) = self.probe_positions.get(row + PREFETCH_DISTANCE) {
+                    map.prefetch(ahead);
+                }
+                self.probe_positions[row] as usize
+            };
 
-            let Some((_, group_index_view)) = entry else {
-                // 1. Bucket not found case
-                // Build `new inlined group index view`
-                let current_group_idx = self.group_values[0].len()
-                    + self.vectorized_operation_buffers.append_row_indices.len();
-                let group_index_view =
-                    GroupIndexView::new_inlined(current_group_idx as u64);
-
-                // Insert the `group index view` and its hash into `map`
-                // for hasher function, use precomputed hash value
-                self.map.insert_accounted(
-                    (target_hash, group_index_view),
-                    |(hash, _)| *hash,
-                    &mut self.map_size,
-                );
-
-                // Add row index to `vectorized_append_row_indices`
-                self.vectorized_operation_buffers
-                    .append_row_indices
-                    .push(row);
-
-                // Set group index to row in `groups`
-                groups[row] = current_group_idx;
-
-                continue;
+            let group_index_view = match map.probe(target_hash, home) {
+                Ok(at) => map.view(at),
+                Err(at) => {
+                    // An index entry becomes visible for later rows in this
+                    // batch before the column builders append its values.
+                    let group_index = self.group_values[0].len()
+                        + self.vectorized_operation_buffers.append_row_indices.len();
+                    map.insert_at(
+                        at,
+                        target_hash,
+                        GroupIndexView::new_inlined(group_index as u64),
+                    );
+                    self.vectorized_operation_buffers
+                        .append_row_indices
+                        .push(row);
+                    groups[row] = group_index;
+                    continue;
+                }
             };
 
             // 2. bucket found
@@ -769,27 +840,12 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             return Ok(());
         }
 
-        let mut map = mem::take(&mut self.map);
-
         for &row in &self.vectorized_operation_buffers.remaining_row_indices {
-            let target_hash = batch_hashes[row];
-            let entry = map.find_mut(target_hash, |(exist_hash, _)| {
-                // Somewhat surprisingly, this closure can be called even if the
-                // hash doesn't match, so check the hash first with an integer
-                // comparison first avoid the more expensive comparison with
-                // group value. https://github.com/apache/datafusion/pull/11718
-                target_hash == *exist_hash
-            });
-
-            // Only `rows` having the same hash value with `exist rows` but different value
-            // will be process in `scalarized_intern`.
-            // So related `buckets` in `map` is ensured to be `Some`.
-            let Some((_, group_index_view)) = entry else {
-                unreachable!()
-            };
-
-            // Perform scalarized equal to
-            if self.scalarized_equal_to_remaining(group_index_view, cols, row, groups) {
+            // The vectorized pass found the hash but no equal group.
+            let map = self.map.flat();
+            let slot = map.find(batch_hashes[row]).unwrap();
+            let group_index_view = map.view(slot);
+            if self.scalarized_equal_to_remaining(&group_index_view, cols, row, groups) {
                 // Found the row actually exists in group values,
                 // don't need to create new group for it.
                 continue;
@@ -829,13 +885,12 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                 // Update the `group_index_view` to non-inlined
                 let new_group_index_view =
                     GroupIndexView::new_non_inlined(list_offset as u64);
-                *group_index_view = new_group_index_view;
+                self.map.flat_mut().set_view(slot, new_group_index_view);
             }
 
             groups[row] = group_idx;
         }
 
-        self.map = map;
         Ok(())
     }
 
@@ -893,23 +948,15 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
     /// Return group indices of the hash, also if its `group_index_view` is non-inlined
     #[cfg(test)]
     fn get_indices_by_hash(&self, hash: u64) -> Option<(Vec<usize>, GroupIndexView)> {
-        let entry = self.map.find(hash, |(exist_hash, _)| hash == *exist_hash);
-
-        match entry {
-            Some((_, group_index_view)) => {
-                if group_index_view.is_non_inlined() {
-                    let list_offset = group_index_view.value() as usize;
-                    Some((
-                        self.group_index_lists[list_offset].clone(),
-                        *group_index_view,
-                    ))
-                } else {
-                    let group_index = group_index_view.value() as usize;
-                    Some((vec![group_index], *group_index_view))
-                }
-            }
-            None => None,
-        }
+        let map = self.map.flat();
+        let slot = map.find(hash)?;
+        let view = map.view(slot);
+        let indices = if view.is_non_inlined() {
+            self.group_index_lists[view.value() as usize].clone()
+        } else {
+            vec![view.value() as usize]
+        };
+        Some((indices, view))
     }
 }
 
@@ -1087,9 +1134,10 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                 .sum::<usize>();
         size_of::<Self>()
             + group_values_size
-            + self.map_size
+            + self.map.size()
+            + self.probe_positions.allocated_size()
             + group_index_lists_size
-            + self.emit_group_index_list_buffer.allocated_size()
+            + self.emit_collision_remap.allocated_size()
             + self.vectorized_operation_buffers.size()
             + self.hashes_buffer.allocated_size()
     }
@@ -1118,6 +1166,7 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                 let fresh = Self::build_group_columns(&self.schema)?;
                 let group_values = mem::replace(&mut self.group_values, fresh);
                 self.map.clear();
+                self.probe_positions.clear();
                 self.group_index_lists.clear();
                 self.vectorized_operation_buffers.clear();
 
@@ -1132,69 +1181,50 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                     .iter_mut()
                     .map(|v| v.take_n(n))
                     .collect::<Vec<_>>();
-                let mut next_new_list_offset = 0;
-
-                self.map.retain(|(_exist_hash, group_idx_view)| {
-                    // In non-streaming case, we need to check if the `group index view`
-                    // is `inlined` or `non-inlined`
-                    if !STREAMING && group_idx_view.is_non_inlined() {
-                        // Non-inlined case
-                        // We take `group_index_list` from `old_group_index_lists`
-
-                        // list_offset is incrementally
-                        self.emit_group_index_list_buffer.clear();
-                        let list_offset = group_idx_view.value() as usize;
-                        for group_index in self.group_index_lists[list_offset].iter() {
-                            if let Some(remaining) = group_index.checked_sub(n) {
-                                self.emit_group_index_list_buffer.push(remaining);
-                            }
-                        }
-
-                        // The possible results:
-                        //   - `new_group_index_list` is empty, we should erase this bucket
-                        //   - only one value in `new_group_index_list`, switch the `view` to `inlined`
-                        //   - still multiple values in `new_group_index_list`, build and set the new `unlined view`
-                        if self.emit_group_index_list_buffer.is_empty() {
-                            false
-                        } else if self.emit_group_index_list_buffer.len() == 1 {
-                            let group_index =
-                                self.emit_group_index_list_buffer.first().unwrap();
-                            *group_idx_view =
-                                GroupIndexView::new_inlined(*group_index as u64);
-                            true
-                        } else {
-                            let group_index_list =
-                                &mut self.group_index_lists[next_new_list_offset];
-                            group_index_list.clear();
-                            group_index_list
-                                .extend(self.emit_group_index_list_buffer.iter());
-                            *group_idx_view = GroupIndexView::new_non_inlined(
-                                next_new_list_offset as u64,
-                            );
-                            next_new_list_offset += 1;
-                            true
-                        }
-                    } else {
-                        // In `streaming case`, the `group index view` is ensured to be `inlined`
-                        debug_assert!(!group_idx_view.is_non_inlined());
-
-                        // Inlined case, we just decrement group index by n)
-                        let group_index = group_idx_view.value() as usize;
-                        match group_index.checked_sub(n) {
-                            // Group index was >= n, shift value down
-                            Some(sub) => {
-                                *group_idx_view = GroupIndexView::new_inlined(sub as u64);
+                // Visit lists in their original order before rebuilding the
+                // index. A later slot may refer to an earlier list.
+                let remap = &mut self.emit_collision_remap;
+                if !STREAMING {
+                    remap.clear();
+                    let lists = &mut self.group_index_lists;
+                    let mut retained = 0;
+                    for offset in 0..lists.len() {
+                        let list = &mut lists[offset];
+                        list.retain_mut(|index| {
+                            if let Some(remaining) = index.checked_sub(n) {
+                                *index = remaining;
                                 true
+                            } else {
+                                false
                             }
-                            // Group index was < n, so remove from table
-                            None => false,
-                        }
+                        });
+                        let view = match list.as_slice() {
+                            [] => VACANT_VIEW,
+                            [index] => GroupIndexView::new_inlined(*index as u64),
+                            _ => {
+                                lists.swap(retained, offset);
+                                let view =
+                                    GroupIndexView::new_non_inlined(retained as u64);
+                                retained += 1;
+                                view
+                            }
+                        };
+                        remap.push(view);
+                    }
+                    lists.truncate(retained);
+                }
+
+                self.map.retain(|view| {
+                    if !STREAMING && view.is_non_inlined() {
+                        *view = remap[view.value() as usize];
+                        *view != VACANT_VIEW
+                    } else if let Some(index) = view.value().checked_sub(n as u64) {
+                        *view = GroupIndexView::new_inlined(index);
+                        true
+                    } else {
+                        false
                     }
                 });
-
-                if !STREAMING {
-                    self.group_index_lists.truncate(next_new_list_offset);
-                }
 
                 output
             }
@@ -1228,14 +1258,15 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
     }
 
     fn shrink_to_fit(&mut self) {
-        self.map.shrink_to_fit(|(hash, _)| *hash);
-        self.map_size = self.map.capacity() * size_of::<(u64, usize)>();
+        self.map.shrink_to_fit();
+        self.probe_positions.clear();
+        self.probe_positions.shrink_to_fit();
         // Scratch for one `intern` call.
         self.hashes_buffer.clear();
         self.hashes_buffer.shrink_to_fit();
         if !STREAMING {
-            self.emit_group_index_list_buffer.clear();
-            self.emit_group_index_list_buffer.shrink_to_fit();
+            self.emit_collision_remap.clear();
+            self.emit_collision_remap.shrink_to_fit();
             self.vectorized_operation_buffers.clear_shrink(0);
         }
     }
@@ -1247,9 +1278,9 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         // `clear_shrink` is infallible by trait signature.
         self.group_values = Self::build_group_columns(&self.schema)
             .expect("schema previously validated in try_new");
-        self.map.clear();
-        self.map.shrink_to(num_rows, |_| 0); // hasher does not matter since the map is cleared
-        self.map_size = self.map.capacity() * size_of::<(u64, usize)>();
+        self.map.clear_shrink(num_rows);
+        self.probe_positions.clear();
+        self.probe_positions.shrink_to(num_rows);
         self.hashes_buffer.clear();
         self.hashes_buffer.shrink_to(num_rows);
 
@@ -1257,8 +1288,8 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         if !STREAMING {
             self.group_index_lists.clear();
             self.group_index_lists.shrink_to(num_rows);
-            self.emit_group_index_list_buffer.clear();
-            self.emit_group_index_list_buffer.shrink_to(num_rows);
+            self.emit_collision_remap.clear();
+            self.emit_collision_remap.shrink_to(num_rows);
             self.vectorized_operation_buffers.clear_shrink(num_rows);
         }
     }
@@ -1299,7 +1330,7 @@ mod tests {
         compute::{concat_batches, take},
         util::pretty::pretty_format_batches,
     };
-    use datafusion_common::{Result, utils::proxy::HashTableAllocExt};
+    use datafusion_common::Result;
     use datafusion_expr::{EmitTo, GroupSelection};
 
     use crate::aggregates::group_values::{
@@ -1350,7 +1381,7 @@ mod tests {
         insert_non_inline_group_index_view(&mut group_values, u64::MAX, vec![1, 2]);
         group_values.emit(EmitTo::First(1))?;
         assert!(!group_values.group_index_lists.is_empty());
-        assert!(group_values.emit_group_index_list_buffer.capacity() > 0);
+        assert!(group_values.emit_collision_remap.capacity() > 0);
         assert!(group_values.size() > baseline);
 
         let input: ArrayRef = Arc::new(Int32Array::from_iter_values(0..32));
@@ -1374,7 +1405,9 @@ mod tests {
         buffers.equal_to_group_indices.push(0);
         buffers.equal_to_results.append(true);
         buffers.remaining_row_indices.push(0);
-        group_values.emit_group_index_list_buffer.push(0);
+        group_values
+            .emit_collision_remap
+            .push(GroupIndexView::new_inlined(0));
 
         assert!(group_values.size() > baseline);
         group_values.clear_shrink(0);
@@ -2347,7 +2380,7 @@ mod tests {
             group_values.get_indices_by_hash(5).unwrap(),
             (vec![9, 10, 11], GroupIndexView::new_non_inlined(3))
         );
-        assert_eq!(group_values.map.len(), 6);
+        assert_eq!(group_values.map.flat().len(), 6);
 
         // Emit first 4 to test cases 1~3, 5~6
         let _ = group_values.emit(EmitTo::First(4)).unwrap();
@@ -2369,7 +2402,7 @@ mod tests {
             group_values.get_indices_by_hash(5).unwrap(),
             (vec![5, 6, 7], GroupIndexView::new_non_inlined(2))
         );
-        assert_eq!(group_values.map.len(), 4);
+        assert_eq!(group_values.map.flat().len(), 4);
 
         // Emit first 1 to test case 4, and cases 5~6 again
         let _ = group_values.emit(EmitTo::First(1)).unwrap();
@@ -2389,7 +2422,7 @@ mod tests {
             group_values.get_indices_by_hash(5).unwrap(),
             (vec![4, 5, 6], GroupIndexView::new_non_inlined(1))
         );
-        assert_eq!(group_values.map.len(), 4);
+        assert_eq!(group_values.map.flat().len(), 4);
 
         // Emit first 5 to test cases 1~3 again
         let _ = group_values.emit(EmitTo::First(5)).unwrap();
@@ -2397,7 +2430,7 @@ mod tests {
             group_values.get_indices_by_hash(5).unwrap(),
             (vec![0, 1], GroupIndexView::new_non_inlined(0))
         );
-        assert_eq!(group_values.map.len(), 1);
+        assert_eq!(group_values.map.flat().len(), 1);
 
         // Emit first 1 to test cases 4 again
         let _ = group_values.emit(EmitTo::First(1)).unwrap();
@@ -2405,11 +2438,11 @@ mod tests {
             group_values.get_indices_by_hash(5).unwrap(),
             (vec![0], GroupIndexView::new_inlined(0))
         );
-        assert_eq!(group_values.map.len(), 1);
+        assert_eq!(group_values.map.flat().len(), 1);
 
         // Emit first 1 to test cases 7
         let _ = group_values.emit(EmitTo::First(1)).unwrap();
-        assert!(group_values.map.is_empty());
+        assert!(group_values.map.flat().is_empty());
     }
 
     /// Test data set for [`GroupValuesColumn::vectorized_intern`]
@@ -2769,14 +2802,13 @@ mod tests {
         group_index: u64,
     ) {
         let group_index_view = GroupIndexView::new_inlined(group_index);
-        group_values.map.insert_accounted(
-            (hash_key, group_index_view),
-            |(hash, _)| *hash,
-            &mut group_values.map_size,
-        );
+        group_values
+            .map
+            .flat_mut()
+            .insert(hash_key, group_index_view);
     }
 
-    fn insert_non_inline_group_index_view(
+    pub(super) fn insert_non_inline_group_index_view(
         group_values: &mut GroupValuesColumn<false>,
         hash_key: u64,
         group_indices: Vec<usize>,
@@ -2784,13 +2816,14 @@ mod tests {
         let list_offset = group_values.group_index_lists.len();
         let group_index_view = GroupIndexView::new_non_inlined(list_offset as u64);
         group_values.group_index_lists.push(group_indices);
-        group_values.map.insert_accounted(
-            (hash_key, group_index_view),
-            |(hash, _)| *hash,
-            &mut group_values.map_size,
-        );
+        group_values
+            .map
+            .flat_mut()
+            .insert(hash_key, group_index_view);
     }
 }
 
+#[cfg(test)]
+mod index_tests;
 #[cfg(test)]
 mod probe_cache_tests;
