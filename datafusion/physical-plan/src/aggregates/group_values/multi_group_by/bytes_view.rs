@@ -13,8 +13,8 @@ use arrow::array::{
 use arrow::buffer::{Buffer, ScalarBuffer};
 use arrow::datatypes::ByteViewType;
 use datafusion_common::Result;
-use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_expr::GroupSelection;
+use datafusion_functions_aggregate_common::aggregate::groups_accumulator::prim_op::GroupBuffer;
 use std::marker::PhantomData;
 use std::mem::{replace, size_of};
 use std::sync::Arc;
@@ -37,7 +37,7 @@ pub struct ByteViewGroupValueBuilder<B: ByteViewType> {
     ///
     /// If string len > 12, its format will be:
     ///     offset(4B) | buffer_index(4B) | prefix(4B) | len(4B)
-    views: Vec<u128>,
+    views: GroupBuffer<u128>,
 
     /// The progressing block
     ///
@@ -73,7 +73,7 @@ impl<B: ByteViewType> Default for ByteViewGroupValueBuilder<B> {
 impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
     pub fn new() -> Self {
         Self {
-            views: Vec::new(),
+            views: GroupBuffer::new(),
             in_progress: Vec::new(),
             completed: Vec::new(),
             max_block_size: BYTE_VIEW_MAX_BLOCK_SIZE,
@@ -259,10 +259,10 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
 
         // Otherwise, we need to check their values
 
-        // SAFETY: the `lhs_row` and rhs_row` are valid
-        let exist_view = unsafe { *self.views.get_unchecked(lhs_row) };
+        let exist_view = *self.views.get(lhs_row);
         let exist_view_len = exist_view as u32;
 
+        // SAFETY: the caller ensures rhs_row is valid.
         let input_view = unsafe { *array.views().get_unchecked(rhs_row) };
         let input_view_len = input_view as u32;
 
@@ -318,7 +318,7 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
 
     /// Returns the bytes stored at `index`, irrespective of nullness.
     fn value(&self, index: usize) -> &[u8] {
-        let view = &self.views[index];
+        let view = self.views.get(index);
         let byte_view = ByteView::from(*view);
         let length = byte_view.length as usize;
         if length <= 12 {
@@ -338,11 +338,12 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
     fn values_preserving_inner(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
         selection.validate_num_groups(self.len())?;
         let mut selected = Self::new().with_max_block_size(self.max_block_size);
+        let mut views = Vec::with_capacity(selection.len());
         for index in selection.iter() {
             let is_null = self.nulls.is_null(index);
             selected.nulls.append(!is_null);
             if is_null {
-                selected.views.push(0);
+                views.push(0);
                 continue;
             }
 
@@ -356,14 +357,18 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
                 selected.in_progress.extend_from_slice(value);
                 make_view(value, buffer_index, offset)
             };
-            selected.views.push(view);
+            views.push(view);
         }
-        Ok(selected.build_inner())
+        Ok(selected.build_with_views(views))
     }
 
-    fn build_inner(self) -> ArrayRef {
+    fn build_inner(mut self) -> ArrayRef {
+        let views = self.views.take_prefix(self.views.len());
+        self.build_with_views(views)
+    }
+
+    fn build_with_views(self, views: Vec<u128>) -> ArrayRef {
         let Self {
-            views,
             in_progress,
             mut completed,
             nulls,
@@ -426,7 +431,7 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
         //
         //   - Shift the `buffer index` of remaining non-inlined `views`
         //
-        let first_n_views = split_vec_min_alloc(&mut self.views, n);
+        let first_n_views = self.views.take_prefix(n);
 
         let last_non_inlined_view =
             first_n_views.iter().rfind(|view| ((**view) as u32) > 12);
@@ -623,7 +628,7 @@ impl<B: ByteViewType> GroupColumn for ByteViewGroupValueBuilder<B> {
             .sum::<usize>();
 
         self.nulls.allocated_size()
-            + self.views.capacity() * size_of::<u128>()
+            + self.views.allocated_size()
             + self.in_progress.capacity() * size_of::<u8>()
             + buffers_size
             + size_of::<Self>()
@@ -648,11 +653,12 @@ mod tests {
 
     use crate::aggregates::group_values::multi_group_by::bytes_view::ByteViewGroupValueBuilder;
     use arrow::array::{
-        ArrayRef, AsArray, BooleanBufferBuilder, NullBufferBuilder, StringViewArray,
+        Array, ArrayRef, AsArray, BooleanBufferBuilder, NullBufferBuilder,
+        StringViewArray,
     };
     use arrow::datatypes::StringViewType;
 
-    use super::GroupColumn;
+    use super::{GroupColumn, GroupSelection};
 
     fn make_true_buffer(n: usize) -> BooleanBufferBuilder {
         let mut buf = BooleanBufferBuilder::new(n);
@@ -913,6 +919,39 @@ mod tests {
         assert!(results[9]);
         assert!(!results[10]);
         assert!(results[11]);
+    }
+
+    #[test]
+    fn byte_view_take_and_regrow_across_blocks() {
+        let count = 40_000;
+        let prefix = 17_001;
+        let mut builder =
+            ByteViewGroupValueBuilder::<StringViewType>::new().with_max_block_size(128);
+        let input: ArrayRef = Arc::new(StringViewArray::from_iter((0..count).map(|i| {
+            match i % 3 {
+                0 => None,
+                1 => Some("inline"),
+                _ => Some("a longer string in a data buffer"),
+            }
+        })));
+        let rows: Vec<_> = (0..count).collect();
+        builder.vectorized_append(&input, &rows).unwrap();
+        let ids = [prefix + 1, 0, 16_384, prefix + 1];
+        let selection = GroupSelection::try_from_indices(&ids, count).unwrap();
+        let values = builder.values_preserving(selection).unwrap();
+        let expected = StringViewArray::from_iter(ids.map(|index| {
+            let input = input.as_string_view();
+            (!input.is_null(index)).then(|| input.value(index))
+        }));
+        assert_eq!(values.as_string_view(), &expected);
+        let first = builder.take_n(prefix);
+        assert_eq!(&first, &input.slice(0, prefix));
+        assert!(builder.equal_to(1, &input, prefix + 1));
+        builder.vectorized_append(&input, &rows).unwrap();
+        let second = builder.take_n(count - prefix);
+        assert_eq!(&second, &input.slice(prefix, count - prefix));
+        let third = Box::new(builder).build();
+        assert_eq!(&third, &input);
     }
 
     #[test]

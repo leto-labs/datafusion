@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::collections::{TryReserveError, VecDeque};
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -10,6 +11,7 @@ use arrow::buffer::NullBuffer;
 use arrow::compute;
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::datatypes::DataType;
+use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
 use datafusion_expr_common::groups_accumulator::{
     EmitTo, GroupSelection, GroupsAccumulator,
@@ -33,7 +35,7 @@ where
     F: Fn(&mut T::Native, T::Native) + Send + Sync + 'static,
 {
     /// values per group, stored as the native type
-    values: Vec<T::Native>,
+    values: GroupBuffer<T::Native>,
 
     /// The output type (needed for Decimal precision and scale)
     data_type: DataType,
@@ -55,7 +57,7 @@ where
 {
     pub fn new(data_type: &DataType, prim_fn: F) -> Self {
         Self {
-            values: vec![],
+            values: GroupBuffer::new(),
             data_type: data_type.clone(),
             null_state: NullState::new(),
             starting_value: T::default_value(),
@@ -95,8 +97,7 @@ where
             opt_filter,
             total_num_groups,
             |group_index, new_value| {
-                // SAFETY: group_index is guaranteed to be in bounds
-                let value = unsafe { self.values.get_unchecked_mut(group_index) };
+                let value = self.values.get_mut(group_index);
                 (self.prim_fn)(value, new_value);
             },
         );
@@ -105,17 +106,23 @@ where
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        let values = emit_to.take_needed(&mut self.values);
+        let count = match emit_to {
+            EmitTo::All => self.values.len(),
+            EmitTo::First(n) => n,
+        };
+        let values = self.values.take_prefix(count);
         let nulls = self.null_state.build(emit_to);
-        let values = PrimitiveArray::<T>::new(values.into(), nulls) // no copy
+        let values = PrimitiveArray::<T>::new(values.into(), nulls)
             .with_data_type(self.data_type.clone());
         Ok(Arc::new(values))
     }
 
     fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
         selection.validate_num_groups(self.values.len())?;
-        let values: Vec<T::Native> =
-            selection.iter().map(|index| self.values[index]).collect();
+        let values: Vec<T::Native> = selection
+            .iter()
+            .map(|index| *self.values.get(index))
+            .collect();
         let nulls = self.null_state.build_preserving(selection)?;
         let values = PrimitiveArray::<T>::new(values.into(), nulls)
             .with_data_type(self.data_type.clone());
@@ -204,7 +211,7 @@ where
         Ok(vec![Arc::new(state_values)])
     }
     fn size(&self) -> usize {
-        self.values.capacity() * size_of::<T::Native>() + self.null_state.size()
+        self.values.allocated_size() + self.null_state.size()
     }
 }
 
@@ -213,6 +220,48 @@ mod tests {
     use super::*;
     use arrow::array::Int64Array;
     use arrow::datatypes::Int64Type;
+
+    #[test]
+    fn nullable_state_emit_and_merge_across_blocks() -> Result<()> {
+        let build = || {
+            PrimitiveGroupsAccumulator::<Int64Type, _>::new(
+                &DataType::Int64,
+                |current, value| *current += value,
+            )
+        };
+        let count = GROUP_BLOCK_LEN * 2 + 17;
+        let prefix = GROUP_BLOCK_LEN + 3;
+        let input =
+            Int64Array::from_iter((0..count).map(|i| (i % 3 != 0).then_some(i as i64)));
+        let indices: Vec<_> = (0..count).collect();
+        let mut partial = build();
+        partial.update_batch(&[Arc::new(input.clone())], &indices, None, count)?;
+        let selected = [prefix, 0, GROUP_BLOCK_LEN - 1, prefix];
+        let preserved = partial
+            .state_preserving(GroupSelection::try_from_indices(&selected, count)?)?;
+        let expected_selection =
+            Int64Array::from_iter(selected.map(|i| (i % 3 != 0).then_some(i as i64)));
+        assert_eq!(
+            preserved[0].as_primitive::<Int64Type>(),
+            &expected_selection
+        );
+        let first = partial.state(EmitTo::First(prefix))?;
+        let suffix = partial.state(EmitTo::All)?;
+
+        let mut merged = build();
+        merged.merge_batch(&first, &indices[..prefix], prefix)?;
+        merged.merge_batch(&suffix, &indices[prefix..], count)?;
+        merged.merge_batch(&first, &indices[..prefix], count)?;
+        let output = merged.evaluate(EmitTo::All)?;
+        let expected = Int64Array::from_iter(
+            input
+                .iter()
+                .enumerate()
+                .map(|(i, v)| v.map(|value| if i < prefix { value * 2 } else { value })),
+        );
+        assert_eq!(output.as_primitive::<Int64Type>(), &expected);
+        Ok(())
+    }
 
     #[test]
     fn preserving_reads_do_not_change_accumulator_state() -> Result<()> {
@@ -245,5 +294,246 @@ mod tests {
         assert!(accumulator.supports_evaluate_preserving());
         assert!(accumulator.supports_state_preserving());
         Ok(())
+    }
+}
+
+/// Fixed-width group state that grows without moving its existing large buffers.
+/// The first block grows as a Vec for small group sets. Subsequent blocks have
+/// a fixed capacity so a group index maps directly to a block and an offset.
+///
+/// This is also used by the physical plan's byte-view group key builder.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct GroupBuffer<T: Copy> {
+    first: Vec<T>,
+    tail: VecDeque<Vec<T>>,
+    head: usize,
+    len: usize,
+}
+
+// 256 KiB for 128-bit values and 128 KiB for 64-bit values.
+const GROUP_BLOCK_LEN: usize = 16 * 1024;
+
+impl<T: Copy> GroupBuffer<T> {
+    pub fn new() -> Self {
+        Self {
+            first: Vec::new(),
+            tail: VecDeque::new(),
+            head: 0,
+            len: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn allocated_size(&self) -> usize {
+        self.tail.capacity() * size_of::<Vec<T>>()
+            + (self.first.capacity() + self.tail.len() * GROUP_BLOCK_LEN) * size_of::<T>()
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> &T {
+        assert!(index < self.len);
+        let index = index + self.head;
+        if index < GROUP_BLOCK_LEN {
+            &self.first[index]
+        } else {
+            &self.tail[index / GROUP_BLOCK_LEN - 1][index % GROUP_BLOCK_LEN]
+        }
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, index: usize) -> &mut T {
+        assert!(index < self.len);
+        let index = index + self.head;
+        if index < GROUP_BLOCK_LEN {
+            &mut self.first[index]
+        } else {
+            &mut self.tail[index / GROUP_BLOCK_LEN - 1][index % GROUP_BLOCK_LEN]
+        }
+    }
+
+    fn block(&mut self, block: usize) -> &mut Vec<T> {
+        if block == 0 {
+            &mut self.first
+        } else {
+            if block > self.tail.len() {
+                self.tail.push_back(Vec::with_capacity(GROUP_BLOCK_LEN));
+            }
+            &mut self.tail[block - 1]
+        }
+    }
+
+    pub fn push(&mut self, value: T) {
+        let index = self.len + self.head;
+        let block = self.block(index / GROUP_BLOCK_LEN);
+        if index < GROUP_BLOCK_LEN && block.len() == block.capacity() {
+            let target = (block.capacity() * 2).clamp(4, GROUP_BLOCK_LEN);
+            block.reserve_exact(target - block.len());
+        }
+        block.push(value);
+        self.len += 1;
+    }
+
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        let end = self
+            .head
+            .saturating_add(self.len)
+            .saturating_add(additional);
+        let first = end.min(GROUP_BLOCK_LEN);
+        if first > self.first.capacity() {
+            let target = first
+                .max(self.first.capacity() * 2)
+                .clamp(4, GROUP_BLOCK_LEN);
+            self.first.try_reserve_exact(target - self.first.len())?;
+        }
+        let blocks = end.div_ceil(GROUP_BLOCK_LEN).saturating_sub(1);
+        self.tail
+            .try_reserve(blocks.saturating_sub(self.tail.len()))?;
+        while self.tail.len() < blocks {
+            let mut block = Vec::new();
+            block.try_reserve_exact(GROUP_BLOCK_LEN)?;
+            self.tail.push_back(block);
+        }
+        Ok(())
+    }
+
+    pub fn extend(&mut self, mut values: impl ExactSizeIterator<Item = T>) {
+        self.try_reserve(values.len())
+            .expect("group buffer allocation");
+        while values.len() != 0 {
+            let index = self.head + self.len;
+            let count = values.len().min(GROUP_BLOCK_LEN - index % GROUP_BLOCK_LEN);
+            self.block(index / GROUP_BLOCK_LEN)
+                .extend(values.by_ref().take(count));
+            self.len += count;
+        }
+    }
+
+    pub fn resize(&mut self, len: usize, value: T) {
+        if len < self.len {
+            let end = self.head + len;
+            let last = end.saturating_sub(1) / GROUP_BLOCK_LEN;
+            self.tail.truncate(last);
+            self.block(last).truncate(end - last * GROUP_BLOCK_LEN);
+            self.len = len;
+            return;
+        }
+        while self.len < len {
+            let start = self.head + self.len;
+            let block_index = start / GROUP_BLOCK_LEN;
+            let block_len =
+                (self.head + len - block_index * GROUP_BLOCK_LEN).min(GROUP_BLOCK_LEN);
+            let block = self.block(block_index);
+            if block_index == 0 && block_len > block.capacity() {
+                let target = block_len
+                    .max(block.capacity() * 2)
+                    .clamp(4, GROUP_BLOCK_LEN);
+                block.reserve_exact(target - block.len());
+            }
+            block.resize(block_len, value);
+            self.len = block_index * GROUP_BLOCK_LEN + block_len - self.head;
+        }
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.first[self.head..]
+            .iter_mut()
+            .chain(self.tail.iter_mut().flatten())
+    }
+
+    pub fn take_prefix(&mut self, n: usize) -> Vec<T> {
+        assert!(n <= self.len);
+        if self.tail.is_empty() && self.head == 0 {
+            self.len -= n;
+            return if self.len == 0 {
+                self.tail = VecDeque::new();
+                std::mem::take(&mut self.first)
+            } else {
+                split_vec_min_alloc(&mut self.first, n)
+            };
+        }
+
+        if self.head == 0 && n == self.first.len() {
+            self.len -= n;
+            return std::mem::replace(
+                &mut self.first,
+                self.tail.pop_front().unwrap_or_default(),
+            );
+        }
+
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            let take = (n - out.len()).min(self.first.len() - self.head);
+            out.extend_from_slice(&self.first[self.head..self.head + take]);
+            self.head += take;
+            if self.head == self.first.len() {
+                self.first = self.tail.pop_front().unwrap_or_default();
+                self.head = 0;
+            }
+        }
+        self.len -= n;
+        if self.len == 0 {
+            *self = Self::new();
+        }
+        out
+    }
+}
+
+impl<T: Copy> Default for GroupBuffer<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod group_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn full_emit_releases_all_prior_segment_capacity() {
+        let mut values = GroupBuffer::new();
+        values.resize(GROUP_BLOCK_LEN + 1, 17_u64);
+        assert_eq!(values.take_prefix(GROUP_BLOCK_LEN).len(), GROUP_BLOCK_LEN);
+        assert_eq!(values.take_prefix(1), vec![17]);
+        assert_eq!(values.allocated_size(), 0);
+    }
+
+    #[test]
+    fn emit_and_regrow_across_boundaries() {
+        let mut values = GroupBuffer::new();
+        let mut expected = Vec::new();
+        for i in 0..GROUP_BLOCK_LEN * 3 + 5 {
+            values.push(i);
+            expected.push(i);
+        }
+        for n in [1, GROUP_BLOCK_LEN, GROUP_BLOCK_LEN + 7, 0] {
+            assert_eq!(
+                values.take_prefix(n),
+                expected.drain(..n).collect::<Vec<_>>()
+            );
+            assert_eq!(values.len(), expected.len());
+            for (index, value) in expected.iter().enumerate() {
+                assert_eq!(values.get(index), value);
+            }
+            values.resize(expected.len() + 11, 42);
+            expected.extend([42; 11]);
+            *values.get_mut(0) = 123;
+            expected[0] = 123;
+            assert!(
+                values
+                    .iter_mut()
+                    .map(|value| *value)
+                    .eq(expected.iter().copied())
+            );
+        }
+        assert_eq!(values.take_prefix(values.len()), expected);
+        assert_eq!(values.allocated_size(), 0);
     }
 }
