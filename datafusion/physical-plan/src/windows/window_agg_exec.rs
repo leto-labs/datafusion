@@ -38,6 +38,8 @@ use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::utils::{evaluate_partition_ranges, transpose};
 use datafusion_common::{Result, assert_eq_or_internal_err};
 use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_physical_expr::window::SlidingAggregateWindowExpr;
 use datafusion_physical_expr_common::sort_expr::{
     OrderingRequirements, PhysicalSortExpr,
 };
@@ -302,6 +304,8 @@ impl ExecutionPlan for WindowAggExec {
     ) -> Result<SendableRecordBatchStream> {
         let memory =
             WindowBufferMemory::try_new(&self.schema, &self.window_expr, &context)?;
+        let frame_reservation =
+            MemoryConsumer::new("WindowAggExecFrame").register(context.memory_pool());
         let input = self.input.execute(partition, context)?;
         let stream = Box::pin(
             WindowAggStream::new(
@@ -312,7 +316,8 @@ impl ExecutionPlan for WindowAggExec {
                 self.partition_by_sort_keys()?,
                 self.ordered_partition_by_indices.clone(),
             )?
-            .with_buffer_memory(memory),
+            .with_buffer_memory(memory)
+            .with_frame_reservation(frame_reservation),
         );
         Ok(stream)
     }
@@ -489,10 +494,21 @@ impl WindowAggExec {
 fn compute_window_aggregates(
     window_expr: &[Arc<dyn WindowExpr>],
     batch: &RecordBatch,
+    frame_reservation: Option<&MemoryReservation>,
 ) -> Result<Vec<ArrayRef>> {
     window_expr
         .iter()
-        .map(|window_expr| window_expr.evaluate(batch))
+        .map(|window_expr| {
+            if let Some(reservation) = frame_reservation
+                && let Some(sliding) = window_expr
+                    .as_any()
+                    .downcast_ref::<SlidingAggregateWindowExpr>()
+            {
+                sliding.evaluate_with_reservation(batch, reservation)
+            } else {
+                window_expr.evaluate(batch)
+            }
+        })
         .collect()
 }
 
@@ -507,6 +523,7 @@ pub struct WindowAggStream {
     baseline_metrics: BaselineMetrics,
     ordered_partition_by_indices: Vec<usize>,
     buffer_memory: Option<WindowBufferMemory>,
+    frame_reservation: Option<MemoryReservation>,
 }
 
 impl WindowAggStream {
@@ -535,11 +552,17 @@ impl WindowAggStream {
             partition_by_sort_keys,
             ordered_partition_by_indices,
             buffer_memory: None,
+            frame_reservation: None,
         })
     }
 
     fn with_buffer_memory(mut self, memory: Option<WindowBufferMemory>) -> Self {
         self.buffer_memory = memory;
+        self
+    }
+
+    fn with_frame_reservation(mut self, reservation: MemoryReservation) -> Self {
+        self.frame_reservation = Some(reservation);
         self
     }
 
@@ -579,6 +602,7 @@ impl WindowAggStream {
             partition_results.push(compute_window_aggregates(
                 &self.window_expr,
                 &batch.slice(partition_point.start, length),
+                self.frame_reservation.as_ref(),
             )?)
         }
         let columns = transpose(partition_results)
@@ -676,6 +700,92 @@ mod tests {
         WindowFrame, WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition,
     };
     use datafusion_functions_aggregate::count::count_udaf;
+
+    #[tokio::test]
+    async fn sliding_median_uses_the_window_execution_memory_pool() -> Result<()> {
+        use crate::InputOrderMode;
+        use crate::windows::BoundedWindowAggExec;
+        use arrow::array::Float64Array;
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        use datafusion_functions_aggregate::median::median_udaf;
+
+        let batch = RecordBatch::try_from_iter([(
+            "v",
+            Arc::new(Float64Array::from_iter_values((0..512).map(f64::from))) as ArrayRef,
+        )])?;
+        let schema = batch.schema();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(TestMemoryExec::try_new(
+            &[vec![batch]],
+            Arc::clone(&schema),
+            None,
+        )?);
+
+        for (end, consumer) in [
+            (WindowFrameBound::CurrentRow, "BoundedWindowAggExecFrame"),
+            (
+                WindowFrameBound::Following(ScalarValue::UInt64(None)),
+                "WindowAggExecFrame",
+            ),
+        ] {
+            let bounded = end == WindowFrameBound::CurrentRow;
+            let expr = create_window_expr(
+                &WindowFunctionDefinition::AggregateUDF(median_udaf()),
+                "median(v)".into(),
+                &[crate::expressions::col("v", &schema)?],
+                &[],
+                &[],
+                Arc::new(WindowFrame::new_bounds(
+                    WindowFrameUnits::Rows,
+                    WindowFrameBound::Preceding(511_u64.into()),
+                    end,
+                )),
+                Arc::clone(&schema),
+                false,
+                false,
+                None,
+            )?;
+            let plan: Arc<dyn ExecutionPlan> = if bounded {
+                Arc::new(BoundedWindowAggExec::try_new(
+                    vec![expr],
+                    Arc::clone(&input),
+                    InputOrderMode::Sorted,
+                    true,
+                )?)
+            } else {
+                Arc::new(WindowAggExec::try_new(
+                    vec![expr],
+                    Arc::clone(&input),
+                    true,
+                )?)
+            };
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(2048));
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build_arc()?;
+            let context = Arc::new(TaskContext::default().with_runtime(runtime));
+            let mut stream = plan.execute(0, context)?;
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert!(error.message().contains(consumer), "{error}");
+            assert_eq!(pool.reserved(), 0);
+            assert!(stream.next().await.is_none());
+
+            if bounded {
+                let pool: Arc<dyn MemoryPool> =
+                    Arc::new(GreedyMemoryPool::new(16 * 1024));
+                let runtime = RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::clone(&pool))
+                    .build_arc()?;
+                let context = Arc::new(TaskContext::default().with_runtime(runtime));
+                let mut stream = plan.execute(0, context)?;
+                assert_eq!(stream.next().await.unwrap()?.num_rows(), 512);
+                assert!(pool.reserved() > 0);
+                drop(stream);
+                assert_eq!(pool.reserved(), 0);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_window_agg_cardinality_effect() -> Result<()> {

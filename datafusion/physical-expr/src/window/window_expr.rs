@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -8,6 +10,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::PhysicalExpr;
+use crate::aggregate::SlidingFrameAccumulator;
 
 use arrow::array::BooleanArray;
 use arrow::array::{Array, ArrayRef, make_comparator, new_empty_array};
@@ -22,6 +25,7 @@ use datafusion_common::{
     Result, ScalarValue, arrow_datafusion_err, exec_datafusion_err, exec_err,
     internal_err,
 };
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::window_state::{
     PartitionBatchState, WindowAggState, WindowFrameContext, WindowFrameStateGroups,
 };
@@ -195,7 +199,17 @@ pub trait AggregateWindowExpr: WindowExpr {
 
     /// Evaluates the window function against the batch.
     fn aggregate_evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
+        self.aggregate_evaluate_with_reservation(batch, None)
+    }
+
+    /// Evaluates a batch with a window operator's frame memory reservation.
+    fn aggregate_evaluate_with_reservation(
+        &self,
+        batch: &RecordBatch,
+        reservation: Option<&MemoryReservation>,
+    ) -> Result<ArrayRef> {
         let mut accumulator = self.get_accumulator()?;
+        SlidingFrameAccumulator::attach_reservation(&mut accumulator, reservation);
         let mut last_range = Range { start: 0, end: 0 };
         let sort_options = self.order_by().iter().map(|o| o.options).collect();
         let mut window_frame_ctx =
@@ -231,7 +245,11 @@ pub trait AggregateWindowExpr: WindowExpr {
             .map(get_orderby_values);
         for (partition_row, partition_batch_state) in partition_batches.iter() {
             if !window_agg_state.contains_key(partition_row) {
-                let accumulator = self.get_accumulator()?;
+                let mut accumulator = self.get_accumulator()?;
+                SlidingFrameAccumulator::attach_reservation(
+                    &mut accumulator,
+                    eval_ctx.frame_reservation,
+                );
                 window_agg_state.insert(
                     partition_row.clone(),
                     WindowState {
@@ -643,9 +661,19 @@ pub struct WindowEvalContext<'a> {
     /// decide whether pending window frames can be finalized before their
     /// partition receives more data.
     pub most_recent_row: Option<&'a RecordBatch>,
+    frame_reservation: Option<&'a MemoryReservation>,
 }
 
 impl<'a> WindowEvalContext<'a> {
+    /// Supplies a stream-owned reservation for sliding frame storage.
+    pub fn with_frame_reservation(
+        mut self,
+        reservation: Option<&'a MemoryReservation>,
+    ) -> Self {
+        self.frame_reservation = reservation;
+        self
+    }
+
     /// Sets the most recent input row (see [`Self::most_recent_row`]).
     pub fn with_most_recent_row(mut self, batch: Option<&'a RecordBatch>) -> Self {
         self.most_recent_row = batch;

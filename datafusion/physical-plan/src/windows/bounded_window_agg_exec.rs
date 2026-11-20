@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -45,6 +47,7 @@ use datafusion_common::{
     HashMap, Result, ScalarValue, arrow_datafusion_err, exec_datafusion_err, exec_err,
 };
 use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_expr::ColumnarValue;
 use datafusion_expr::window_state::{PartitionBatchState, WindowAggState};
 use datafusion_physical_expr::window::{
@@ -506,17 +509,22 @@ impl ExecutionPlan for BoundedWindowAggExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let frame_reservation = MemoryConsumer::new("BoundedWindowAggExecFrame")
+            .register(context.memory_pool());
         let input = self.input.execute(partition, context)?;
         let search_mode = self.get_search_algo()?;
-        let stream = Box::pin(BoundedWindowAggStream::new(
-            Arc::clone(&self.schema),
-            self.window_expr.clone(),
-            input,
-            BaselineMetrics::new(&self.metrics, partition),
-            search_mode,
-            partition,
-            self.state_observer.clone(),
-        )?);
+        let stream = Box::pin(
+            BoundedWindowAggStream::new(
+                Arc::clone(&self.schema),
+                self.window_expr.clone(),
+                input,
+                BaselineMetrics::new(&self.metrics, partition),
+                search_mode,
+                partition,
+                self.state_observer.clone(),
+            )?
+            .with_frame_reservation(frame_reservation),
+        );
         Ok(stream)
     }
 
@@ -1224,6 +1232,7 @@ pub struct BoundedWindowAggStream {
     /// finalized per-window-expression state for every partition key that is
     /// about to be dropped.
     state_observer: Option<Arc<dyn WindowStateObserver>>,
+    frame_reservation: Option<MemoryReservation>,
 }
 
 impl BoundedWindowAggStream {
@@ -1287,6 +1296,10 @@ impl Stream for BoundedWindowAggStream {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let poll = self.poll_next_inner(cx);
+        if matches!(poll, Poll::Ready(Some(Err(_)) | None)) {
+            self.finished = true;
+            self.window_agg_states.clear();
+        }
         self.baseline_metrics.record_poll(poll)
     }
 }
@@ -1317,13 +1330,20 @@ impl BoundedWindowAggStream {
             most_recent_row: None,
             partition_idx,
             state_observer,
+            frame_reservation: None,
         })
+    }
+
+    fn with_frame_reservation(mut self, reservation: MemoryReservation) -> Self {
+        self.frame_reservation = Some(reservation);
+        self
     }
 
     fn compute_aggregates(&mut self) -> Result<Option<RecordBatch>> {
         // calculate window cols
         let eval_ctx = WindowEvalContext::default()
-            .with_most_recent_row(self.most_recent_row.as_ref());
+            .with_most_recent_row(self.most_recent_row.as_ref())
+            .with_frame_reservation(self.frame_reservation.as_ref());
         for (cur_window_expr, state) in
             self.window_expr.iter().zip(&mut self.window_agg_states)
         {

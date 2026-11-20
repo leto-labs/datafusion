@@ -388,6 +388,20 @@ Regressions (fail on stock 56 with 6_299_999 for 0.9 of `0..8 * 1e6`; the
 decimal ones fail on the first QI commit 0fee7b30c):
 `scripts/vendored-tests.py datafusion-functions-aggregate -E 'test(percentile_cont::tests)'`.
 
+## Family SW: blocked sliding percentile frames
+
+Family SW maintains exact rolling `percentile_cont` and `MEDIAN` in sorted
+blocks for forward-moving frames. The dependent Longbow feature is **pull
+sliding frames** (ADR 0054, decision 7, and OpenSpec task 5.24c). The audit
+classification is **UPSTREAMABLE**.
+
+- `0083ceb7c` introduces the blocked frame and shares the existing
+  interpolation arithmetic between blocked ranking and ordinary selection.
+- `4ab5c9d30` restores the original plan-time error for sliding aggregates
+  without `retract_batch`. The opt-in `SlidingFrame` trait lets both pull
+  window operators charge the block directory and value buffers to their
+  query memory reservations before allocation.
+
 ## Family RBC: owned boundary prefix on upstream Top-K heaps
 
 Purpose: keep an owned 15-byte prefix of the current worst encoded key in

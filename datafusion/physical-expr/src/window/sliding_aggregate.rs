@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -8,7 +10,7 @@ use std::any::Any;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::aggregate::AggregateFunctionExpr;
+use crate::aggregate::{AggregateFunctionExpr, SlidingFrameAccumulator};
 use crate::window::aggregate::reverse_aggregate_window_expr;
 use crate::window::window_expr::{
     AggregateWindowExpr, WindowEvalContext, WindowFn, filter_array,
@@ -20,6 +22,7 @@ use arrow::array::{ArrayRef, BooleanArray};
 use arrow::datatypes::FieldRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, ScalarValue};
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::{Accumulator, WindowFrame};
 
 /// A window expr that takes the form of an aggregate function that
@@ -51,6 +54,15 @@ impl SlidingAggregateWindowExpr {
             window_frame,
             filter,
         }
+    }
+
+    /// Evaluate the physical window with its query-pool memory reservation.
+    pub fn evaluate_with_reservation(
+        &self,
+        batch: &RecordBatch,
+        reservation: &MemoryReservation,
+    ) -> Result<ArrayRef> {
+        self.aggregate_evaluate_with_reservation(batch, Some(reservation))
     }
 
     /// Get the [AggregateFunctionExpr] of this object.
@@ -174,58 +186,36 @@ impl AggregateWindowExpr for SlidingAggregateWindowExpr {
         accumulator: &mut Box<dyn Accumulator>,
         filter_mask: Option<&BooleanArray>,
     ) -> Result<ScalarValue> {
-        if cur_range.start == cur_range.end {
-            // Keep the accumulator synchronized with `last_range`. RANGE frames
-            // can become empty between two non-empty frames when the ORDER BY
-            // values contain gaps.
-            let retract_bound = last_range.end - last_range.start;
-            if retract_bound > 0 {
-                let slice_mask =
-                    filter_mask.map(|m| m.slice(last_range.start, retract_bound));
-                let retract: Vec<ArrayRef> = value_slice
-                    .iter()
-                    .map(|v| v.slice(last_range.start, retract_bound))
-                    .map(|arr| match &slice_mask {
-                        Some(m) => filter_array(&arr, m),
-                        None => Ok(arr),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                accumulator.retract_batch(&retract)?
-            }
+        let leaving = last_range.start..last_range.end.min(cur_range.start);
+        let entering = cur_range.start.max(last_range.end)..cur_range.end;
+        if let ([values], None, false) = (value_slice, filter_mask, cur_range.is_empty())
+            && let Some(frame) = SlidingFrameAccumulator::as_sliding(accumulator)
+        {
+            return frame.advance(values, leaving, entering);
+        }
+
+        if last_range.end <= cur_range.start {
+            // Skip rows between disjoint frames. Drain before adding the new
+            // frame so that the aggregate never evaluates skipped rows.
+            with_frame_values(value_slice, filter_mask, leaving, |values| {
+                accumulator.retract_batch(values)
+            })?;
+            with_frame_values(value_slice, filter_mask, entering, |values| {
+                accumulator.update_batch(values)
+            })?;
+        } else {
+            with_frame_values(value_slice, filter_mask, entering, |values| {
+                accumulator.update_batch(values)
+            })?;
+            with_frame_values(value_slice, filter_mask, leaving, |values| {
+                accumulator.retract_batch(values)
+            })?;
+        }
+
+        if cur_range.is_empty() {
             self.aggregate
                 .default_value(self.aggregate.field().data_type())
         } else {
-            // Accumulate any new rows that have entered the window:
-            let update_bound = cur_range.end - last_range.end;
-            if update_bound > 0 {
-                let slice_mask =
-                    filter_mask.map(|m| m.slice(last_range.end, update_bound));
-                let update: Vec<ArrayRef> = value_slice
-                    .iter()
-                    .map(|v| v.slice(last_range.end, update_bound))
-                    .map(|arr| match &slice_mask {
-                        Some(m) => filter_array(&arr, m),
-                        None => Ok(arr),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                accumulator.update_batch(&update)?
-            }
-
-            // Remove rows that have now left the window:
-            let retract_bound = cur_range.start - last_range.start;
-            if retract_bound > 0 {
-                let slice_mask =
-                    filter_mask.map(|m| m.slice(last_range.start, retract_bound));
-                let retract: Vec<ArrayRef> = value_slice
-                    .iter()
-                    .map(|v| v.slice(last_range.start, retract_bound))
-                    .map(|arr| match &slice_mask {
-                        Some(m) => filter_array(&arr, m),
-                        None => Ok(arr),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                accumulator.retract_batch(&retract)?
-            }
             accumulator.evaluate()
         }
     }
@@ -233,4 +223,34 @@ impl AggregateWindowExpr for SlidingAggregateWindowExpr {
     fn is_constant_in_partition(&self) -> bool {
         false
     }
+}
+
+fn with_frame_values(
+    values: &[ArrayRef],
+    filter: Option<&BooleanArray>,
+    range: Range<usize>,
+    apply: impl FnOnce(&[ArrayRef]) -> Result<()>,
+) -> Result<()> {
+    if range.is_empty() {
+        return Ok(());
+    }
+
+    // Median and most other window aggregates have a single input. Keep
+    // their slice on the stack.
+    if let ([value], None) = (values, filter) {
+        return apply(&[value.slice(range.start, range.len())]);
+    }
+
+    let mask = filter.map(|mask| mask.slice(range.start, range.len()));
+    let slices = values
+        .iter()
+        .map(|value| {
+            let slice = value.slice(range.start, range.len());
+            match &mask {
+                Some(mask) => filter_array(&slice, mask),
+                None => Ok(slice),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    apply(&slices)
 }
