@@ -5,16 +5,17 @@
 //! Defines physical expressions that can evaluated at runtime during query execution
 
 use std::mem::size_of_val;
+use std::ops::Range;
 
-use arrow::array::ArrayRef;
-use arrow::array::BooleanArray;
+use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::compute::bool_and as compute_bool_and;
 use arrow::compute::bool_or as compute_bool_or;
 use arrow::datatypes::Field;
 use arrow::datatypes::{DataType, FieldRef};
 
-use datafusion_common::internal_err;
+use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{Result, ScalarValue};
+use datafusion_common::{assert_or_internal_err, internal_err};
 use datafusion_common::{downcast_value, not_impl_err};
 use datafusion_expr::DistinctHandling;
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
@@ -26,6 +27,7 @@ use datafusion_expr::{
 
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::bool_op::BooleanGroupsAccumulator;
 use datafusion_macros::user_doc;
+use datafusion_physical_expr::window::{RecomputeFrame, RecomputingFrameAccumulator};
 
 // returns the new value after bool_and/bool_or with the new values, taking nullability into account
 macro_rules! typed_bool_and_or_batch {
@@ -60,6 +62,43 @@ fn bool_and_batch(values: &ArrayRef) -> Result<ScalarValue> {
 /// dynamically-typed bool_or(array) -> ScalarValue
 fn bool_or_batch(values: &ArrayRef) -> Result<ScalarValue> {
     bool_and_or_batch!(values, compute_bool_or)
+}
+
+fn recompute_bool(
+    values: &[ArrayRef],
+    range: Range<usize>,
+    filter: Option<&BooleanArray>,
+    and: bool,
+) -> Result<Option<bool>> {
+    let [values] = values else {
+        return internal_err!("Expected one input for a boolean aggregate window");
+    };
+    let values = as_boolean_array(values.as_ref())?;
+    assert_or_internal_err!(range.end <= values.len());
+    if let Some(filter) = filter {
+        assert_or_internal_err!(range.end <= filter.len());
+        // Read the two masks in place. Materializing a filtered array for
+        // each frame would require scratch proportional to its width.
+        let mut result = None;
+        for i in range {
+            if filter.is_valid(i) && filter.value(i) && values.is_valid(i) {
+                let value = values.value(i);
+                if value != and {
+                    return Ok(Some(value));
+                }
+                result = Some(value);
+            }
+        }
+        Ok(result)
+    } else {
+        // The concrete Arrow slice shares the existing buffers.
+        let frame = values.slice(range.start, range.len());
+        Ok(if and {
+            compute_bool_and(&frame)
+        } else {
+            compute_bool_or(&frame)
+        })
+    }
 }
 
 make_udaf_expr_and_func!(
@@ -127,6 +166,15 @@ impl AggregateUDFImpl for BoolAnd {
 
     fn accumulator(&self, _: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
         Ok(Box::<BoolAndAccumulator>::default())
+    }
+
+    fn create_sliding_accumulator(
+        &self,
+        _: AccumulatorArgs,
+    ) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(RecomputingFrameAccumulator::new(
+            BoolAndAccumulator::default(),
+        )))
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
@@ -212,6 +260,18 @@ impl Accumulator for BoolAndAccumulator {
     }
 }
 
+impl RecomputeFrame for BoolAndAccumulator {
+    fn recompute(
+        &mut self,
+        values: &[ArrayRef],
+        range: Range<usize>,
+        filter: Option<&BooleanArray>,
+    ) -> Result<()> {
+        self.acc = recompute_bool(values, range, filter, true)?;
+        Ok(())
+    }
+}
+
 #[user_doc(
     doc_section(label = "General Functions"),
     description = "Returns true if any non-null input value is true, otherwise false.",
@@ -261,6 +321,15 @@ impl AggregateUDFImpl for BoolOr {
 
     fn accumulator(&self, _: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
         Ok(Box::<BoolOrAccumulator>::default())
+    }
+
+    fn create_sliding_accumulator(
+        &self,
+        _: AccumulatorArgs,
+    ) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(RecomputingFrameAccumulator::new(
+            BoolOrAccumulator::default(),
+        )))
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
@@ -346,3 +415,18 @@ impl Accumulator for BoolOrAccumulator {
         self.update_batch(states)
     }
 }
+
+impl RecomputeFrame for BoolOrAccumulator {
+    fn recompute(
+        &mut self,
+        values: &[ArrayRef],
+        range: Range<usize>,
+        filter: Option<&BooleanArray>,
+    ) -> Result<()> {
+        self.acc = recompute_bool(values, range, filter, false)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sliding_tests;

@@ -5,12 +5,14 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 mod aggregate;
+mod recomputing_frame;
 mod sliding_aggregate;
 mod standard;
 mod standard_window_function_expr;
 mod window_expr;
 
 pub use aggregate::PlainAggregateWindowExpr;
+pub use recomputing_frame::{RecomputeFrame, RecomputingFrameAccumulator};
 pub use sliding_aggregate::SlidingAggregateWindowExpr;
 pub use standard::StandardWindowExpr;
 pub use standard_window_function_expr::StandardWindowFunctionExpr;

@@ -15,7 +15,9 @@ use crate::window::aggregate::reverse_aggregate_window_expr;
 use crate::window::window_expr::{
     AggregateWindowExpr, WindowEvalContext, WindowFn, filter_array,
 };
-use crate::window::{PartitionBatches, PartitionWindowAggStates, WindowExpr};
+use crate::window::{
+    PartitionBatches, PartitionWindowAggStates, RecomputingFrameAccumulator, WindowExpr,
+};
 use crate::{PhysicalExpr, expressions::PhysicalSortExpr};
 
 use arrow::array::{ArrayRef, BooleanArray};
@@ -186,6 +188,18 @@ impl AggregateWindowExpr for SlidingAggregateWindowExpr {
         accumulator: &mut Box<dyn Accumulator>,
         filter_mask: Option<&BooleanArray>,
     ) -> Result<ScalarValue> {
+        if let Some(frame) = RecomputingFrameAccumulator::as_recomputing(accumulator) {
+            // RANGE frames can be empty with their start past their end.
+            let start = cur_range.start.min(cur_range.end);
+            frame.recompute(value_slice, start..cur_range.end, filter_mask)?;
+            return if cur_range.is_empty() {
+                self.aggregate
+                    .default_value(self.aggregate.field().data_type())
+            } else {
+                accumulator.evaluate()
+            };
+        }
+
         let leaving = last_range.start..last_range.end.min(cur_range.start);
         let entering = cur_range.start.max(last_range.end)..cur_range.end;
         if let ([values], None, false) = (value_slice, filter_mask, cur_range.is_empty())

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::PhysicalExpr;
 use crate::aggregate::SlidingFrameAccumulator;
+use crate::window::RecomputingFrameAccumulator;
 
 use arrow::array::BooleanArray;
 use arrow::array::{Array, ArrayRef, make_comparator, new_empty_array};
@@ -209,7 +210,7 @@ pub trait AggregateWindowExpr: WindowExpr {
         reservation: Option<&MemoryReservation>,
     ) -> Result<ArrayRef> {
         let mut accumulator = self.get_accumulator()?;
-        SlidingFrameAccumulator::attach_reservation(&mut accumulator, reservation);
+        attach_frame_reservation(&mut accumulator, reservation)?;
         let mut last_range = Range { start: 0, end: 0 };
         let sort_options = self.order_by().iter().map(|o| o.options).collect();
         let mut window_frame_ctx =
@@ -246,10 +247,7 @@ pub trait AggregateWindowExpr: WindowExpr {
         for (partition_row, partition_batch_state) in partition_batches.iter() {
             if !window_agg_state.contains_key(partition_row) {
                 let mut accumulator = self.get_accumulator()?;
-                SlidingFrameAccumulator::attach_reservation(
-                    &mut accumulator,
-                    eval_ctx.frame_reservation,
-                );
+                attach_frame_reservation(&mut accumulator, eval_ctx.frame_reservation)?;
                 window_agg_state.insert(
                     partition_row.clone(),
                     WindowState {
@@ -401,6 +399,20 @@ pub trait AggregateWindowExpr: WindowExpr {
             ScalarValue::iter_to_array(row_wise_results)
         }
     }
+}
+
+fn attach_frame_reservation(
+    accumulator: &mut Box<dyn Accumulator>,
+    reservation: Option<&MemoryReservation>,
+) -> Result<()> {
+    if let Some(reservation) = reservation {
+        if let Some(frame) = RecomputingFrameAccumulator::as_recomputing(accumulator) {
+            frame.reserve(reservation)?;
+        } else {
+            SlidingFrameAccumulator::attach_reservation(accumulator, Some(reservation));
+        }
+    }
+    Ok(())
 }
 
 /// Filters a single array with the provided boolean mask.

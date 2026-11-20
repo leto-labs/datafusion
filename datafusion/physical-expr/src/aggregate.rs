@@ -31,6 +31,7 @@ use std::sync::Arc;
 use crate::expressions::Column;
 use crate::physical_expr::create_physical_sort_exprs;
 use crate::planner::{create_physical_expr, create_physical_exprs};
+use crate::window::RecomputingFrameAccumulator;
 
 use arrow::array::ArrayRef;
 use arrow::compute::SortOptions;
@@ -849,7 +850,7 @@ impl AggregateFunctionExpr {
         builder.build().map(Some)
     }
 
-    /// Creates an accumulator with retraction for forward-moving window frames.
+    /// Creates an accumulator for forward-moving window frames.
     pub fn create_sliding_accumulator(&self) -> Result<Box<dyn Accumulator>> {
         let args = AccumulatorArgs {
             return_field: Arc::clone(&self.return_field),
@@ -868,7 +869,9 @@ impl AggregateFunctionExpr {
             frame.inner.enable_sliding();
         }
 
-        if !accumulator.supports_retract_batch() {
+        let supports_recompute = !self.is_distinct
+            && RecomputingFrameAccumulator::as_recomputing(&mut accumulator).is_some();
+        if !accumulator.supports_retract_batch() && !supports_recompute {
             return not_impl_err!(
                 "Aggregate can not be used as a sliding accumulator because \
                      `retract_batch` is not implemented: {}",
@@ -1397,6 +1400,66 @@ mod tests {
             error.message(),
             "Aggregate can not be used as a sliding accumulator because `retract_batch` is not implemented: ordered_digits"
         );
+        Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct NonRetractingFloatSum(f64);
+
+    impl Accumulator for NonRetractingFloatSum {
+        fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+            use arrow::array::AsArray;
+            for value in values[0]
+                .as_primitive::<arrow::datatypes::Float64Type>()
+                .iter()
+                .flatten()
+            {
+                self.0 += value;
+            }
+            Ok(())
+        }
+
+        fn merge_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+            self.update_batch(values)
+        }
+
+        fn evaluate(&mut self) -> Result<ScalarValue> {
+            Ok(ScalarValue::Float64(Some(self.0)))
+        }
+
+        fn state(&mut self) -> Result<Vec<ScalarValue>> {
+            Ok(vec![self.evaluate()?])
+        }
+
+        fn size(&self) -> usize {
+            size_of_val(self)
+        }
+    }
+
+    #[test]
+    fn sliding_non_retracting_float_sum_is_refused() -> Result<()> {
+        use arrow::array::Float64Array;
+
+        let fun = datafusion_expr::create_udaf(
+            "sequential_sum",
+            vec![DataType::Float64],
+            Arc::new(DataType::Float64),
+            Volatility::Immutable,
+            Arc::new(|_| Ok(Box::<NonRetractingFloatSum>::default())),
+            Arc::new(vec![DataType::Float64]),
+        );
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
+        let expr =
+            AggregateExprBuilder::new(Arc::new(fun), vec![Arc::new(Column::new("v", 0))])
+                .schema(schema)
+                .alias("sequential_sum")
+                .build()?;
+        let mut fresh = expr.create_accumulator()?;
+        fresh.update_batch(&[Arc::new(Float64Array::from(vec![1e16, -1e16, 1.0]))])?;
+        assert_eq!(fresh.evaluate()?, ScalarValue::Float64(Some(1.0)));
+        let err = expr.create_sliding_accumulator().unwrap_err();
+        assert!(err.message().contains("`retract_batch` is not implemented"));
         Ok(())
     }
 
