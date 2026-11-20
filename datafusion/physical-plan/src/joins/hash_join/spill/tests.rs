@@ -1130,7 +1130,7 @@ mod review {
                     ready.wait();
 
                     let (_, _, table) = build
-                        .build_on_floor(&mut rows, &mut |_, attempt| {
+                        .build_on_floor(&mut rows, &mut |_, attempt, _| {
                             attempt.try_grow(WORKSPACE)
                         })
                         .unwrap();

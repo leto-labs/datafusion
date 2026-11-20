@@ -495,8 +495,9 @@ impl MatchedBits {
     /// Marks the rows numbered in `ids`.
     pub(super) fn set(&self, ids: &UInt64Array) -> Result<()> {
         let mut words = self.lock();
-        for id in ids.values() {
-            let index = (*id / 64) as usize;
+        // A Left chunk's unmatched build rows carry a null row number.
+        for id in ids.iter().flatten() {
+            let index = (id / 64) as usize;
             let Some(word) = words.get_mut(index) else {
                 return internal_err!("hash join spill: probe row {id} out of range");
             };

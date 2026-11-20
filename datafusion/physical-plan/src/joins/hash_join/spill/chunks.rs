@@ -28,6 +28,11 @@
 //! | RightSemi | RightSemi over the rows not yet marked; marks and emits them | - |
 //! | RightAnti | RightSemi over the rows not yet marked; marks them | the probe rows not marked |
 //! | RightMark | RightSemi over the rows not yet marked; marks them | every probe row, with its mark |
+//! | Left | Left | - |
+//! | Full | Left; marks the probe rows it matches | the probe rows not marked, with null build columns |
+//!
+//! Left and Full runs are the build-row pass of a build with one probe
+//! partition, which keeps the original join type (leto-mjj.106).
 //!
 //! A partition that needs more than `hash_join_spill_max_replay_passes`
 //! chunks fails with `ResourcesExhausted`, naming the bound.
@@ -97,11 +102,12 @@ impl Plan {
             JoinType::RightMark => {
                 plan(JoinType::RightSemi, true, true, false, Rest::Mark)
             }
-            JoinType::Left | JoinType::Full => {
-                return internal_err!(
-                    "hash join spill: a {run_type} run is never joined in chunks"
-                );
-            }
+            // The build-row pass of a single-probe Left or Full build
+            // (leto-mjj.106) keeps its join type: Left is the union of its
+            // chunks; Full runs Left chunks that mark the probe rows they
+            // match, then emits the unmarked rows as Right does.
+            JoinType::Left => plan(JoinType::Left, false, false, true, Rest::None),
+            JoinType::Full => plan(JoinType::Left, true, false, true, Rest::Unmatched),
         })
     }
 }
@@ -332,7 +338,9 @@ impl Chunks {
         let template = &self.run.build.template;
         let probe = template.probe_schema.fields().len();
         let id = match self.plan.chunk_type {
-            JoinType::Inner => template.build_schema.fields().len() + probe,
+            JoinType::Inner | JoinType::Left => {
+                template.build_schema.fields().len() + probe
+            }
             _ => probe,
         };
         if !self.plan.emit {
@@ -368,7 +376,9 @@ impl Chunks {
         Ok(Some(match self.run.kind {
             Output::Own => output.own(batch)?,
             Output::Unmatched => output.emit(&batch)?,
-            Output::Same => batch,
+            // A Full run's Left chunks declare the build columns as the
+            // build side does; the join declares them nullable.
+            Output::Same => output.own(batch)?,
         }))
     }
 
