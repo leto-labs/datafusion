@@ -363,8 +363,11 @@ async fn refused_written_partitions_spill_one_level_deeper() -> Result<()> {
         shape: Shape::CollectLeft(1),
     };
     let plan = join_plan(&case, &build, &probe)?;
+    // leto-mjj.98 v2: 4 KiB workspace (was 1 KiB): one written row, decoded
+    // with its copy and table, needs about 1.35 KiB (review MJJ98-REVIEW3,
+    // finding 2), more than three quarters of 1 KiB.
     let context =
-        task_context(no_reversal(spill_config(0, 1024, 3)), Some(48 * 1024), true);
+        task_context(no_reversal(spill_config(0, 4096, 3)), Some(48 * 1024), true);
     let actual = batches_to_sort_string(&run(&plan, context).await?);
     assert_eq!(actual, expected(&case, &build, &probe).await);
     let (_, _, depth) = spill_metrics(&plan);
@@ -389,8 +392,11 @@ async fn depth_limit_joins_in_build_chunks() -> Result<()> {
             shape: Shape::CollectLeft(1),
         };
         let plan = join_plan(&case, &build, &probe)?;
+        // leto-mjj.98 v2: 4 KiB workspace (was 1 KiB): one written row, decoded
+        // with its copy and table, needs about 1.35 KiB (review MJJ98-REVIEW3,
+        // finding 2), more than three quarters of 1 KiB.
         let context =
-            task_context(no_reversal(spill_config(0, 1024, 0)), Some(48 * 1024), true);
+            task_context(no_reversal(spill_config(0, 4096, 0)), Some(48 * 1024), true);
         let actual = batches_to_sort_string(&run(&plan, Arc::clone(&context)).await?);
         assert_eq!(actual, expected(&case, &build, &probe).await, "{join_type}");
         let metrics = plan.metrics().unwrap();
@@ -428,8 +434,11 @@ async fn hot_key_is_joined_in_build_chunks() -> Result<()> {
         shape: Shape::CollectLeft(1),
     };
     let plan = join_plan(&case, &build, &probe)?;
+    // leto-mjj.98 v2: 4 KiB workspace (was 1 KiB): one written row, decoded
+    // with its copy and table, needs about 1.35 KiB (review MJJ98-REVIEW3,
+    // finding 2), more than three quarters of 1 KiB.
     let context =
-        task_context(no_reversal(spill_config(0, 1024, 2)), Some(48 * 1024), true);
+        task_context(no_reversal(spill_config(0, 4096, 2)), Some(48 * 1024), true);
     let actual = batches_to_sort_string(&run(&plan, context).await?);
     assert_eq!(actual, expected(&case, &build, &probe).await);
     let metrics = plan.metrics().unwrap();
@@ -819,7 +828,10 @@ async fn unmatchable_rows_need_no_table() -> Result<()> {
                 shape,
             };
             let plan = join_plan(&case, &build, &probe)?;
-            let context = task_context(spill_config(0, 1024, 3), Some(24 * 1024), true);
+            // leto-mjj.98 v2: 4 KiB workspace (was 1 KiB): one written row, decoded
+            // with its copy and table, needs about 1.35 KiB (review MJJ98-REVIEW3,
+            // finding 2), more than three quarters of 1 KiB.
+            let context = task_context(spill_config(0, 4096, 3), Some(24 * 1024), true);
             let actual = run(&plan, context)
                 .await
                 .unwrap_or_else(|error| panic!("{join_type} {shape:?}: {error}"));
@@ -2021,6 +2033,7 @@ mod review {
         /// `empty_table_is_charged_without_refusal` with the parameters it
         /// had at b86028d75 (a 512 byte workspace, four streams, a 2,048
         /// byte pool), 12 times, and with workspaces up to the lane's 8 KiB.
+        /// Below 2 KiB the named refusal of the chunk unit is the answer.
         #[tokio::test]
         async fn rereview_empty_table_test_with_its_first_parameters() -> Result<()> {
             let build = table("b", 2000, 1999, 0, 100);
@@ -2053,7 +2066,18 @@ mod review {
                         }
                     }
                 }
-                failed += 12 - pass;
+                // leto-mjj.98 v2: below 2 KiB no written row fits the chunk
+                // unit with its decoded IPC message, copy and table (about
+                // 1.35 KiB; review MJJ98-REVIEW3, finding 2). Those
+                // workspaces must refuse with the error that names the unit.
+                if workspace < 2048 {
+                    let named = errors.keys().all(|error| {
+                        error.contains("one row of") && error.contains("needs")
+                    });
+                    assert!(pass == 12 || named, "workspace={workspace}: {errors:?}");
+                } else {
+                    failed += 12 - pass;
+                }
                 report.push(format!(
                     "workspace={workspace}: pass {pass} of 12 {errors:?}"
                 ));
@@ -2102,8 +2126,11 @@ mod review {
                 shape: Shape::CollectLeft(1),
             };
             let plan = join_plan(&case, &build, &probe)?;
+            // leto-mjj.98 v2: 4 KiB workspace (was 1 KiB): one written row, decoded
+            // with its copy and table, needs about 1.35 KiB (review MJJ98-REVIEW3,
+            // finding 2), more than three quarters of 1 KiB.
             let context = task_context(
-                no_reversal(spill_config(0, 1024, 2)),
+                no_reversal(spill_config(0, 4096, 2)),
                 Some(48 * 1024),
                 true,
             );
@@ -2314,4 +2341,5 @@ async fn bound_range_build_rows_follow_the_stock_count() -> Result<()> {
 // (add-join-spill section 3).
 // ---------------------------------------------------------------------------
 
+pub(crate) mod bound;
 mod skew;

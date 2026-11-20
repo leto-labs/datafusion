@@ -3359,37 +3359,34 @@ async fn collect_left_input(
     let schema = left_stream.schema();
     let prepared = mode == BuildMode::Prepared;
     // Longbow family JS: a build chunk uses the single-future build, which
-    // gives its rows back when the table is refused.
+    // gives its rows back when the table is refused. Its first read is
+    // made under the permit that `start` reserves.
     let parallel = parallel.filter(|_| chunk.is_none());
+    if let Some(chunk) = chunk.as_mut() {
+        chunk.start(&schema, &on_left)?;
+    }
 
-    let is_phj_candidate = is_perfect_hash_join_candidate(&on_left, &schema)?;
+    // Chunks use the hash table without dynamic filters or perfect hash
+    // bounds. Their original key expressions run only during admission.
+    let collect_bounds = chunk.is_none()
+        && (should_compute_dynamic_filters
+            || is_perfect_hash_join_candidate(&on_left, &schema)?);
 
     let mut state = BuildSideState::try_new(
         metrics,
         reservation,
         on_left.clone(),
         &schema,
-        should_compute_dynamic_filters || is_phj_candidate,
+        collect_bounds,
     )?;
 
     let mut max_batch_rows = 0;
     while let Some(batch) = left_stream.try_next().await? {
-        // Longbow family JS (build chunks): a chunk ends at the first batch
-        // that the pool refuses, which goes back to the chunk's cursor.
-        let chunk_size = match chunk.as_mut() {
-            Some(chunk) => match chunk.admit(&batch, state.batches.is_empty())? {
-                Some(size) => Some(size),
-                None => break,
-            },
-            None => None,
-        };
-        max_batch_rows = max_batch_rows.max(batch.num_rows());
-        if let Some(accumulators) = &mut state.bounds_accumulators {
-            for accumulator in accumulators {
-                accumulator.update_batch(&batch)?;
-            }
-        }
-        if let Some(size) = chunk_size {
+        // Longbow family JS (build chunks): the chunk admits the batch under
+        // its read permit and appends its evaluated keys; its input ends
+        // before the read it cannot reserve a permit for.
+        if let Some(chunk) = chunk.as_mut() {
+            let (batch, size) = chunk.admit(batch)?;
             // Charged to the chunk run (`ChunkBuild::admit`), not here.
             state.metrics.build_mem_used.add(size);
             state.metrics.build_input_batches.add(1);
@@ -3397,6 +3394,12 @@ async fn collect_left_input(
             state.num_rows += batch.num_rows();
             state.batches.push(batch);
             continue;
+        }
+        max_batch_rows = max_batch_rows.max(batch.num_rows());
+        if let Some(accumulators) = &mut state.bounds_accumulators {
+            for accumulator in accumulators {
+                accumulator.update_batch(&batch)?;
+            }
         }
         // Longbow family JS (hook 1): an eligible join answers a refused
         // reservation by writing partitions, and stays in spill mode.
@@ -3443,8 +3446,6 @@ async fn collect_left_input(
             chunk,
             std::mem::take(&mut state.batches),
             &random_state,
-            &schema,
-            &on_left,
             &state.metrics,
             with_visited_indices_bitmap,
             probe_threads_count,
@@ -3646,22 +3647,28 @@ async fn collect_left_input(
     }
 }
 
-/// Longbow family JS: the table of a build chunk. Its rows and an estimate
-/// of their table were admitted batch by batch (`ChunkBuild::admit`). The
-/// table is built against a pool capped at that grant, so every allocation
-/// of the build (copy, table, key expressions, bitmaps) is refused at the cap
-/// before it is made: nothing is allocated beyond memory the real pool
-/// already granted. A refused build gives the second half of its batches
-/// back (still charged in the run) and builds again; one batch that does not
-/// fit fails with `ResourcesExhausted`. The table's charge is then split off
-/// the run's charge and the unused grant goes back to the pool.
+/// Longbow family JS: the table of a build chunk. Its keyed rows (each batch
+/// with its join keys evaluated once and appended, see `spill::ChunkKeys`)
+/// and an estimate of their table were admitted batch by batch
+/// (`ChunkBuild::admit`). The table is built over the key columns, so the
+/// build evaluates no key expression and normalizes no key again: every
+/// evaluation is a clone of a charged column. It is built against a pool
+/// capped at the grant, in which the admitted rows stay charged (`pinned`)
+/// for as long as the attempt holds them, and the hash buffer of the
+/// row-by-row build is charged before the build; every other allocation of
+/// the build (copy, table, bitmap) is charged before it is made. Nothing is
+/// allocated beyond memory the real pool already granted (review
+/// MJJ98-REVIEW3, finding 1). A refused build gives the second half of its
+/// batches back (still charged in the run) and builds again; one batch that
+/// does not fit fails with `ResourcesExhausted`. The table's charge is then
+/// split off the run's charge, the unused grant goes back to the pool, and
+/// the table's batch keeps only the build columns (the keys stay in its
+/// key values).
 #[expect(clippy::too_many_arguments)]
 fn build_chunk(
     mut chunk: ChunkBuild,
     mut batches: Vec<RecordBatch>,
     random_state: &RandomState,
-    schema: &SchemaRef,
-    on_left: &[PhysicalExprRef],
     metrics: &BuildProbeJoinMetrics,
     with_visited_indices_bitmap: bool,
     probe_threads_count: usize,
@@ -3669,25 +3676,45 @@ fn build_chunk(
     null_equality: NullEquality,
     array_map_created_count: &Count,
 ) -> Result<JoinLeftData> {
+    let keys = chunk.chunk_keys()?;
+    let schema = keys.keyed_schema();
+    let build_columns: Vec<usize> = (0..keys.columns()).collect();
     loop {
+        #[cfg(test)]
+        let window = spill::BuildWindow::open(chunk.granted(), chunk.rows_bytes());
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(chunk.granted()));
-        let mut attempt = MemoryConsumer::new("HashJoinChunkTable")
-            .with_can_spill(true)
-            .register(&pool);
-        attempt.try_grow(chunk.rows_bytes())?;
-        let originals = batches.clone();
+        let consumer = |name: &str| {
+            MemoryConsumer::new(name)
+                .with_can_spill(true)
+                .register(&pool)
+        };
+        let pinned = consumer("HashJoinChunkRows");
+        pinned.try_grow(chunk.rows_bytes())?;
         let num_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        let max_batch_rows = batches.iter().map(RecordBatch::num_rows).max();
-        let input_bytes = attempt.size();
+        let max_batch_rows = batches.iter().map(RecordBatch::num_rows).max().unwrap_or(0);
+        let nested_hash_scratch = batches
+            .iter()
+            .map(|batch| keys.hash_scratch(batch))
+            .max()
+            .unwrap_or(0);
+        let scratch = consumer("HashJoinChunkHashes");
+        scratch.try_grow(max_batch_rows * size_of::<u64>() + nested_hash_scratch)?;
+        let sizes: Vec<usize> =
+            batches.iter().map(get_record_batch_memory_size).collect();
+        let originals = batches.clone();
+        let mut attempt = consumer("HashJoinChunkTable");
+        // The rows are charged by `pinned`, not as the attempt's input:
+        // the concatenation charges only its copy, and the inputs stay
+        // charged while `originals` holds them for a retry.
         let built = build_in_memory(
             random_state,
             schema,
             &mut batches,
             num_rows,
-            max_batch_rows.unwrap_or(0),
-            input_bytes,
+            max_batch_rows,
             0,
-            on_left,
+            0,
+            keys.on_keyed(),
             metrics,
             &mut attempt,
             None,
@@ -3705,21 +3732,31 @@ fn build_chunk(
             None,
             None,
         );
+        drop(scratch);
+        #[cfg(test)]
+        window.close();
         match built {
             Ok(mut data) => {
+                drop(batches);
+                drop(originals);
+                drop(pinned);
+                drop(attempt);
                 let charge = chunk.take_charge(pool.reserved());
                 let left = Arc::get_mut(&mut data.build)
                     .ok_or_else(|| internal_datafusion_err!("shared build chunk"))?;
                 left.reservation = charge;
+                left.batch = left.batch.project(&build_columns)?;
                 return Ok(data);
             }
             Err(error) if spill::is_refusal(&error) && originals.len() > 1 => {
                 drop(batches);
                 drop(attempt);
-                let mut keep = originals;
+                drop(pinned);
+                let mut keep: Vec<(RecordBatch, usize)> =
+                    originals.into_iter().zip(sizes).collect();
                 let rest = keep.split_off(keep.len() / 2);
                 chunk.give_back(rest);
-                batches = keep;
+                batches = keep.into_iter().map(|(batch, _)| batch).collect();
             }
             Err(error) if spill::is_refusal(&error) => {
                 return Err(error.context(format!(

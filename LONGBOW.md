@@ -1047,19 +1047,21 @@ Section 3 (lane `leto-mjj.98`):
   whole. If its indivisible join is refused beyond its floor it raises the
   run's `ChunkSignal` and fails before it produced a row; the run then
   joins the partition in chunks. Each chunk is a stock `CollectLeft` join
-  whose build reads the build file from a `Cursor` until the pool refuses a
-  batch together with an estimate of its table (copy, 48 B per row, 256 B):
-  that batch goes back to the cursor, and the first batch of a chunk is
-  charged without refusal, so every chunk progresses. A refused table gives
-  half of its batches back; a table over one batch is built on a private
-  pool and charged without refusal. The probe replays the partition's probe
-  files. Inner, LeftSemi, LeftAnti and LeftMark are the union of their
-  chunks (each build row is in one chunk and sees every probe row). Joins
-  that emit probe rows keep one matched bit per probe row, numbered by a
-  column the probe leaf appends: Right runs Inner chunks and then emits the
-  unmarked probe rows with null build columns; RightSemi runs RightSemi over
-  the unmarked rows; RightAnti and RightMark mark with RightSemi chunks and
-  then emit the unmarked rows, or every row with its mark. A partition that
+  whose build reads the build file from a `Cursor`, each batch under a read
+  permit of one chunk unit (the first of a chunk charged without refusal, so
+  every chunk progresses), until the pool refuses the permit of the next
+  read; the cursor ends at the file's last row. A refused table gives half
+  of its batches back (still charged) and builds again. The probe replays
+  the partition's probe files. Inner, Left, LeftSemi, LeftAnti and LeftMark
+  are the union of their chunks (each build row is in one chunk and sees
+  every probe row). Joins that emit probe rows keep one matched bit per
+  probe row, numbered by a column the probe leaf appends: Right runs Inner
+  chunks and Full runs Left chunks, then each emits the unmarked probe rows
+  with null build columns; RightSemi runs RightSemi over the unmarked rows;
+  RightAnti and RightMark mark with RightSemi chunks and then emit the
+  unmarked rows, or every row with its mark. Left and Full runs are the
+  build-row pass of a build with one probe partition, which keeps the
+  original join type (leto-mjj.106). A partition that
   needs more than `hash_join_spill_max_replay_passes` (64) chunks fails with
   `ResourcesExhausted` naming the bound. Later own runs of a partition that
   a stream found needs chunks start in chunks. Each stream chunks its own
@@ -1076,17 +1078,34 @@ Section 3 (lane `leto-mjj.98`):
   build falls back to chunks in the partition's own orientation.
 - `hash_join_spill_relief_divisor`: a relief releases the refused bytes and
   at least 1/N of what the build held (0: the refused bytes only).
-- Memory bound (fixes from the review `MJJ98-REVIEW-20261119`): written
-  build batches are bounded by bytes as well as rows, so that no batch needs
-  more than three quarters of the workspace with its table (a larger piece is
-  written in slices); a chunk admits its rows and their table estimate batch
-  by batch and splits before its build; the table, built on a private pool,
-  moves into charge the pool granted, and a rest beyond the estimate is
-  admitted (or charged without refusal up to the chunk unit); a batch given
-  back to the cursor keeps its charge; the matched bitmap is admitted (up to
-  a quarter of the workspace without refusal). A unit or bitmap above its
-  share that the pool refuses fails with `ResourcesExhausted` naming it. The
-  reversal decision uses each file's own size.
+- Memory bound: charged once-per-batch key evaluation (`spill/footprint.rs`,
+  reviews `MJJ98-REVIEW-20261119`, `MJJ98-REREVIEW-20261120` and
+  `MJJ98-REVIEW3-20261120`). A chunk evaluates each batch's join keys once,
+  under the batch's read permit, normalizes float keys, and appends them to
+  the batch (`ChunkKeys`; a column key without floats is used where it is).
+  It charges `admission_need`: the decoded batch and its new key bytes, their
+  copy in the table, the dictionaries the IPC reader keeps, nested hash
+  scratch, 56 B per row (table and hash buffer) and 256 B. The table is built over the key columns
+  against a pool capped at the chunk's grant, in which the admitted rows
+  stay pinned while the attempt can retry. The build charges the hash
+  buffer and the largest batch's nested hash scratch before it starts.
+  The hash table uses the charged key columns and skips collecting
+  bounds. Every written build and probe batch is checked as written
+  (groups after concatenation; oversized pieces split and compacted)
+  against `write_need`, an upper bound of `admission_need`: IPC
+  buffers plus 64 B of padding each and a header bound based on the
+  number of buffers and field nodes (doubled with compression), and the
+  keys evaluated over the written rows. A row whose
+  need exceeds the chunk unit (three quarters of the workspace) fails with
+  `ResourcesExhausted` before it is written. The matched bitmap is admitted
+  (up to a quarter of the workspace without refusal). A batch given back to
+  the cursor keeps its charge; the table's charge is split off the run's.
+  The reversal decision uses each file's own size. Outside the pool remain
+  the IPC readers' I/O buffers (128 KiB per open local file, at most the
+  build cursor and one probe replay per chunking stream, as for every
+  DataFusion spill reader), writer compaction and encoding, small build
+  objects and sparse-union hashing's Arrow `take` buffers. Pending
+  halves of a piece can retain their parents' compacted buffers.
 - Metrics `spill_reliefs`, `spill_reversed_runs`, `spill_chunked_runs`,
   `spill_replay_passes`.
 
@@ -1109,7 +1128,15 @@ rows) in build chunks. Section 3 (`spill/tests/skew.rs`): a hot key and a
 NULL key under `NullEqualsNull` in every join type and shape, the replay
 bound, one join when the partition fits, reversal of every type, reversal
 under pressure, a reversed join that falls back to chunks, and independent
-bits for every pair of levels.
+bits for every pair of levels. Bound (`spill/tests/bound.rs`, a test-only
+counting allocator): every chunk build of a `k || k` key over 200-character
+strings allocates at most its grant less its rows (worst 0.945; 2.43 with
+the keys evaluated in the build, as before); every batch written for
+several units, column types (strings, views, dictionaries, lists, floats
+with -0.0), key kinds and compressions fits its read permit when read back
+and admitted, and a row that cannot fit is refused before it is written;
+a chunk's first read holds a permit; a permit refused after the file's last
+row ends the file.
 
 Evidence: Longbow lanes `leto-mjj.90`,
 `~/data/longbow/benchmarks/MJJ90-20261119/`, `leto-mjj.99`,

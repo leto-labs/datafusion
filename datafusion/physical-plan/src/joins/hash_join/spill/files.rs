@@ -20,6 +20,7 @@ use std::task::{Context, Poll};
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion_common::config::SpillCompression;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     DataFusionError, Result, exec_datafusion_err, resources_datafusion_err,
@@ -188,6 +189,11 @@ impl PartitionFileWriter {
         self.manager.schema()
     }
 
+    /// Whether the file's IPC buffers are compressed.
+    pub(super) fn compressed(&self) -> bool {
+        !matches!(self.manager.compression, SpillCompression::Uncompressed)
+    }
+
     pub(super) fn write(
         &mut self,
         batches: impl Iterator<Item = Result<RecordBatch>>,
@@ -303,9 +309,16 @@ impl FileSource {
 }
 
 /// The read position in the build file of a partition joined in chunks,
-/// and the one charge of the run: the batches given back, and the rows and
-/// table estimate of the chunk being built, are all held by `charge`, so
-/// moving bytes between them never passes through the pool.
+/// and the one charge of the run: the batches given back, the read permit,
+/// the reader's dictionaries, and the rows and table estimate of the chunk
+/// being built, are all held by `charge`, so moving bytes between them never
+/// passes through the pool.
+///
+/// Every read from the file happens under a read permit of one chunk unit
+/// (review MJJ98-REVIEW3, finding 2): the chunk build reserves it before the
+/// read (the first of a chunk without refusal, as the chunk's smallest
+/// unit), and the writer checked that no written batch needs more
+/// ([`super::footprint`]). A read without a permit is an internal error.
 pub(crate) struct Cursor {
     file: SpilledFile,
     spill_manager: SpillManager,
@@ -317,17 +330,23 @@ pub(crate) struct Cursor {
 
 struct CursorState {
     reader: Option<Rows>,
-    /// Batches given back, read before the file.
-    back: Vec<RecordBatch>,
+    /// Batches given back, read before the file, with the bytes of
+    /// `charge` that cover each.
+    back: Vec<(RecordBatch, usize)>,
     /// The run's charge (see [`Cursor`]).
     charge: MemoryReservation,
-    /// Bytes of `charge` that cover the batches given back.
-    back_bytes: usize,
-    /// The batch read last came back from a chunk (still charged).
-    carried: bool,
+    /// Bytes of `charge` reserved for the next read.
+    permit: usize,
+    /// Bytes of `charge` that cover the dictionaries the reader keeps.
+    dictionaries: usize,
+    /// The bytes of the batch read last, if it came back from a chunk
+    /// (still charged).
+    carried: Option<usize>,
     /// The chunk being built could not reserve room for another batch: its
     /// build input ends here, before anything more is read.
     stop: bool,
+    /// Rows read from the file so far.
+    read_rows: usize,
     /// The file has been read to its end.
     ended: bool,
 }
@@ -347,9 +366,11 @@ impl Cursor {
                 reader: None,
                 back: vec![],
                 charge,
-                back_bytes: 0,
-                carried: false,
+                permit: 0,
+                dictionaries: 0,
+                carried: None,
                 stop: false,
+                read_rows: 0,
                 ended: false,
             }),
         }
@@ -359,26 +380,15 @@ impl Cursor {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    pub(crate) fn unit(&self) -> usize {
-        self.unit
-    }
-
-    /// Whether the batch read last came back from a chunk; its `size` bytes
-    /// then move from the given-back bytes to the caller's (no pool change).
-    pub(crate) fn take_carried(&self, size: usize) -> bool {
-        let mut state = self.lock();
-        if !std::mem::take(&mut state.carried) {
-            return false;
-        }
-        state.back_bytes = state.back_bytes.saturating_sub(size);
-        true
+    /// The bytes of the batch read last if it came back from a chunk: they
+    /// move from the given-back bytes to the caller's (no pool change).
+    pub(crate) fn take_carried(&self) -> Option<usize> {
+        self.lock().carried.take()
     }
 
     /// Gives `batch` back; `size` bytes of the charge already cover it.
     pub(crate) fn give_back(&self, batch: RecordBatch, size: usize) {
-        let mut state = self.lock();
-        state.back_bytes += size;
-        state.back.push(batch);
+        self.lock().back.push((batch, size));
     }
 
     /// Ends the current chunk's build input before its next read.
@@ -391,12 +401,60 @@ impl Cursor {
         self.lock().stop = false;
     }
 
+    /// Reserves the read permit of a chunk's first read: admitted by the
+    /// pool, or charged without refusal as the chunk's smallest unit.
+    pub(crate) fn open_permit(&self) {
+        let mut state = self.lock();
+        let missing = self.unit.saturating_sub(state.permit);
+        if missing > 0 && state.charge.try_grow(missing).is_err() {
+            state.charge.grow(missing);
+        }
+        state.permit = state.permit.max(self.unit);
+    }
+
+    /// Reserves the permit of the next read if the pool admits it; `false`
+    /// if it does not (the chunk then stops before the read). No permit is
+    /// needed once nothing is left to read.
+    pub(crate) fn next_permit(&self) -> bool {
+        let mut state = self.lock();
+        if state.ended && state.back.is_empty() {
+            return true;
+        }
+        let missing = self.unit.saturating_sub(state.permit);
+        if missing > 0 {
+            if state.charge.try_grow(missing).is_err() {
+                return false;
+            }
+            state.permit = self.unit;
+        }
+        true
+    }
+
+    /// Takes the permit that covered the read just made.
+    pub(crate) fn take_permit(&self) -> usize {
+        std::mem::take(&mut self.lock().permit)
+    }
+
+    /// The reader keeps dictionaries of `bytes` (a bound) from the batch
+    /// read last: returns the bytes the charge must grow by to cover them
+    /// (none once the reader is gone).
+    pub(crate) fn keep_dictionaries(&self, bytes: usize) -> usize {
+        let mut state = self.lock();
+        if state.reader.is_none() || bytes <= state.dictionaries {
+            return 0;
+        }
+        let extra = bytes - state.dictionaries;
+        state.dictionaries = bytes;
+        extra
+    }
+
     /// Grows the run's charge by `bytes` if the pool admits them.
     pub(crate) fn try_grow(&self, bytes: usize) -> Result<()> {
         self.lock().charge.try_grow(bytes)
     }
 
-    /// Grows the run's charge without refusal (the smallest unit).
+    /// Grows the run's charge without refusal (an empty table's fixed
+    /// parts).
     pub(crate) fn grow(&self, bytes: usize) {
         self.lock().charge.grow(bytes)
     }
@@ -420,19 +478,32 @@ impl Cursor {
         state.ended && state.back.is_empty()
     }
 
-    fn poll_next(&self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
+    #[cfg(test)]
+    pub(super) fn charged(&self) -> usize {
+        self.lock().charge.size()
+    }
+
+    pub(super) fn poll_next(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<RecordBatch>>> {
         let mut state = self.lock();
         if state.stop {
             return Poll::Ready(None);
         }
-        if let Some(batch) = state.back.pop() {
+        if let Some((batch, size)) = state.back.pop() {
             // The chunk build takes its bytes over as it admits the batch
             // (`ChunkBuild::admit`, right after the read).
-            state.carried = true;
+            state.carried = Some(size);
             return Poll::Ready(Some(Ok(batch)));
         }
         if state.ended {
             return Poll::Ready(None);
+        }
+        if state.permit < self.unit {
+            return Poll::Ready(Some(internal_err!(
+                "hash join spill: a build chunk read its file without a read permit"
+            )));
         }
         if state.reader.is_none() {
             match self
@@ -445,9 +516,22 @@ impl Cursor {
         }
         let reader = state.reader.as_mut().expect("a reader");
         let next = reader.poll_next_unpin(cx);
-        if matches!(next, Poll::Ready(None)) {
+        let finished = match &next {
+            Poll::Ready(None) => true,
+            Poll::Ready(Some(Ok(batch))) => {
+                state.read_rows += batch.num_rows();
+                // The file's last row (review MJJ98-REVIEW3, finding 3): the
+                // cursor ends here, so a chunk that cannot reserve another
+                // permit does not leave an empty replay behind.
+                state.read_rows >= self.file.rows
+            }
+            _ => false,
+        };
+        if finished {
             state.ended = true;
             state.reader = None;
+            let dictionaries = std::mem::take(&mut state.dictionaries);
+            state.charge.shrink(dictionaries.min(state.charge.size()));
         }
         next.map(|batch| batch.map(|batch| batch.map_err(spill_file_error)))
     }

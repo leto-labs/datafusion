@@ -577,7 +577,9 @@ async fn join_by_key_spills(target_partitions: usize) {
                 SessionConfig::new().with_target_partitions(target_partitions);
             let execution = &mut config.options_mut().execution;
             execution.enable_hash_join_spilling = spilling;
-            execution.hash_join_spill_reservation_bytes = 4096;
+            // The wide access-log schema needs more than a 3 KiB permit
+            // for one IPC row, even after compacting the dictionaries.
+            execution.hash_join_spill_reservation_bytes = 24 * 1024;
             let mut runtime = RuntimeEnvBuilder::new()
                 .with_disk_manager_builder(DiskManagerBuilder::default());
             if let Some(limit) = limit {

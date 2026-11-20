@@ -41,13 +41,19 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow::compute::filter_record_batch;
-use datafusion_common::{DataFusionError, JoinType, Result, internal_err};
+use arrow::datatypes::SchemaRef;
+use datafusion_common::utils::memory::get_record_batch_memory_size;
+use datafusion_common::{
+    DataFusionError, JoinType, Result, internal_datafusion_err, internal_err,
+};
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr::projection::ProjectionRef;
 use futures::StreamExt;
 
 use super::files::{MatchedBits, RowIds, with_row_id};
+use super::footprint::{self, ChunkKeys};
 use super::{
     Cursor, FileSource, Origin, Output, SpillFilesExec, SpilledBuild, SpilledFile,
     UnmatchedOutput,
@@ -434,41 +440,60 @@ impl Chunks {
     }
 }
 
-/// The build of one chunk (the hook in `collect_left_input`): it admits
-/// batches from its cursor while the pool grants each batch and an estimate
-/// of its table, and gives back the first batch the pool refuses. Every byte
+/// The build of one chunk (the hook in `collect_left_input`). Every byte
 /// lives in the run's one charge, held by the cursor: a batch given back
 /// keeps its bytes there, and the table's charge is split off it, so no
-/// transfer grows one reservation before another shrinks. The first batch
-/// of a chunk may be charged without refusal only within the chunk unit
-/// (three quarters of the workspace); a larger one refused fails with
-/// `ResourcesExhausted` naming it.
+/// transfer grows one reservation before another shrinks.
+///
+/// Each batch is read under a read permit of one chunk unit (the first of a
+/// chunk charged without refusal, as its smallest unit). Under the same
+/// permit the batch's join keys are evaluated once and appended to it
+/// ([`ChunkKeys`]), and the chunk charges what it needs for the batch
+/// ([`footprint::admission_need`]: the batch and its keys, their copy in
+/// the table, the reader's dictionaries, the table and hash scratch); the writer
+/// checked that this fits the permit. The table is then built from the key
+/// columns (`build_chunk` in `exec.rs`) against a pool capped at the grant.
 pub(crate) struct ChunkBuild {
     cursor: Arc<Cursor>,
-    /// Bytes of the run's charge that this chunk holds: its rows and the
-    /// table estimate.
+    keys: Option<Arc<ChunkKeys>>,
+    /// Bytes of the run's charge that this chunk holds: its rows and keys,
+    /// their copy, and the table estimate.
     granted: usize,
-    /// Of those, the bytes of the rows.
+    /// Of those, the bytes of the keyed rows.
     rows: usize,
-    /// Bytes of the run's charge reserved for the next batch read.
-    permit: usize,
-}
-
-/// Bytes kept for the table of `rows` rows of `bytes` bytes: their copy,
-/// 48 bytes of table and keys per row (the floor's estimate), and the fixed
-/// parts.
-fn table_estimate(bytes: usize, rows: usize) -> usize {
-    bytes + rows * 48 + 256
 }
 
 impl ChunkBuild {
     pub(crate) fn new(cursor: Arc<Cursor>) -> Self {
         Self {
             cursor,
+            keys: None,
             granted: 0,
             rows: 0,
-            permit: 0,
         }
+    }
+
+    /// Starts the chunk's build over batches of `schema` joined on
+    /// `on_left`: reserves the permit of its first read.
+    pub(crate) fn start(
+        &mut self,
+        schema: &SchemaRef,
+        on_left: &[PhysicalExprRef],
+    ) -> Result<()> {
+        self.keys = Some(Arc::new(ChunkKeys::try_new(schema, on_left)?));
+        self.cursor.open_permit();
+        Ok(())
+    }
+
+    fn keys(&self) -> Result<&Arc<ChunkKeys>> {
+        self.keys
+            .as_ref()
+            .ok_or_else(|| internal_datafusion_err!("a build chunk that did not start"))
+    }
+
+    /// The keys of the chunk's batches.
+    pub(crate) fn chunk_keys(&self) -> Result<Arc<ChunkKeys>> {
+        self.keys().cloned()
     }
 
     /// The bytes this chunk's table may use: the cap of its build.
@@ -476,74 +501,73 @@ impl ChunkBuild {
         self.granted
     }
 
-    /// The bytes of the chunk's rows.
+    /// The bytes of the chunk's keyed rows.
     pub(crate) fn rows_bytes(&self) -> usize {
         self.rows
     }
 
-    /// Takes `batch` into the chunk and returns its bytes. A batch after the
-    /// first was read only under a read permit (one chunk unit, the most a
-    /// written batch needs with its table), which now covers it; the first
-    /// is admitted by the pool, or charged without refusal within the chunk
-    /// unit. Then a permit for the next batch is reserved; if the pool
-    /// refuses it, the chunk's input ends before the next read, so no batch
-    /// is ever read that the chunk cannot hold.
-    pub(crate) fn admit(
-        &mut self,
-        batch: &RecordBatch,
-        first: bool,
-    ) -> Result<Option<usize>> {
-        let size = datafusion_common::utils::memory::get_record_batch_memory_size(batch);
+    /// Takes `batch`, read under the current permit, into the chunk: returns
+    /// it with its keys appended, and its bytes. Then reserves the permit of
+    /// the next read; if the pool refuses it, the chunk's input ends before
+    /// that read.
+    pub(crate) fn admit(&mut self, batch: RecordBatch) -> Result<(RecordBatch, usize)> {
         let rows = batch.num_rows();
-        let extra = table_estimate(size, rows);
-        // A batch given back before is still charged: its bytes move over.
-        let carried = self.cursor.take_carried(size);
-        if carried {
-            self.granted += size;
-            self.rows += size;
-        }
-        let need = if carried { extra } else { size + extra };
-        let permit = std::mem::take(&mut self.permit);
+        // The bytes of `need` that cover the reader's dictionaries: they stay
+        // in the run's charge, outside the chunk's grant, until the file ends.
+        let mut kept = 0;
+        let (batch, resident, need) = match self.cursor.take_carried() {
+            // A batch given back is keyed and its bytes are still charged:
+            // they move over. This permit covers a fresh copy, table and
+            // hash scratch allowance.
+            Some(size) => {
+                let keys = self.keys()?;
+                let copy = size + keys.appended_copy(&batch)?;
+                let scratch = keys.hash_scratch(&batch);
+                self.granted += size;
+                self.rows += size;
+                (
+                    batch,
+                    size,
+                    footprint::admission_need(0, copy, 0, scratch, rows),
+                )
+            }
+            None => {
+                let decoded = get_record_batch_memory_size(&batch);
+                let dictionaries = self
+                    .cursor
+                    .keep_dictionaries(footprint::dictionary_bound(&batch)?);
+                let keyed = self.keys()?.materialize(&batch)?;
+                drop(batch);
+                let resident = decoded + keyed.new_bytes;
+                let need = footprint::admission_need(
+                    resident,
+                    decoded + keyed.copy_bytes,
+                    dictionaries,
+                    self.keys()?.hash_scratch(&keyed.batch),
+                    rows,
+                );
+                self.rows += resident;
+                kept = dictionaries;
+                (keyed.batch, resident, need)
+            }
+        };
+        let permit = self.cursor.take_permit();
         if permit >= need {
             self.cursor.shrink(permit - need);
-        } else {
-            if permit > 0 {
-                self.cursor.shrink(permit);
-            }
-            match self.cursor.try_grow(need) {
-                Ok(()) => {}
-                Err(error) if super::is_refusal(&error) && first => {
-                    if size + extra > self.cursor.unit() {
-                        return Err(DataFusionError::ResourcesExhausted(format!(
-                            "Hash join spill: a build chunk's smallest unit, one batch \
-                             of {rows} rows ({size} bytes, {} bytes with its table), is \
-                             larger than three quarters of datafusion.execution.\
-                             hash_join_spill_reservation_bytes ({} bytes), and the pool \
-                             refused it: {error}",
-                            size + extra,
-                            self.cursor.unit(),
-                        )));
-                    }
-                    // The smallest unit, inside the stream's workspace share.
-                    self.cursor.grow(need);
-                }
-                Err(error) => {
-                    return Err(error.context(format!(
-                        "Hash join spill: a build batch of {rows} rows ({size} bytes) \
-                         above the chunk unit"
-                    )));
-                }
-            }
+        } else if let Err(error) = self.cursor.try_grow(need - permit) {
+            // The permit stays charged until the batch is dropped with the
+            // chunk's other rows.
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "Hash join spill: a build batch of {rows} rows needs {need} bytes with \
+                 its keys and table, more than its read permit ({permit} bytes), and \
+                 the pool refused the rest: {error}"
+            )));
         }
-        self.granted += need;
-        if !carried {
-            self.rows += size;
+        self.granted += need - kept;
+        if !self.cursor.next_permit() {
+            self.cursor.stop_chunk();
         }
-        match self.cursor.try_grow(self.cursor.unit()) {
-            Ok(()) => self.permit = self.cursor.unit(),
-            Err(_) => self.cursor.stop_chunk(),
-        }
-        Ok(Some(size))
+        Ok((batch, resident))
     }
 
     /// The build input ended without a row (the chunk before stopped just
@@ -559,18 +583,16 @@ impl ChunkBuild {
 
     /// The build input ended: the unused read permit goes back to the pool.
     pub(crate) fn release_permit(&mut self) {
-        let permit = std::mem::take(&mut self.permit);
+        let permit = self.cursor.take_permit();
         if permit > 0 {
             self.cursor.shrink(permit);
         }
     }
 
-    /// Gives back batches that the chunk's table could not hold; their bytes
-    /// stay charged in the run.
-    pub(crate) fn give_back(&mut self, batches: Vec<RecordBatch>) {
-        for batch in batches {
-            let size =
-                datafusion_common::utils::memory::get_record_batch_memory_size(&batch);
+    /// Gives back keyed batches that the chunk's table could not hold;
+    /// their bytes stay charged in the run.
+    pub(crate) fn give_back(&mut self, batches: Vec<(RecordBatch, usize)>) {
+        for (batch, size) in batches {
             self.granted = self.granted.saturating_sub(size);
             self.rows = self.rows.saturating_sub(size);
             self.cursor.give_back(batch, size);

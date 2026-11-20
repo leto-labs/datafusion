@@ -311,8 +311,11 @@ async fn reversed_runs_spill_under_pressure() -> Result<()> {
     let build = table("b", 20000, 9001, 0, 500);
     let probe = table("p", 4000, 9001, 3, 250);
     for case in all_cases(&[Shape::CollectLeft(1), Shape::Partitioned(2)]) {
+        // leto-mjj.98 v2: 4 KiB workspace (was 1 KiB): one written row, decoded
+        // with its copy and table, needs about 1.35 KiB (review MJJ98-REVIEW3,
+        // finding 2), more than three quarters of 1 KiB.
         let metrics =
-            check(&case, &build, &probe, spill_config(0, 1024, 3), 40 * 1024).await?;
+            check(&case, &build, &probe, spill_config(0, 4096, 3), 40 * 1024).await?;
         assert!(
             metric(&metrics, "spilled_partitions").unwrap_or(0) > 0,
             "{}",

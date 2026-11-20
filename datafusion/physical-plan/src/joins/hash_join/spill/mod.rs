@@ -36,6 +36,7 @@
 
 mod chunks;
 mod files;
+mod footprint;
 #[cfg(test)]
 mod tests;
 
@@ -73,6 +74,8 @@ use files::{
     ChunkSignal, Cursor, FileSource, Origin, PartitionFileWriter, PollShortWrite,
     SPILL_WRITER_SLOTS, Stage, short_write_permit, spill_file_error,
 };
+#[cfg(test)]
+pub(crate) use tests::bound::BuildWindow;
 
 use super::exec::{HashJoinExec, HashJoinExecBuilder, JoinLeftData};
 use crate::attempt_tasks::AttemptTasks;
@@ -621,43 +624,44 @@ struct PartWriter {
     /// Bytes of the batches written, counted by this writer (the shared
     /// spill metric also counts concurrent writers).
     bytes: usize,
-    /// A build file: no written batch may need more than this many bytes
-    /// with its table ([`unit_bytes`]), so that a build chunk's smallest
-    /// unit stays inside its share of the workspace.
-    unit: Option<usize>,
+    /// A file that a build chunk or a reversed join may build on: no
+    /// written batch may need more than its unit when a chunk admits it.
+    unit: Option<WriteUnit>,
 }
 
-/// Splits `batch` into slices whose own footprint fits `unit` with their
-/// table (after compacting view buffers and dictionary values), halving until
-/// each does; one row that does not fit fails with
-/// `ResourcesExhausted` before anything is written (a wide value, or a
-/// dictionary kept whole).
-fn split_to_unit(
-    batch: &RecordBatch,
-    unit: usize,
-    out: &mut std::collections::VecDeque<RecordBatch>,
-) -> Result<()> {
-    // A slice keeps its parent's view data buffers and dictionary values:
-    // compact them before measuring, so that what is written is what fits.
+/// The largest admission need ([`footprint::write_need`]) of a written
+/// batch, and the keys that a build over the file evaluates.
+struct WriteUnit {
+    bytes: usize,
+    keys: footprint::ChunkKeys,
+}
+
+impl WriteUnit {
+    /// The need of `batch` written as is; `None` without a unit.
+    fn need(unit: Option<&Self>, batch: &RecordBatch, compressed: bool) -> Result<usize> {
+        match unit {
+            Some(unit) => footprint::write_need(batch, &unit.keys, compressed),
+            None => Ok(0),
+        }
+    }
+}
+
+/// Compacts a piece before it is measured, so that what is measured is
+/// what is written: view data buffers and dictionary values that it shares
+/// with the batch it was taken from. A half of a piece (`copy`) is copied
+/// whole first, so that it no longer references its parent's buffers (a
+/// list's child values, a string's data), which the bound would count.
+fn compact_slice(batch: &RecordBatch, copy: bool) -> Result<RecordBatch> {
+    let copied;
+    let batch = if copy {
+        let rows = batch.num_rows() as u32;
+        copied = take_record_batch(batch, &UInt32Array::from_iter_values(0..rows))?;
+        &copied
+    } else {
+        batch
+    };
     let columns: Vec<usize> = (0..batch.num_columns()).collect();
-    let batch = &compact_views(&crate::spill::gc_columns(batch, &columns)?)?;
-    let rows = batch.num_rows();
-    let size = batch.get_sliced_size()?;
-    if unit_bytes(size, rows) <= unit {
-        out.push_back(batch.clone());
-        return Ok(());
-    }
-    if rows <= 1 {
-        return Err(DataFusionError::ResourcesExhausted(format!(
-            "Hash join spill: one row of {size} bytes needs {} bytes with its table, \
-             more than three quarters of \
-             datafusion.execution.hash_join_spill_reservation_bytes ({unit} bytes)",
-            unit_bytes(size, rows)
-        )));
-    }
-    let half = rows / 2;
-    split_to_unit(&batch.slice(0, half), unit, out)?;
-    split_to_unit(&batch.slice(half, rows - half), unit, out)
+    compact_views(&crate::spill::gc_columns(batch, &columns)?)
 }
 
 /// Copies the referenced bytes of every top-level view column into compact
@@ -692,18 +696,106 @@ fn compact_views(batch: &RecordBatch) -> Result<RecordBatch> {
     )?)
 }
 
-/// The bytes a build chunk holds for `rows` rows of `bytes` bytes: the
-/// rows, their copy, 48 bytes of table and keys per row, and the fixed
-/// parts (`chunks::table_estimate` plus the rows).
-pub(super) fn unit_bytes(bytes: usize, rows: usize) -> usize {
-    2 * bytes + rows * 48 + 256
+/// The batches that `PartWriter::write` sends to IPC, produced one at a
+/// time. A group of small pieces is concatenated and checked as written. An
+/// oversized group falls back to its pieces. An oversized piece is halved
+/// until it fits. Each pending half can reference its parent's compacted
+/// buffers until that half is taken from the stack and compacted.
+struct WriteBatches<'a> {
+    schema: SchemaRef,
+    batches: &'a [RecordBatch],
+    unit: Option<&'a WriteUnit>,
+    compressed: bool,
+    /// Rows already given to IPC or to the stack.
+    start: usize,
+    /// Ranges still to write, the next on top, and whether each is a half
+    /// of a piece (see [`compact_slice`]).
+    stack: Vec<(RecordBatch, bool)>,
+}
+
+impl WriteBatches<'_> {
+    fn fits(&self, batch: &RecordBatch) -> Result<bool> {
+        Ok(match self.unit {
+            Some(unit) => {
+                WriteUnit::need(Some(unit), batch, self.compressed)? <= unit.bytes
+            }
+            None => true,
+        })
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        loop {
+            if let Some((range, half)) = self.stack.pop() {
+                let batch = compact_slice(&range, half)?;
+                drop(range);
+                if self.fits(&batch)? {
+                    return Ok(Some(batch));
+                }
+                let rows = batch.num_rows();
+                if rows <= 1 {
+                    let need = WriteUnit::need(self.unit, &batch, self.compressed)?;
+                    return Err(DataFusionError::ResourcesExhausted(format!(
+                        "Hash join spill: one row of {} bytes needs {need} bytes with \
+                         its keys and table when a build reads it back, more than \
+                         three quarters of \
+                         datafusion.execution.hash_join_spill_reservation_bytes \
+                         ({} bytes)",
+                        batch.get_array_memory_size(),
+                        self.unit.map_or(0, |unit| unit.bytes),
+                    )));
+                }
+                let half = rows / 2;
+                self.stack.push((batch.slice(half, rows - half), true));
+                self.stack.push((batch.slice(0, half), true));
+                continue;
+            }
+            if self.start == self.batches.len() {
+                return Ok(None);
+            }
+            // Up to WRITE_BATCH_ROWS rows of pieces in one batch, as long as
+            // their logical bytes (a lower bound of the need) could fit.
+            let budget = self.unit.map_or(usize::MAX, |unit| unit.bytes);
+            let mut end = self.start;
+            let (mut rows, mut bytes) = (0, 0);
+            while end < self.batches.len() {
+                let piece = &self.batches[end];
+                let piece_bytes = piece.get_sliced_size()?;
+                if end > self.start
+                    && (rows + piece.num_rows() > WRITE_BATCH_ROWS
+                        || 2 * (bytes + piece_bytes) > budget)
+                {
+                    break;
+                }
+                rows += piece.num_rows();
+                bytes += piece_bytes;
+                end += 1;
+            }
+            let group = &self.batches[self.start..end];
+            self.start = end;
+            if let [piece] = group {
+                if self.unit.is_none() {
+                    return Ok(Some(piece.clone()));
+                }
+                self.stack.push((piece.clone(), false));
+                continue;
+            }
+            let batch = concat_batches(&self.schema, group)?;
+            if self.fits(&batch)? {
+                return Ok(Some(batch));
+            }
+            // The concatenation is above the unit: its pieces one by one.
+            drop(batch);
+            self.stack
+                .extend(group.iter().rev().map(|piece| (piece.clone(), false)));
+        }
+    }
 }
 
 impl PartWriter {
     fn new(
         manager: &SpillManager,
         description: &str,
-        unit: Option<usize>,
+        unit: Option<WriteUnit>,
     ) -> Result<Self> {
         Ok(Self {
             file: PartitionFileWriter::new(manager, description)?,
@@ -717,66 +809,28 @@ impl PartWriter {
     }
 
     /// Writes `batches` as batches of up to [`WRITE_BATCH_ROWS`] rows and,
-    /// for a build file, of at most `unit` bytes with their table: a piece
-    /// above it is written in slices. Writes go through the scoped writer
-    /// of family JS's descriptor bound (one writer slot per write).
+    /// for a file with a unit, of at most the unit's need each
+    /// ([`WriteBatches`]). Writes go through the scoped writer of family
+    /// JS's descriptor bound (one writer slot per write).
     fn write(
         &mut self,
         batches: &[RecordBatch],
         metrics: &JoinSpillMetrics,
         side: Side,
     ) -> Result<()> {
-        let schema = Arc::clone(self.file.schema());
         let (rows_metric, bytes_metric) = metrics.side(side);
         let before = metrics.spill.spilled_bytes.value();
-        let unit = self.unit.unwrap_or(usize::MAX);
-        // Each piece's own footprint (a slice shares its parent's buffers).
-        let sizes = batches
-            .iter()
-            .map(|batch| batch.get_sliced_size())
-            .collect::<Result<Vec<_>>>()?;
-        let mut start = 0;
-        // Slices of a piece above the unit, written before the next group.
-        let mut slices: std::collections::VecDeque<RecordBatch> = Default::default();
+        let mut source = WriteBatches {
+            schema: Arc::clone(self.file.schema()),
+            batches,
+            unit: self.unit.as_ref(),
+            compressed: self.file.compressed(),
+            start: 0,
+            stack: vec![],
+        };
         let mut bytes = 0;
         let written = self.file.write(std::iter::from_fn(|| {
-            let next = match slices.pop_front() {
-                Some(slice) => Ok(slice),
-                None if start == batches.len() => return None,
-                None => {
-                    let piece = &batches[start];
-                    let piece_rows = piece.num_rows();
-                    if unit_bytes(sizes[start], piece_rows) > unit {
-                        start += 1;
-                        match split_to_unit(piece, unit, &mut slices) {
-                            Ok(()) => Ok(slices.pop_front().expect("a slice")),
-                            Err(error) => Err(error),
-                        }
-                    } else {
-                        let mut end = start;
-                        let (mut rows, mut group_bytes) = (0, 0);
-                        while end < batches.len()
-                            && (end == start
-                                || (rows < WRITE_BATCH_ROWS
-                                    && unit_bytes(
-                                        group_bytes + sizes[end],
-                                        rows + batches[end].num_rows(),
-                                    ) <= unit))
-                        {
-                            rows += batches[end].num_rows();
-                            group_bytes += sizes[end];
-                            end += 1;
-                        }
-                        let group = &batches[start..end];
-                        start = end;
-                        if group.len() == 1 {
-                            Ok(group[0].clone())
-                        } else {
-                            concat_batches(&schema, group).map_err(Into::into)
-                        }
-                    }
-                }
-            };
+            let next = source.next_batch().transpose()?;
             if let Ok(batch) = &next {
                 bytes += get_record_batch_memory_size(batch);
             }
@@ -1259,11 +1313,15 @@ impl BuildSpill {
         let manager = self.manager.as_ref().ok_or_else(|| {
             datafusion_common::internal_datafusion_err!("no spill manager")
         })?;
-        let mut writer = PartWriter::new(
-            manager,
-            "HashJoin build partition",
-            Some(self.options.chunk_unit()),
-        )?;
+        let unit = WriteUnit {
+            bytes: self.options.chunk_unit(),
+            keys: footprint::ChunkKeys::try_new(
+                &self.template.build_schema,
+                &self.on_left,
+            )?,
+        };
+        let mut writer =
+            PartWriter::new(manager, "HashJoin build partition", Some(unit))?;
         writer.write(&batches, &self.metrics, Side::Build)?;
         drop(batches);
         self.parts[part] = Part::Writing(Box::new(writer));
@@ -2710,13 +2768,28 @@ impl StreamSpill {
             let piece = take_record_batch(&batch, &UInt32Array::from(rows))?;
             let writer = match &mut router.writers[part] {
                 Some(writer) => writer,
-                slot => slot.insert(PartWriter::new(
-                    &router.manager,
-                    "HashJoin probe partition",
+                slot => {
                     // A probe file is the build input of a reversed join:
-                    // the same unit as a build file.
-                    Some(self.options.chunk_unit()),
-                )?),
+                    // the same unit as a build file, with the probe keys.
+                    let on_right: Vec<PhysicalExprRef> = build
+                        .template
+                        .on
+                        .iter()
+                        .map(|(_, right)| Arc::clone(right))
+                        .collect();
+                    let unit = WriteUnit {
+                        bytes: self.options.chunk_unit(),
+                        keys: footprint::ChunkKeys::try_new(
+                            &build.template.probe_schema,
+                            &on_right,
+                        )?,
+                    };
+                    slot.insert(PartWriter::new(
+                        &router.manager,
+                        "HashJoin probe partition",
+                        Some(unit),
+                    )?)
+                }
             };
             // A buffered piece is charged; one the pool refuses is written
             // at once with the buffer, so no buffer grows without refusal.
