@@ -9,7 +9,8 @@
 use arrow::array::{Array, ArrayRef, BooleanArray, downcast_integer_array};
 use arrow::buffer::{BooleanBuffer, MutableBuffer};
 use arrow::util::bit_util;
-use datafusion_common::ScalarValue;
+use datafusion_common::{Result, ScalarValue};
+use datafusion_execution::memory_pool::MemoryReservation;
 use num_traits::AsPrimitive;
 
 use crate::joins::array_map::ArrayMap;
@@ -60,6 +61,8 @@ pub struct KeyRangeBitmap {
     shift: u32,
     /// One bit per bucket.
     bits: BooleanBuffer,
+    /// Declared after the bits so the charge outlives their backing buffer.
+    _memory: Option<MemoryReservation>,
 }
 
 impl KeyRangeBitmap {
@@ -121,6 +124,7 @@ impl KeyRangeBitmap {
             span,
             shift,
             bits,
+            _memory: None,
         })
     }
 
@@ -219,7 +223,19 @@ impl KeyRangeBitmap {
             span,
             shift,
             bits: BooleanBuffer::new(words.into(), 0, buckets as usize),
+            _memory: None,
         })
+    }
+
+    /// Charge this bitmap to a build's memory consumer. The bitmap owns the
+    /// charge so every shared owner, including a standalone pruning predicate,
+    /// keeps the allocation reserved (Longbow family KB).
+    #[doc(hidden)]
+    pub fn try_with_reservation(mut self, build: &MemoryReservation) -> Result<Self> {
+        let reservation = build.new_empty();
+        reservation.try_grow(self.size())?;
+        self._memory = Some(reservation);
+        Ok(self)
     }
 
     /// One Boolean per `[min[i], max[i]]` container interval: `false` proves no
@@ -355,6 +371,28 @@ mod tests {
     }
     fn may(b: &KeyRangeBitmap, lo: i64, hi: i64) -> bool {
         b.may_contain_range(lo as u64, hi as u64)
+    }
+
+    #[test]
+    fn shared_bitmap_keeps_its_own_reservation() {
+        use datafusion_execution::memory_pool::{
+            GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        };
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let build = MemoryConsumer::new("join build").register(&pool);
+        let bitmap = Arc::new(
+            bitmap(&[0, 64])
+                .unwrap()
+                .try_with_reservation(&build)
+                .unwrap(),
+        );
+        let retained = Arc::clone(&bitmap);
+        drop((build, bitmap));
+        assert_eq!(pool.reserved(), retained.size());
+        assert!(may(&retained, 64, 64));
+        drop(retained);
+        assert_eq!(pool.reserved(), 0);
     }
 
     #[test]

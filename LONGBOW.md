@@ -1154,8 +1154,8 @@ resource error. The compressed IPC round-trip test checks exact batch order.
 
 ### Family KB: chunked key-range bitmap
 
-UPSTREAMABLE. Longbow's native join passes the concatenated keys of each
-driver directly to `KeyRangeBitmap::try_new_chunks`. Each chunk contributes
+UPSTREAMABLE. Longbow's native join passes key chunks directly to
+`KeyRangeBitmap::try_new_chunks`. Each chunk contributes
 bits to the global range after the existing distinct-key cutoff. The
 single-array constructor shares the same mapping and saturation check.
 The change saves a whole-build copy during native filter publication.
@@ -1163,6 +1163,11 @@ The regression compares the bits, capacity and bitmap eligibility with
 the single-array path for nullable, sliced keys across 96 chunks.
 
 See Longbow lane `leto-mjj.101`.
+
+In lane `leto-3y0`, the native join attaches a reservation for the
+bitmap's backing capacity before publication. The bitmap owns that charge
+so a standalone pruning expression can retain it after the join releases
+its directory and build keys.
 
 ## Family OO: open a Parquet file once per generation and scan
 
