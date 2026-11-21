@@ -7,10 +7,12 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::Result;
+use datafusion_execution::memory_pool::MemoryReservation;
 
 use crate::aggregates::AggregateExec;
 use crate::aggregates::group_values::AccumulatorPhase;
 
+use super::EvaluatedAggregateBatch;
 use super::common::{AggregateHashTable, HashAggregateAccumulator, PartialReduceMarker};
 
 /// Methods specific to the aggregate hash table used in the partial-reduce stage.
@@ -50,10 +52,12 @@ impl AggregateHashTable<PartialReduceMarker> {
     /// them into the table's partial-state accumulators.
     pub(in crate::aggregates) fn aggregate_batch(
         &mut self,
-        batch: &RecordBatch,
+        batch: &EvaluatedAggregateBatch,
+        reservation: &MemoryReservation,
     ) -> Result<()> {
         self.aggregate_batch_inner(
             batch,
+            reservation,
             HashAggregateAccumulator::merge_batch,
             AccumulatorPhase::Merge,
         )

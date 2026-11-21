@@ -12,6 +12,8 @@ mod partial_reduce_table;
 mod partial_table;
 mod single_table;
 
+pub(super) use common::EvaluatedAggregateBatch;
+
 use std::sync::Arc;
 
 use crate::aggregates::group_values::{

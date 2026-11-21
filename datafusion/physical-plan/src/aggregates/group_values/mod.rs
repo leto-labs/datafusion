@@ -92,8 +92,16 @@ pub trait GroupValues: Send {
     /// assigned.
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()>;
 
-    /// Use the owner's pool and consumer registration for temporary migration memory.
-    fn set_migration_reservation(&mut self, _reservation: &MemoryReservation) {}
+    /// Intern a batch, using its owner's existing reservation if the
+    /// implementation needs extra memory to replace its key layout.
+    fn intern_reserved(
+        &mut self,
+        cols: &[ArrayRef],
+        groups: &mut Vec<usize>,
+        _reservation: &MemoryReservation,
+    ) -> Result<()> {
+        self.intern(cols, groups)
+    }
 
     /// Returns the number of bytes of memory used by this [`GroupValues`].
     ///

@@ -14,14 +14,13 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{
-    DataFusionError, Result, assert_ne_or_internal_err, internal_datafusion_err,
-};
+use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{TaskContext, TryEmitter, async_try_stream};
 use futures::stream::{Stream, StreamExt};
 
 use super::AggregateExec;
+use super::aggregate_hash_table::EvaluatedAggregateBatch;
 use super::aggregate_hash_table::{
     AggregateHashTable, ClusteredAggregateTableMetrics, FinalMarker, PartialMarker,
     PartialSkipMarker,
@@ -235,7 +234,7 @@ impl PartialHashAggregateStream {
         let early_emit_count =
             MetricBuilder::new(&agg.metrics).counter("early_emit_count", partition);
 
-        let mut hash_table = AggregateHashTable::<PartialMarker>::new(
+        let hash_table = AggregateHashTable::<PartialMarker>::new(
             agg,
             partition,
             Arc::clone(&schema),
@@ -272,7 +271,6 @@ impl PartialHashAggregateStream {
                 .register(context.memory_pool());
 
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
-        hash_table.set_migration_reservation(&reservation);
         reservation.try_grow(hash_table.memory_size())?;
         let group_values_soft_limit = agg.limit_options().map(|config| config.limit());
         // DISTINCT LIMIT retains its early-stop semantics. Grouping sets must
@@ -323,14 +321,26 @@ impl PartialHashAggregateStream {
 
             let mut last_state = HandleInputResult::ProcessNext;
             'input: while let Some(batch) = self.input.next().await.transpose()? {
+                let evaluated = {
+                    let _timer = elapsed_compute.timer();
+                    hash_table.evaluate_batch(&batch)?
+                };
+                let input_rows = batch.num_rows();
                 loop {
                     let timer = elapsed_compute.timer();
-                    let retry = match self.handle_input_batch(&batch, &mut hash_table) {
+                    let retry = match self.handle_input_batch(
+                        &evaluated,
+                        input_rows,
+                        &mut hash_table,
+                    ) {
                         Ok(state) => {
                             last_state = state;
                             false
                         }
-                        Err(error) if migration_needs_memory(&error) => {
+                        Err(error)
+                            if migration_needs_memory(&error)
+                                && hash_table.building_group_count() > 0 =>
+                        {
                             last_state = HandleInputResult::OOM;
                             true
                         }
@@ -464,14 +474,14 @@ impl PartialHashAggregateStream {
     /// Aggregate input batch into the hash table
     fn handle_input_batch(
         &mut self,
-        batch: &RecordBatch,
+        batch: &EvaluatedAggregateBatch,
+        input_rows: usize,
         hash_table: &mut AggregateHashTable<PartialMarker>,
     ) -> Result<HandleInputResult> {
         // ----------------------------------
         // Step 1: Aggregate the input batch
         // ----------------------------------
-        let input_rows = batch.num_rows();
-        hash_table.aggregate_batch(batch)?;
+        hash_table.aggregate_batch(batch, &self.reservation)?;
         self.reduction_factor.add_total(input_rows);
 
         // --------------------------------
@@ -655,7 +665,7 @@ impl FinalHashAggregateStream {
         let baseline_metrics = BaselineMetrics::new(&agg.metrics, partition);
         let spill_metrics = SpillMetrics::new(&agg.metrics, partition);
 
-        let mut hash_table = AggregateHashTable::<FinalMarker>::new(
+        let hash_table = AggregateHashTable::<FinalMarker>::new(
             agg,
             partition,
             Arc::clone(&schema),
@@ -684,7 +694,6 @@ impl FinalHashAggregateStream {
                 .register(context.memory_pool());
 
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
-        hash_table.set_migration_reservation(&reservation);
         reservation.try_grow(hash_table.memory_size())?;
 
         Ok(Self {
@@ -781,12 +790,14 @@ impl FinalHashAggregateStream {
 
         'input: while let Some(batch) = self.input.next().await.transpose()? {
             let _timer = elapsed_compute.timer();
+            let evaluated = hash_table.evaluate_batch(&batch)?;
             loop {
-                let migration_error = match hash_table.aggregate_batch(&batch) {
-                    Ok(()) => None,
-                    Err(error) if migration_needs_memory(&error) => Some(error),
-                    Err(error) => return Err(error),
-                };
+                let migration_error =
+                    match hash_table.aggregate_batch(&evaluated, &self.reservation) {
+                        Ok(()) => None,
+                        Err(error) if migration_needs_memory(&error) => Some(error),
+                        Err(error) => return Err(error),
+                    };
                 let retry = migration_error.is_some();
 
                 // Soft group limits are usually small and rarely coincide with
@@ -823,16 +834,15 @@ impl FinalHashAggregateStream {
                         ) =>
                     {
                         // OOM and don't support spilling from configuration
-                        let spill_context = spill_context.as_mut().ok_or_else(|| e.context(
-                        "Final hash aggregate cannot spill because temporary files are not enabled in the DiskManager",
-                    ))?;
+                        let Some(spill_context) = spill_context.as_mut() else {
+                            return Err(e.context(
+                                "Final hash aggregate cannot spill because temporary files are not enabled in the DiskManager",
+                            ));
+                        };
 
-                        // Sanity check: impossible to OOM when there is no group aggregated.
-                        assert_ne_or_internal_err!(
-                            hash_table.building_group_count(),
-                            0,
-                            "Final hash aggregate ran out of memory with no aggregated groups"
-                        );
+                        if hash_table.building_group_count() == 0 {
+                            return Err(e);
+                        }
 
                         // Sorts and spills one complete in-memory state run
 

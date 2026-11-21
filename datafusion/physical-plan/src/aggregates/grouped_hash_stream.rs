@@ -320,7 +320,7 @@ pub(crate) struct GroupedHashAggregateStream {
     /// Tracks if this stream is generating input or output
     exec_state: ExecutionState,
     /// A batch refused before interning, resumed after emitting the old groups.
-    pending_migration_batch: Option<RecordBatch>,
+    pending_migration_batch: Option<EvaluatedLegacyBatch>,
 
     /// Have we seen the end of the input
     input_done: bool,
@@ -545,7 +545,7 @@ impl GroupedHashAggregateStream {
             _ => OutOfMemoryMode::ReportError,
         };
 
-        let mut group_values = new_group_values(group_schema, &group_clustering)?;
+        let group_values = new_group_values(group_schema, &group_clustering)?;
         let merge_pool = Arc::new(MergeMemoryPool::new(
             Arc::clone(context.memory_pool()),
             MemoryConsumer::new(name)
@@ -556,7 +556,6 @@ impl GroupedHashAggregateStream {
         ));
         let reservation = MemoryConsumer::new("GroupedHashAggregateStream state")
             .register(&(Arc::clone(&merge_pool) as Arc<dyn MemoryPool>));
-        group_values.set_migration_reservation(&reservation);
         timer.done();
 
         let exec_state = ExecutionState::ReadingInput;
@@ -668,18 +667,27 @@ impl Stream for GroupedHashAggregateStream {
                 ExecutionState::ReadingInput => 'reading_input: {
                     let next = match self.pending_migration_batch.take() {
                         Some(batch) => Some(Ok(batch)),
-                        None => ready!(self.input.poll_next_unpin(cx)),
+                        None => match ready!(self.input.poll_next_unpin(cx)) {
+                            Some(Ok(batch)) => {
+                                let _timer = elapsed_compute.timer();
+                                Some(self.evaluate_batch(&batch))
+                            }
+                            Some(Err(error)) => Some(Err(error)),
+                            None => None,
+                        },
                     };
                     match next {
                         // New batch to aggregate
                         Some(Ok(batch)) => {
                             let timer = elapsed_compute.timer();
-                            let input_rows = batch.num_rows();
+                            let input_rows = batch.input_rows;
 
                             // A refused migration has not incorporated any
                             // row of this single-key input batch.
                             if let Err(error) = self.group_aggregate_batch(&batch) {
-                                if !migration_needs_memory(&error) {
+                                if !migration_needs_memory(&error)
+                                    || self.group_values.is_empty()
+                                {
                                     return Poll::Ready(Some(Err(error)));
                                 }
                                 match self.oom_mode {
@@ -891,9 +899,16 @@ impl RecordBatchStream for GroupedHashAggregateStream {
     }
 }
 
+struct EvaluatedLegacyBatch {
+    input_rows: usize,
+    group_by_values: Vec<Vec<ArrayRef>>,
+    input_values: Vec<Vec<ArrayRef>>,
+    filter_values: Vec<Option<ArrayRef>>,
+}
+
 impl GroupedHashAggregateStream {
-    /// Perform group-by aggregation for the given [`RecordBatch`].
-    fn group_aggregate_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+    /// Evaluate once before aggregation, including when migration needs relief.
+    fn evaluate_batch(&self, batch: &RecordBatch) -> Result<EvaluatedLegacyBatch> {
         let is_stream_merging = self.spill_state.is_stream_merging;
 
         // Evaluate the grouping expressions; interning happens below in the
@@ -933,21 +948,35 @@ impl GroupedHashAggregateStream {
                 Ok::<_, DataFusionError>((input_values, filter_values))
             })?;
 
+        Ok(EvaluatedLegacyBatch {
+            input_rows: batch.num_rows(),
+            group_by_values,
+            input_values,
+            filter_values,
+        })
+    }
+
+    fn group_aggregate_batch(&mut self, batch: &EvaluatedLegacyBatch) -> Result<()> {
+        let is_stream_merging = self.spill_state.is_stream_merging;
         // Convert filters before timing accumulator calls. The timer covers
         // one interval across all accumulator operations, rather than a
         // prefix sum charged once per aggregate expression.
-        let filters = filter_values
+        let filters = batch
+            .filter_values
             .iter()
             .map(|filter| filter.as_ref().map(|filter| filter.as_boolean()))
             .collect::<Vec<_>>();
 
-        for group_values in &group_by_values {
+        for group_values in &batch.group_by_values {
             // Calculate group indices and update the completion tracker.
             let total_num_groups =
                 self.group_by_metrics.time_group_key_preparation(|| {
                     let starting_num_groups = self.group_values.len();
-                    self.group_values
-                        .intern(group_values, &mut self.current_group_indices)?;
+                    self.group_values.intern_reserved(
+                        group_values,
+                        &mut self.current_group_indices,
+                        &self.reservation,
+                    )?;
                     let group_indices = &self.current_group_indices;
                     let total_num_groups = self.group_values.len();
                     if total_num_groups > starting_num_groups {
@@ -965,7 +994,7 @@ impl GroupedHashAggregateStream {
                 let t = self
                     .accumulators
                     .iter_mut()
-                    .zip(input_values.iter())
+                    .zip(batch.input_values.iter())
                     .zip(filters.iter());
 
                 for (idx, ((acc, values), opt_filter)) in t.enumerate() {

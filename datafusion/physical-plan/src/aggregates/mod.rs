@@ -4220,6 +4220,9 @@ mod tests {
 
     /// build the aggregates on the data from some_data() and check the results
     async fn check_aggregates(input: Arc<dyn ExecutionPlan>, spill: bool) -> Result<()> {
+        let yield_first = input
+            .downcast_ref::<TestYieldingExec>()
+            .is_some_and(|input| input.yield_first);
         let input_schema = input.schema();
 
         let grouping_set = PhysicalGroupBy::new(
@@ -4284,20 +4287,8 @@ mod tests {
             }
         }
 
-        let merge: Arc<dyn ExecutionPlan> = if spill {
-            // The final fixture needs enough replay memory for the ordinary
-            // clustered table at startup. Repeat the partial states in large
-            // batches to exceed this pool by growing the input scratch.
-            // Repeating all states equally preserves each expected average.
-            let schema = result[0].schema();
-            let batches = result
-                .iter()
-                .map(|batch| concat_batches(&schema, std::iter::repeat_n(batch, 1024)))
-                .collect::<Result<Vec<_>, _>>()?;
-            TestMemoryExec::try_new_exec(&[batches], schema, None)?
-        } else {
-            Arc::new(CoalescePartitionsExec::new(partial_aggregate))
-        };
+        let merge: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(partial_aggregate.clone()));
 
         let final_grouping_set = grouping_set.as_final();
 
@@ -4306,7 +4297,7 @@ mod tests {
             final_grouping_set,
             aggregates,
             vec![None],
-            merge,
+            Arc::clone(&merge),
             input_schema,
         )?);
 
@@ -4315,12 +4306,43 @@ mod tests {
             .compute(merged_aggregate.as_ref(), &StatisticsArgs::new())?;
         assert!(final_stats.total_byte_size.get_value().is_some());
 
+        // Keep the normal plan above for the statistics check. The expanded
+        // fixture forces runtime spill while retaining the live partial input.
+        let merged_aggregate: Arc<dyn ExecutionPlan> = if spill {
+            merged_aggregate.with_new_children(vec![repeat_avg_states(merge)?])?
+        } else {
+            merged_aggregate
+        };
+        let mut producer = merged_aggregate
+            .children()
+            .into_iter()
+            .next()
+            .unwrap()
+            .as_ref();
+        loop {
+            if let Some(partial) = producer.downcast_ref::<AggregateExec>() {
+                assert!(std::ptr::eq(partial, partial_aggregate.as_ref()));
+                break;
+            }
+            producer = producer
+                .children()
+                .into_iter()
+                .next()
+                .expect("final AVG must poll a live partial producer")
+                .as_ref();
+        }
+
         let task_ctx = if spill {
-            new_spill_ctx(2, 8 * 1024)
+            new_spill_ctx(2048, 8 * 1024)
         } else {
             Arc::clone(&task_ctx)
         };
-        let result = collect(merged_aggregate.execute(0, task_ctx)?).await?;
+        let mut stream = merged_aggregate.execute(0, Arc::clone(&task_ctx))?;
+        if yield_first {
+            assert!(stream.next().now_or_never().is_none());
+        }
+        let result = collect(stream).await?;
+        assert_eq!(task_ctx.memory_pool().reserved(), 0);
         let batch = concat_batches(&result[0].schema(), &result)?;
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(batch.num_rows(), 3);
@@ -4357,6 +4379,47 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// Repeat each partial AVG state equally so a wide input batch forces the
+    /// final spill. The partial producer still runs live under the final pool.
+    fn repeat_avg_states(
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use crate::unnest::{ListUnnest, UnnestExec};
+
+        let schema = input.schema();
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| Ok((col(field.name(), &schema)?, field.name().clone())))
+            .collect::<Result<Vec<_>>>()?;
+        let repeated = ScalarValue::List(ScalarValue::new_list_from_iter(
+            std::iter::repeat_n(ScalarValue::Int32(Some(1)), 1024),
+            &DataType::Int32,
+            false,
+        ));
+        let mut projection = columns.clone();
+        projection.push((Arc::new(Literal::new(repeated)), "repetition".to_string()));
+        let input = Arc::new(ProjectionExec::try_new(projection, input)?);
+
+        let fields = schema
+            .fields()
+            .iter()
+            .cloned()
+            .chain([Arc::new(Field::new("repetition", DataType::Int32, false))])
+            .collect::<Vec<_>>();
+        let expanded = Arc::new(UnnestExec::new(
+            input,
+            vec![ListUnnest {
+                index_in_input_schema: columns.len(),
+                depth: 1,
+            }],
+            vec![],
+            Arc::new(Schema::new(fields)),
+            datafusion_common::UnnestOptions::default(),
+        )?);
+        Ok(Arc::new(ProjectionExec::try_new(columns, expanded)?))
     }
 
     /// Define a test source that can yield back to runtime before returning its first item ///

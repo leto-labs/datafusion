@@ -173,7 +173,6 @@ pub struct GroupValuesPacked {
     shifts: Vec<u32>,
     table: PackedKeyTable,
     keys: PackBuffer,
-    migration_reservation: Option<MemoryReservation>,
     fallback: Option<Box<dyn GroupValues>>,
     make_fallback: Fallback,
     /// The widest layout before the groups move to the general interner.
@@ -213,7 +212,6 @@ impl GroupValuesPacked {
             } else {
                 PackBuffer::Multi(Vec::new())
             },
-            migration_reservation: None,
             fallback: None,
             make_fallback,
             max_bits: if columns_len == 1 {
@@ -362,26 +360,42 @@ impl GroupValuesPacked {
     }
 
     /// Move every group, in order, into the general interner.
-    fn fall_back(&mut self) -> Result<&mut Box<dyn GroupValues>> {
+    fn fall_back(
+        &mut self,
+        reservation: Option<&MemoryReservation>,
+    ) -> Result<&mut Box<dyn GroupValues>> {
         if matches!(&self.keys, PackBuffer::Single(_)) {
+            let prior_size = self.size();
             let keys = self.table.keys();
             let column = &mut self.columns[0];
-            // Keep the temporary charge until the packed allocations have
-            // been released. The caller then accounts for the new table.
-            let grant = self
-                .migration_reservation
-                .as_ref()
-                .map(MemoryReservation::new_empty);
-            if let Some(grant) = &grant {
-                let bytes = column.single_migration_bytes(keys.len());
-                if bytes > 0 {
-                    grant
-                        .try_grow(bytes)
-                        .map_err(|error| error.context(SINGLE_KEY_MIGRATION))?;
-                }
+            let bytes = column.single_migration_bytes(keys.len());
+            if let Some(owner) = reservation {
+                // The fair pool admits a spillable reservation by its own
+                // total, so charge the overlap directly on the table owner.
+                owner
+                    .try_grow(bytes)
+                    .map_err(|error| error.context(SINGLE_KEY_MIGRATION))?;
             }
-            let inner = column.fall_back_single(keys)?;
-            return Ok(self.finish_fallback(inner));
+
+            let inner = match column.fall_back_single(keys) {
+                Ok(inner) => inner,
+                Err(error) => {
+                    if let Some(owner) = reservation {
+                        owner.shrink(bytes);
+                    }
+                    return Err(error);
+                }
+            };
+            self.finish_fallback(inner);
+            if let Some(owner) = reservation {
+                // Keep the live replacement charged. Release the estimate's
+                // excess and freed packed buffers together, in one shrink.
+                let released = (prior_size + bytes)
+                    .checked_sub(self.size())
+                    .expect("single-key migration estimate covers the replacement");
+                owner.shrink(released);
+            }
+            return Ok(self.fallback.as_mut().unwrap());
         }
         let groups = self.table.len();
         let arrays = self.build(groups)?;
@@ -435,17 +449,20 @@ impl GroupValuesPacked {
         }
         Ok(arrays)
     }
-}
 
-impl GroupValues for GroupValuesPacked {
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+    fn intern_inner(
+        &mut self,
+        cols: &[ArrayRef],
+        groups: &mut Vec<usize>,
+        reservation: Option<&MemoryReservation>,
+    ) -> Result<()> {
         if let Some(fallback) = &mut self.fallback {
             return fallback.intern(cols, groups);
         }
         let rows = cols.first().map_or(0, |c| c.len());
         // Group ids of the table are u32.
         if self.table.len() + rows >= u32::MAX as usize {
-            return self.fall_back()?.intern(cols, groups);
+            return self.fall_back(reservation)?.intern(cols, groups);
         }
         for (index, array) in cols.iter().enumerate().take(self.columns.len()) {
             let mut observed = self.columns[index].observe(array)?;
@@ -457,7 +474,7 @@ impl GroupValues for GroupValuesPacked {
                 observed = column.observe(array)?;
             }
             if observed == Observed::Costly {
-                return self.fall_back()?.intern(cols, groups);
+                return self.fall_back(reservation)?.intern(cols, groups);
             }
         }
         let too_many = self
@@ -465,7 +482,7 @@ impl GroupValues for GroupValuesPacked {
             .iter()
             .any(|c| c.cardinality() > MAX_DICTIONARY || c.costly());
         if too_many || (!self.columns.iter().all(|c| c.fits()) && !self.relayout(rows)) {
-            return self.fall_back()?.intern(cols, groups);
+            return self.fall_back(reservation)?.intern(cols, groups);
         }
         match &mut self.keys {
             PackBuffer::Single(keys) => {
@@ -490,11 +507,20 @@ impl GroupValues for GroupValuesPacked {
         }
         Ok(())
     }
+}
 
-    fn set_migration_reservation(&mut self, reservation: &MemoryReservation) {
-        if matches!(&self.keys, PackBuffer::Single(_)) {
-            self.migration_reservation = Some(reservation.new_empty());
-        }
+impl GroupValues for GroupValuesPacked {
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+        self.intern_inner(cols, groups, None)
+    }
+
+    fn intern_reserved(
+        &mut self,
+        cols: &[ArrayRef],
+        groups: &mut Vec<usize>,
+        reservation: &MemoryReservation,
+    ) -> Result<()> {
+        self.intern_inner(cols, groups, Some(reservation))
     }
 
     fn size(&self) -> usize {

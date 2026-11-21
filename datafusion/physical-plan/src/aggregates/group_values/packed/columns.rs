@@ -408,10 +408,6 @@ where
     }
 
     fn single_migration_bytes(&self, groups: usize) -> usize {
-        if groups == 0 {
-            // No old keys are being migrated.
-            return 0;
-        }
         let capacity = groups.max(GroupValuesPrimitive::<T>::INITIAL_CAPACITY);
         // Hashbrown uses power-of-two buckets at a 7/8 load. Round up
         // using 3/4 and include control bytes and SIMD padding. Both
