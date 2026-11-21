@@ -391,6 +391,10 @@ pub(crate) struct RowFilterContext {
     pub(crate) reorder_predicates: bool,
     pub(crate) file_metrics: ParquetFileMetrics,
     pub(crate) max_predicate_cache_size: Option<usize>,
+    pub(crate) dictionary_filter: Option<(
+        parquet::arrow::arrow_reader::DictionaryFilterOptions,
+        Arc<crate::metrics::DictionaryFilterCounters>,
+    )>,
 }
 
 impl RowFilterContext {
@@ -404,17 +408,20 @@ impl RowFilterContext {
         reorder_predicates: bool,
         file_metrics: ParquetFileMetrics,
         max_predicate_cache_size: Option<usize>,
+        dictionary_enabled: bool,
     ) -> Option<Self> {
         match prebuild_row_filter_candidates(
             predicate,
             physical_file_schema,
             file_metadata.as_ref(),
+            dictionary_enabled,
         ) {
             Ok(Some(prebuilt)) => Some(Self {
                 prebuilt: PrebuiltRowFilterCandidateList::new(prebuilt),
                 reorder_predicates,
                 file_metrics,
                 max_predicate_cache_size,
+                dictionary_filter: None,
             }),
             Ok(None) => None,
             Err(e) => {
@@ -443,6 +450,7 @@ impl RowFilterContext {
             self.prebuilt.as_slice(),
             self.reorder_predicates,
             &self.file_metrics,
+            self.dictionary_filter.as_ref(),
         )
     }
 }
