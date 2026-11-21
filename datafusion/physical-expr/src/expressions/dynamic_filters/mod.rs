@@ -293,11 +293,25 @@ impl DynamicFilterPhysicalExpr {
     /// [`Self::update_from`] fires, so we cache the remapped expression per
     /// generation and return it directly on subsequent per-batch calls.
     pub fn current(&self) -> Result<Arc<dyn PhysicalExpr>> {
-        let (expr, generation) = {
+        self.current_with_generation().map(|(expr, _, _)| expr)
+    }
+
+    /// Read the expression, generation and completion flag from the same
+    /// publication, then remap its columns for this consumer.
+    pub fn current_with_generation(&self) -> Result<(Arc<dyn PhysicalExpr>, u64, bool)> {
+        let (expr, generation, complete) = {
             let inner = self.inner.read();
-            (Arc::clone(inner.expr()), inner.generation)
+            (
+                Arc::clone(inner.expr()),
+                inner.generation,
+                inner.is_complete,
+            )
         };
-        self.remapped_current(expr, generation)
+        Ok((
+            self.remapped_current(expr, generation)?,
+            generation,
+            complete,
+        ))
     }
 
     /// Snapshot a publication that can safely reject rows during pruning.

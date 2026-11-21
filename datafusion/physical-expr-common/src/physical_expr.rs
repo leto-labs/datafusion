@@ -14,7 +14,7 @@ use crate::utils::scatter;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, new_empty_array};
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::{DataType, Field, FieldRef, Schema};
+use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
@@ -34,6 +34,17 @@ use itertools::izip;
 
 /// Shared [`PhysicalExpr`].
 pub type PhysicalExprRef = Arc<dyn PhysicalExpr>;
+
+/// A stable evaluator for a dictionary-aware runtime predicate.
+#[derive(Debug)]
+pub struct RuntimeDictionaryFilter {
+    /// The evaluator used for both dictionary entries and the decoded oracle.
+    pub expression: PhysicalExprRef,
+    /// The publication from which the evaluator was built.
+    pub generation: u64,
+    /// Whether the evaluator recognizes the complete, exact key set.
+    pub exact: bool,
+}
 
 /// Whether an expression node can contribute to an irreversible pruning decision.
 #[derive(Debug)]
@@ -386,6 +397,21 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
     ///
     /// See the [`fmt_sql`] function for an example of printing `PhysicalExpr`s as SQL.
     fn fmt_sql(&self, f: &mut Formatter<'_>) -> fmt::Result;
+
+    /// Whether this expression opts into unit-scoped dictionary evaluation.
+    fn supports_runtime_dictionary_filter(&self) -> bool {
+        false
+    }
+
+    /// Capture a conservative filter publication for the decoder's current
+    /// unit. The returned expression must be stable for the life of the unit.
+    /// Evaluating it must not mutate any decoded-row sampling state.
+    fn runtime_dictionary_filter(
+        &self,
+        _schema: &SchemaRef,
+    ) -> Result<Option<RuntimeDictionaryFilter>> {
+        Ok(None)
+    }
 
     /// Take a snapshot of this `PhysicalExpr`, if it is dynamic.
     ///

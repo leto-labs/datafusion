@@ -1291,3 +1291,11 @@ policy before execution. With no policy, scan open skips session extension
 lookups, a source clone, eligibility checks and dictionary metrics. The pull
 decoder and prepared scan reuse the same opener. The plan codec continues to
 carry the exact filter.
+
+## Family RV: dictionary verdicts for runtime filter publications
+
+Purpose: freeze each opted-in runtime expression at the decoder unit boundary
+and expose that same expression to the dictionary evaluator and decoded
+oracle. Ordinary value fallback retains the expression's sampling policy.
+Dependent feature: DICTIONARY-CODE-EXECUTION (ADR 0060 decision 5).
+Audit classification: UPSTREAMABLE.

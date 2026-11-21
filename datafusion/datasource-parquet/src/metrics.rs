@@ -495,6 +495,9 @@ impl RowFilterSkippedFullyMatchedMetric {
 pub(crate) struct DictionaryFilterCounters {
     chunks_verdict: Count,
     rows_verdict: Count,
+    rows_runtime_exact: Count,
+    rows_runtime_conservative: Count,
+    pub(crate) runtime_eval_time: Time,
     chunks_value: Count,
     rows_value: Count,
     rows_verified: Count,
@@ -522,6 +525,13 @@ impl DictionaryFilterCounters {
         Self {
             chunks_verdict: counter("dictionary_filter_chunks_verdict"),
             rows_verdict: counter("dictionary_filter_rows_verdict"),
+            rows_runtime_exact: counter("dictionary_filter_rows_runtime_exact"),
+            rows_runtime_conservative: counter(
+                "dictionary_filter_rows_runtime_conservative",
+            ),
+            runtime_eval_time: builder
+                .clone()
+                .subset_time("runtime_row_filter_eval_time", partition),
             chunks_value: counter("dictionary_filter_chunks_value"),
             rows_value: counter("dictionary_filter_rows_value"),
             rows_verified: counter("dictionary_filter_rows_verified"),
@@ -544,6 +554,11 @@ impl DictionaryFilterCounters {
         for (counter, value) in [
             (&self.chunks_verdict, report.chunks_verdict),
             (&self.rows_verdict, report.rows_verdict),
+            (&self.rows_runtime_exact, report.rows_runtime_exact),
+            (
+                &self.rows_runtime_conservative,
+                report.rows_runtime_conservative,
+            ),
             (&self.chunks_value, report.chunks_value),
             (&self.rows_value, report.rows_value),
             (&self.rows_verified, report.rows_verified),

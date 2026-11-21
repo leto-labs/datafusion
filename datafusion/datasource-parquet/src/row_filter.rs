@@ -57,13 +57,15 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, new_null_array};
+use arrow::buffer::BooleanBuffer;
+use arrow::compute::filter_record_batch;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowPredicate, DictionaryFilterMetrics, DictionaryFilterOptions, DictionaryVerdict,
-    RowFilter,
+    RowFilter, RuntimeVerdict,
 };
 use parquet::file::metadata::ParquetMetaData;
 
@@ -73,7 +75,9 @@ use datafusion_common::{DataFusionError, Result};
 use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
-use datafusion_physical_expr_common::physical_expr::is_volatile;
+use datafusion_physical_expr_common::physical_expr::{
+    RuntimeDictionaryFilter, is_volatile,
+};
 
 use datafusion_physical_plan::metrics;
 
@@ -108,6 +112,8 @@ pub(crate) struct DatafusionArrowPredicate {
     /// expression
     projection_mask: ProjectionMask,
     dictionary_schema: Option<SchemaRef>,
+    runtime_dictionary: bool,
+    unit_snapshot: Option<RuntimeDictionaryFilter>,
     dictionary_filter: Option<(DictionaryFilterOptions, Arc<DictionaryFilterCounters>)>,
     /// how many rows were filtered out by this predicate
     rows_pruned: metrics::Count,
@@ -137,6 +143,8 @@ impl DatafusionArrowPredicate {
             physical_expr,
             projection_mask: candidate.read_plan.projection_mask,
             dictionary_schema: None,
+            runtime_dictionary: false,
+            unit_snapshot: None,
             dictionary_filter: None,
             rows_pruned,
             rows_matched,
@@ -146,12 +154,27 @@ impl DatafusionArrowPredicate {
 }
 
 impl DatafusionArrowPredicate {
-    fn evaluate_values(&self, batch: &RecordBatch) -> ArrowResult<BooleanArray> {
-        self.physical_expr
-            .evaluate(batch)
+    fn evaluate_values(
+        expr: &dyn PhysicalExpr,
+        batch: &RecordBatch,
+    ) -> ArrowResult<BooleanArray> {
+        expr.evaluate(batch)
             .and_then(|v| v.into_array(batch.num_rows()))
             .and_then(|array| as_boolean_array(&array).cloned())
             .map_err(predicate_error)
+    }
+
+    fn record_values(&self, result: &BooleanArray) {
+        let matched = result.true_count();
+        self.rows_pruned.add(result.len() - matched);
+        self.rows_matched.add(matched);
+    }
+
+    fn runtime_eval_time(&self) -> Option<&metrics::Time> {
+        self.dictionary_filter.as_ref().and_then(|(_, counters)| {
+            self.runtime_dictionary
+                .then_some(&counters.runtime_eval_time)
+        })
     }
 }
 
@@ -168,28 +191,80 @@ impl ArrowPredicate for DatafusionArrowPredicate {
     }
 
     fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
-        let mut timer = self.time.timer();
-        self.physical_expr
-            .evaluate(&batch)
-            .and_then(|v| v.into_array(batch.num_rows()))
-            .and_then(|array| {
-                let bool_arr = as_boolean_array(&array)?.clone();
-                let num_matched = bool_arr.true_count();
-                let num_pruned = bool_arr.len() - num_matched;
-                self.rows_pruned.add(num_pruned);
-                self.rows_matched.add(num_matched);
-                timer.stop();
-                Ok(bool_arr)
-            })
-            .map_err(predicate_error)
+        let _timer = self.time.timer();
+        let _runtime = self.runtime_eval_time().map(metrics::Time::timer);
+        let result = Self::evaluate_values(self.physical_expr.as_ref(), &batch)?;
+        self.record_values(&result);
+        Ok(result)
     }
 
     fn dictionary_filter_options(&self) -> Option<DictionaryFilterOptions> {
         self.dictionary_filter.as_ref().map(|(options, _)| *options)
     }
 
+    fn begin_dictionary_filter_unit(&mut self) {
+        if !self.runtime_dictionary {
+            return;
+        }
+        self.unit_snapshot = {
+            let _runtime = self.runtime_eval_time().map(metrics::Time::timer);
+            self.dictionary_schema.as_ref().and_then(|schema| {
+                self.physical_expr
+                    .runtime_dictionary_filter(schema)
+                    .unwrap_or_default()
+            })
+        };
+    }
+
+    fn end_dictionary_filter_unit(&mut self) {
+        self.unit_snapshot = None;
+    }
+
     fn dictionary_filter_eligible(&self) -> bool {
         self.dictionary_schema.is_some()
+            && (!self.runtime_dictionary || self.unit_snapshot.is_some())
+    }
+
+    fn evaluate_dictionary_oracle(
+        &mut self,
+        batch: RecordBatch,
+        covered: &BooleanBuffer,
+    ) -> ArrowResult<BooleanArray> {
+        let Some(snapshot) = &self.unit_snapshot else {
+            return self.evaluate(batch);
+        };
+        let covered_rows = covered.count_set_bits();
+        if covered_rows == 0 {
+            return self.evaluate(batch);
+        }
+        let _timer = self.time.timer();
+        let _runtime = self.runtime_eval_time().map(metrics::Time::timer);
+        let result = if covered_rows == batch.num_rows() {
+            Self::evaluate_values(snapshot.expression.as_ref(), &batch)?
+        } else {
+            // Oracle rows do not advance the membership sample. Real value
+            // fallback still does, including for a mixed PLAIN/code chunk.
+            let mask = BooleanArray::new(covered.clone(), None);
+            let values = filter_record_batch(&batch, &mask)?;
+            let oracle = Self::evaluate_values(snapshot.expression.as_ref(), &values)?;
+            let fallback =
+                filter_record_batch(&batch, &BooleanArray::new(!covered, None))?;
+            let fallback = Self::evaluate_values(self.physical_expr.as_ref(), &fallback)?;
+            let mut oracle = oracle.iter();
+            let mut fallback = fallback.iter();
+            BooleanArray::new(
+                BooleanBuffer::collect_bool(batch.num_rows(), |row| {
+                    if covered.value(row) {
+                        oracle.next().flatten().unwrap_or(false)
+                    } else {
+                        fallback.next().flatten().unwrap_or(false)
+                    }
+                }),
+                None,
+            )
+        };
+        self.record_values(&result);
+        Ok(result)
     }
 
     fn evaluate_dictionary(
@@ -201,15 +276,23 @@ impl ArrowPredicate for DatafusionArrowPredicate {
             return Ok(None);
         };
         let _timer = self.time.timer();
-        let entries = self.evaluate_values(&RecordBatch::try_new(
-            Arc::clone(schema),
-            vec![Arc::clone(values)],
-        )?)?;
+        let _runtime = self.runtime_eval_time().map(metrics::Time::timer);
+        let expr = self
+            .unit_snapshot
+            .as_ref()
+            .map_or(&self.physical_expr, |snapshot| &snapshot.expression);
+        let entries = Self::evaluate_values(
+            expr.as_ref(),
+            &RecordBatch::try_new(Arc::clone(schema), vec![Arc::clone(values)])?,
+        )?;
         let field = schema.field(0).clone().with_nullable(true);
-        let null = self.evaluate_values(&RecordBatch::try_new(
-            Arc::new(Schema::new(vec![field])),
-            vec![new_null_array(values.data_type(), 1)],
-        )?)?;
+        let null = Self::evaluate_values(
+            expr.as_ref(),
+            &RecordBatch::try_new(
+                Arc::new(Schema::new(vec![field])),
+                vec![new_null_array(values.data_type(), 1)],
+            )?,
+        )?;
         let entries = match entries.nulls() {
             None => entries.values().clone(),
             Some(nulls) => entries.values() & nulls.inner(),
@@ -217,6 +300,10 @@ impl ArrowPredicate for DatafusionArrowPredicate {
         Ok(Some(DictionaryVerdict {
             entries,
             null: null.is_valid(0) && null.value(0),
+            runtime: self.unit_snapshot.as_ref().map(|snapshot| RuntimeVerdict {
+                generation: snapshot.generation,
+                exact: snapshot.exact,
+            }),
         }))
     }
 
@@ -232,7 +319,6 @@ impl ArrowPredicate for DatafusionArrowPredicate {
     }
 }
 
-// Dynamic filter generations belong to the separate runtime-verdict lane.
 // An ordinary immutable scalar expression must depend on exactly one column.
 fn dictionary_verdict_eligible(expr: &Arc<dyn PhysicalExpr>) -> bool {
     if is_volatile(expr) || collect_columns(expr).len() != 1 {
@@ -535,6 +621,7 @@ pub(crate) struct PrebuiltRowFilterCandidate {
     /// predicate.
     projection_mask: ProjectionMask,
     dictionary_schema: Option<SchemaRef>,
+    runtime_dictionary: bool,
     /// Precomputed sum-of-compressed-bytes for the referenced columns across
     /// all row groups in the file. Used to sort predicates when
     /// `reorder_predicates` is enabled. Stable across row groups within a
@@ -589,11 +676,15 @@ pub(crate) fn prebuild_row_filter_candidates<const DICTIONARY: bool>(
                 Arc::clone(&candidate.expr),
                 &candidate.read_plan.projected_schema,
             )?;
+            let runtime_dictionary =
+                DICTIONARY && physical_expr.supports_runtime_dictionary_filter();
             Ok(PrebuiltRowFilterCandidate {
                 dictionary_schema: (DICTIONARY
                     && candidate.read_plan.projected_schema.fields().len() == 1
-                    && dictionary_verdict_eligible(&physical_expr))
+                    && (runtime_dictionary
+                        || dictionary_verdict_eligible(&physical_expr)))
                 .then_some(candidate.read_plan.projected_schema),
+                runtime_dictionary,
                 physical_expr,
                 projection_mask: candidate.read_plan.projection_mask.clone(),
                 required_bytes: candidate.required_bytes,
@@ -641,6 +732,8 @@ pub(crate) fn row_filter_from_prebuilt(
                 physical_expr: Arc::clone(&candidate.physical_expr),
                 projection_mask: candidate.projection_mask.clone(),
                 dictionary_schema: candidate.dictionary_schema.clone(),
+                runtime_dictionary: candidate.runtime_dictionary,
+                unit_snapshot: None,
                 dictionary_filter: dictionary_filter.cloned(),
                 rows_pruned: predicate_rows_pruned,
                 rows_matched: predicate_rows_matched,
@@ -735,12 +828,14 @@ mod test {
                 physical_expr: expr,
                 projection_mask: projection_mask.clone(),
                 dictionary_schema: Some(Arc::clone(&schema)),
+                runtime_dictionary: false,
+                unit_snapshot: None,
                 dictionary_filter: None,
                 rows_pruned: Count::new(),
                 rows_matched: Count::new(),
                 time: Time::new(),
             };
-            let DictionaryVerdict { entries, null } =
+            let DictionaryVerdict { entries, null, .. } =
                 predicate.evaluate_dictionary(0, &values).unwrap().unwrap();
             let actual = predicate
                 .evaluate(
@@ -765,6 +860,8 @@ mod test {
             physical_expr: expr,
             projection_mask,
             dictionary_schema: Some(Arc::clone(&schema)),
+            runtime_dictionary: false,
+            unit_snapshot: None,
             dictionary_filter: None,
             rows_pruned: Count::new(),
             rows_matched: Count::new(),
