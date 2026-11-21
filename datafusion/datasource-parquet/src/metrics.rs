@@ -570,3 +570,49 @@ impl DictionaryFilterCounters {
         }
     }
 }
+
+/// Work counters for an opted-in staged scan.
+pub(crate) struct StagedScanCounters {
+    rows_in: Count,
+    rows_out: Count,
+    selected: Count,
+    full: Count,
+    skipped: Count,
+    decoded: Count,
+    gathered: Count,
+    filter_time: Time,
+    payload_time: Time,
+}
+
+impl StagedScanCounters {
+    pub(crate) fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        let counter = |name| MetricBuilder::new(metrics).counter(name, partition);
+        Self {
+            rows_in: counter("staged_scan_filter_rows_in"),
+            rows_out: counter("staged_scan_filter_rows_out"),
+            selected: counter("staged_scan_vectors_selected"),
+            full: counter("staged_scan_vectors_full"),
+            skipped: counter("staged_scan_vectors_skipped"),
+            decoded: counter("staged_scan_payload_values_decoded"),
+            gathered: counter("staged_scan_payload_values_gathered"),
+            filter_time: MetricBuilder::new(metrics)
+                .subset_time("staged_scan_filter_time", partition),
+            payload_time: MetricBuilder::new(metrics)
+                .subset_time("staged_scan_payload_time", partition),
+        }
+    }
+
+    pub(crate) fn observe(&self, work: parquet::arrow::arrow_reader::StagedScanWork) {
+        self.rows_in.add(work.input_rows);
+        self.rows_out.add(work.output_rows);
+        match (work.output_rows, work.selected) {
+            (0, _) => self.skipped.add(1),
+            (_, true) => self.selected.add(1),
+            (_, false) => self.full.add(1),
+        }
+        self.decoded.add(work.decoded_values);
+        self.gathered.add(work.gathered_values);
+        self.filter_time.add_duration(work.filter_time);
+        self.payload_time.add_duration(work.payload_time);
+    }
+}

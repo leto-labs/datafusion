@@ -83,19 +83,39 @@ impl DecoderBuilderConfig<'_> {
         &self,
         row_group_selections: Vec<RowGroupSelection>,
         metadata: ArrowReaderMetadata,
+        staged: Option<Arc<parquet::arrow::arrow_reader::StagedScan>>,
     ) -> ParquetPushDecoderBuilder {
-        let mut builder = ParquetPushDecoderBuilder::new_with_metadata(metadata)
+        let builder = ParquetPushDecoderBuilder::new_with_metadata(metadata)
             .with_projection(self.projection_mask.clone())
-            .with_batch_size(self.batch_size)
-            .with_metrics(self.arrow_reader_metrics.clone());
-        if self.force_filter_selections {
-            builder = builder.with_row_selection_policy(RowSelectionPolicy::Selectors);
-        }
-        builder = builder.with_row_group_selections(row_group_selections);
+            .with_metrics(self.arrow_reader_metrics.clone())
+            .with_staged_scan(staged);
+        let mut builder = Self::apply_units(
+            builder,
+            row_group_selections,
+            self.batch_size,
+            self.force_filter_selections,
+        );
         if let Some(limit) = self.decoder_limit {
             builder = builder.with_limit(limit);
         }
         builder
+    }
+
+    /// Apply physical row ranges to a fresh decoder or a reusable template.
+    pub(crate) fn apply_units(
+        builder: ParquetPushDecoderBuilder,
+        selections: Vec<RowGroupSelection>,
+        batch_size: usize,
+        force_selectors: bool,
+    ) -> ParquetPushDecoderBuilder {
+        let builder = builder
+            .with_row_group_selections(selections)
+            .with_batch_size(batch_size);
+        if force_selectors {
+            builder.with_row_selection_policy(RowSelectionPolicy::Selectors)
+        } else {
+            builder
+        }
     }
 }
 

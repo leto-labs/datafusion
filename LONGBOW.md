@@ -1291,3 +1291,17 @@ policy before execution. With no policy, scan open skips session extension
 lookups, a source clone, eligibility checks and dictionary metrics. The pull
 decoder and prepared scan reuse the same opener. The plan codec continues to
 carry the exact filter.
+
+
+## Family LMS: prepare one staged decoder for pull and native scans
+
+Purpose: compile execution-bound, total Parquet predicates for Arrow's
+per-vector staged reader. Dependent feature: LATE-MATERIALIZED-SCAN.
+Audit classification: UPSTREAMABLE.
+
+Both openers bind the staged predicates to the physical schema and share
+decoder unit setup. File schema coercions that would add a cast leave the
+predicate at its residual. A fully matched row group bypasses staging only
+when the pruning predicate proves all staged conjuncts. Existing row filters
+own their scans; staged decoding uses the other decoder mode. No fields are
+added to the scan's protobuf.

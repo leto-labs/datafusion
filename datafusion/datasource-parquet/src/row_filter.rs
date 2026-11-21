@@ -548,6 +548,49 @@ impl PrebuiltRowFilterCandidate {
     }
 }
 
+/// Compile staged conjuncts without introducing casts or changing their order.
+pub(crate) fn staged_predicates(
+    predicates: &[Arc<dyn PhysicalExpr>],
+    logical_schema: &SchemaRef,
+    file_schema: &SchemaRef,
+    metadata: &ParquetMetaData,
+) -> Option<Vec<parquet::arrow::arrow_reader::StagedPredicate>> {
+    let descriptor = metadata.file_metadata().schema_descr();
+    predicates
+        .iter()
+        .map(|predicate| {
+            for column in collect_columns(predicate) {
+                let logical = logical_schema.fields().get(column.index())?;
+                let physical = file_schema.field_with_name(column.name()).ok()?;
+                if logical.name() != column.name()
+                    || logical.data_type() != physical.data_type()
+                {
+                    return None;
+                }
+            }
+            let predicate =
+                reassign_expr_columns(Arc::clone(predicate), file_schema).ok()?;
+            let (read, _) =
+                build_parquet_read_plan(&predicate, file_schema, metadata).ok()??;
+            let leaves = (0..descriptor.num_columns())
+                .filter(|&index| read.projection_mask.leaf_included(index))
+                .collect();
+            let predicate =
+                reassign_expr_columns(predicate, &read.projected_schema).ok()?;
+            Some(parquet::arrow::arrow_reader::StagedPredicate::new(
+                leaves,
+                move |batch| {
+                    predicate
+                        .evaluate(batch)
+                        .and_then(|value| value.into_array(batch.num_rows()))
+                        .and_then(|array| as_boolean_array(&array).cloned())
+                        .map_err(|error| predicate_error(error).into())
+                },
+            ))
+        })
+        .collect()
+}
+
 /// Precompute the list of [`PrebuiltRowFilterCandidate`]s for a predicate.
 ///
 /// This is the expensive part of [`build_row_filter`]: split into conjuncts,
