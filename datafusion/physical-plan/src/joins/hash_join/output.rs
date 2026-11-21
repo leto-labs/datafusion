@@ -113,14 +113,16 @@ pub(super) fn filter_rows(width: usize, columns: usize, row_limit: usize) -> usi
 /// Data already produced by the join's state machine, drained one byte-
 /// and row-limited piece per poll before the join advances to more input.
 enum Pending {
-    Gather {
-        build: RecordBatch,
-        probe: RecordBatch,
-        left: UInt64Array,
-        right: UInt32Array,
-        side: JoinSide,
-    },
+    Gather(Box<Gather>),
     Batch(RecordBatch),
+}
+
+struct Gather {
+    build: RecordBatch,
+    probe: RecordBatch,
+    left: UInt64Array,
+    right: UInt32Array,
+    side: JoinSide,
 }
 
 struct Remainder {
@@ -259,13 +261,13 @@ impl OutputBatches {
                 None,
             )?;
             self.pending = Some(Remainder {
-                data: Pending::Gather {
+                data: Pending::Gather(Box::new(Gather {
                     build: build.clone(),
                     probe: probe.clone(),
                     left,
                     right,
                     side,
-                },
+                })),
                 offset: len,
                 width,
             });
@@ -294,13 +296,14 @@ impl OutputBatches {
                 let len = (batch.num_rows() - start).min(max_rows);
                 (batch.slice(start, len), batch.num_rows())
             }
-            Pending::Gather {
-                build,
-                probe,
-                left,
-                right,
-                side,
-            } => {
+            Pending::Gather(gather) => {
+                let Gather {
+                    build,
+                    probe,
+                    left,
+                    right,
+                    side,
+                } = gather.as_ref();
                 let rows = index_rows(left, right, join_type);
                 let len = (rows - start).min(max_rows);
                 let left_start = start.min(left.len());

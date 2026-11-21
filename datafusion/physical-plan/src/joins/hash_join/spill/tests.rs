@@ -1159,6 +1159,27 @@ mod review {
         assert_eq!(pool.reserved(), LIMIT + WORKSPACE);
     }
 
+    #[derive(Default)]
+    struct PeakCharges {
+        replay: usize,
+        replay_peak: usize,
+        workspace_peak: usize,
+    }
+
+    impl PeakCharges {
+        fn is_replay(reservation: &MemoryReservation) -> bool {
+            reservation
+                .consumer()
+                .name()
+                .starts_with("HashJoinProbeReplay[")
+        }
+
+        fn note(&mut self, reserved: usize) {
+            self.replay_peak = self.replay_peak.max(self.replay);
+            self.workspace_peak = self.workspace_peak.max(reserved - self.replay);
+        }
+    }
+
     /// A greedy pool that records its peak, and that can hand whatever a
     /// consumer releases to a competing consumer at once (as a concurrent
     /// operator's `try_grow` would take it).
@@ -1166,6 +1187,9 @@ mod review {
         inner: GreedyMemoryPool,
         limit: usize,
         pub(super) peak: AtomicUsize,
+        // Serialize the pool operation and its category sample so a
+        // concurrent grow or shrink cannot skew the workspace measurement.
+        charges: Mutex<PeakCharges>,
         competing: AtomicBool,
         competitor: OnceLock<Mutex<MemoryReservation>>,
         taken: AtomicUsize,
@@ -1177,14 +1201,25 @@ mod review {
                 inner: GreedyMemoryPool::new(limit),
                 limit,
                 peak: AtomicUsize::new(0),
+                charges: Mutex::new(PeakCharges::default()),
                 competing: AtomicBool::new(false),
                 competitor: OnceLock::new(),
                 taken: AtomicUsize::new(0),
             })
         }
 
-        fn note(&self) {
-            self.peak.fetch_max(self.inner.reserved(), Ordering::SeqCst);
+        fn note_grow(
+            &self,
+            charges: &mut PeakCharges,
+            reservation: &MemoryReservation,
+            additional: usize,
+        ) {
+            if PeakCharges::is_replay(reservation) {
+                charges.replay += additional;
+            }
+            let reserved = self.inner.reserved();
+            charges.note(reserved);
+            self.peak.fetch_max(reserved, Ordering::SeqCst);
         }
     }
 
@@ -1206,12 +1241,17 @@ mod review {
         }
 
         fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+            let mut charges = self.charges.lock().unwrap();
             self.inner.grow(reservation, additional);
-            self.note();
+            self.note_grow(&mut charges, reservation, additional);
         }
 
         fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+            let mut charges = self.charges.lock().unwrap();
             self.inner.shrink(reservation, shrink);
+            if PeakCharges::is_replay(reservation) {
+                charges.replay -= shrink;
+            }
             if self.competing.load(Ordering::SeqCst)
                 && let Some(competitor) = self.competitor.get()
                 && let Ok(competitor) = competitor.try_lock()
@@ -1219,6 +1259,7 @@ mod review {
                 let free = self.limit.saturating_sub(self.inner.reserved());
                 if free > 0 && self.inner.try_grow(&competitor, free).is_ok() {
                     self.taken.fetch_add(free, Ordering::SeqCst);
+                    self.note_grow(&mut charges, &competitor, free);
                 }
             }
         }
@@ -1228,8 +1269,9 @@ mod review {
             reservation: &MemoryReservation,
             additional: usize,
         ) -> Result<()> {
+            let mut charges = self.charges.lock().unwrap();
             self.inner.try_grow(reservation, additional)?;
-            self.note();
+            self.note_grow(&mut charges, reservation, additional);
             Ok(())
         }
 
@@ -1814,8 +1856,8 @@ mod review {
 
         /// Measurement. A pool that another consumer keeps full from the
         /// start: every reservation of the join is refused, so it runs on
-        /// its floors. Prints the peak against the stated bound
-        /// `limit + (streams + 1) x workspace`.
+        /// its floors. The original workspace bound applies to all
+        /// charges other than the independently admitted replay buffers.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn rereview_peak_in_a_pool_that_stays_full() -> Result<()> {
             let build = table("b", 20000, 9001, 0, 500);
@@ -1849,7 +1891,16 @@ mod review {
                             pool_context(spill_config(0, workspace, 3), dyn_pool);
                         let result = run(&plan, context).await;
                         pool.competing.store(false, Ordering::SeqCst);
-                        let peak = pool.peak.load(Ordering::SeqCst);
+                        let total_peak = pool.peak.load(Ordering::SeqCst);
+                        let (peak, replay_peak) = {
+                            let charges = pool.charges.lock().unwrap();
+                            assert_eq!(charges.replay, 0, "replay left a live charge");
+                            assert!(
+                                charges.replay_peak > 0,
+                                "fixture did not charge replay"
+                            );
+                            (charges.workspace_peak, charges.replay_peak)
+                        };
                         let streams = match shape {
                             Shape::CollectLeft(streams) | Shape::Partitioned(streams) => {
                                 streams
@@ -1880,11 +1931,13 @@ mod review {
                             }
                         };
                         let line = format!(
-                            "{label}: peak-limit={} bound-limit={} in workspaces={:.2} \
+                            "{label}: workspace peak-limit={} bound-limit={} in workspaces={:.2} \
+                             replay peak={replay_peak} total peak-limit={} \
                              written={written} depth={depth} -> {outcome}",
                             peak - limit,
                             bound - limit,
                             (peak - limit) as f64 / workspace as f64,
+                            total_peak - limit,
                         );
                         if peak > bound {
                             over.push(line.clone());

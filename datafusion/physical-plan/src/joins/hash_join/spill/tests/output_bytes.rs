@@ -242,7 +242,7 @@ async fn probe_replay_charges_one_file_permit_and_releases_on_drop() -> Result<(
     let metrics = JoinSpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0, Gauge::new());
     let manager = spill_manager(&context, &metrics, batch.schema());
     let mut writer = PartWriter::new(&manager, "wide probe replay", None)?;
-    writer.write(&[batch.clone()], &metrics, Side::Probe)?;
+    writer.write(std::slice::from_ref(&batch), &metrics, Side::Probe)?;
     let file = writer.finish(&metrics, Side::Probe)?.unwrap();
     assert!(file.replay_bytes <= REPLAY_BATCH_BYTES);
     let permit = file.replay_bytes;
