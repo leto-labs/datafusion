@@ -317,6 +317,7 @@ pub struct ParquetSource {
     filter_cache: Arc<crate::opener::filter_cache::PreparedFilterCache>,
     /// Execution policy bound from the worker's session at open time.
     dictionary_filter: Option<DictionaryFilterOptions>,
+    staged_predicates: Option<Arc<[Arc<dyn PhysicalExpr>]>>,
 }
 
 impl ParquetSource {
@@ -346,7 +347,23 @@ impl ParquetSource {
             sort_order_for_reorder: None,
             filter_cache: Default::default(),
             dictionary_filter: None,
+            staged_predicates: None,
         }
+    }
+
+    /// Attach total predicates proved by the parent residual, in file-schema
+    /// coordinates. This is execution state reconstructed from the plan.
+    pub fn with_staged_predicates(
+        mut self,
+        predicates: Arc<[Arc<dyn PhysicalExpr>]>,
+    ) -> Self {
+        self.staged_predicates = Some(predicates);
+        self
+    }
+
+    /// Staging predicates, when bound by the execution plan.
+    pub fn staged_predicates(&self) -> Option<&[Arc<dyn PhysicalExpr>]> {
+        self.staged_predicates.as_deref()
     }
 
     /// Give an independently executed scan fresh counters. Ordinary plan
@@ -406,6 +423,7 @@ impl ParquetSource {
         conf.table_schema = table_schema;
         conf.projection = projection;
         conf.predicate = predicate;
+        conf.staged_predicates = None;
         conf
     }
 
@@ -651,6 +669,7 @@ impl ParquetSource {
             schema_provider: self.schema_provider.clone(),
             pushdown_filters: self.pushdown_filters(),
             dictionary_filter: self.dictionary_filter,
+            staged_predicates: self.staged_predicates.clone(),
             reorder_filters: self.reorder_filters(),
             force_filter_selections: self.force_filter_selections(),
             enable_page_index: self.enable_page_index(),
@@ -1192,6 +1211,7 @@ impl FileSource for ParquetSource {
             // Longbow family OO: execution state, rebuilt on demand.
             filter_cache: _,
             dictionary_filter: _,
+            staged_predicates: _,
         } = self;
 
         if schema_provider.is_some() {

@@ -266,6 +266,7 @@ pub(super) struct ParquetMorselizer {
     /// [`DatafusionArrowPredicate`](crate::row_filter::DatafusionArrowPredicate)?
     pub pushdown_filters: bool,
     pub dictionary_filter: Option<parquet::arrow::arrow_reader::DictionaryFilterOptions>,
+    pub staged_predicates: Option<Arc<[Arc<dyn PhysicalExpr>]>>,
     /// Should the filters be reordered to optimize the scan?
     pub reorder_filters: bool,
     /// Should we force the reader to use RowSelections for filtering
@@ -3056,6 +3057,7 @@ mod test {
                 schema_provider: None,
                 pushdown_filters: self.pushdown_filters,
                 dictionary_filter: None,
+                staged_predicates: None,
                 reorder_filters: self.reorder_filters,
                 force_filter_selections: self.force_filter_selections,
                 enable_page_index: self.enable_page_index,
