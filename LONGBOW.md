@@ -1291,3 +1291,11 @@ policy before execution. With no policy, scan open skips session extension
 lookups, a source clone, eligibility checks and dictionary metrics. The pull
 decoder and prepared scan reuse the same opener. The plan codec continues to
 carry the exact filter.
+
+## Family DKN: preserve logical NULL in non-nullable dictionary grouping keys
+
+Purpose: emit a valid index referencing a NULL dictionary value when the
+declared grouping field disallows null indices. Full emission, prefix emission,
+and preserving reads all honor this field constraint. The NULL value consumes
+one key slot in this representation. Dependent feature: CORE-AGGREGATION.
+Audit classification: UPSTREAMABLE.

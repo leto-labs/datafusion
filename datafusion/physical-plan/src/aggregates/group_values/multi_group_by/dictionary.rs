@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -39,6 +41,8 @@ pub struct DictionaryGroupValuesColumn<K: ArrowDictionaryKeyType + Send + Sync> 
     value_dedup_size: usize,
     /// Slot in `inner` for the null group; `None` until the first null is seen.
     null_inner_slot: Option<usize>,
+    /// Whether the output field permits a null index.
+    nullable: bool,
     /// Hash seed — must match `create_hashes` so hashes are consistent across calls.
     random_state: RandomState,
     /// Maps `val_idx → inner_slot` for the values array in `cached_values`.
@@ -58,7 +62,7 @@ pub struct DictionaryGroupValuesColumn<K: ArrowDictionaryKeyType + Send + Sync> 
 }
 
 impl<K: ArrowDictionaryKeyType + Send + Sync> DictionaryGroupValuesColumn<K> {
-    pub fn new(inner: Box<dyn GroupColumn>, field: &Field) -> Self {
+    pub fn new(inner: Box<dyn GroupColumn>, field: &Field, nullable: bool) -> Self {
         let null_array = arrow::array::new_null_array(field.data_type(), 1);
         Self {
             inner,
@@ -67,6 +71,7 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> DictionaryGroupValuesColumn<K> {
             value_dedup: HashTable::new(),
             value_dedup_size: 0,
             null_inner_slot: None,
+            nullable,
             random_state: AGGREGATION_HASH_SEED,
             val_to_inner: Vec::default(),
             val_hashes: Vec::default(),
@@ -76,16 +81,15 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> DictionaryGroupValuesColumn<K> {
     }
 
     /// Build a `DictionaryArray` from `values` (all inner slots) and the
-    /// per-group slot mapping.  The null inner slot, if any, is excluded from
-    /// the values array and its groups emit a null key — so it never consumes
-    /// a key index regardless of where it sits in `inner`.
+    /// per-group slot mapping. `null_key_slot` identifies a slot to encode
+    /// as a null index. A non-nullable field keeps the null value in the
+    /// dictionary and references it with a valid index.
     fn into_dict(
         values: ArrayRef,
         group_to_inner: &[usize],
-        null_inner_slot: Option<usize>,
+        null_key_slot: Option<usize>,
     ) -> ArrayRef {
-        let Some(null_slot) = null_inner_slot else {
-            // Fast path: no null group — raw slot indices are valid keys.
+        let Some(null_slot) = null_key_slot else {
             let keys: PrimitiveArray<K> = group_to_inner
                 .iter()
                 .map(|&slot| Some(K::Native::usize_as(slot)))
@@ -127,15 +131,15 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> DictionaryGroupValuesColumn<K> {
     }
 
     // https://github.com/apache/datafusion/issues/23127
-    // Null groups emit a null key (None), not a slot index, so the null inner
-    // slot never consumes a key index regardless of its position in inner.
+    // The null group consumes a slot only if the field disallows null indices.
     fn check_key_overflow(&self) -> Result<()> {
-        let non_null_count = self.inner.len() - self.null_inner_slot.is_some() as usize;
-        if !Self::key_type_fits(non_null_count) {
+        let value_count = self.inner.len()
+            - usize::from(self.nullable && self.null_inner_slot.is_some());
+        if !Self::key_type_fits(value_count) {
             return exec_err!(
                 "Dictionary key type {:?} cannot represent {} distinct values",
                 K::DATA_TYPE,
-                non_null_count
+                value_count
             );
         }
         Ok(())
@@ -503,9 +507,9 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
     }
 
     fn build(self: Box<Self>) -> ArrayRef {
-        let null_inner_slot = self.null_inner_slot;
+        let null_key_slot = self.null_inner_slot.filter(|_| self.nullable);
         let values = self.inner.build();
-        Self::into_dict(values, &self.group_to_inner, null_inner_slot)
+        Self::into_dict(values, &self.group_to_inner, null_key_slot)
     }
 
     fn values_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
@@ -530,23 +534,24 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
         let inner_selection =
             GroupSelection::try_from_indices(&selected_inner, self.inner.len())?;
         let values = self.inner.values_preserving(inner_selection)?;
-        let null_inner_slot = self
+        let null_key_slot = self
             .null_inner_slot
+            .filter(|_| self.nullable)
             .and_then(|slot| old_to_new.get(&slot).copied());
-        Ok(Self::into_dict(values, &selected_groups, null_inner_slot))
+        Ok(Self::into_dict(values, &selected_groups, null_key_slot))
     }
 
     fn take_n(&mut self, n: usize) -> ArrayRef {
         let old_inner_len = self.inner.len();
         let all_inner_values = self.inner.take_n(old_inner_len);
+        let null_key_slot = self.null_inner_slot.filter(|_| self.nullable);
 
         let mut emit_old_to_new = vec![usize::MAX; old_inner_len];
         let mut emit_new_to_old: Vec<usize> = Vec::new();
         for &old in &self.group_to_inner[..n] {
-            // Null groups emit a null key (None) and need no slot in the
-            // values array, so excluding them keeps key indices tight and
-            // prevents overflow at key-type capacity.
-            if all_inner_values.is_null(old) {
+            // When the field permits a null index, omit its value slot to
+            // leave the full dictionary capacity available for non-null values.
+            if null_key_slot == Some(old) {
                 continue;
             }
             if emit_old_to_new[old] == usize::MAX {
@@ -561,7 +566,7 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
         let emitted_keys: PrimitiveArray<K> = self.group_to_inner[..n]
             .iter()
             .map(|&old| {
-                if all_inner_values.is_null(old) {
+                if null_key_slot == Some(old) {
                     None
                 } else {
                     Some(K::Native::usize_as(emit_old_to_new[old]))
@@ -571,14 +576,13 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
         let emitted: ArrayRef =
             Arc::new(DictionaryArray::<K>::new(emitted_keys, compact_emit_values));
 
-        // Null deferred to last so null_inner_slot is always the highest index
-        // and check_key_overflow can subtract it without a false overflow.
+        // Defer the null slot so it can be restored through null_array.
         let remaining = self.group_to_inner[n..].to_vec();
         let mut old_to_new = vec![usize::MAX; old_inner_len];
         let mut new_to_old: Vec<usize> = Vec::new();
         let mut null_old_slot: Option<usize> = None;
         for &old in &remaining {
-            if all_inner_values.is_null(old) {
+            if self.null_inner_slot == Some(old) {
                 if null_old_slot.is_none() {
                     null_old_slot = Some(old);
                 }
@@ -601,7 +605,7 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
         self.hash_values(&all_inner_values);
 
         for (new_slot, &old_slot) in new_to_old.iter().enumerate() {
-            if all_inner_values.is_null(old_slot) {
+            if null_old_slot == Some(old_slot) {
                 self.inner
                     .append_val(&self.null_array, 0)
                     .expect("append null failed in take_n");
@@ -643,15 +647,23 @@ mod tests {
         DictionaryGroupValuesColumn::new(
             Box::new(ByteGroupValueBuilder::<i32>::new(OutputType::Utf8)),
             &f,
+            true,
         )
     }
 
-    fn int8_col() -> DictionaryGroupValuesColumn<Int8Type> {
+    fn int8_col_with_nullability(
+        nullable: bool,
+    ) -> DictionaryGroupValuesColumn<Int8Type> {
         let f = Field::new("", DataType::Utf8, true);
         DictionaryGroupValuesColumn::new(
             Box::new(ByteGroupValueBuilder::<i32>::new(OutputType::Utf8)),
             &f,
+            nullable,
         )
+    }
+
+    fn int8_col() -> DictionaryGroupValuesColumn<Int8Type> {
+        int8_col_with_nullability(true)
     }
 
     fn uint8_col() -> DictionaryGroupValuesColumn<UInt8Type> {
@@ -659,6 +671,7 @@ mod tests {
         DictionaryGroupValuesColumn::new(
             Box::new(ByteGroupValueBuilder::<i32>::new(OutputType::Utf8)),
             &f,
+            true,
         )
     }
 
@@ -854,6 +867,54 @@ mod tests {
         let mut buf = all_true(1);
         col.vectorized_equal_to(&[0], &batch2, &[0], &mut buf);
         assert_eq!(bool_vec(&buf), vec![true]);
+    }
+
+    #[test]
+    fn nonnullable_dictionary_keeps_a_null_value_across_emission_paths() {
+        let mut col = int8_col_with_nullability(false);
+        let input = i8_dict(&[Some(0), Some(1), Some(0)], &[None, Some("a")]);
+        col.vectorized_append(&input, &[0, 1, 2]).unwrap();
+
+        let selected = col
+            .values_preserving(GroupSelection::try_from_indices(&[2, 1], 3).unwrap())
+            .unwrap();
+        assert_eq!(selected.null_count(), 0);
+        assert_eq!(str_values(&selected), vec![None, Some("a".to_owned())]);
+
+        let emitted = col.take_n(1);
+        assert_eq!(emitted.null_count(), 0);
+        assert_eq!(str_values(&emitted), vec![None]);
+
+        // The null slot must still be interned after emitting a prefix.
+        col.append_val(&input, 0).unwrap();
+        let remaining = Box::new(col).build();
+        assert_eq!(remaining.null_count(), 0);
+        assert_eq!(
+            str_values(&remaining),
+            vec![Some("a".to_owned()), None, None]
+        );
+        assert_eq!(remaining.as_dictionary::<Int8Type>().values().len(), 2);
+    }
+
+    #[test]
+    fn nonnullable_dictionary_null_consumes_one_key_slot() {
+        let mut col = int8_col_with_nullability(false);
+        col.append_val(&i8_dict(&[Some(0)], &[None]), 0).unwrap();
+        col.vectorized_append(&distinct_i8_dict(0, 127), &(0..127).collect::<Vec<_>>())
+            .unwrap();
+        let batch = col.take_n(128);
+        assert_eq!(batch.null_count(), 0);
+        assert_eq!(str_values(&batch)[127], Some("v126".to_owned()));
+
+        col.append_val(&i8_dict(&[Some(0)], &[None]), 0).unwrap();
+        let error = col
+            .vectorized_append(&distinct_i8_dict(0, 128), &(0..128).collect::<Vec<_>>())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot represent 129 distinct values")
+        );
     }
 
     #[test]
