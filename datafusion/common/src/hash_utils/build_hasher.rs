@@ -62,7 +62,7 @@ where
         buffer.clear();
         buffer.resize(required_size, 0);
 
-        create_hashes_with_hasher_impl(iter, hash_builder, &mut buffer[..required_size])?;
+        create_hashes_with_hasher_impl::<_, _, _, true>(iter, hash_builder, &mut buffer[..required_size])?;
 
         let result = callback(&buffer[..required_size])?;
 
@@ -89,10 +89,10 @@ where
     T: AsDynArray,
     S: BuildHasher,
 {
-    create_hashes_with_hasher_impl(arrays, hash_builder, hashes_buffer)
+    create_hashes_with_hasher_impl::<_, _, _, true>(arrays, hash_builder, hashes_buffer)
 }
 
-fn create_hashes_with_hasher_impl<'a, I, T, S>(
+fn create_hashes_with_hasher_impl<'a, I, T, S, const TOP_LEVEL: bool>(
     arrays: I,
     hash_builder: &S,
     hashes_buffer: &'a mut [u64],
@@ -104,7 +104,7 @@ where
 {
     for (i, array) in arrays.into_iter().enumerate() {
         let rehash = i >= 1;
-        hash_single_array_with_hasher(
+        hash_single_array_with_hasher::<_, TOP_LEVEL>(
             array.as_dyn_array(),
             hash_builder,
             hashes_buffer,
@@ -126,8 +126,12 @@ impl<S: BuildHasher> ChildHashing for BuildHasherChildHashing<'_, S> {
         I: IntoIterator<Item = T>,
         T: AsDynArray,
     {
-        create_hashes_with_hasher_impl(arrays, self.hash_builder, hashes_buffer)
-            .map(|_| ())
+        create_hashes_with_hasher_impl::<_, _, _, false>(
+            arrays,
+            self.hash_builder,
+            hashes_buffer,
+        )
+        .map(|_| ())
     }
 }
 
@@ -395,7 +399,7 @@ fn hash_generic_byte_view_array_with_hasher<T: ByteViewType, S: BuildHasher>(
 }
 
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_single_array_with_hasher<S: BuildHasher>(
+fn hash_single_array_with_hasher<S: BuildHasher, const TOP_LEVEL: bool>(
     array: &dyn Array,
     hash_builder: &S,
     hashes_buffer: &mut [u64],
@@ -418,7 +422,7 @@ fn hash_single_array_with_hasher<S: BuildHasher>(
             hash_array_with_hasher(&array, hash_builder, hashes_buffer, rehash)
         }
         DataType::Dictionary(_, _) => downcast_dictionary_array! {
-            array => hash_dictionary_with_child_hashing(array, &child_hashing, hashes_buffer, rehash)?,
+            array => hash_dictionary_with_child_hashing::<_, TOP_LEVEL>(array, &child_hashing, hashes_buffer, rehash)?,
             _ => unreachable!()
         }
         DataType::Struct(_) => {
@@ -468,7 +472,7 @@ fn hash_single_array_with_hasher<S: BuildHasher>(
 }
 
 #[cfg(feature = "force_hash_collisions")]
-fn hash_single_array_with_hasher<S: BuildHasher>(
+fn hash_single_array_with_hasher<S: BuildHasher, const TOP_LEVEL: bool>(
     _array: &dyn Array,
     _hash_builder: &S,
     hashes_buffer: &mut [u64],
