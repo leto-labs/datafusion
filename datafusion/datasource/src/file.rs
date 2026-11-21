@@ -223,6 +223,18 @@ pub trait FileSource: Any + Send + Sync {
         ))
     }
 
+    /// Try predicate pushdown with the scan's file groups available. Sources
+    /// whose readers may withdraw filters after opening a file can use this
+    /// hook to keep required predicates in the parent execution plan.
+    fn try_pushdown_filters_for_scan(
+        &self,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        config: &ConfigOptions,
+        _scan: &FileScanConfig,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn FileSource>>> {
+        self.try_pushdown_filters(filters, config)
+    }
+
     /// Try to create a new FileSource that can produce data in the specified sort order.
     ///
     /// This method attempts to optimize data retrieval to match the requested ordering.

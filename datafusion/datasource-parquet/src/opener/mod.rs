@@ -10,6 +10,7 @@ mod early_stop;
 #[cfg(feature = "parquet_encryption")]
 mod encryption;
 pub(crate) mod filter_cache;
+pub(crate) mod positional;
 mod prepared;
 pub use prepared::{PreparedParquetFile, PreparedParquetScan};
 
@@ -365,7 +366,7 @@ impl Morselizer for ParquetMorselizer {
 /// [LoadEncryption]?
 ///        |
 ///        v
-///    PruneFile
+///    BeginMetadata
 ///        |
 ///        v
 ///   LoadMetadata
@@ -404,9 +405,8 @@ enum ParquetOpenState {
     /// Loading encryption footers
     #[cfg(feature = "parquet_encryption")]
     LoadEncryption(BoxFuture<'static, Result<Box<PreparedParquetOpen>>>),
-    /// Try to prune file using only file-level statistics and partition
-    /// values before loading any parquet metadata
-    PruneFile(Box<PreparedParquetOpen>),
+    /// Begin loading the footer before interpreting statistics.
+    BeginMetadata(Box<PreparedParquetOpen>),
     /// Loading Parquet metadata (in footer)
     LoadMetadata(BoxFuture<'static, Result<MetadataLoadedParquetOpen>>),
     /// Specialize any filters for the actual file schema (only known after
@@ -436,7 +436,7 @@ impl fmt::Debug for ParquetOpenState {
             ParquetOpenState::Start { .. } => "Start",
             #[cfg(feature = "parquet_encryption")]
             ParquetOpenState::LoadEncryption(_) => "LoadEncryption",
-            ParquetOpenState::PruneFile(_) => "PruneFile",
+            ParquetOpenState::BeginMetadata(_) => "BeginMetadata",
             ParquetOpenState::LoadMetadata(_) => "LoadMetadata",
             ParquetOpenState::PrepareFilters(_) => "PrepareFilters",
             ParquetOpenState::LoadPageIndex(_) => "LoadPageIndex",
@@ -483,6 +483,9 @@ struct PreparedParquetOpen {
     logical_file_schema: SchemaRef,
     physical_file_schema: SchemaRef,
     output_schema: SchemaRef,
+    table_schema: TableSchema,
+    original_projection: ProjectionExprs,
+    positional_projection: bool,
     projection: ProjectionExprs,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Per-scan virtual-column state, Arc-cloned from [`ParquetMorselizer`] so
@@ -542,7 +545,7 @@ struct PreparedParquetOpen {
 
 /// State of [`ParquetOpenState`]
 ///
-/// Result of loading parquet metadata after file-level pruning is complete.
+/// Result of loading parquet metadata before using file statistics.
 struct MetadataLoadedParquetOpen {
     prepared: PreparedParquetOpen,
     reader_metadata: ArrowReaderMetadata,
@@ -588,13 +591,22 @@ impl DecoderReadPlans {
         // opener's orchestration body focused on filter / decoder / stream
         // wiring. The file-column projection excludes virtual columns and
         // respects nested field projections.
-        let projection = DecoderProjection::try_new(
-            &prepared.projection,
-            &prepared.physical_file_schema,
-            metadata.parquet_schema(),
-            &prepared.output_schema,
-            prepared.virtual_state.as_deref(),
-        )?;
+        let projection = if prepared.positional_projection {
+            DecoderProjection::try_new_positional(
+                &prepared.projection,
+                &prepared.physical_file_schema,
+                &prepared.output_schema,
+                prepared.virtual_state.as_deref(),
+            )?
+        } else {
+            DecoderProjection::try_new(
+                &prepared.projection,
+                &prepared.physical_file_schema,
+                metadata.parquet_schema(),
+                &prepared.output_schema,
+                prepared.virtual_state.as_deref(),
+            )?
+        };
         let pushdown_predicate = prepared
             .pushdown_filters
             .then_some(prepared.predicate.as_ref())
@@ -670,23 +682,23 @@ impl ParquetOpenState {
                 }
                 #[cfg(not(feature = "parquet_encryption"))]
                 {
-                    Ok(ParquetOpenState::PruneFile(prepared))
+                    Ok(ParquetOpenState::BeginMetadata(prepared))
                 }
             }
             #[cfg(feature = "parquet_encryption")]
             ParquetOpenState::LoadEncryption(future) => {
                 Ok(ParquetOpenState::LoadEncryption(future))
             }
-            ParquetOpenState::PruneFile(prepared) => {
-                let Some(prepared) = (*prepared).prune_file()? else {
-                    return Ok(ParquetOpenState::Done);
-                };
+            ParquetOpenState::BeginMetadata(prepared) => {
                 Ok(ParquetOpenState::LoadMetadata(prepared.load().boxed()))
             }
             ParquetOpenState::LoadMetadata(future) => {
                 Ok(ParquetOpenState::LoadMetadata(future))
             }
             ParquetOpenState::PrepareFilters(loaded) => {
+                let Some(loaded) = loaded.prune_file()? else {
+                    return Ok(ParquetOpenState::Done);
+                };
                 let prepared_filters = loaded.prepare_filters()?;
                 Ok(ParquetOpenState::PruneWithStatistics(Box::new(
                     prepared_filters,
@@ -831,7 +843,7 @@ impl MorselPlanner for ParquetMorselPlanner {
             #[cfg(feature = "parquet_encryption")]
             ParquetOpenState::LoadEncryption(future) => {
                 Ok(Some(Self::schedule_io(async move {
-                    Ok(ParquetOpenState::PruneFile(future.await?))
+                    Ok(ParquetOpenState::BeginMetadata(future.await?))
                 })))
             }
             ParquetOpenState::LoadMetadata(future) => {
@@ -907,6 +919,12 @@ impl ParquetMorselizer {
         // Calculate the output schema from the original projection (before literal replacement)
         // so we get correct field names from column references
         let logical_file_schema = Arc::clone(self.table_schema.file_schema());
+        let positional_projection =
+            positional::has_duplicate_names(self.table_schema.table_schema())
+                || partitioned_file
+                    .arrow_schema
+                    .as_deref()
+                    .is_some_and(positional::has_duplicate_names);
         let output_schema = Arc::new(
             self.projection
                 .project_schema(self.table_schema.table_schema())?,
@@ -930,21 +948,23 @@ impl ParquetMorselizer {
         // there are cases where partition columns may appear in more complex
         // predicates that cannot be simplified until we open the file (such as
         // dynamic predicates).
-        let mut literal_columns: HashMap<String, ScalarValue> = self
-            .table_schema
-            .table_partition_cols()
-            .iter()
-            .zip(partitioned_file.partition_values.iter())
-            .map(|(field, value)| (field.name().clone(), value.clone()))
-            .collect();
-        // Add constant columns from file statistics.
-        // Note that if there are statistics for partition columns there will be overlap,
-        // but since we use a HashMap, we'll just overwrite the partition values with the
-        // constant values from statistics (which should be the same).
-        let stats_constants = constant_columns_from_stats(
-            partitioned_file.statistics.as_deref(),
-            &logical_file_schema,
-        );
+        let mut literal_columns = HashMap::new();
+        let stats_constants = if positional_projection {
+            HashMap::new()
+        } else {
+            literal_columns.extend(
+                self.table_schema
+                    .table_partition_cols()
+                    .iter()
+                    .zip(partitioned_file.partition_values.iter())
+                    .map(|(field, value)| (field.name().clone(), value.clone())),
+            );
+            // Collected statistics can also contain the same partition values.
+            constant_columns_from_stats(
+                partitioned_file.statistics.as_deref(),
+                &logical_file_schema,
+            )
+        };
         // Whether the statistics substitution *itself* proves the predicate
         // unsatisfiable has to be decided here, before the partition-value
         // and missing-column rewriting below: a predicate can collapse to a
@@ -979,7 +999,7 @@ impl ParquetMorselizer {
         literal_columns.extend(stats_constants);
 
         let mut projection = self.projection.clone();
-        let mut predicate = self.predicate.clone();
+        let mut predicate = self.predicate.clone().filter(|_| !positional_projection);
         if !literal_columns.is_empty() {
             // Keep the field metadata of the replaced columns, such as extension types
             let table_schema = self.table_schema.table_schema();
@@ -1075,6 +1095,9 @@ impl ParquetMorselizer {
             logical_file_schema: Arc::clone(&logical_file_schema),
             physical_file_schema: logical_file_schema,
             output_schema,
+            table_schema: self.table_schema.clone(),
+            original_projection: self.projection.clone(),
+            positional_projection,
             projection,
             predicate,
             virtual_state: self.virtual_state.as_ref().map(Arc::clone),
@@ -1108,7 +1131,7 @@ impl ParquetMorselizer {
 }
 
 impl PreparedParquetOpen {
-    /// Attempt file-level pruning before any metadata is loaded.
+    /// Attempt file-level pruning once the physical schema is known.
     ///
     /// Returns `None` if the file can be skipped completely.
     fn prune_file(mut self) -> Result<Option<Self>> {
@@ -1178,7 +1201,7 @@ impl PreparedParquetOpen {
         }
     }
 
-    /// Load parquet metadata after file-level pruning is complete.
+    /// Load parquet metadata to verify the physical schema before pruning.
     async fn load(mut self) -> Result<MetadataLoadedParquetOpen> {
         // Don't load the page index yet. Since it is not stored inline in
         // the footer, loading the page index if it is not needed will do
@@ -1226,6 +1249,42 @@ impl PreparedParquetOpen {
 }
 
 impl MetadataLoadedParquetOpen {
+    fn prune_file(self) -> Result<Option<Self>> {
+        let Self {
+            mut prepared,
+            reader_metadata,
+            options,
+        } = self;
+        let duplicate_parquet_fields = {
+            let mut names: HashSet<&str> = HashSet::default();
+            reader_metadata
+                .parquet_schema()
+                .root_schema()
+                .get_fields()
+                .iter()
+                .any(|field| !names.insert(field.name()))
+        };
+        prepared.positional_projection |= duplicate_parquet_fields
+            || positional::has_duplicate_names(reader_metadata.schema());
+        if prepared.positional_projection {
+            // The footer can reveal duplicate names even under a unique table
+            // schema. Discard every tentative filter before evaluating it.
+            prepared.predicate = None;
+            prepared.file_pruner = None;
+            prepared.settled_file_pruning = None;
+            prepared.stats_prove_unsatisfiable = false;
+            prepared.pushdown_filters = false;
+            prepared.enable_row_group_stats_pruning = false;
+            prepared.enable_page_index = false;
+            prepared.enable_bloom_filter = false;
+        }
+        Ok(prepared.prune_file()?.map(|prepared| Self {
+            prepared,
+            reader_metadata,
+            options,
+        }))
+    }
+
     /// Prepare file-schema coercions and pruning predicates once metadata is
     /// loaded.
     fn prepare_filters(self) -> Result<FiltersPreparedParquetOpen> {
@@ -1250,11 +1309,13 @@ impl MetadataLoadedParquetOpen {
         // desired schema (for example if we want to instruct the parquet
         // reader to read strings using Utf8View instead). Update if necessary
         let mut metadata_dirty = false;
-        if let Some(merged) = apply_file_schema_type_coercions_with_rle(
-            &prepared.logical_file_schema,
-            &physical_file_schema,
-            prepared.enable_rle_to_dictionary,
-        ) {
+        if !prepared.positional_projection
+            && let Some(merged) = apply_file_schema_type_coercions_with_rle(
+                &prepared.logical_file_schema,
+                &physical_file_schema,
+                prepared.enable_rle_to_dictionary,
+            )
+        {
             physical_file_schema = Arc::new(merged);
             options = options.with_schema(Arc::clone(&physical_file_schema));
             metadata_dirty = true;
@@ -1262,11 +1323,13 @@ impl MetadataLoadedParquetOpen {
 
         // A table that declares a narrow decimal for a `Decimal128` file column
         // reads the column at the table's width instead of casting each batch.
-        if let Some(merged) = coerce_decimals_to_table_width(
-            reader_metadata.parquet_schema(),
-            &prepared.logical_file_schema,
-            &physical_file_schema,
-        ) {
+        if !prepared.positional_projection
+            && let Some(merged) = coerce_decimals_to_table_width(
+                reader_metadata.parquet_schema(),
+                &prepared.logical_file_schema,
+                &physical_file_schema,
+            )
+        {
             physical_file_schema = Arc::new(merged);
             options = options.with_schema(Arc::clone(&physical_file_schema));
             metadata_dirty = true;
@@ -1316,7 +1379,15 @@ impl MetadataLoadedParquetOpen {
         let needs_rewrite = prepared.predicate.is_some()
             || prepared.logical_file_schema != physical_file_schema;
         let mut prepared_filters = None;
-        if needs_rewrite {
+        if prepared.positional_projection {
+            prepared.projection = positional::project(
+                prepared.original_projection.clone(),
+                &prepared.table_schema,
+                &physical_file_schema,
+                &prepared.partitioned_file.partition_values,
+                &prepared.file_name,
+            )?;
+        } else if needs_rewrite {
             // When virtual columns are requested, augment the logical and
             // physical schemas passed to the rewriter/simplifier with those
             // fields. The rewriter identity-rewrites references found in both
@@ -3228,6 +3299,62 @@ mod test {
         batch: RecordBatch,
     ) -> usize {
         write_parquet_batches(store, filename, vec![batch], None).await
+    }
+
+    #[tokio::test]
+    async fn duplicate_file_fields_keep_their_ordinals_with_an_independent_hint() {
+        use arrow::array::Int32Array;
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::{BinaryExpr, lit};
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("k", DataType::Int32, false),
+            Field::new("u", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![100, 100])),
+                Arc::new(Int32Array::from(vec![2, 3])),
+                Arc::new(Int32Array::from(vec![10, 11])),
+            ],
+        )
+        .unwrap();
+        let name = "duplicate-names.parquet";
+        let size = write_parquet(Arc::clone(&store), name, batch).await as u64;
+        let u_predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("u", 2)),
+            Operator::Gt,
+            lit(0_i32),
+        ));
+        for predicate in [None, Some(u_predicate), Some(lit(false))] {
+            let mut builder = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_schema(Arc::clone(&schema))
+                .with_projection_indices(&[1, 2])
+                .with_pushdown_filters(true);
+            if let Some(predicate) = predicate {
+                builder = builder.with_predicate(predicate);
+            }
+            let stream = open_file(&builder.build(), PartitionedFile::new(name, size))
+                .await
+                .unwrap();
+            let mut keys = Vec::new();
+            let mut independent = Vec::new();
+            for batch in stream.collect::<Vec<_>>().await {
+                let batch = batch.unwrap();
+                keys.extend_from_slice(
+                    batch.column(0).as_primitive::<Int32Type>().values(),
+                );
+                independent.extend_from_slice(
+                    batch.column(1).as_primitive::<Int32Type>().values(),
+                );
+            }
+            assert_eq!(keys, [2, 3]);
+            assert_eq!(independent, [10, 11]);
+        }
     }
 
     /// Write `batch` and return the statistics a collecting `ListingTable`
@@ -6660,7 +6787,7 @@ mod test {
             state = match state {
                 #[cfg(feature = "parquet_encryption")]
                 ParquetOpenState::LoadEncryption(f) => {
-                    ParquetOpenState::PruneFile(f.await.unwrap())
+                    ParquetOpenState::BeginMetadata(f.await.unwrap())
                 }
                 ParquetOpenState::LoadMetadata(f) => {
                     ParquetOpenState::PrepareFilters(Box::new(f.await.unwrap()))

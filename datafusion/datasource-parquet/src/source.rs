@@ -15,6 +15,7 @@ use crate::ParquetFileSchemaProvider;
 use crate::opener::ParquetMorselizer;
 use crate::opener::build_pruning_predicates;
 use crate::opener::build_virtual_columns_state;
+use crate::opener::positional::has_duplicate_names;
 use crate::row_filter::can_expr_be_pushed_down_with_schemas;
 use arrow_schema::Fields;
 use arrow_schema::extension::ExtensionType;
@@ -292,6 +293,8 @@ pub struct ParquetSource {
     pub(crate) table_schema: TableSchema,
     /// Optional predicate for row filtering during parquet scan
     pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Pushed hints can be withdrawn after inspecting a file footer.
+    advisory_predicate: bool,
     /// Optional user defined parquet file reader factory
     pub(crate) parquet_file_reader_factory: Option<Arc<dyn ParquetFileReaderFactory>>,
     /// Optional policy for deriving each file's Arrow schema after footer loading.
@@ -334,6 +337,7 @@ impl ParquetSource {
             table_parquet_options: TableParquetOptions::default(),
             metrics: ExecutionPlanMetricsSet::new(),
             predicate: None,
+            advisory_predicate: false,
             parquet_file_reader_factory: None,
             schema_provider: None,
             batch_size: None,
@@ -378,10 +382,10 @@ impl ParquetSource {
     /// Predicates referencing virtual columns must go through
     /// [`Self::try_pushdown_filters`]. Passing them here with pushdown
     /// enabled trips a debug assert in the opener.
-    #[expect(clippy::needless_pass_by_value)]
     pub fn with_predicate(&self, predicate: Arc<dyn PhysicalExpr>) -> Self {
         let mut conf = self.clone();
-        conf.predicate = Some(Arc::clone(&predicate));
+        conf.predicate =
+            (!has_duplicate_names(self.table_schema.table_schema())).then_some(predicate);
         conf
     }
 
@@ -400,9 +404,10 @@ impl ParquetSource {
         predicate: Option<Arc<dyn PhysicalExpr>>,
     ) -> Self {
         let mut conf = self.clone();
+        conf.predicate =
+            predicate.filter(|_| !has_duplicate_names(table_schema.table_schema()));
         conf.table_schema = table_schema;
         conf.projection = projection;
-        conf.predicate = predicate;
         conf
     }
 
@@ -727,7 +732,7 @@ impl FileSource for ParquetSource {
     /// enabled, and then only the conjuncts that can become a `RowFilter`.
     /// Otherwise the predicate is used only for pruning.
     fn exact_filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
-        if !self.pushdown_filters() {
+        if self.advisory_predicate || !self.pushdown_filters() {
             return None;
         }
         let predicate = self.predicate.as_ref()?;
@@ -874,11 +879,44 @@ impl FileSource for ParquetSource {
         Ok(())
     }
 
+    fn try_pushdown_filters_for_scan(
+        &self,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        config: &ConfigOptions,
+        scan: &FileScanConfig,
+    ) -> datafusion_common::Result<FilterPushdownPropagation<Arc<dyn FileSource>>> {
+        if scan
+            .file_groups
+            .iter()
+            .flat_map(|group| group.files())
+            .any(|file| {
+                file.arrow_schema
+                    .as_deref()
+                    .is_some_and(has_duplicate_names)
+            })
+        {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                vec![PushedDown::No; filters.len()],
+            ));
+        }
+        // The physical schema is only verified when loading the footer. The
+        // decoder can still evaluate the predicate for unambiguous files,
+        // but the scan cannot promise it has evaluated every row.
+        let mut source = self.clone();
+        source.advisory_predicate = true;
+        source.try_pushdown_filters(filters, config)
+    }
+
     fn try_pushdown_filters(
         &self,
         filters: Vec<Arc<dyn PhysicalExpr>>,
         config: &ConfigOptions,
     ) -> datafusion_common::Result<FilterPushdownPropagation<Arc<dyn FileSource>>> {
+        if has_duplicate_names(self.table_schema.table_schema()) {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                vec![PushedDown::No; filters.len()],
+            ));
+        }
         // Use the schema excluding virtual columns: virtual columns (e.g.
         // Parquet `row_number`) are produced by the reader itself and cannot
         // be referenced inside a RowFilter, so predicates that reference them
@@ -932,19 +970,15 @@ impl FileSource for ParquetSource {
         };
         source.predicate = Some(predicate);
         source = source.with_pushdown_filters(pushdown_filters);
-        let source = Arc::new(source);
-        // If pushdown_filters is false we tell our parents that they still have to handle the filters,
-        // even if we updated the predicate to include the filters (they will only be used for stats pruning).
-        if !pushdown_filters {
-            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                vec![PushedDown::No; filters.len()],
-            )
-            .with_updated_node(source));
-        }
-        Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-            filters.iter().map(|f| f.discriminant).collect(),
+        let statuses = if pushdown_filters && !source.advisory_predicate {
+            filters.iter().map(|f| f.discriminant).collect()
+        } else {
+            vec![PushedDown::No; filters.len()]
+        };
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(statuses)
+                .with_updated_node(Arc::new(source)),
         )
-        .with_updated_node(source))
     }
 
     /// Try to optimize the scan to produce data in the requested sort order.
@@ -1148,6 +1182,8 @@ impl FileSource for ParquetSource {
             // Carried by `base`.
             table_schema: _,
             predicate,
+            // Required filters stay above scans across the wire.
+            advisory_predicate: _,
             // Rebuilt from the decode context.
             parquet_file_reader_factory: _,
             // Requires a custom codec for serialization.
@@ -1257,6 +1293,8 @@ impl ParquetSource {
                 .try_into()?,
         );
 
+        let table_schema = FileScanConfig::parse_table_schema_from_proto(base_conf)?;
+
         // The predicate was serialized against the scan's output schema, so it
         // must be decoded against the projected schema when a projection is
         // present.
@@ -1271,10 +1309,14 @@ impl ParquetSource {
             schema
         };
 
-        let predicate = predicate
-            .as_ref()
-            .map(|expr| ctx.decode_expr(expr, predicate_schema.as_ref()))
-            .transpose()?;
+        let predicate = if has_duplicate_names(table_schema.table_schema()) {
+            None
+        } else {
+            predicate
+                .as_ref()
+                .map(|expr| ctx.decode_expr(expr, predicate_schema.as_ref()))
+                .transpose()?
+        };
         let sort_order_for_reorder = sort_order_for_reorder
             .as_ref()
             .map(|ordering| {
@@ -1294,7 +1336,6 @@ impl ParquetSource {
             options = table_options.try_into()?;
         }
 
-        let table_schema = FileScanConfig::parse_table_schema_from_proto(base_conf)?;
         let object_store_url = match base_conf.object_store_url.is_empty() {
             false => ObjectStoreUrl::parse(&base_conf.object_store_url)?,
             true => ObjectStoreUrl::local_filesystem(),
@@ -1316,6 +1357,7 @@ impl ParquetSource {
 
         if let Some(predicate) = predicate {
             source = source.with_predicate(predicate);
+            source.advisory_predicate = true;
         }
         let base_config =
             FileScanConfig::try_from_proto(base_conf, ctx, Arc::new(source))?;

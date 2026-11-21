@@ -1170,7 +1170,7 @@ impl DataSource for FileScanConfig {
 
         let mut result = self
             .file_source
-            .try_pushdown_filters(remapped_filters, config)?;
+            .try_pushdown_filters_for_scan(remapped_filters, config, self)?;
         if has_duplicate_names {
             let mut statuses = result.filters.into_iter();
             result.filters = forwarded

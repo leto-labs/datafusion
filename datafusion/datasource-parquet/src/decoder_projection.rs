@@ -120,6 +120,29 @@ impl DecoderProjection {
         })
     }
 
+    /// Read all file slots so the positional projection survives decoding.
+    /// Neither the nested projection optimizer nor the name-based rebasing
+    /// may run when the file or table schema has ambiguous field names.
+    pub(crate) fn try_new_positional(
+        projection: &ProjectionExprs,
+        physical_file_schema: &SchemaRef,
+        output_schema: &SchemaRef,
+        virtual_state: Option<&VirtualColumnsState>,
+    ) -> Result<Self> {
+        let stream_schema = match virtual_state {
+            Some(state) => append_fields(physical_file_schema, state.virtual_columns()),
+            None => Arc::clone(physical_file_schema),
+        };
+        let projector = projection.make_projector(&stream_schema)?;
+        let replace_schema = projector.output_schema() != output_schema;
+        Ok(Self {
+            projection_mask: ProjectionMask::all(),
+            projector,
+            output_schema: Arc::clone(output_schema),
+            replace_schema,
+        })
+    }
+
     /// The projection mask to install on every parquet decoder in the scan.
     pub(crate) fn projection_mask(&self) -> &ProjectionMask {
         &self.projection_mask
