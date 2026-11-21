@@ -1311,3 +1311,15 @@ and collision lists. Spill uses the same materialized columns and replay
 interner. The regression tests force a full-hash collision across nullable
 mixed columns, check IDs before and after prefix emission, and verify
 bounded spill replay and reservation release.
+
+## Family ECL: preserve aggregate collision lists during prefix emission
+
+Purpose: remove emitted groups and rebase retained group IDs in place, then
+remap every hash bucket before compacting the collision lists. This preserves
+retained keys when hash bucket traversal visits lists in a different order
+from their insertion order. Dependent feature: CORE-AGGREGATION.
+Audit classification: UPSTREAMABLE.
+
+Regressions cover exact group IDs with two forced collisions and aggregate
+counts for naturally colliding nullable keys after memory-pressure output
+from a partial aggregate.

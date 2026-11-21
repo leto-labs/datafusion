@@ -195,12 +195,9 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     ///   `latest group index -> older group index -> even older group index -> ...`
     group_index_lists: Vec<Vec<usize>>,
 
-    /// When emitting first n, we need to decrease/erase group indices in
-    /// `map` and `group_index_lists`.
-    ///
-    /// This buffer is used to temporarily store the remaining group indices in
-    /// a specific list in `group_index_lists`.
-    emit_group_index_list_buffer: Vec<usize>,
+    /// Maps original collision list offsets to compacted offsets during prefix
+    /// emission. Only entries for lists with multiple survivors are used.
+    emit_group_index_list_offsets: Vec<usize>,
 
     /// Buffers for `vectorized_append` and `vectorized_equal_to`
     vectorized_operation_buffers: VectorizedOperationBuffers,
@@ -294,7 +291,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             schema,
             map,
             group_index_lists: Vec::new(),
-            emit_group_index_list_buffer: Vec::new(),
+            emit_group_index_list_offsets: Vec::new(),
             vectorized_operation_buffers: VectorizedOperationBuffers::default(),
             map_size: 0,
             group_values,
@@ -1092,7 +1089,7 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
             + group_values_size
             + self.map_size
             + group_index_lists_size
-            + self.emit_group_index_list_buffer.allocated_size()
+            + self.emit_group_index_list_offsets.allocated_size()
             + self.vectorized_operation_buffers.size()
             + self.hashes_buffer.allocated_size()
     }
@@ -1135,47 +1132,44 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                     .iter_mut()
                     .map(|v| v.take_n(n))
                     .collect::<Vec<_>>();
-                let mut next_new_list_offset = 0;
+                if !STREAMING {
+                    // Keep each list at its original offset until every bucket
+                    // has been updated. Bucket traversal can visit the lists
+                    // in a different order from their insertion order.
+                    let offsets = &mut self.emit_group_index_list_offsets;
+                    offsets.clear();
+                    offsets.reserve(self.group_index_lists.len());
+                    let mut next_offset = 0;
+                    for list in &mut self.group_index_lists {
+                        list.retain_mut(|id| {
+                            if let Some(remaining) = id.checked_sub(n) {
+                                *id = remaining;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        offsets.push(next_offset);
+                        next_offset += usize::from(list.len() > 1);
+                    }
+                }
 
                 self.map.retain(|(_exist_hash, group_idx_view)| {
-                    // In non-streaming case, we need to check if the `group index view`
-                    // is `inlined` or `non-inlined`
                     if !STREAMING && group_idx_view.is_non_inlined() {
-                        // Non-inlined case
-                        // We take `group_index_list` from `old_group_index_lists`
-
-                        // list_offset is incrementally
-                        self.emit_group_index_list_buffer.clear();
-                        let list_offset = group_idx_view.value() as usize;
-                        for group_index in self.group_index_lists[list_offset].iter() {
-                            if let Some(remaining) = group_index.checked_sub(n) {
-                                self.emit_group_index_list_buffer.push(remaining);
+                        let offset = group_idx_view.value() as usize;
+                        match self.group_index_lists[offset].as_slice() {
+                            [] => false,
+                            [id] => {
+                                *group_idx_view = GroupIndexView::new_inlined(*id as u64);
+                                true
                             }
-                        }
-
-                        // The possible results:
-                        //   - `new_group_index_list` is empty, we should erase this bucket
-                        //   - only one value in `new_group_index_list`, switch the `view` to `inlined`
-                        //   - still multiple values in `new_group_index_list`, build and set the new `unlined view`
-                        if self.emit_group_index_list_buffer.is_empty() {
-                            false
-                        } else if self.emit_group_index_list_buffer.len() == 1 {
-                            let group_index =
-                                self.emit_group_index_list_buffer.first().unwrap();
-                            *group_idx_view =
-                                GroupIndexView::new_inlined(*group_index as u64);
-                            true
-                        } else {
-                            let group_index_list =
-                                &mut self.group_index_lists[next_new_list_offset];
-                            group_index_list.clear();
-                            group_index_list
-                                .extend(self.emit_group_index_list_buffer.iter());
-                            *group_idx_view = GroupIndexView::new_non_inlined(
-                                next_new_list_offset as u64,
-                            );
-                            next_new_list_offset += 1;
-                            true
+                            _ => {
+                                let new_offset =
+                                    self.emit_group_index_list_offsets[offset];
+                                *group_idx_view =
+                                    GroupIndexView::new_non_inlined(new_offset as u64);
+                                true
+                            }
                         }
                     } else {
                         // In `streaming case`, the `group index view` is ensured to be `inlined`
@@ -1196,7 +1190,7 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                 });
 
                 if !STREAMING {
-                    self.group_index_lists.truncate(next_new_list_offset);
+                    self.group_index_lists.retain(|list| list.len() > 1);
                 }
 
                 output
@@ -1237,8 +1231,8 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         self.hashes_buffer.clear();
         self.hashes_buffer.shrink_to_fit();
         if !STREAMING {
-            self.emit_group_index_list_buffer.clear();
-            self.emit_group_index_list_buffer.shrink_to_fit();
+            self.emit_group_index_list_offsets.clear();
+            self.emit_group_index_list_offsets.shrink_to_fit();
             self.vectorized_operation_buffers.clear_shrink(0);
         }
     }
@@ -1260,8 +1254,8 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         if !STREAMING {
             self.group_index_lists.clear();
             self.group_index_lists.shrink_to(num_rows);
-            self.emit_group_index_list_buffer.clear();
-            self.emit_group_index_list_buffer.shrink_to(num_rows);
+            self.emit_group_index_list_offsets.clear();
+            self.emit_group_index_list_offsets.shrink_to(num_rows);
             self.vectorized_operation_buffers.clear_shrink(num_rows);
         }
     }
@@ -1353,7 +1347,7 @@ mod tests {
         insert_non_inline_group_index_view(&mut group_values, u64::MAX, vec![1, 2]);
         group_values.emit(EmitTo::First(1))?;
         assert!(!group_values.group_index_lists.is_empty());
-        assert!(group_values.emit_group_index_list_buffer.capacity() > 0);
+        assert!(group_values.emit_group_index_list_offsets.capacity() > 0);
         assert!(group_values.size() > baseline);
 
         let input: ArrayRef = Arc::new(Int32Array::from_iter_values(0..32));
@@ -1377,7 +1371,7 @@ mod tests {
         buffers.equal_to_group_indices.push(0);
         buffers.equal_to_results.append(true);
         buffers.remaining_row_indices.push(0);
-        group_values.emit_group_index_list_buffer.push(0);
+        group_values.emit_group_index_list_offsets.push(0);
 
         assert!(group_values.size() > baseline);
         group_values.clear_shrink(0);
