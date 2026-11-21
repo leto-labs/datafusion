@@ -2291,6 +2291,15 @@ pub struct ConfigEntry {
     pub description: &'static str,
 }
 
+/// Application-provided policy for evaluating Parquet row filters on dictionaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParquetDictionaryFilter {
+    /// Compare the verdict selection against the ordinary value filter.
+    pub verify: bool,
+    /// Maximum dictionary entry count as a percentage of chunk rows.
+    pub max_percent: u8,
+}
+
 /// Configuration options struct, able to store both built-in configuration and custom options
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -2307,6 +2316,9 @@ pub struct ConfigOptions {
     pub explain: ExplainOptions,
     /// Optional extensions registered using [`Extensions::insert`]
     pub extensions: Extensions,
+    /// Optional execution policy set by the application. Applications that
+    /// expose SQL settings resolve them into this policy before execution.
+    pub parquet_dictionary_filter: Option<ParquetDictionaryFilter>,
     /// Formatting options when printing batches
     pub format: FormatOptions,
     /// Spark-compatibility options (functions under `datafusion/spark`)

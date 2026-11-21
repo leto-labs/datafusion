@@ -19,7 +19,6 @@ use crate::row_filter::can_expr_be_pushed_down_with_schemas;
 use arrow_schema::Fields;
 use arrow_schema::extension::ExtensionType;
 use arrow_schema::{DataType, Field};
-use datafusion_common::config::ConfigOptions;
 #[cfg(feature = "parquet_encryption")]
 use datafusion_common::config::EncryptionFactoryOptions;
 use datafusion_datasource::as_file_source;
@@ -27,14 +26,13 @@ use datafusion_datasource::file_stream::FileOpener;
 use datafusion_datasource::morsel::Morselizer;
 
 use arrow::datatypes::TimeUnit;
-use datafusion_common::config::TableParquetOptions;
+use datafusion_common::config::{ConfigOptions, TableParquetOptions};
 use datafusion_common::tree_node::TreeNodeRecursion;
 #[cfg(feature = "proto")]
 use datafusion_common::utils::{usize_from_wire, usize_to_wire};
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
-use datafusion_execution::config::SessionConfig;
 use datafusion_functions::core::file_row_index::FileRowIndexFunc;
 use datafusion_physical_expr::expressions::{Column, DynamicFilterTracking};
 use datafusion_physical_expr::projection::ProjectionExprs;
@@ -321,20 +319,7 @@ pub struct ParquetSource {
     dictionary_filter: Option<DictionaryFilterOptions>,
 }
 
-/// Resolves scan-time dictionary filtering from application session options.
-struct DictionaryFilterPolicy(fn(&ConfigOptions) -> Option<DictionaryFilterOptions>);
-
 impl ParquetSource {
-    /// Configure optional dictionary filtering for Parquet scans using this
-    /// session. The resolver sees the current options, including changes made
-    /// after registration. Return `None` to retain ordinary row filtering.
-    pub fn set_dictionary_filter_policy(
-        config: &mut SessionConfig,
-        resolve: fn(&ConfigOptions) -> Option<DictionaryFilterOptions>,
-    ) {
-        config.set_extension(Arc::new(DictionaryFilterPolicy(resolve)));
-    }
-
     /// Create a new ParquetSource to read the data specified in the file scan
     /// configuration with the provided schema.
     ///
@@ -763,17 +748,22 @@ impl FileSource for ParquetSource {
         &self,
         context: &datafusion_execution::TaskContext,
     ) -> Option<Arc<dyn FileSource>> {
-        let config = context.session_config();
-        let resolve = config.get_extension::<DictionaryFilterPolicy>()?;
-        let options = (resolve.0)(config.options())?;
-        if options.mode == DictionaryFilterMode::Off
-            || !self.pushdown_filters()
-            || self.predicate.is_none()
-        {
+        let policy = context
+            .session_config()
+            .options()
+            .parquet_dictionary_filter?;
+        if !self.pushdown_filters() || self.predicate.is_none() {
             return None;
         }
         let mut source = self.clone();
-        source.dictionary_filter = Some(options);
+        source.dictionary_filter = Some(DictionaryFilterOptions {
+            mode: if policy.verify {
+                DictionaryFilterMode::Verify
+            } else {
+                DictionaryFilterMode::On
+            },
+            max_percent: policy.max_percent,
+        });
         Some(Arc::new(source))
     }
 
@@ -1431,6 +1421,32 @@ mod tests {
     use datafusion_physical_expr::expressions::lit;
 
     #[test]
+    fn dictionary_verdict_policy_is_opt_in_without_session_extensions() {
+        use datafusion_common::config::ParquetDictionaryFilter;
+        use datafusion_execution::TaskContext;
+        use datafusion_execution::config::SessionConfig;
+
+        let source = ParquetSource::new(Arc::new(Schema::empty()))
+            .with_pushdown_filters(true)
+            .with_predicate(lit(true));
+        let mut config = SessionConfig::new();
+        let off = TaskContext::default().with_session_config(config.clone());
+        assert!(source.with_task_context(&off).is_none());
+
+        config.options_mut().parquet_dictionary_filter = Some(ParquetDictionaryFilter {
+            verify: true,
+            max_percent: 60,
+        });
+        let verify = TaskContext::default().with_session_config(config);
+        let configured = source.with_task_context(&verify).unwrap();
+        let configured = configured.downcast_ref::<ParquetSource>().unwrap();
+        let policy = configured.dictionary_filter.unwrap();
+        assert_eq!(policy.mode, DictionaryFilterMode::Verify);
+        assert_eq!(policy.max_percent, 60);
+        assert!(source.dictionary_filter.is_none());
+    }
+
+    #[test]
     fn partition_metrics_exclude_derived_plan_metrics() {
         use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
         use datafusion_datasource::source::DataSourceExec;
@@ -1846,7 +1862,6 @@ mod tests {
         use arrow::compute::SortOptions;
         use arrow::datatypes::{DataType, Field, Schema};
         use datafusion_datasource::TableSchema;
-        use datafusion_execution::config::SessionConfig;
         use datafusion_physical_expr::EquivalenceProperties;
         use datafusion_physical_expr::expressions::Column;
         use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
@@ -2227,7 +2242,6 @@ mod tests {
         use arrow::datatypes::{DataType, Field, FieldRef, Schema};
         use datafusion_common::config::ConfigOptions;
         use datafusion_datasource::TableSchema;
-        use datafusion_execution::config::SessionConfig;
         use datafusion_expr::{col, lit as logical_lit};
         use datafusion_functions::core::expr_fn::file_row_index;
         use datafusion_physical_expr::planner::logical2physical;

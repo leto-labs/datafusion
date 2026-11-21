@@ -1286,7 +1286,8 @@ values and on NULL. Reuse the ordinary decoder when a verdict cannot be
 computed. Dependent feature: DICTIONARY-CODE-EXECUTION.
 Audit classification: UPSTREAMABLE.
 
-The application can resolve an optional policy from its typed session settings.
-With no policy, the opener skips eligibility checks and dictionary metrics and
-uses the ordinary row filter. The pull decoder and prepared scan reuse the same
-opener. The plan codec continues to carry the exact filter.
+The application can bind an optional `ConfigOptions::parquet_dictionary_filter`
+policy before execution. With no policy, scan open skips session extension
+lookups, a source clone, eligibility checks and dictionary metrics. The pull
+decoder and prepared scan reuse the same opener. The plan codec continues to
+carry the exact filter.
