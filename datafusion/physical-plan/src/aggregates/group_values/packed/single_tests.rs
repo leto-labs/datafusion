@@ -151,3 +151,24 @@ fn single_column_falling_minimum_and_repeated_runs() {
     }
     check.emit(EmitTo::All);
 }
+
+#[test]
+fn single_column_overwrites_reused_key_and_group_buffers() {
+    let mut packed = Differential::new(&[DataType::Int32]).packed;
+    let mut groups = vec![usize::MAX; 8];
+    for (keys, expected) in [
+        (vec![Some(7), None, Some(4_933_010)], vec![0, 1, 2]),
+        (vec![None, Some(17)], vec![1, 3]),
+        (
+            vec![Some(4_933_010), Some(7), None, Some(19)],
+            vec![2, 0, 1, 4],
+        ),
+        (vec![], vec![]),
+        (vec![None, Some(17)], vec![1, 3]),
+    ] {
+        let keys = Arc::new(Int32Array::from(keys)) as ArrayRef;
+        packed.intern(&[keys], &mut groups).unwrap();
+        assert_eq!(groups, expected);
+        assert!(!packed.is_fallback());
+    }
+}

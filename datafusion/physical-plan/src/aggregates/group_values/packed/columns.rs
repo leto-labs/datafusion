@@ -59,6 +59,11 @@ pub(super) trait KeyColumn: Send {
     fn width(&self) -> u32;
     /// OR the codes of the observed batch, shifted by `shift`, into `keys`.
     fn pack(&self, array: &ArrayRef, keys: &mut [u64], shift: u32);
+    /// Write one column's codes into the whole key buffer.
+    fn pack_single(&self, array: &ArrayRef, keys: &mut [u64]) {
+        keys.fill(0);
+        self.pack(array, keys, 0);
+    }
     /// The column of the groups with these codes.
     fn build(&mut self, codes: &[u64]) -> Result<ArrayRef>;
     fn size(&self) -> usize;
@@ -376,6 +381,21 @@ where
             keys,
             shift,
         );
+    }
+
+    fn pack_single(&self, array: &ArrayRef, keys: &mut [u64]) {
+        if self.range.width() == 0 {
+            keys.fill(0);
+            return;
+        }
+        let array = array.as_primitive::<T>();
+        let base = self.range.base() as u64;
+        for (key, value) in keys.iter_mut().zip(array.values().iter()) {
+            *key = value.low64().wrapping_sub(base).wrapping_add(1);
+        }
+        if let Some(nulls) = array.nulls().filter(|nulls| nulls.null_count() > 0) {
+            for_each_null(nulls, |row| keys[row] = 0);
+        }
     }
 
     fn translate_all(&self, codes: &mut [u64]) {

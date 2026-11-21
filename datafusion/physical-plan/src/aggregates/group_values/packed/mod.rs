@@ -384,10 +384,17 @@ impl GroupValues for GroupValuesPacked {
         if too_many || (!self.columns.iter().all(|c| c.fits()) && !self.relayout(rows)) {
             return self.fall_back()?.intern(cols, groups);
         }
-        self.keys.clear();
-        self.keys.resize(rows, 0);
-        for ((column, array), &shift) in self.columns.iter().zip(cols).zip(&self.shifts) {
-            column.pack(array, &mut self.keys, shift);
+        if let ([column], [array]) = (self.columns.as_slice(), cols) {
+            self.keys.resize(rows, 0);
+            column.pack_single(array, &mut self.keys);
+        } else {
+            self.keys.clear();
+            self.keys.resize(rows, 0);
+            for ((column, array), &shift) in
+                self.columns.iter().zip(cols).zip(&self.shifts)
+            {
+                column.pack(array, &mut self.keys, shift);
+            }
         }
         self.table.intern(&self.keys, groups);
         Ok(())

@@ -337,8 +337,7 @@ impl PackedKeyTable {
             self.bits == 64 || keys.iter().all(|&k| k >> self.bits == 0),
             "key above its declared width"
         );
-        // Ids go into a sized slice: no length update per row.
-        groups.clear();
+        // Every probe stores an id, so reuse the initialized output prefix.
         groups.resize(keys.len(), 0);
         if self.is_direct() {
             self.intern_direct(keys, groups);
