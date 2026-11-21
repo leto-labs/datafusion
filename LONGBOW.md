@@ -1264,3 +1264,15 @@ Review fixes (MJJ96 independent review, 2026-11-19):
   (`CachedParquetMetaData::derived`). `ParquetFileReaderFactory::with_derived_copies`
   (default `None`; the cached factory returns a configured clone) lets a
   wrapping factory reserve them.
+
+## Family DV: evaluate static Parquet predicates on chunk dictionaries
+
+Purpose: evaluate deterministic single-column expressions on the chunk's Arrow
+values and on NULL. Reuse the ordinary decoder when a verdict cannot be
+computed. Dependent feature: DICTIONARY-CODE-EXECUTION.
+Audit classification: UPSTREAMABLE.
+
+The application can resolve an optional policy from its typed session settings.
+With no policy, the opener skips eligibility checks and dictionary metrics and
+uses the ordinary row filter. The pull decoder and prepared scan reuse the same
+opener. The plan codec continues to carry the exact filter.
