@@ -497,6 +497,7 @@ struct PreparedParquetOpen {
     reorder_predicates: bool,
     pushdown_filters: bool,
     dictionary_filter: Option<parquet::arrow::arrow_reader::DictionaryFilterOptions>,
+    staged_predicates: Option<Arc<[Arc<dyn PhysicalExpr>]>>,
     force_filter_selections: bool,
     enable_page_index: bool,
     enable_bloom_filter: bool,
@@ -575,6 +576,42 @@ struct RowGroupsPrunedParquetOpen {
     row_groups: RowGroupAccessPlanFilter,
     /// Built lazily for external-selection index checks and reused by the stream.
     decoder_read_plans: Option<DecoderReadPlans>,
+}
+
+impl PreparedParquetOpen {
+    fn staged_scan(
+        &self,
+        metadata: &ArrowReaderMetadata,
+        access: &ParquetAccessPlan,
+    ) -> Option<Arc<parquet::arrow::arrow_reader::StagedScan>> {
+        let predicates = self.staged_predicates.as_deref()?;
+        if self.pushdown_filters || self.limit.is_some() || self.virtual_state.is_some() {
+            return None;
+        }
+        let compiled = crate::row_filter::staged_predicates(
+            predicates,
+            &self.logical_file_schema,
+            &self.physical_file_schema,
+            metadata.metadata(),
+        )?;
+        // A full-match proof for the pruning predicate applies only when
+        // it proves all the staged conjuncts too.
+        let already_matched = self.predicate.as_ref().and_then(|hint| {
+            let conjuncts = datafusion_physical_expr::split_conjunction(hint);
+            predicates
+                .iter()
+                .all(|predicate| conjuncts.contains(&predicate))
+                .then(|| Arc::from(access.fully_matched().as_slice()))
+        });
+        let counters =
+            crate::metrics::StagedScanCounters::new(&self.metrics, self.partition_index);
+        Some(Arc::new(
+            parquet::arrow::arrow_reader::StagedScan::new(compiled, move |work| {
+                counters.observe(work)
+            })
+            .with_fully_matched(already_matched),
+        ))
+    }
 }
 
 /// Per-file projection and filter plans shared by index loading and decoding.
@@ -1099,6 +1136,7 @@ impl ParquetMorselizer {
             reorder_predicates: self.reorder_filters,
             pushdown_filters: self.pushdown_filters,
             dictionary_filter: self.dictionary_filter,
+            staged_predicates: self.staged_predicates.clone(),
             force_filter_selections: self.force_filter_selections,
             enable_page_index: self.enable_page_index,
             enable_bloom_filter: self.enable_bloom_filter,
@@ -1944,6 +1982,7 @@ impl RowGroupsPrunedParquetOpen {
             access_plan,
             decoder_read_plans,
         } = self.finish_pruning()?;
+        let staged_scan = prepared.staged_scan(&reader_metadata, &access_plan);
         let file_metadata = Arc::clone(reader_metadata.metadata());
         let rg_metadata = file_metadata.row_groups();
 
@@ -2103,7 +2142,8 @@ impl RowGroupsPrunedParquetOpen {
             let first_rg_fully_matched = rg_plan.front().is_some_and(|e| e.fully_matched);
             let row_filter_context = precomputed_context;
 
-            let mut builder = decoder_config.build(selections, reader_metadata.clone());
+            let mut builder =
+                decoder_config.build(selections, reader_metadata.clone(), staged_scan);
             let mut filter_installed = false;
             if let Some(ctx) = row_filter_context.as_ref() {
                 if first_rg_fully_matched {

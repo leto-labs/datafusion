@@ -101,6 +101,7 @@ pub struct PreparedParquetFile {
     /// Upstream's per-file row-filter plan (pushdown only): the candidates are
     /// resolved once and every decoder gets a fresh `RowFilter`.
     row_filter: Option<RowFilterContext>,
+    staged_scan: Option<Arc<parquet::arrow::arrow_reader::StagedScan>>,
     force_selections: bool,
     read_mask: ProjectionMask,
     factory: Arc<dyn ParquetFileReaderFactory>,
@@ -194,9 +195,16 @@ impl PreparedParquetFile {
         }
         if !filter.predicates().is_empty() {
             builder = builder.with_row_filter(filter);
+        } else {
+            builder = builder.with_staged_scan(self.staged_scan.clone());
         }
         Ok(builder)
     }
+    /// Whether native batches can carry the exact staged selection.
+    pub fn has_staged_scan(&self) -> bool {
+        self.staged_scan.is_some()
+    }
+
     /// Reuse a driver's decoder template with a fresh unit selection. No encoded
     /// buffers from the previous unit may remain in `builder`.
     pub fn reset_decoder_builder(
@@ -225,18 +233,12 @@ impl PreparedParquetFile {
             RowGroupAccess::Scan => interval,
             RowGroupAccess::Selection(base) => base.intersection(&interval),
         };
-        let mut builder = builder
-            .with_row_group_selections(vec![RowGroupSelection::new(
-                group,
-                Some(selection),
-            )])
-            .with_batch_size(batch_size);
-        if self.force_selections {
-            builder = builder.with_row_selection_policy(
-                parquet::arrow::arrow_reader::RowSelectionPolicy::Selectors,
-            );
-        }
-        Ok(builder)
+        Ok(DecoderBuilderConfig::apply_units(
+            builder,
+            vec![RowGroupSelection::new(group, Some(selection))],
+            batch_size,
+            self.force_selections,
+        ))
     }
     /// Encoded ranges for a row group. Includes all predicate and output columns;
     /// Static selections include predicate-cache batch boundaries. Adjacent
@@ -481,6 +483,7 @@ fn prepared_scan(pruned: PrunedParquetOpen) -> Result<PreparedParquetScan> {
         projection,
         row_filter_context,
     } = decoder_read_plans;
+    let staged_scan = prepared.staged_scan(&metadata, &access);
     let mut read_mask = projection.projection_mask().clone();
     // Include every declared predicate input, including dynamic inputs whose
     // initial predicate is still an always-true literal.
@@ -548,6 +551,7 @@ fn prepared_scan(pruned: PrunedParquetOpen) -> Result<PreparedParquetScan> {
         max_in_list_size: prepared.max_in_list_size,
         physical_schema: prepared.physical_file_schema,
         row_filter: row_filter_context,
+        staged_scan,
         force_selections: prepared.force_filter_selections,
         read_mask,
         factory: prepared.parquet_file_reader_factory,
