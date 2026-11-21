@@ -118,7 +118,8 @@ impl GroupValues for GroupValuesRows {
         let normalized_cols: Vec<ArrayRef> = cols.iter().map(normalize_floats).collect();
         let cols = normalized_cols.as_slice();
 
-        // Convert the group keys into the row format
+        // Arrow's dictionary row codec encodes null keys and keys into null
+        // values alike. The shared hash scatter applies the same equivalence.
         let group_rows = &mut self.rows_buffer;
         group_rows.clear();
         self.row_converter.append(group_rows, cols)?;
@@ -571,6 +572,61 @@ mod tests {
         check(values.emit(EmitTo::All)?, vec![Some("a")])?;
         values.intern(&input, &mut groups)?;
         check(values.emit(EmitTo::All)?, vec![None, Some("a")])?;
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_null_representations_share_one_group() -> Result<()> {
+        use crate::Partitioning;
+        use crate::metrics::Time;
+        use crate::repartition::BatchPartitioner;
+        use datafusion_physical_expr::expressions::col;
+
+        let key = Arc::new(DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0, 0]),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+        )?);
+        let companion = Arc::new(DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![None, Some(0)]),
+            Arc::new(NullArray::new(1)),
+        )?);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", key.data_type().clone(), false),
+            Field::new("companion", companion.data_type().clone(), true),
+            Field::new("n", DataType::Null, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![key, companion, Arc::new(NullArray::new(2))],
+        )?;
+        let mut values = GroupValuesRows::try_new(Arc::clone(&schema))?;
+        let mut groups = vec![];
+        values.intern(batch.columns(), &mut groups)?;
+        assert_eq!(values.rows_buffer.row(0), values.rows_buffer.row(1));
+        assert_eq!(groups, [0, 0]);
+
+        let keys = schema
+            .fields()
+            .iter()
+            .map(|field| col(field.name(), &schema))
+            .collect::<Result<_>>()?;
+        let mut partitioner =
+            BatchPartitioner::try_new(Partitioning::Hash(keys, 13), Time::new(), 0, 1)?;
+        let partitions = partitioner
+            .partition_iter(batch)?
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].1.num_rows(), 2);
+
+        let output = RecordBatch::try_new(schema, values.emit(EmitTo::All)?)?;
+        assert_eq!(output.num_rows(), 1);
+        assert_eq!(output.column(0).null_count(), 0);
+        assert!(
+            output
+                .columns()
+                .iter()
+                .all(|col| col.logical_null_count() == 1)
+        );
         Ok(())
     }
 
