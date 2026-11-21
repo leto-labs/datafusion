@@ -54,23 +54,29 @@
 
 use std::sync::Arc;
 
-use arrow::array::BooleanArray;
+use arrow::array::{Array, ArrayRef, BooleanArray, new_null_array};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowPredicate, RowFilter};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicate, DictionaryFilterMetrics, DictionaryFilterOptions, DictionaryVerdict,
+    RowFilter,
+};
 use parquet::file::metadata::ParquetMetaData;
 
 use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
-use datafusion_common::tree_node::TreeNode;
-use datafusion_physical_expr::utils::reassign_expr_columns;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
+use datafusion_physical_expr_common::physical_expr::is_volatile;
 
 use datafusion_physical_plan::metrics;
 
 use super::ParquetFileMetrics;
+use super::metrics::DictionaryFilterCounters;
 use super::supported_predicates::supports_list_predicates;
 use crate::projection_read_plan::{
     ParquetReadPlan, PushdownChecker, PushdownColumns, assemble_read_plan,
@@ -99,6 +105,9 @@ pub(crate) struct DatafusionArrowPredicate {
     /// Path to the leaf columns in the parquet schema required to evaluate the
     /// expression
     projection_mask: ProjectionMask,
+    projected_schema: SchemaRef,
+    dictionary_eligible: bool,
+    dictionary_filter: Option<(DictionaryFilterOptions, Arc<DictionaryFilterCounters>)>,
     /// how many rows were filtered out by this predicate
     rows_pruned: metrics::Count,
     /// how many rows passed this predicate
@@ -124,12 +133,30 @@ impl DatafusionArrowPredicate {
             reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
 
         Ok(Self {
+            dictionary_eligible: dictionary_verdict_eligible(&physical_expr),
             physical_expr,
             projection_mask: candidate.read_plan.projection_mask,
+            projected_schema: candidate.read_plan.projected_schema,
+            dictionary_filter: None,
             rows_pruned,
             rows_matched,
             time,
         })
+    }
+}
+
+impl DatafusionArrowPredicate {
+    fn evaluate_values(&self, batch: &RecordBatch) -> ArrowResult<BooleanArray> {
+        self.physical_expr
+            .evaluate(batch)
+            .and_then(|v| v.into_array(batch.num_rows()))
+            .and_then(|array| as_boolean_array(&array).cloned())
+            // Preserve the source so DataFusionError::find_root can recover it.
+            .map_err(|e| {
+                ArrowError::ExternalError(Box::new(
+                    e.context("Error evaluating filter predicate"),
+                ))
+            })
     }
 }
 
@@ -139,30 +166,77 @@ impl ArrowPredicate for DatafusionArrowPredicate {
     }
 
     fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
-        // scoped timer updates on drop
-        let mut timer = self.time.timer();
-
-        self.physical_expr
-            .evaluate(&batch)
-            .and_then(|v| v.into_array(batch.num_rows()))
-            .and_then(|array| {
-                let bool_arr = as_boolean_array(&array)?.clone();
-                let num_matched = bool_arr.true_count();
-                let num_pruned = bool_arr.len() - num_matched;
-                self.rows_pruned.add(num_pruned);
-                self.rows_matched.add(num_matched);
-                timer.stop();
-                Ok(bool_arr)
-            })
-            // `ExternalError` is the only `ArrowError` variant that keeps a
-            // source, and therefore the only one that leaves the original error
-            // recoverable (see `DataFusionError::find_root`)
-            .map_err(|e| {
-                ArrowError::ExternalError(Box::new(
-                    e.context("Error evaluating filter predicate"),
-                ))
-            })
+        let _timer = self.time.timer();
+        let values = self.evaluate_values(&batch)?;
+        let matched = values.true_count();
+        self.rows_pruned.add(values.len() - matched);
+        self.rows_matched.add(matched);
+        Ok(values)
     }
+
+    fn dictionary_filter_options(&self) -> Option<DictionaryFilterOptions> {
+        self.dictionary_filter.as_ref().map(|(options, _)| *options)
+    }
+
+    fn dictionary_filter_eligible(&self) -> bool {
+        self.dictionary_eligible
+    }
+
+    fn evaluate_dictionary(
+        &mut self,
+        _leaf: usize,
+        values: &ArrayRef,
+    ) -> ArrowResult<Option<DictionaryVerdict>> {
+        if !self.dictionary_eligible || self.projected_schema.fields().len() != 1 {
+            return Ok(None);
+        }
+        let _timer = self.time.timer();
+        let entries = self.evaluate_values(&RecordBatch::try_new(
+            Arc::clone(&self.projected_schema),
+            vec![Arc::clone(values)],
+        )?)?;
+        let field = self.projected_schema.field(0).clone().with_nullable(true);
+        let null = self.evaluate_values(&RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field])),
+            vec![new_null_array(values.data_type(), 1)],
+        )?)?;
+        let entries = match entries.nulls() {
+            None => entries.values().clone(),
+            Some(nulls) => entries.values() & nulls.inner(),
+        };
+        Ok(Some(DictionaryVerdict {
+            entries,
+            null: null.is_valid(0) && null.value(0),
+        }))
+    }
+
+    fn record_dictionary_filter(&mut self, report: DictionaryFilterMetrics) {
+        if let Some((_, counters)) = &self.dictionary_filter {
+            counters.record(&report);
+            if report.rows_verified == 0 {
+                self.rows_pruned
+                    .add(report.rows_verdict - report.rows_verdict_matched);
+                self.rows_matched.add(report.rows_verdict_matched);
+            }
+        }
+    }
+}
+
+// Dynamic filter generations belong to the separate runtime-verdict lane.
+// An ordinary immutable scalar expression must depend on exactly one column.
+fn dictionary_verdict_eligible(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    if is_volatile(expr) || collect_columns(expr).len() != 1 {
+        return false;
+    }
+    let mut static_expr = true;
+    let result = expr.apply(|node| {
+        if node.is::<DynamicFilterPhysicalExpr>() {
+            static_expr = false;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    result.is_ok() && static_expr
 }
 
 /// A candidate expression for creating a `RowFilter`.
@@ -420,7 +494,8 @@ pub fn build_row_filter(
     // that splits conjuncts, orders candidates, and wires metrics — callers
     // that build once per file go through the same code as the per-row-group
     // rebuild path in `RowFilterContext`.
-    let Some(prebuilt) = prebuild_row_filter_candidates(expr, file_schema, metadata)?
+    let Some(prebuilt) =
+        prebuild_row_filter_candidates(expr, file_schema, metadata, false)?
     else {
         return Ok(None);
     };
@@ -428,6 +503,7 @@ pub fn build_row_filter(
         &prebuilt,
         reorder_predicates,
         file_metrics,
+        None,
     )))
 }
 
@@ -448,6 +524,8 @@ pub(crate) struct PrebuiltRowFilterCandidate {
     /// Projection mask over the parquet leaf columns needed to evaluate this
     /// predicate.
     projection_mask: ProjectionMask,
+    projected_schema: SchemaRef,
+    dictionary_eligible: bool,
     /// Precomputed sum-of-compressed-bytes for the referenced columns across
     /// all row groups in the file. Used to sort predicates when
     /// `reorder_predicates` is enabled. Stable across row groups within a
@@ -476,6 +554,7 @@ pub(crate) fn prebuild_row_filter_candidates(
     expr: &Arc<dyn PhysicalExpr>,
     file_schema: &SchemaRef,
     metadata: &ParquetMetaData,
+    dictionary_enabled: bool,
 ) -> Result<Option<Vec<PrebuiltRowFilterCandidate>>> {
     // Split into conjuncts:
     // `a = 1 AND b = 2 AND c = 3` -> [`a = 1`, `b = 2`, `c = 3`]
@@ -495,7 +574,7 @@ pub(crate) fn prebuild_row_filter_candidates(
         return Ok(None);
     }
 
-    let prebuilt: Vec<PrebuiltRowFilterCandidate> = candidates
+    let mut prebuilt: Vec<PrebuiltRowFilterCandidate> = candidates
         .into_iter()
         .map(|candidate| {
             let physical_expr = reassign_expr_columns(
@@ -503,13 +582,21 @@ pub(crate) fn prebuild_row_filter_candidates(
                 &candidate.read_plan.projected_schema,
             )?;
             Ok(PrebuiltRowFilterCandidate {
+                dictionary_eligible: false,
                 physical_expr,
-                projection_mask: candidate.read_plan.projection_mask.clone(),
+                projection_mask: candidate.read_plan.projection_mask,
+                projected_schema: candidate.read_plan.projected_schema,
                 required_bytes: candidate.required_bytes,
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
+    if dictionary_enabled {
+        for candidate in &mut prebuilt {
+            candidate.dictionary_eligible =
+                dictionary_verdict_eligible(&candidate.physical_expr);
+        }
+    }
     Ok(Some(prebuilt))
 }
 
@@ -521,6 +608,7 @@ pub(crate) fn row_filter_from_prebuilt(
     prebuilt: &[PrebuiltRowFilterCandidate],
     reorder_predicates: bool,
     file_metrics: &ParquetFileMetrics,
+    dictionary_filter: Option<&(DictionaryFilterOptions, Arc<DictionaryFilterCounters>)>,
 ) -> RowFilter {
     let rows_pruned = &file_metrics.pushdown_rows_pruned;
     let rows_matched = &file_metrics.pushdown_rows_matched;
@@ -548,13 +636,21 @@ pub(crate) fn row_filter_from_prebuilt(
             Box::new(DatafusionArrowPredicate {
                 physical_expr: Arc::clone(&candidate.physical_expr),
                 projection_mask: candidate.projection_mask.clone(),
+                projected_schema: Arc::clone(&candidate.projected_schema),
+                dictionary_eligible: candidate.dictionary_eligible,
+                dictionary_filter: dictionary_filter.cloned(),
                 rows_pruned: predicate_rows_pruned,
                 rows_matched: predicate_rows_matched,
                 time: time.clone(),
             }) as Box<dyn ArrowPredicate>
         })
         .collect();
-    RowFilter::new(filters)
+    let filter = RowFilter::new(filters);
+    if dictionary_filter.is_some() {
+        filter.with_dictionary_filter()
+    } else {
+        filter
+    }
 }
 
 #[cfg(test)]
@@ -589,6 +685,100 @@ mod test {
     use tempfile::NamedTempFile;
 
     // List predicates used by the decoder should be accepted for pushdown
+    #[test]
+    fn dictionary_verdict_refuses_volatile_and_multi_column_predicates() {
+        use datafusion_functions::math::expr_fn::random;
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Float64, true),
+            Field::new("b", DataType::Float64, true),
+        ]);
+        let stable = logical2physical(&col("a").lt(lit(0.5)), &schema);
+        let volatile = logical2physical(&col("a").lt(random()), &schema);
+        let multiple = logical2physical(&col("a").lt(col("b")), &schema);
+        assert!(dictionary_verdict_eligible(&stable));
+        assert!(!dictionary_verdict_eligible(&volatile));
+        assert!(!dictionary_verdict_eligible(&multiple));
+    }
+
+    #[test]
+    fn dictionary_verdict_differential_and_fallible_inputs() {
+        use arrow::array::{Array, ArrayRef};
+        use parquet::arrow::arrow_reader::DictionaryVerdict;
+
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("word", DataType::Utf8, true)]));
+        let builder =
+            ArrowWriter::try_new(Vec::new(), Arc::clone(&schema), None).unwrap();
+        let file = bytes::Bytes::from(builder.into_inner().unwrap());
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let projection_mask = ProjectionMask::leaves(builder.parquet_schema(), [0]);
+        let values: ArrayRef =
+            Arc::new(StringArray::from(vec!["alpha", "beta", "1", "0"]));
+        let with_null: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("alpha"),
+            Some("beta"),
+            Some("1"),
+            Some("0"),
+            None,
+        ]));
+        for expr in [
+            col("word").eq(lit("alpha")),
+            col("word").in_list(vec![lit("beta"), lit(ScalarValue::Utf8(None))], false),
+            col("word").like(lit("a%")),
+            col("word").is_null(),
+        ] {
+            let expr = logical2physical(&expr, &schema);
+            let mut predicate = DatafusionArrowPredicate {
+                dictionary_eligible: dictionary_verdict_eligible(&expr),
+                physical_expr: expr,
+                projection_mask: projection_mask.clone(),
+                projected_schema: Arc::clone(&schema),
+                dictionary_filter: None,
+                rows_pruned: Count::new(),
+                rows_matched: Count::new(),
+                time: Time::new(),
+            };
+            let DictionaryVerdict { entries, null } =
+                predicate.evaluate_dictionary(0, &values).unwrap().unwrap();
+            let actual = predicate
+                .evaluate(
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::clone(&with_null)],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let expected = (0..actual.len())
+                .map(|i| actual.is_valid(i) && actual.value(i))
+                .collect::<Vec<_>>();
+            assert_eq!(entries.iter().chain([null]).collect::<Vec<_>>(), expected);
+        }
+
+        let expr = logical2physical(
+            &datafusion_expr::cast(col("word"), DataType::Int32).eq(lit(1i32)),
+            &schema,
+        );
+        let mut predicate = DatafusionArrowPredicate {
+            dictionary_eligible: dictionary_verdict_eligible(&expr),
+            physical_expr: expr,
+            projection_mask,
+            projected_schema: Arc::clone(&schema),
+            dictionary_filter: None,
+            rows_pruned: Count::new(),
+            rows_matched: Count::new(),
+            time: Time::new(),
+        };
+        assert!(predicate.evaluate_dictionary(0, &values).is_err());
+        let selected: ArrayRef = Arc::new(StringArray::from(vec!["1"]));
+        assert_eq!(
+            predicate
+                .evaluate(RecordBatch::try_new(schema, vec![selected]).unwrap())
+                .unwrap(),
+            BooleanArray::from(vec![true]),
+        );
+    }
+
     #[test]
     fn test_filter_candidate_builder_supports_list_types() {
         let testdata = datafusion_common::test_util::parquet_test_data();

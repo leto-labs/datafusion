@@ -175,10 +175,8 @@ impl PreparedParquetFile {
             rows,
             batch_size,
         )?;
-        let mut predicates = additional
-            .map(RowFilter::into_predicates)
-            .unwrap_or_default();
-        for predicate in &predicates {
+        let mut filter = additional.unwrap_or_else(|| RowFilter::new(vec![]));
+        for predicate in filter.predicates() {
             if (0..self.metadata.parquet_schema().num_columns()).any(|column| {
                 predicate.projection().leaf_included(column)
                     && !self.read_mask.leaf_included(column)
@@ -189,13 +187,13 @@ impl PreparedParquetFile {
             }
         }
         if let Some(context) = &self.row_filter {
-            predicates.extend(context.build_row_filter().into_predicates());
+            filter.append(context.build_row_filter());
             if let Some(bytes) = context.max_predicate_cache_size {
                 builder = builder.with_max_predicate_cache_size(bytes);
             }
         }
-        if !predicates.is_empty() {
-            builder = builder.with_row_filter(RowFilter::new(predicates));
+        if !filter.predicates().is_empty() {
+            builder = builder.with_row_filter(filter);
         }
         Ok(builder)
     }

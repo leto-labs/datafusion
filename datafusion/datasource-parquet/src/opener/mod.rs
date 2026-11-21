@@ -265,6 +265,7 @@ pub(super) struct ParquetMorselizer {
     /// Should the filters be evaluated during the parquet scan using
     /// [`DatafusionArrowPredicate`](crate::row_filter::DatafusionArrowPredicate)?
     pub pushdown_filters: bool,
+    pub dictionary_filter: Option<parquet::arrow::arrow_reader::DictionaryFilterOptions>,
     /// Should the filters be reordered to optimize the scan?
     pub reorder_filters: bool,
     /// Should we force the reader to use RowSelections for filtering
@@ -494,6 +495,7 @@ struct PreparedParquetOpen {
     virtual_state: Option<Arc<VirtualColumnsState>>,
     reorder_predicates: bool,
     pushdown_filters: bool,
+    dictionary_filter: Option<parquet::arrow::arrow_reader::DictionaryFilterOptions>,
     force_filter_selections: bool,
     enable_page_index: bool,
     enable_bloom_filter: bool,
@@ -614,7 +616,19 @@ impl DecoderReadPlans {
                 prepared.reorder_predicates,
                 prepared.file_metrics.clone(),
                 prepared.max_predicate_cache_size,
+                prepared.dictionary_filter.is_some(),
             )
+            .map(|mut context| {
+                context.dictionary_filter = prepared.dictionary_filter.map(|options| {
+                    let counters = crate::metrics::DictionaryFilterCounters::new(
+                        &prepared.metrics,
+                        prepared.partition_index,
+                        &prepared.file_name,
+                    );
+                    (options, Arc::new(counters))
+                });
+                context
+            })
         });
         Ok(Self {
             projection,
@@ -1083,6 +1097,7 @@ impl ParquetMorselizer {
             virtual_state: self.virtual_state.as_ref().map(Arc::clone),
             reorder_predicates: self.reorder_filters,
             pushdown_filters: self.pushdown_filters,
+            dictionary_filter: self.dictionary_filter,
             force_filter_selections: self.force_filter_selections,
             enable_page_index: self.enable_page_index,
             enable_bloom_filter: self.enable_bloom_filter,
@@ -3040,6 +3055,7 @@ mod test {
                     }),
                 schema_provider: None,
                 pushdown_filters: self.pushdown_filters,
+                dictionary_filter: None,
                 reorder_filters: self.reorder_filters,
                 force_filter_selections: self.force_filter_selections,
                 enable_page_index: self.enable_page_index,
