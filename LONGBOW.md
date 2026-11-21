@@ -1328,6 +1328,7 @@ from a partial aggregate.
 
 Purpose: emit a valid index referencing a NULL dictionary value when the
 declared grouping field disallows null indices. Full emission, prefix emission,
-and preserving reads all honor this field constraint. The NULL value consumes
-one key slot in this representation. Dependent feature: CORE-AGGREGATION.
+and preserving reads honor this constraint in both the dictionary group column
+and the row-format fallback. The NULL value consumes one key slot in this
+representation. Dependent feature: CORE-AGGREGATION.
 Audit classification: UPSTREAMABLE.

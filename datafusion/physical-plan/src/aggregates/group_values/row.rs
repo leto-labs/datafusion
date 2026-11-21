@@ -6,12 +6,13 @@
 
 use crate::aggregates::group_values::GroupValues;
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListArray, LargeListArray, LargeListViewArray, ListArray,
-    ListViewArray, MapArray, PrimitiveArray, RunArray, StructArray,
-    downcast_run_end_index,
+    Array, ArrayRef, DictionaryArray, FixedSizeListArray, LargeListArray,
+    LargeListViewArray, ListArray, ListViewArray, MapArray, PrimitiveArray, RunArray,
+    StructArray, downcast_dictionary_array, downcast_run_end_index, new_null_array,
 };
-use arrow::compute::cast;
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::compute::{cast, concat};
+use arrow::datatypes::{ArrowDictionaryKeyType, ArrowNativeType, DataType, SchemaRef};
+use arrow::error::ArrowError;
 use arrow::row::{RowConverter, Rows, SortField};
 use datafusion_common::Result;
 use datafusion_common::float_semantics::normalize_floats;
@@ -246,8 +247,7 @@ impl GroupValues for GroupValuesRows {
         // TODO: Materialize dictionaries in group keys
         // https://github.com/apache/datafusion/issues/7647
         for (field, array) in self.schema.fields.iter().zip(&mut output) {
-            let expected = field.data_type();
-            *array = encode_array_if_necessary(array, expected)?;
+            *array = encode_group_key(array, field)?;
         }
 
         self.group_values = Some(group_values);
@@ -272,7 +272,7 @@ impl GroupValues for GroupValuesRows {
         // TODO: Materialize dictionaries in group keys
         // https://github.com/apache/datafusion/issues/7647
         for (field, array) in self.schema.fields.iter().zip(&mut output) {
-            *array = encode_array_if_necessary(array, field.data_type())?;
+            *array = encode_group_key(array, field)?;
         }
         Ok(output)
     }
@@ -312,6 +312,50 @@ impl GroupValues for GroupValuesRows {
             self.rows_buffer = Self::new_rows_buffer(&self.row_converter);
         }
     }
+}
+
+/// Restore a top-level grouping field, including its dictionary index validity.
+fn encode_group_key(
+    array: &ArrayRef,
+    field: &arrow::datatypes::Field,
+) -> Result<ArrayRef> {
+    let encoded = encode_array_if_necessary(array, field.data_type())?;
+    if field.is_nullable()
+        || !matches!(field.data_type(), DataType::Dictionary(..))
+        || encoded.null_count() == 0
+    {
+        return Ok(encoded);
+    }
+
+    let dictionary = encoded.as_ref();
+    downcast_dictionary_array!(
+        dictionary => encode_null_indices_as_values(dictionary),
+        _ => unreachable!("encoded grouping key has the requested dictionary type"),
+    )
+}
+
+fn encode_null_indices_as_values<K: ArrowDictionaryKeyType>(
+    dictionary: &DictionaryArray<K>,
+) -> Result<ArrayRef> {
+    let values = dictionary.values();
+    let null_slot = values
+        .logical_nulls()
+        .and_then(|nulls| nulls.iter().position(|valid| !valid));
+    let slot = null_slot.unwrap_or_else(|| values.len());
+    let null_key =
+        K::Native::from_usize(slot).ok_or(ArrowError::DictionaryKeyOverflowError)?;
+
+    // A non-nullable field represents NULL through a valid index into the values.
+    let values = if null_slot.is_some() {
+        Arc::clone(values)
+    } else {
+        let null = new_null_array(values.data_type(), 1);
+        concat(&[values.as_ref(), null.as_ref()])?
+    };
+    let keys = PrimitiveArray::<K>::from_iter_values(
+        dictionary.keys().iter().map(|key| key.unwrap_or(null_key)),
+    );
+    Ok(Arc::new(DictionaryArray::try_new(keys, values)?))
 }
 
 /// Re-apply dictionary / run-end encoding to `array` so it matches `expected`.
@@ -464,8 +508,11 @@ pub(crate) fn encode_array_if_necessary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{AsArray, Int32Array, ListArray, StringArray};
-    use arrow::datatypes::{Field, Int32Type, Schema};
+    use arrow::array::{
+        AsArray, Int8Array, Int32Array, ListArray, NullArray, RecordBatch, StringArray,
+    };
+    use arrow::datatypes::{Field, Int8Type, Int32Type, Schema};
+    use datafusion_common::DataFusionError;
     use std::mem::size_of;
 
     fn expected_size(group_values: &GroupValuesRows) -> usize {
@@ -488,6 +535,76 @@ mod tests {
             DataType::Int32,
             true,
         )]))
+    }
+
+    #[test]
+    fn mixed_row_fallback_preserves_nonnullable_dictionary_null() -> Result<()> {
+        let key: ArrayRef = Arc::new(DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0, 1, 0]),
+            Arc::new(StringArray::from(vec![None, Some("a")])),
+        )?);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", key.data_type().clone(), false),
+            Field::new("n", DataType::Null, true),
+        ]));
+        let mut values = GroupValuesRows::try_new(Arc::clone(&schema))?;
+        let mut groups = vec![];
+        let input = [key, Arc::new(NullArray::new(3)) as ArrayRef];
+        values.intern(&input, &mut groups)?;
+        assert_eq!(groups, [0, 1, 0]);
+
+        let check = |columns: Vec<ArrayRef>, expected: Vec<Option<&str>>| -> Result<()> {
+            let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+            assert_eq!(batch.column(0).null_count(), 0);
+            assert_eq!(
+                cast(batch.column(0), &DataType::Utf8)?.as_string::<i32>(),
+                &StringArray::from(expected)
+            );
+            assert_eq!(batch.column(1).logical_null_count(), batch.num_rows());
+            Ok(())
+        };
+        check(
+            values.values_preserving(GroupSelection::all(2))?,
+            vec![None, Some("a")],
+        )?;
+        check(values.emit(EmitTo::First(1))?, vec![None])?;
+        check(values.emit(EmitTo::All)?, vec![Some("a")])?;
+        values.intern(&input, &mut groups)?;
+        check(values.emit(EmitTo::All)?, vec![None, Some("a")])?;
+        Ok(())
+    }
+
+    #[test]
+    fn row_dictionary_null_slot_checks_key_capacity() -> Result<()> {
+        let array: ArrayRef = Arc::new(StringArray::from_iter(
+            std::iter::once(None).chain((0..128).map(|value| Some(value.to_string()))),
+        ));
+        let field = Field::new(
+            "k",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            false,
+        );
+        let at_capacity = array.slice(0, 128);
+        let encoded = encode_group_key(&at_capacity, &field)?;
+        assert_eq!(encoded.null_count(), 0);
+        assert_eq!(
+            cast(encoded.as_ref(), &DataType::Utf8)?.as_ref(),
+            at_capacity.as_ref()
+        );
+        let error = encode_group_key(&array, &field).unwrap_err();
+        assert!(matches!(
+            error.find_root(),
+            DataFusionError::ArrowError(error, _)
+                if matches!(**error, ArrowError::DictionaryKeyOverflowError)
+        ));
+        let nullable_field = field.with_nullable(true);
+        let encoded = encode_group_key(&array, &nullable_field)?;
+        assert_eq!(encoded.null_count(), 1);
+        assert_eq!(
+            cast(encoded.as_ref(), &DataType::Utf8)?.as_ref(),
+            array.as_ref()
+        );
+        Ok(())
     }
 
     #[test]
