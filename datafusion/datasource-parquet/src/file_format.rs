@@ -417,7 +417,7 @@ async fn fetch_stats_and_ordering(
         .with_metadata_size_hint(metadata_size_hint)
         .with_decryption_properties(file_decryption_properties)
         .with_file_metadata_cache(Some(file_metadata_cache))
-        .fetch_metadata()
+        .fetch_metadata_with_unique_fields()
         .await?;
     let statistics =
         DFParquetMetadata::statistics_from_parquet_metadata(&metadata, table_schema)?;
@@ -448,6 +448,12 @@ impl FileFormat for ParquetFormat {
 
     fn compression_type(&self) -> Option<FileCompressionType> {
         None
+    }
+
+    fn validate_table_schema(&self, schema: &Schema) -> Result<()> {
+        ensure_unique_field_names(schema, &mut HashSet::new()).map_err(|err| {
+            DataFusionError::Context("Invalid Parquet table schema".into(), Box::new(err))
+        })
     }
 
     async fn infer_schema(
@@ -586,7 +592,7 @@ impl FileFormat for ParquetFormat {
             .with_metadata_size_hint(self.metadata_size_hint())
             .with_decryption_properties(file_decryption_properties)
             .with_file_metadata_cache(Some(file_metadata_cache))
-            .fetch_metadata()
+            .fetch_metadata_with_unique_fields()
             .await?;
         crate::metadata::ordering_from_parquet_metadata(&metadata, &table_schema)
     }

@@ -100,6 +100,11 @@ pub trait FileFormat: Any + Send + Sync + fmt::Debug {
     /// Returns whether this instance uses compression if applicable
     fn compression_type(&self) -> Option<FileCompressionType>;
 
+    /// Validate the complete listing table schema before registering it.
+    fn validate_table_schema(&self, _schema: &Schema) -> Result<()> {
+        Ok(())
+    }
+
     /// Infer the common schema of the provided objects. The objects will usually
     /// be analysed up to a given number of records or files (as specified in the
     /// format config) then give the estimated common schema. This might fail if

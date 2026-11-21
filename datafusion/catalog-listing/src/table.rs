@@ -254,6 +254,7 @@ impl ListingTable {
                 .finish()
                 .with_metadata(file_schema.metadata().clone()),
         );
+        options.format.validate_table_schema(&table_schema)?;
 
         let file_schema_fingerprint =
             Arc::new(SchemaFingerprint::from_schema(&file_schema));

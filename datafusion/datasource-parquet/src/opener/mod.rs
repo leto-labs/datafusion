@@ -18,7 +18,7 @@ use self::early_stop::EarlyStoppingStream;
 use self::encryption::EncryptionContext;
 use crate::access_plan::PreparedAccessPlan;
 use crate::decoder_projection::DecoderProjection;
-use crate::metadata::PageIndexRequest;
+use crate::metadata::{PageIndexRequest, validate_parquet_field_names};
 use crate::metrics::{ByteProgress, RowFilterSkippedFullyMatchedMetric};
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::push_decoder::{
@@ -1207,6 +1207,7 @@ impl PreparedParquetOpen {
             Some(donated) => Arc::clone(&donated.metadata),
             None => self.async_file_reader.get_metadata(Some(&options)).await?,
         };
+        validate_parquet_field_names(&metadata, &self.file_name)?;
         if self.partitioned_file.arrow_schema.is_none()
             && let Some(provider) = &self.schema_provider
         {

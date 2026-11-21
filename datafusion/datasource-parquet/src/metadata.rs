@@ -16,9 +16,10 @@ use arrow::compute::{and, sum};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion_common::encryption::FileDecryptionProperties;
 use datafusion_common::stats::Precision;
+use datafusion_common::utils::quote_identifier;
 use datafusion_common::{
     ColumnStatistics, DataFusionError, HashMap, HashSet, Result, ScalarValue, Statistics,
-    internal_datafusion_err,
+    exec_err, internal_datafusion_err,
 };
 use datafusion_execution::cache::cache_manager::{
     CachedFileMetadataEntry, FileMetadata, FileMetadataCache,
@@ -54,6 +55,38 @@ use std::sync::{Arc, OnceLock};
 /// merged result to be `Inexact` rather than `Absent`, as the estimate
 /// would be too unreliable otherwise.
 const PARTIAL_NDV_THRESHOLD: f64 = 0.75;
+
+/// Reject ambiguous file roots before any name-based filtering or adaptation.
+pub(crate) fn validate_parquet_field_names(
+    metadata: &ParquetMetaData,
+    path: &str,
+) -> Result<()> {
+    let fields = metadata.file_metadata().schema().get_fields();
+    let duplicate = if fields.len() <= 32 {
+        // Avoid allocating or hashing for ordinary small schemas.
+        fields.iter().enumerate().find_map(|(index, field)| {
+            let name = field.name();
+            fields[..index]
+                .iter()
+                .any(|other| other.name() == name)
+                .then_some(name)
+        })
+    } else {
+        // Keep the check linear for very wide tables.
+        let mut seen = HashSet::with_capacity(fields.len());
+        fields
+            .iter()
+            .map(|field| field.name())
+            .find(|name| !seen.insert(*name))
+    };
+    if let Some(name) = duplicate {
+        return exec_err!(
+            "Parquet file {path} contains duplicate unqualified field name {}",
+            quote_identifier(name)
+        );
+    }
+    Ok(())
+}
 
 fn requires_unsigned_byte_array_order(column: &ColumnDescriptor) -> bool {
     matches!(
@@ -771,10 +804,19 @@ impl<'a> DFParquetMetadata<'a> {
         Ok((loc_path, schema))
     }
 
-    /// Fetch the metadata from the Parquet file via [`Self::fetch_metadata`] and convert
-    /// the statistics in the metadata using [`Self::statistics_from_parquet_metadata`]
-    pub async fn fetch_statistics(&self, table_schema: &SchemaRef) -> Result<Statistics> {
+    /// Fetch metadata for name-based planning, even with an explicit table schema.
+    pub(crate) async fn fetch_metadata_with_unique_fields(
+        &self,
+    ) -> Result<Arc<ParquetMetaData>> {
         let metadata = self.fetch_metadata().await?;
+        validate_parquet_field_names(&metadata, self.object_meta.location.as_ref())?;
+        Ok(metadata)
+    }
+
+    /// Fetch and validate the Parquet metadata and convert the statistics in
+    /// the metadata using [`Self::statistics_from_parquet_metadata`].
+    pub async fn fetch_statistics(&self, table_schema: &SchemaRef) -> Result<Statistics> {
+        let metadata = self.fetch_metadata_with_unique_fields().await?;
         Self::statistics_from_parquet_metadata(&metadata, table_schema)
     }
 
