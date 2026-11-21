@@ -572,6 +572,7 @@ impl DictionaryFilterCounters {
 }
 
 /// Work counters for an opted-in staged scan.
+#[derive(Debug)]
 pub(crate) struct StagedScanCounters {
     rows_in: Count,
     rows_out: Count,

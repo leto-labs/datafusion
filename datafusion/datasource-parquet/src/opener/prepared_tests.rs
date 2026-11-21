@@ -46,6 +46,104 @@ fn at_least(value: i32) -> Arc<dyn PhysicalExpr> {
     ))
 }
 
+#[tokio::test]
+async fn staged_metrics_register_on_first_vector_and_are_shared_across_files() {
+    use datafusion_datasource::file::FileSource;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("payload", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..64)),
+            Arc::new(Int32Array::from_iter_values(64..128)),
+        ],
+    )
+    .unwrap();
+    let properties = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(Vec::new(), Arc::clone(&schema), Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    let bytes = bytes::Bytes::from(writer.into_inner().unwrap());
+    let predicate = at_least(63);
+    let source = ParquetSource::new(schema)
+        .with_staged_predicates([Arc::clone(&predicate)].into());
+    assert!(
+        source
+            .with_predicate(predicate)
+            .staged_predicates()
+            .is_none()
+    );
+    assert!(
+        source
+            .clone()
+            .with_pushdown_filters(true)
+            .staged_predicates()
+            .is_none()
+    );
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut config = FileScanConfigBuilder::new(
+        ObjectStoreUrl::local_filesystem(),
+        Arc::new(source.clone()),
+    );
+    let mut files = Vec::new();
+    for path in [Path::from("one.parquet"), Path::from("two.parquet")] {
+        store.put(&path, bytes.clone().into()).await.unwrap();
+        let file = PartitionedFile::new_from_meta(store.head(&path).await.unwrap());
+        config = config.with_file(file.clone());
+        files.push(file);
+    }
+    let config = config.build();
+    let staged_metrics = || {
+        source
+            .metrics()
+            .clone_inner()
+            .iter()
+            .filter(|metric| metric.value().name().starts_with("staged_scan_"))
+            .count()
+    };
+    let mut readers = Vec::new();
+    for file in files {
+        let mut scan = source
+            .prepare_file(Arc::clone(&store), &config, file, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        let ranges = scan.file.byte_ranges(0, 64);
+        let buffers = scan.reader.get_byte_ranges(ranges.clone()).await.unwrap();
+        let mut decoder = scan
+            .file
+            .decoder_builder(0, 0..64, 64)
+            .unwrap()
+            .build()
+            .unwrap();
+        decoder.push_ranges(ranges, buffers).unwrap();
+        let parquet::DecodeResult::Data(reader) = decoder.try_next_reader().unwrap()
+        else {
+            panic!("expected a staged row-group reader");
+        };
+        assert!(reader.is_staged());
+        readers.push(reader);
+    }
+    assert_eq!(staged_metrics(), 0);
+    for mut reader in readers {
+        assert_eq!(reader.next().unwrap().unwrap().num_rows(), 1);
+        assert!(reader.next().is_none());
+        assert_eq!(staged_metrics(), 9);
+    }
+    let rows = source
+        .metrics()
+        .clone_inner()
+        .sum_by_name("staged_scan_filter_rows_in")
+        .unwrap();
+    assert_eq!(rows.as_usize(), 128);
+}
+
 fn builds() -> usize {
     PRUNING_PREDICATE_BUILDS.with(|builds| builds.get())
 }

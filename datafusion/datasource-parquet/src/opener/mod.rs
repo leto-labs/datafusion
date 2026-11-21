@@ -47,7 +47,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::datatypes::{FieldRef, Schema, SchemaRef, TimeUnit};
 #[cfg(feature = "parquet_encryption")]
@@ -233,7 +233,29 @@ fn validate_predicate_does_not_reference_virtual_columns(
     Ok(())
 }
 
-/// Stateless Parquet morselizer implementation.
+/// Staging state shared across file opens of the same scan.
+#[derive(Debug)]
+pub(super) struct StagedScanConfig {
+    predicates: Arc<[Arc<dyn PhysicalExpr>]>,
+    counters: std::sync::Mutex<
+        HashMap<usize, Arc<OnceLock<crate::metrics::StagedScanCounters>>>,
+    >,
+}
+
+impl StagedScanConfig {
+    pub(super) fn new(predicates: Arc<[Arc<dyn PhysicalExpr>]>) -> Self {
+        Self {
+            predicates,
+            counters: Default::default(),
+        }
+    }
+
+    pub(super) fn predicates(&self) -> &Arc<[Arc<dyn PhysicalExpr>]> {
+        &self.predicates
+    }
+}
+
+/// Parquet morselizer implementation.
 ///
 /// Reading a Parquet file is a multi-stage process, with multiple CPU-intensive
 /// steps interspersed with I/O steps. The code in this module implements the steps
@@ -266,7 +288,7 @@ pub(super) struct ParquetMorselizer {
     /// [`DatafusionArrowPredicate`](crate::row_filter::DatafusionArrowPredicate)?
     pub pushdown_filters: bool,
     pub dictionary_filter: Option<parquet::arrow::arrow_reader::DictionaryFilterOptions>,
-    pub staged_predicates: Option<Arc<[Arc<dyn PhysicalExpr>]>>,
+    pub staged_scan: Option<Arc<StagedScanConfig>>,
     /// Should the filters be reordered to optimize the scan?
     pub reorder_filters: bool,
     /// Should we force the reader to use RowSelections for filtering
@@ -497,7 +519,7 @@ struct PreparedParquetOpen {
     reorder_predicates: bool,
     pushdown_filters: bool,
     dictionary_filter: Option<parquet::arrow::arrow_reader::DictionaryFilterOptions>,
-    staged_predicates: Option<Arc<[Arc<dyn PhysicalExpr>]>>,
+    staged_scan: Option<Arc<StagedScanConfig>>,
     force_filter_selections: bool,
     enable_page_index: bool,
     enable_bloom_filter: bool,
@@ -584,7 +606,8 @@ impl PreparedParquetOpen {
         metadata: &ArrowReaderMetadata,
         access: &ParquetAccessPlan,
     ) -> Option<Arc<parquet::arrow::arrow_reader::StagedScan>> {
-        let predicates = self.staged_predicates.as_deref()?;
+        let staged_scan = self.staged_scan.as_ref()?;
+        let predicates = staged_scan.predicates.as_ref();
         if self.pushdown_filters || self.limit.is_some() || self.virtual_state.is_some() {
             return None;
         }
@@ -603,11 +626,23 @@ impl PreparedParquetOpen {
                 .all(|predicate| conjuncts.contains(&predicate))
                 .then(|| Arc::from(access.fully_matched().as_slice()))
         });
-        let counters =
-            crate::metrics::StagedScanCounters::new(&self.metrics, self.partition_index);
+        let metrics = self.metrics.clone();
+        let partition = self.partition_index;
+        let counters = Arc::clone(
+            staged_scan
+                .counters
+                .lock()
+                .unwrap()
+                .entry(partition)
+                .or_default(),
+        );
         Some(Arc::new(
             parquet::arrow::arrow_reader::StagedScan::new(compiled, move |work| {
-                counters.observe(work)
+                counters
+                    .get_or_init(|| {
+                        crate::metrics::StagedScanCounters::new(&metrics, partition)
+                    })
+                    .observe(work)
             })
             .with_fully_matched(already_matched),
         ))
@@ -1136,7 +1171,7 @@ impl ParquetMorselizer {
             reorder_predicates: self.reorder_filters,
             pushdown_filters: self.pushdown_filters,
             dictionary_filter: self.dictionary_filter,
-            staged_predicates: self.staged_predicates.clone(),
+            staged_scan: self.staged_scan.clone(),
             force_filter_selections: self.force_filter_selections,
             enable_page_index: self.enable_page_index,
             enable_bloom_filter: self.enable_bloom_filter,
@@ -3097,7 +3132,7 @@ mod test {
                 schema_provider: None,
                 pushdown_filters: self.pushdown_filters,
                 dictionary_filter: None,
-                staged_predicates: None,
+                staged_scan: None,
                 reorder_filters: self.reorder_filters,
                 force_filter_selections: self.force_filter_selections,
                 enable_page_index: self.enable_page_index,
