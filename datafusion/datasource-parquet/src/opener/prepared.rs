@@ -353,6 +353,11 @@ impl PreparedParquetFile {
         }
         keep
     }
+
+    /// Record one row group skipped by the native scan after file open.
+    pub fn record_runtime_pruned_row_group(&self) {
+        self.file_metrics.row_groups_pruned_dynamic_filter.add(1);
+    }
 }
 fn runtime_pruner(
     dynamic: bool,

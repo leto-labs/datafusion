@@ -277,6 +277,7 @@ impl PagePruningAccessPlanFilter {
         let mut total_pages_skip = 0;
         // track the total number of pages that should not be skipped
         let mut total_pages_select = 0;
+        let mut total_row_groups_skip = 0;
         // track pages for which page-index pruning was skipped because the
         // containing row group was already proven fully matched by statistics
         let mut total_pages_skipped_by_fully_matched = 0;
@@ -356,6 +357,11 @@ impl PagePruningAccessPlanFilter {
             }
 
             if let Some(overall_selection) = overall_selection {
+                let group_had_rows = match &access_plan.inner()[row_group_index] {
+                    RowGroupAccess::Skip => false,
+                    RowGroupAccess::Scan => true,
+                    RowGroupAccess::Selection(existing) => existing.selects_any(),
+                };
                 let rows_selected = overall_selection.row_count();
                 if rows_selected > 0 {
                     let rows_skipped = overall_selection.skipped_row_count();
@@ -374,6 +380,13 @@ impl PagePruningAccessPlanFilter {
                         "Overall selection from predicate is empty, \
                         skipping all {rows_skipped} rows in row group {row_group_index}"
                     );
+                }
+                if group_had_rows {
+                    total_row_groups_skip += match &access_plan.inner()[row_group_index] {
+                        RowGroupAccess::Skip => 1,
+                        RowGroupAccess::Scan => 0,
+                        RowGroupAccess::Selection(selection) => usize::from(!selection.selects_any()),
+                    };
                 }
             } else {
                 total_select +=
@@ -444,6 +457,9 @@ impl PagePruningAccessPlanFilter {
         file_metrics
             .page_index_pages_pruned
             .add_matched(total_pages_select);
+        file_metrics
+            .page_index_row_groups_pruned
+            .add(total_row_groups_skip);
 
         let mut limit_pruned_rows = 0;
         if let Some(limit) = limit
@@ -911,6 +927,50 @@ mod tests {
 
     thread_local! {
         pub(super) static PAGE_PREDICATE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn page_pruning_counts_groups_eliminated_by_an_intersection() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
+            .build();
+        let mut writer = ArrowWriter::try_new(Vec::new(), Arc::clone(&schema), Some(props)).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![0, 1, 10, 11]))],
+        )
+        .unwrap();
+        for _ in 0..3 {
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
+        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            Bytes::from(writer.into_inner().unwrap()),
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
+        )
+        .unwrap();
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Operator::Gt,
+            lit(5i32),
+        ));
+        let filter = PagePruningAccessPlanFilter::new(&predicate, Arc::clone(&schema));
+        let mut plan = ParquetAccessPlan::new_all(3);
+        plan.scan_selection(0, vec![RowSelector::select(2), RowSelector::skip(2)].into());
+        plan.skip(2);
+        let metrics = ParquetFileMetrics::new(0, "test", &ExecutionPlanMetricsSet::new());
+        let result = filter.prune_plan_with_page_index_and_metrics(
+            plan,
+            &schema,
+            reader.parquet_schema(),
+            reader.metadata(),
+            &metrics,
+            None,
+        );
+        assert_eq!(selected_row_count(&result.access_plan, reader.metadata().row_groups()), 2);
+        assert_eq!(metrics.page_index_row_groups_pruned.value(), 1);
     }
 
     #[test]

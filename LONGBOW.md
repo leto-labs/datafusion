@@ -230,6 +230,14 @@ prepared scan without a batch size uses the scan config's, else 8192. The
 default reader ties the prepared footer and every later data read to the
 file's ETag/version (family D).
 
+## Family PRM: report Parquet pruning by stage
+
+Purpose: count row groups whose last selected row is eliminated by the page
+index in the shared opener, and expose the file's existing dynamic-pruning
+counter to prepared-scan consumers. Unordered LIMIT pruning is accounted for
+by its separate counters. Dependent Longbow feature: SCAN-PRUNING-REPORT.
+Audit classification: UPSTREAMABLE.
+
 ## Family NFC: plan native fetches through charged page leases
 
 Purpose: let a prepared scan skip fetching a column whose pages the caller
