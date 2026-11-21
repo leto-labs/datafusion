@@ -358,6 +358,14 @@ impl PreparedParquetFile {
     pub fn record_runtime_pruned_row_group(&self) {
         self.file_metrics.row_groups_pruned_dynamic_filter.add(1);
     }
+
+    /// Record one runtime-pruned key-range visit, which can share a row group
+    /// with visits from other ranges.
+    pub fn record_runtime_pruned_range_visit(&self) {
+        self.file_metrics
+            .row_group_range_visits_pruned_dynamic_filter
+            .add(1);
+    }
 }
 fn runtime_pruner(
     dynamic: bool,

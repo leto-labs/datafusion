@@ -75,6 +75,8 @@ pub struct ParquetFileMetrics {
     /// the initial pruning but were proved unreachable mid-scan after the
     /// dynamic filter tightened.
     pub row_groups_pruned_dynamic_filter: Count,
+    /// Key-range visits pruned at runtime, counted separately from row groups.
+    pub row_group_range_visits_pruned_dynamic_filter: Count,
     /// Total number of bytes scanned
     pub bytes_scanned: Count,
     /// Total rows filtered out by predicates pushed into parquet scan
@@ -89,7 +91,8 @@ pub struct ParquetFileMetrics {
     pub bloom_filter_eval_time: Time,
     /// Total rows filtered or matched by parquet page index
     pub page_index_rows_pruned: PruningMetrics,
-    /// Total pages filtered or matched by parquet page index
+    /// Page-index verdicts per distinct (row group, predicate column, page).
+    /// Only pages of evaluated predicates are counted.
     pub page_index_pages_pruned: PruningMetrics,
     /// Row groups eliminated by the page-index predicate after earlier pruning.
     pub page_index_row_groups_pruned: Count,
@@ -218,6 +221,10 @@ impl ParquetFileMetrics {
             .clone()
             .with_type(MetricType::Summary)
             .counter("page_index_row_groups_pruned", partition);
+        let row_group_range_visits_pruned_dynamic_filter = builder
+            .clone()
+            .with_type(MetricType::Summary)
+            .counter("row_group_range_visits_pruned_dynamic_filter", partition);
 
         let bytes_scanned = builder
             .clone()
@@ -290,7 +297,6 @@ impl ParquetFileMetrics {
             .with_new_label("filename", filename.to_string())
             .with_type(MetricType::Summary)
             .counter("row_groups_pruned_dynamic_filter", partition);
-
         Self {
             files_ranges_pruned_statistics,
             predicate_evaluation_errors,
@@ -298,6 +304,7 @@ impl ParquetFileMetrics {
             limit_pruned_row_groups,
             row_groups_pruned_statistics,
             row_groups_pruned_dynamic_filter,
+            row_group_range_visits_pruned_dynamic_filter,
             bytes_scanned,
             pushdown_rows_pruned,
             pushdown_rows_matched,
