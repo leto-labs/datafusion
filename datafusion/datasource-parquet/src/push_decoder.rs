@@ -410,12 +410,20 @@ impl RowFilterContext {
         max_predicate_cache_size: Option<usize>,
         dictionary_enabled: bool,
     ) -> Option<Self> {
-        match prebuild_row_filter_candidates(
-            predicate,
-            physical_file_schema,
-            file_metadata.as_ref(),
-            dictionary_enabled,
-        ) {
+        let prebuilt = if dictionary_enabled {
+            prebuild_row_filter_candidates::<true>(
+                predicate,
+                physical_file_schema,
+                file_metadata,
+            )
+        } else {
+            prebuild_row_filter_candidates::<false>(
+                predicate,
+                physical_file_schema,
+                file_metadata,
+            )
+        };
+        match prebuilt {
             Ok(Some(prebuilt)) => Some(Self {
                 prebuilt: PrebuiltRowFilterCandidateList::new(prebuilt),
                 reorder_predicates,

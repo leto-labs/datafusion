@@ -67,9 +67,9 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::file::metadata::ParquetMetaData;
 
-use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_common::{DataFusionError, Result};
 use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
@@ -107,8 +107,7 @@ pub(crate) struct DatafusionArrowPredicate {
     /// Path to the leaf columns in the parquet schema required to evaluate the
     /// expression
     projection_mask: ProjectionMask,
-    projected_schema: SchemaRef,
-    dictionary_eligible: bool,
+    dictionary_schema: Option<SchemaRef>,
     dictionary_filter: Option<(DictionaryFilterOptions, Arc<DictionaryFilterCounters>)>,
     /// how many rows were filtered out by this predicate
     rows_pruned: metrics::Count,
@@ -135,10 +134,9 @@ impl DatafusionArrowPredicate {
             reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
 
         Ok(Self {
-            dictionary_eligible: dictionary_verdict_eligible(&physical_expr),
             physical_expr,
             projection_mask: candidate.read_plan.projection_mask,
-            projected_schema: candidate.read_plan.projected_schema,
+            dictionary_schema: None,
             dictionary_filter: None,
             rows_pruned,
             rows_matched,
@@ -153,13 +151,15 @@ impl DatafusionArrowPredicate {
             .evaluate(batch)
             .and_then(|v| v.into_array(batch.num_rows()))
             .and_then(|array| as_boolean_array(&array).cloned())
-            // Preserve the source so DataFusionError::find_root can recover it.
-            .map_err(|e| {
-                ArrowError::ExternalError(Box::new(
-                    e.context("Error evaluating filter predicate"),
-                ))
-            })
+            .map_err(predicate_error)
     }
+}
+
+fn predicate_error(error: DataFusionError) -> ArrowError {
+    // Preserve the source so DataFusionError::find_root can recover it.
+    ArrowError::ExternalError(Box::new(
+        error.context("Error evaluating filter predicate"),
+    ))
 }
 
 impl ArrowPredicate for DatafusionArrowPredicate {
@@ -168,12 +168,20 @@ impl ArrowPredicate for DatafusionArrowPredicate {
     }
 
     fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
-        let _timer = self.time.timer();
-        let values = self.evaluate_values(&batch)?;
-        let matched = values.true_count();
-        self.rows_pruned.add(values.len() - matched);
-        self.rows_matched.add(matched);
-        Ok(values)
+        let mut timer = self.time.timer();
+        self.physical_expr
+            .evaluate(&batch)
+            .and_then(|v| v.into_array(batch.num_rows()))
+            .and_then(|array| {
+                let bool_arr = as_boolean_array(&array)?.clone();
+                let num_matched = bool_arr.true_count();
+                let num_pruned = bool_arr.len() - num_matched;
+                self.rows_pruned.add(num_pruned);
+                self.rows_matched.add(num_matched);
+                timer.stop();
+                Ok(bool_arr)
+            })
+            .map_err(predicate_error)
     }
 
     fn dictionary_filter_options(&self) -> Option<DictionaryFilterOptions> {
@@ -181,7 +189,7 @@ impl ArrowPredicate for DatafusionArrowPredicate {
     }
 
     fn dictionary_filter_eligible(&self) -> bool {
-        self.dictionary_eligible
+        self.dictionary_schema.is_some()
     }
 
     fn evaluate_dictionary(
@@ -189,15 +197,15 @@ impl ArrowPredicate for DatafusionArrowPredicate {
         _leaf: usize,
         values: &ArrayRef,
     ) -> ArrowResult<Option<DictionaryVerdict>> {
-        if !self.dictionary_eligible || self.projected_schema.fields().len() != 1 {
+        let Some(schema) = &self.dictionary_schema else {
             return Ok(None);
-        }
+        };
         let _timer = self.time.timer();
         let entries = self.evaluate_values(&RecordBatch::try_new(
-            Arc::clone(&self.projected_schema),
+            Arc::clone(schema),
             vec![Arc::clone(values)],
         )?)?;
-        let field = self.projected_schema.field(0).clone().with_nullable(true);
+        let field = schema.field(0).clone().with_nullable(true);
         let null = self.evaluate_values(&RecordBatch::try_new(
             Arc::new(Schema::new(vec![field])),
             vec![new_null_array(values.data_type(), 1)],
@@ -497,7 +505,7 @@ pub fn build_row_filter(
     // that build once per file go through the same code as the per-row-group
     // rebuild path in `RowFilterContext`.
     let Some(prebuilt) =
-        prebuild_row_filter_candidates(expr, file_schema, metadata, false)?
+        prebuild_row_filter_candidates::<false>(expr, file_schema, metadata)?
     else {
         return Ok(None);
     };
@@ -526,8 +534,7 @@ pub(crate) struct PrebuiltRowFilterCandidate {
     /// Projection mask over the parquet leaf columns needed to evaluate this
     /// predicate.
     projection_mask: ProjectionMask,
-    projected_schema: SchemaRef,
-    dictionary_eligible: bool,
+    dictionary_schema: Option<SchemaRef>,
     /// Precomputed sum-of-compressed-bytes for the referenced columns across
     /// all row groups in the file. Used to sort predicates when
     /// `reorder_predicates` is enabled. Stable across row groups within a
@@ -552,11 +559,10 @@ impl PrebuiltRowFilterCandidate {
 ///
 /// Returns `Ok(None)` when the predicate has no push-downable conjuncts, in
 /// which case callers should skip installing a `RowFilter` entirely.
-pub(crate) fn prebuild_row_filter_candidates(
+pub(crate) fn prebuild_row_filter_candidates<const DICTIONARY: bool>(
     expr: &Arc<dyn PhysicalExpr>,
     file_schema: &SchemaRef,
     metadata: &ParquetMetaData,
-    dictionary_enabled: bool,
 ) -> Result<Option<Vec<PrebuiltRowFilterCandidate>>> {
     // Split into conjuncts:
     // `a = 1 AND b = 2 AND c = 3` -> [`a = 1`, `b = 2`, `c = 3`]
@@ -576,7 +582,7 @@ pub(crate) fn prebuild_row_filter_candidates(
         return Ok(None);
     }
 
-    let mut prebuilt: Vec<PrebuiltRowFilterCandidate> = candidates
+    let prebuilt: Vec<PrebuiltRowFilterCandidate> = candidates
         .into_iter()
         .map(|candidate| {
             let physical_expr = reassign_expr_columns(
@@ -584,21 +590,17 @@ pub(crate) fn prebuild_row_filter_candidates(
                 &candidate.read_plan.projected_schema,
             )?;
             Ok(PrebuiltRowFilterCandidate {
-                dictionary_eligible: false,
+                dictionary_schema: (DICTIONARY
+                    && candidate.read_plan.projected_schema.fields().len() == 1
+                    && dictionary_verdict_eligible(&physical_expr))
+                .then_some(candidate.read_plan.projected_schema),
                 physical_expr,
-                projection_mask: candidate.read_plan.projection_mask,
-                projected_schema: candidate.read_plan.projected_schema,
+                projection_mask: candidate.read_plan.projection_mask.clone(),
                 required_bytes: candidate.required_bytes,
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
-    if dictionary_enabled {
-        for candidate in &mut prebuilt {
-            candidate.dictionary_eligible =
-                dictionary_verdict_eligible(&candidate.physical_expr);
-        }
-    }
     Ok(Some(prebuilt))
 }
 
@@ -638,8 +640,7 @@ pub(crate) fn row_filter_from_prebuilt(
             Box::new(DatafusionArrowPredicate {
                 physical_expr: Arc::clone(&candidate.physical_expr),
                 projection_mask: candidate.projection_mask.clone(),
-                projected_schema: Arc::clone(&candidate.projected_schema),
-                dictionary_eligible: candidate.dictionary_eligible,
+                dictionary_schema: candidate.dictionary_schema.clone(),
                 dictionary_filter: dictionary_filter.cloned(),
                 rows_pruned: predicate_rows_pruned,
                 rows_matched: predicate_rows_matched,
@@ -731,10 +732,9 @@ mod test {
         ] {
             let expr = logical2physical(&expr, &schema);
             let mut predicate = DatafusionArrowPredicate {
-                dictionary_eligible: dictionary_verdict_eligible(&expr),
                 physical_expr: expr,
                 projection_mask: projection_mask.clone(),
-                projected_schema: Arc::clone(&schema),
+                dictionary_schema: Some(Arc::clone(&schema)),
                 dictionary_filter: None,
                 rows_pruned: Count::new(),
                 rows_matched: Count::new(),
@@ -762,10 +762,9 @@ mod test {
             &schema,
         );
         let mut predicate = DatafusionArrowPredicate {
-            dictionary_eligible: dictionary_verdict_eligible(&expr),
             physical_expr: expr,
             projection_mask,
-            projected_schema: Arc::clone(&schema),
+            dictionary_schema: Some(Arc::clone(&schema)),
             dictionary_filter: None,
             rows_pruned: Count::new(),
             rows_matched: Count::new(),
