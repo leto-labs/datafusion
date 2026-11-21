@@ -7,7 +7,7 @@
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::*;
 #[cfg(not(feature = "force_hash_collisions"))]
-use arrow::buffer::ScalarBuffer;
+use arrow::buffer::{NullBuffer, ScalarBuffer};
 #[cfg(not(feature = "force_hash_collisions"))]
 use arrow::compute::{nullif, take};
 use arrow::datatypes::*;
@@ -548,7 +548,7 @@ fn hash_generic_byte_view_array<T: ByteViewType>(
 ///
 /// Uses const generics to eliminate runtime branching in the hot loop:
 /// - `HAS_NULL_KEYS`: Whether to check for null dictionary keys
-/// - `HAS_NULL_VALUES`: Whether to check for null dictionary values
+/// - `HAS_NULL_VALUES`: Whether to check for logically null dictionary values
 /// - `MULTI_COL`: Whether to combine with existing hash (true) or initialize (false)
 #[cfg(not(feature = "force_hash_collisions"))]
 #[inline(never)]
@@ -560,14 +560,16 @@ fn hash_dictionary_scatter<
 >(
     array: &DictionaryArray<K>,
     dict_hashes: &[u64],
+    value_nulls: Option<&NullBuffer>,
     hashes_buffer: &mut [u64],
 ) {
-    let dict_values = array.values();
     if HAS_NULL_KEYS {
         for (hash, key) in hashes_buffer.iter_mut().zip(array.keys().iter()) {
             if let Some(key) = key {
                 let idx = key.as_usize();
-                if !HAS_NULL_VALUES || dict_values.is_valid(idx) {
+                if !HAS_NULL_VALUES
+                    || value_nulls.is_some_and(|nulls| nulls.is_valid(idx))
+                {
                     // SAFETY: `idx` is a valid Arrow dict key, in-bounds for `dict_hashes`.
                     let dict_hash = unsafe { *dict_hashes.get_unchecked(idx) };
                     *hash = if MULTI_COL {
@@ -581,7 +583,7 @@ fn hash_dictionary_scatter<
     } else {
         for (hash, key) in hashes_buffer.iter_mut().zip(array.keys().values()) {
             let idx = key.as_usize();
-            if !HAS_NULL_VALUES || dict_values.is_valid(idx) {
+            if !HAS_NULL_VALUES || value_nulls.is_some_and(|nulls| nulls.is_valid(idx)) {
                 // SAFETY: `idx` is a valid Arrow dict key, in-bounds for `dict_hashes`.
                 let dict_hash = unsafe { *dict_hashes.get_unchecked(idx) };
                 *hash = if MULTI_COL {
@@ -602,47 +604,58 @@ fn dispatch_dictionary_scatter<K: ArrowDictionaryKeyType>(
     multi_col: bool,
 ) {
     let has_null_keys = array.keys().null_count() != 0;
-    let has_null_values = array.values().null_count() != 0;
+    // A key into a logically null value contributes the same hash as a
+    // null key. Encoded children and NullArray can lack a physical bitmap.
+    let value_nulls = array.values().logical_nulls();
+    let value_nulls = value_nulls.as_ref().filter(|nulls| nulls.null_count() != 0);
 
-    match (has_null_keys, has_null_values, multi_col) {
+    match (has_null_keys, value_nulls.is_some(), multi_col) {
         (false, false, false) => hash_dictionary_scatter::<K, false, false, false>(
             array,
             dict_hashes,
+            value_nulls,
             hashes_buffer,
         ),
         (false, false, true) => hash_dictionary_scatter::<K, false, false, true>(
             array,
             dict_hashes,
+            value_nulls,
             hashes_buffer,
         ),
         (false, true, false) => hash_dictionary_scatter::<K, false, true, false>(
             array,
             dict_hashes,
+            value_nulls,
             hashes_buffer,
         ),
         (false, true, true) => hash_dictionary_scatter::<K, false, true, true>(
             array,
             dict_hashes,
+            value_nulls,
             hashes_buffer,
         ),
         (true, false, false) => hash_dictionary_scatter::<K, true, false, false>(
             array,
             dict_hashes,
+            value_nulls,
             hashes_buffer,
         ),
         (true, false, true) => hash_dictionary_scatter::<K, true, false, true>(
             array,
             dict_hashes,
+            value_nulls,
             hashes_buffer,
         ),
         (true, true, false) => hash_dictionary_scatter::<K, true, true, false>(
             array,
             dict_hashes,
+            value_nulls,
             hashes_buffer,
         ),
         (true, true, true) => hash_dictionary_scatter::<K, true, true, true>(
             array,
             dict_hashes,
+            value_nulls,
             hashes_buffer,
         ),
     }
@@ -1791,6 +1804,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual_hashes, expected_hashes);
+    }
+
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn dictionary_logical_nulls_hash_like_null_indices() -> Result<()> {
+        let keys = Int8Array::from(vec![None, Some(0)]);
+        let null_values: ArrayRef = Arc::new(NullArray::new(1));
+        let nested_values: ArrayRef = Arc::new(DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0]),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+        )?);
+        let prefix = Int32Array::from(vec![42, 42]);
+        let state = RandomState::with_seed(0);
+        let custom = BuildHasherDefault::<TestHasher>::default();
+        for values in [null_values, nested_values] {
+            let dictionary = DictionaryArray::<Int8Type>::try_new(keys.clone(), values)?;
+            for columns in [vec![&dictionary as &dyn Array], vec![&prefix, &dictionary]] {
+                let mut hashes = [0; 2];
+                create_hashes(columns.iter().copied(), &state, &mut hashes)?;
+                assert_eq!(hashes[0], hashes[1]);
+                let mut hashes = [0; 2];
+                create_hashes_with_hasher(columns, &custom, &mut hashes)?;
+                assert_eq!(hashes[0], hashes[1]);
+            }
+
+            // In separate batches the valid-index slice takes the scatter
+            // path with no null keys. Both routes must produce the same hash.
+            let left = dictionary.slice(0, 1);
+            let right = dictionary.slice(1, 1);
+            let mut left_hash = [0];
+            let mut right_hash = [0];
+            create_hashes([&left], &state, &mut left_hash)?;
+            create_hashes([&right], &state, &mut right_hash)?;
+            assert_eq!(left_hash, right_hash);
+        }
+        Ok(())
     }
 
     #[test]
