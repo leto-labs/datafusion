@@ -19,6 +19,7 @@ use futures::stream::StreamExt;
 use super::aggregate_hash_table::{
     AggregateHashTable, ClusteredAggregateTableMetrics, SingleMarker,
 };
+use super::group_values::packed::migration_needs_memory;
 use super::order::GroupClusteringMode;
 use super::spill::AggregateSpill;
 use super::{AggregateExec, create_schema};
@@ -165,7 +166,7 @@ impl SingleHashAggregateStream {
             AggregateMode::Partial,
         )?);
 
-        let hash_table = AggregateHashTable::<SingleMarker>::new(
+        let mut hash_table = AggregateHashTable::<SingleMarker>::new(
             agg,
             partition,
             Arc::clone(&schema),
@@ -194,6 +195,7 @@ impl SingleHashAggregateStream {
                 .with_can_spill(can_spill)
                 .register(context.memory_pool());
 
+        hash_table.set_migration_reservation(&reservation);
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
         reservation.try_grow(hash_table.memory_size())?;
 
@@ -313,6 +315,30 @@ impl Aggregating {
         }
     }
 
+    fn spill_table(
+        &mut self,
+        reservation: &mut MemoryReservation,
+        oom: DataFusionError,
+    ) -> Result<()> {
+        let Some(spill_context) = self.spill_context.as_mut() else {
+            return Err(oom.context(
+                "Single hash aggregate cannot spill because temporary files are not enabled in the DiskManager",
+            ));
+        };
+        assert_ne_or_internal_err!(
+            self.hash_table.building_group_count(),
+            0,
+            "Single hash aggregate ran out of memory with no aggregated groups"
+        );
+        spill_context.sort_and_spill(self.hash_table.take_state_batch()?)?;
+        spill_context.retain_merge_workspace(reservation);
+        reservation
+            .try_resize(self.hash_table.memory_size())
+            .map_err(|error| {
+                error.context("Decreasing allocation after spilling should succeed")
+            })
+    }
+
     fn has_spills(&self) -> bool {
         self.spill_context.as_ref().is_some_and(|s| s.has_spills())
     }
@@ -337,33 +363,31 @@ impl Aggregating {
 
         while let Some(batch) = self.input.next().await.transpose()? {
             let _timer = elapsed_compute.timer();
-            self.hash_table.aggregate_batch(&batch)?;
-
-            match reservation.try_resize(self.reservation_size()) {
-                Ok(()) => {}
-                Err(oom @ DataFusionError::ResourcesExhausted(_)) => {
-                    let Some(spill_context) = self.spill_context.as_mut() else {
-                        return Err(oom.context(
-                            "Single hash aggregate cannot spill because temporary files are not enabled in the DiskManager",
-                        ));
-                    };
-                    assert_ne_or_internal_err!(
-                        self.hash_table.building_group_count(),
-                        0,
-                        "Single hash aggregate ran out of memory with no aggregated groups"
-                    );
-                    spill_context.sort_and_spill(self.hash_table.take_state_batch()?)?;
-                    spill_context.retain_merge_workspace(reservation);
-                    reservation
-                        .try_resize(self.hash_table.memory_size())
-                        .map_err(|e| {
-                            e.context(
-                                "Decreasing allocation after spilling should succeed",
-                            )
-                        })?;
-                    continue;
+            loop {
+                let (result, retry_batch) = match self.hash_table.aggregate_batch(&batch)
+                {
+                    Ok(()) => (reservation.try_resize(self.reservation_size()), false),
+                    Err(error) if migration_needs_memory(&error) => (Err(error), true),
+                    Err(error) => return Err(error),
+                };
+                match result {
+                    Ok(()) => break,
+                    Err(oom)
+                        if matches!(
+                            oom.find_root(),
+                            DataFusionError::ResourcesExhausted(_)
+                        ) =>
+                    {
+                        self.spill_table(reservation, oom)?;
+                        // Migration is checked before any group or accumulator
+                        // changes in a single-key batch. Retry after releasing
+                        // the old state. Ordinary pressure has consumed it.
+                        if !retry_batch {
+                            break;
+                        }
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(e) => return Err(e),
             }
 
             // Soft group limits are usually small and rarely coincide with

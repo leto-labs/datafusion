@@ -27,6 +27,7 @@ use super::aggregate_hash_table::{
     PartialSkipMarker,
 };
 use super::bounded_partial::{BoundedPartial, configured_groups};
+use super::group_values::packed::migration_needs_memory;
 use super::order::GroupClusteringMode;
 use super::skip_partial::SkipAggregationProbe;
 use super::spill::AggregateSpill;
@@ -234,7 +235,7 @@ impl PartialHashAggregateStream {
         let early_emit_count =
             MetricBuilder::new(&agg.metrics).counter("early_emit_count", partition);
 
-        let hash_table = AggregateHashTable::<PartialMarker>::new(
+        let mut hash_table = AggregateHashTable::<PartialMarker>::new(
             agg,
             partition,
             Arc::clone(&schema),
@@ -271,6 +272,7 @@ impl PartialHashAggregateStream {
                 .register(context.memory_pool());
 
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
+        hash_table.set_migration_reservation(&reservation);
         reservation.try_grow(hash_table.memory_size())?;
         let group_values_soft_limit = agg.limit_options().map(|config| config.limit());
         // DISTINCT LIMIT retains its early-stop semantics. Grouping sets must
@@ -320,73 +322,87 @@ impl PartialHashAggregateStream {
             let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
 
             let mut last_state = HandleInputResult::ProcessNext;
-            while let Some(batch) = self.input.next().await.transpose()? {
-                let timer = elapsed_compute.timer();
-                last_state = self.handle_input_batch(&batch, &mut hash_table)?;
-
-                match last_state {
-                    HandleInputResult::ProcessNext => {}
-                    HandleInputResult::ReachedLimit
-                    | HandleInputResult::SwitchToSkipAggregation => {
-                        break;
-                    }
-                    HandleInputResult::FlushBounded => {
-                        let retain = self.bounded.bound().unwrap_or(0);
-                        let states = hash_table.take_state_batch_retaining(retain)?.ok_or_else(|| {
+            'input: while let Some(batch) = self.input.next().await.transpose()? {
+                loop {
+                    let timer = elapsed_compute.timer();
+                    let retry = match self.handle_input_batch(&batch, &mut hash_table) {
+                        Ok(state) => {
+                            last_state = state;
+                            false
+                        }
+                        Err(error) if migration_needs_memory(&error) => {
+                            last_state = HandleInputResult::OOM;
+                            true
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    match last_state {
+                        HandleInputResult::ProcessNext => {}
+                        HandleInputResult::ReachedLimit
+                        | HandleInputResult::SwitchToSkipAggregation => {
+                            break 'input;
+                        }
+                        HandleInputResult::FlushBounded => {
+                            let retain = self.bounded.bound().unwrap_or(0);
+                            let states = hash_table.take_state_batch_retaining(retain)?.ok_or_else(|| {
                             internal_datafusion_err!(
                                 "Bounded partial hash aggregate flushed with no aggregated groups"
                             )
                         })?;
-                        self.bounded.record_flush(
-                            &states.columns()[..self.num_group_columns],
-                            states.num_rows(),
-                            self.batch_size,
-                        )?;
-                        // Charge the optional sketch's actual buffers. If they
-                        // do not fit, disable it and preserve upstream progress.
-                        if let Err(error) = self.reservation.try_resize(
-                            hash_table.memory_size() + self.bounded.memory_size(),
-                        ) {
-                            match error {
-                                DataFusionError::ResourcesExhausted(_) => {
-                                    self.bounded.unbound()
+                            self.bounded.record_flush(
+                                &states.columns()[..self.num_group_columns],
+                                states.num_rows(),
+                                self.batch_size,
+                            )?;
+                            // Charge the optional sketch's actual buffers. If they
+                            // do not fit, disable it and preserve upstream progress.
+                            if let Err(error) = self.reservation.try_resize(
+                                hash_table.memory_size() + self.bounded.memory_size(),
+                            ) {
+                                match error {
+                                    DataFusionError::ResourcesExhausted(_) => {
+                                        self.bounded.unbound()
+                                    }
+                                    error => return Err(error),
                                 }
-                                error => return Err(error),
                             }
+                            timer.done();
+                            self.emit_on_memory_pressure(
+                                states,
+                                &mut emitter,
+                                hash_table.memory_size() + self.bounded.memory_size(),
+                            )
+                            .await?;
                         }
-                        timer.done();
-                        self.emit_on_memory_pressure(
-                            states,
-                            &mut emitter,
-                            hash_table.memory_size() + self.bounded.memory_size(),
-                        )
-                        .await?;
-                    }
-                    HandleInputResult::OOM => {
-                        let materialized_group_states = hash_table.take_state_batch()?.ok_or_else(|| {
+                        HandleInputResult::OOM => {
+                            let materialized_group_states = hash_table.take_state_batch()?.ok_or_else(|| {
                             internal_datafusion_err!(
                                 "Partial hash aggregate ran out of memory with no aggregated groups"
                             )
                         })?;
 
-                        // Preserve upstream probe behavior until G has emitted
-                        // states. Thereafter account all output, even if G's
-                        // reduction/HLL guard has since removed the bound.
-                        if self.bounded.flushed_groups() > 0 {
-                            self.pressure_emitted_groups +=
-                                materialized_group_states.num_rows();
+                            // Preserve upstream probe behavior until G has emitted
+                            // states. Thereafter account all output, even if G's
+                            // reduction/HLL guard has since removed the bound.
+                            if self.bounded.flushed_groups() > 0 {
+                                self.pressure_emitted_groups +=
+                                    materialized_group_states.num_rows();
+                            }
+                            // Under pool pressure use the native policy and release
+                            // the optional sketch as well as the table's capacity.
+                            self.bounded.unbound();
+                            self.early_emit_count.add(1);
+                            timer.done();
+                            self.emit_on_memory_pressure(
+                                materialized_group_states,
+                                &mut emitter,
+                                hash_table.memory_size() + self.bounded.memory_size(),
+                            )
+                            .await?;
                         }
-                        // Under pool pressure use the native policy and release
-                        // the optional sketch as well as the table's capacity.
-                        self.bounded.unbound();
-                        self.early_emit_count.add(1);
-                        timer.done();
-                        self.emit_on_memory_pressure(
-                            materialized_group_states,
-                            &mut emitter,
-                            hash_table.memory_size() + self.bounded.memory_size(),
-                        )
-                        .await?;
+                    }
+                    if !retry {
+                        break;
                     }
                 }
             }
@@ -455,8 +471,8 @@ impl PartialHashAggregateStream {
         // Step 1: Aggregate the input batch
         // ----------------------------------
         let input_rows = batch.num_rows();
-        self.reduction_factor.add_total(input_rows);
         hash_table.aggregate_batch(batch)?;
+        self.reduction_factor.add_total(input_rows);
 
         // --------------------------------
         // Step 2: Soft limit optimization
@@ -639,7 +655,7 @@ impl FinalHashAggregateStream {
         let baseline_metrics = BaselineMetrics::new(&agg.metrics, partition);
         let spill_metrics = SpillMetrics::new(&agg.metrics, partition);
 
-        let hash_table = AggregateHashTable::<FinalMarker>::new(
+        let mut hash_table = AggregateHashTable::<FinalMarker>::new(
             agg,
             partition,
             Arc::clone(&schema),
@@ -668,6 +684,7 @@ impl FinalHashAggregateStream {
                 .register(context.memory_pool());
 
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
+        hash_table.set_migration_reservation(&reservation);
         reservation.try_grow(hash_table.memory_size())?;
 
         Ok(Self {
@@ -762,72 +779,91 @@ impl FinalHashAggregateStream {
     ) -> Result<()> {
         let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
 
-        while let Some(batch) = self.input.next().await.transpose()? {
+        'input: while let Some(batch) = self.input.next().await.transpose()? {
             let _timer = elapsed_compute.timer();
-            hash_table.aggregate_batch(&batch)?;
+            loop {
+                let migration_error = match hash_table.aggregate_batch(&batch) {
+                    Ok(()) => None,
+                    Err(error) if migration_needs_memory(&error) => Some(error),
+                    Err(error) => return Err(error),
+                };
+                let retry = migration_error.is_some();
 
-            // Soft group limits are usually small and rarely coincide with
-            // spilling. Once spilling has occurred, skip this optimization to
-            // make the internal logic simpler.
-            let spilled = spill_context
-                .as_ref()
-                .is_some_and(|context| context.has_spills());
-            if self.hit_soft_group_limit(hash_table) && !spilled {
-                break;
-            }
+                // Soft group limits are usually small and rarely coincide with
+                // spilling. Once spilling has occurred, skip this optimization to
+                // make the internal logic simpler.
+                let spilled = spill_context
+                    .as_ref()
+                    .is_some_and(|context| context.has_spills());
+                if !retry && self.hit_soft_group_limit(hash_table) && !spilled {
+                    break 'input;
+                }
 
-            // Check memory reservation, and potentially spill.
-            let resize_result =
-                self.reservation
-                    .try_resize(Self::reservation_size_for_table(
-                        hash_table,
-                        spill_context.as_deref(),
-                    ));
+                // Check memory reservation, and potentially spill.
+                let resize_result = migration_error.map_or_else(
+                    || {
+                        self.reservation
+                            .try_resize(Self::reservation_size_for_table(
+                                hash_table,
+                                spill_context.as_deref(),
+                            ))
+                    },
+                    Err,
+                );
 
-            match resize_result {
-                Ok(()) => {}
+                match resize_result {
+                    Ok(()) => break,
 
-                // The table cannot reserve enough memory.
-                // Move all current states into one fully group-key-sorted spill run.
-                Err(e @ DataFusionError::ResourcesExhausted(_)) => {
-                    // OOM and don't support spilling from configuration
-                    let spill_context = spill_context.as_mut().ok_or_else(|| e.context(
+                    // The table cannot reserve enough memory.
+                    // Move all current states into one fully group-key-sorted spill run.
+                    Err(e)
+                        if matches!(
+                            e.find_root(),
+                            DataFusionError::ResourcesExhausted(_)
+                        ) =>
+                    {
+                        // OOM and don't support spilling from configuration
+                        let spill_context = spill_context.as_mut().ok_or_else(|| e.context(
                         "Final hash aggregate cannot spill because temporary files are not enabled in the DiskManager",
                     ))?;
 
-                    // Sanity check: impossible to OOM when there is no group aggregated.
-                    assert_ne_or_internal_err!(
-                        hash_table.building_group_count(),
-                        0,
-                        "Final hash aggregate ran out of memory with no aggregated groups"
-                    );
+                        // Sanity check: impossible to OOM when there is no group aggregated.
+                        assert_ne_or_internal_err!(
+                            hash_table.building_group_count(),
+                            0,
+                            "Final hash aggregate ran out of memory with no aggregated groups"
+                        );
 
-                    // Sorts and spills one complete in-memory state run
+                        // Sorts and spills one complete in-memory state run
 
-                    // Go to the next state to perform spilling the aggregated
-                    // groups so far.
-                    let result = hash_table
-                        .take_state_batch()
-                        .and_then(|batch| spill_context.sort_and_spill(batch));
-                    if result.is_ok() {
-                        spill_context.retain_merge_workspace(&mut self.reservation);
+                        // Go to the next state to perform spilling the aggregated
+                        // groups so far.
+                        let result = hash_table
+                            .take_state_batch()
+                            .and_then(|batch| spill_context.sort_and_spill(batch));
+                        if result.is_ok() {
+                            spill_context.retain_merge_workspace(&mut self.reservation);
+                        }
+
+                        // Spilling shrinks the aggregate table and releases its accumulated
+                        // memory. Update the reservation accordingly.
+                        self.reservation
+                            .try_resize(hash_table.memory_size())
+                            .map_err(|e| {
+                                e.context(
+                                    "Decreasing allocation after spilling should succeed",
+                                )
+                            })?;
+
+                        result?;
+
+                        // One sorted run was written; resume reading the original input.
                     }
-
-                    // Spilling shrinks the aggregate table and releases its accumulated
-                    // memory. Update the reservation accordingly.
-                    self.reservation
-                        .try_resize(hash_table.memory_size())
-                        .map_err(|e| {
-                            e.context(
-                                "Decreasing allocation after spilling should succeed",
-                            )
-                        })?;
-
-                    result?;
-
-                    // One sorted run was written; resume reading the original input.
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
+                if !retry {
+                    break;
+                }
             }
         }
 

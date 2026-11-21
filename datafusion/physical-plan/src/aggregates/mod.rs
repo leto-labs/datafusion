@@ -225,6 +225,8 @@ pub mod order;
 mod partial_reduce_sets_tests;
 mod partial_reduce_stream;
 mod single_stream;
+#[cfg(test)]
+mod sk_memory_tests;
 mod skip_partial;
 mod spill;
 mod topk;
@@ -4282,7 +4284,20 @@ mod tests {
             }
         }
 
-        let merge = Arc::new(CoalescePartitionsExec::new(partial_aggregate));
+        let merge: Arc<dyn ExecutionPlan> = if spill {
+            // The final fixture needs enough replay memory for the ordinary
+            // clustered table at startup. Repeat the partial states in large
+            // batches to exceed this pool by growing the input scratch.
+            // Repeating all states equally preserves each expected average.
+            let schema = result[0].schema();
+            let batches = result
+                .iter()
+                .map(|batch| concat_batches(&schema, std::iter::repeat_n(batch, 1024)))
+                .collect::<Result<Vec<_>, _>>()?;
+            TestMemoryExec::try_new_exec(&[batches], schema, None)?
+        } else {
+            Arc::new(CoalescePartitionsExec::new(partial_aggregate))
+        };
 
         let final_grouping_set = grouping_set.as_final();
 
@@ -4301,9 +4316,7 @@ mod tests {
         assert!(final_stats.total_byte_size.get_value().is_some());
 
         let task_ctx = if spill {
-            // The fair pool is shared by the partial and final tables, give each
-            // one its initial table plus a little, so the final aggregation spills
-            new_spill_ctx(2, initial_reservation(&merged_aggregate)? + 2 * 64)
+            new_spill_ctx(2, 8 * 1024)
         } else {
             Arc::clone(&task_ctx)
         };

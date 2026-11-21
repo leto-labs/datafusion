@@ -107,11 +107,11 @@ impl<S: Slot> Hashed<S> {
 
     /// Intern `rows[start..]` until the table must grow before the next new
     /// group. Returns the first row not interned.
-    fn probe(
+    fn probe<K: Copy + Into<u64>>(
         &mut self,
         keys: &mut Vec<u64>,
         positions: &mut Vec<u32>,
-        rows: &[u64],
+        rows: &[K],
         start: usize,
         groups: &mut [usize],
     ) -> usize {
@@ -125,10 +125,11 @@ impl<S: Slot> Hashed<S> {
         if prefetch {
             // Positions of later rows hide the latency of a table in DRAM.
             positions.clear();
-            positions.extend(tail.iter().map(|&k| position(k, shift) as u32));
+            positions.extend(tail.iter().map(|&k| position(k.into(), shift) as u32));
         }
         let slots = &mut self.slots;
         for (offset, &key) in tail.iter().enumerate() {
+            let key = key.into();
             let mut at = if prefetch {
                 if let Some(&ahead) = positions.get(offset + PREFETCH_DISTANCE) {
                     prefetch_slot(slots, ahead as usize);
@@ -346,12 +347,30 @@ impl PackedKeyTable {
         }
     }
 
-    fn intern_direct(&mut self, keys: &[u64], groups: &mut [usize]) {
+    /// Intern one integer column without widening its batch scratch.
+    pub(super) fn intern_narrow(&mut self, keys: &[u32], groups: &mut Vec<usize>) {
+        debug_assert!(self.bits <= NARROW_BITS);
+        groups.resize(keys.len(), 0);
+        if self.is_direct() {
+            self.intern_direct(keys, groups);
+        } else {
+            Self::intern_hashed(
+                &mut self.narrow,
+                &mut self.keys,
+                &mut self.positions,
+                keys,
+                groups,
+            );
+        }
+    }
+
+    fn intern_direct<K: Copy + Into<u64>>(&mut self, keys: &[K], groups: &mut [usize]) {
         if self.direct.is_empty() {
             self.direct = vacant(1 << self.bits, VACANT);
         }
         let direct = &mut self.direct;
         for (group, &key) in groups.iter_mut().zip(keys) {
+            let key = key.into();
             let entry = &mut direct[key as usize];
             if *entry == VACANT {
                 *entry = self.keys.len() as u32;
@@ -361,11 +380,11 @@ impl PackedKeyTable {
         }
     }
 
-    fn intern_hashed<S: Slot>(
+    fn intern_hashed<S: Slot, K: Copy + Into<u64>>(
         h: &mut Hashed<S>,
         stored: &mut Vec<u64>,
         positions: &mut Vec<u32>,
-        keys: &[u64],
+        keys: &[K],
         groups: &mut [usize],
     ) {
         if h.slots.is_empty() {

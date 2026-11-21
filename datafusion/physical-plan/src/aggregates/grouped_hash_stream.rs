@@ -24,6 +24,7 @@ use std::task::{Context, Poll};
 use std::vec;
 
 use super::aggregate_hash_table::{accumulator_phases, create_group_accumulator};
+use super::group_values::packed::migration_needs_memory;
 use super::order::GroupClustering;
 use super::skip_partial::SkipAggregationProbe;
 use super::{AggregateExec, format_human_display};
@@ -318,6 +319,8 @@ pub(crate) struct GroupedHashAggregateStream {
     // ========================================================================
     /// Tracks if this stream is generating input or output
     exec_state: ExecutionState,
+    /// A batch refused before interning, resumed after emitting the old groups.
+    pending_migration_batch: Option<RecordBatch>,
 
     /// Have we seen the end of the input
     input_done: bool,
@@ -542,7 +545,7 @@ impl GroupedHashAggregateStream {
             _ => OutOfMemoryMode::ReportError,
         };
 
-        let group_values = new_group_values(group_schema, &group_clustering)?;
+        let mut group_values = new_group_values(group_schema, &group_clustering)?;
         let merge_pool = Arc::new(MergeMemoryPool::new(
             Arc::clone(context.memory_pool()),
             MemoryConsumer::new(name)
@@ -553,6 +556,7 @@ impl GroupedHashAggregateStream {
         ));
         let reservation = MemoryConsumer::new("GroupedHashAggregateStream state")
             .register(&(Arc::clone(&merge_pool) as Arc<dyn MemoryPool>));
+        group_values.set_migration_reservation(&reservation);
         timer.done();
 
         let exec_state = ExecutionState::ReadingInput;
@@ -634,6 +638,7 @@ impl GroupedHashAggregateStream {
             group_values,
             current_group_indices: Default::default(),
             exec_state,
+            pending_migration_batch: None,
             baseline_metrics,
             group_by_metrics,
             aggregate_argument_metrics,
@@ -661,11 +666,48 @@ impl Stream for GroupedHashAggregateStream {
         loop {
             match &self.exec_state {
                 ExecutionState::ReadingInput => 'reading_input: {
-                    match ready!(self.input.poll_next_unpin(cx)) {
+                    let next = match self.pending_migration_batch.take() {
+                        Some(batch) => Some(Ok(batch)),
+                        None => ready!(self.input.poll_next_unpin(cx)),
+                    };
+                    match next {
                         // New batch to aggregate
                         Some(Ok(batch)) => {
                             let timer = elapsed_compute.timer();
                             let input_rows = batch.num_rows();
+
+                            // A refused migration has not incorporated any
+                            // row of this single-key input batch.
+                            if let Err(error) = self.group_aggregate_batch(&batch) {
+                                if !migration_needs_memory(&error) {
+                                    return Poll::Ready(Some(Err(error)));
+                                }
+                                match self.oom_mode {
+                                    OutOfMemoryMode::Spill => {
+                                        self.spill()?;
+                                        let batch_size = self.batch_size;
+                                        self.clear_shrink(batch_size);
+                                        self.update_memory_reservation()?;
+                                        self.group_aggregate_batch(&batch)?;
+                                    }
+                                    OutOfMemoryMode::EmitEarly => {
+                                        let Some(states) =
+                                            self.emit(EmitTo::All, false)?
+                                        else {
+                                            return Poll::Ready(Some(Err(error)));
+                                        };
+                                        self.clear_shrink(0);
+                                        self.update_memory_reservation()?;
+                                        self.pending_migration_batch = Some(batch);
+                                        self.exec_state =
+                                            ExecutionState::ProducingOutput(states);
+                                        break 'reading_input;
+                                    }
+                                    OutOfMemoryMode::ReportError => {
+                                        return Poll::Ready(Some(Err(error)));
+                                    }
+                                }
+                            }
 
                             if self.mode == AggregateMode::Partial
                                 && let Some(reduction_factor) =
@@ -673,12 +715,6 @@ impl Stream for GroupedHashAggregateStream {
                             {
                                 reduction_factor.add_total(input_rows);
                             }
-
-                            // Do the grouping.
-                            // `group_aggregate_batch` will _not_ have updated the memory reservation yet.
-                            // The rest of the code will first try to reduce memory usage by
-                            // already emitting results.
-                            self.group_aggregate_batch(&batch)?;
 
                             assert!(!self.input_done);
 
@@ -799,6 +835,7 @@ impl Stream for GroupedHashAggregateStream {
                             // In Partial aggregation, we also need to check
                             // if we should trigger partial skipping
                             else if self.mode == AggregateMode::Partial
+                                && self.pending_migration_batch.is_none()
                                 && self.should_skip_aggregation()
                             {
                                 ExecutionState::SkippingAggregation

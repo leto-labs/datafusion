@@ -16,6 +16,7 @@ use arrow::compute::{filter_record_batch, prep_null_mask_filter};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, internal_err};
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::{AggregateMetrics, EmitTo, GroupsAccumulator};
 use datafusion_physical_expr::GroupsAccumulatorAdapter;
@@ -189,6 +190,16 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
             }),
             _mode: PhantomData,
         })
+    }
+
+    pub(in crate::aggregates) fn set_migration_reservation(
+        &mut self,
+        reservation: &MemoryReservation,
+    ) {
+        self.state
+            .building_mut()
+            .group_values
+            .set_migration_reservation(reservation);
     }
 
     /// See comments in [`EvaluatedAggregateBatch`]

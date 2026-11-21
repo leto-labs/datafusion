@@ -38,7 +38,8 @@ use arrow::datatypes::{
     TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type,
     UInt16Type, UInt32Type, UInt64Type,
 };
-use datafusion_common::{Result, internal_err};
+use datafusion_common::{DataFusionError, Result, internal_err};
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::{EmitTo, GroupSelection};
 
 use super::GroupValues;
@@ -123,6 +124,45 @@ fn make_column(data_type: &DataType) -> Option<Box<dyn KeyColumn>> {
     }
 }
 
+const SINGLE_KEY_MIGRATION: &str = "packed single-key migration";
+
+/// A refused migration grant leaves the packed groups and incoming batch untouched.
+pub fn migration_needs_memory(error: &DataFusionError) -> bool {
+    matches!(
+        error,
+        DataFusionError::Context(context, cause)
+            if context == SINGLE_KEY_MIGRATION
+                && matches!(cause.find_root(), DataFusionError::ResourcesExhausted(_))
+    )
+}
+
+enum PackBuffer {
+    Single(Vec<u32>),
+    Multi(Vec<u64>),
+}
+
+impl PackBuffer {
+    fn clear_shrink(&mut self, rows: usize) {
+        match self {
+            Self::Single(keys) => {
+                keys.clear();
+                keys.shrink_to(rows);
+            }
+            Self::Multi(keys) => {
+                keys.clear();
+                keys.shrink_to(rows);
+            }
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            Self::Single(keys) => keys.capacity() * size_of::<u32>(),
+            Self::Multi(keys) => keys.capacity() * size_of::<u64>(),
+        }
+    }
+}
+
 /// [`GroupValues`] for keys whose columns' codes fit in 64 bits.
 pub struct GroupValuesPacked {
     schema: SchemaRef,
@@ -132,7 +172,8 @@ pub struct GroupValuesPacked {
     widths: Vec<u32>,
     shifts: Vec<u32>,
     table: PackedKeyTable,
-    keys: Vec<u64>,
+    keys: PackBuffer,
+    migration_reservation: Option<MemoryReservation>,
     fallback: Option<Box<dyn GroupValues>>,
     make_fallback: Fallback,
     /// The widest layout before the groups move to the general interner.
@@ -156,13 +197,23 @@ impl GroupValuesPacked {
             return internal_err!("packed group keys exceed {KEY_BITS} fixed bits");
         }
         let columns_len = columns.len();
+        let single_integer = columns_len == 1
+            && !matches!(
+                schema.field(0).data_type(),
+                DataType::Boolean | DataType::Utf8View | DataType::BinaryView
+            );
         let mut packed = Self {
             widths: vec![0; columns.len()],
             shifts: vec![0; columns.len()],
             schema,
             columns,
             table: PackedKeyTable::new(),
-            keys: Vec::new(),
+            keys: if single_integer {
+                PackBuffer::Single(Vec::new())
+            } else {
+                PackBuffer::Multi(Vec::new())
+            },
+            migration_reservation: None,
             fallback: None,
             make_fallback,
             max_bits: if columns_len == 1 {
@@ -282,7 +333,12 @@ impl GroupValuesPacked {
             .collect();
         let bits = self.set_layout();
         debug_assert_eq!(bits, total);
-        let expected = self.table.len() + rows;
+        let expected = if matches!(&self.keys, PackBuffer::Single(_)) {
+            // A big, duplicate-heavy batch must not buy a large group index.
+            self.table.len()
+        } else {
+            self.table.len() + rows
+        };
         let (columns, new) = (&self.columns, &self.shifts);
         self.table.relayout(bits, expected, |key| {
             let mut out = 0;
@@ -307,6 +363,26 @@ impl GroupValuesPacked {
 
     /// Move every group, in order, into the general interner.
     fn fall_back(&mut self) -> Result<&mut Box<dyn GroupValues>> {
+        if matches!(&self.keys, PackBuffer::Single(_)) {
+            let keys = self.table.keys();
+            let column = &mut self.columns[0];
+            // Keep the temporary charge until the packed allocations have
+            // been released. The caller then accounts for the new table.
+            let grant = self
+                .migration_reservation
+                .as_ref()
+                .map(MemoryReservation::new_empty);
+            if let Some(grant) = &grant {
+                let bytes = column.single_migration_bytes(keys.len());
+                if bytes > 0 {
+                    grant
+                        .try_grow(bytes)
+                        .map_err(|error| error.context(SINGLE_KEY_MIGRATION))?;
+                }
+            }
+            let inner = column.fall_back_single(keys)?;
+            return Ok(self.finish_fallback(inner));
+        }
         let groups = self.table.len();
         let arrays = self.build(groups)?;
         let mut inner = (self.make_fallback)(Arc::clone(&self.schema))?;
@@ -330,12 +406,19 @@ impl GroupValuesPacked {
                 }
             }
         }
+        Ok(self.finish_fallback(inner))
+    }
+
+    fn finish_fallback(
+        &mut self,
+        inner: Box<dyn GroupValues>,
+    ) -> &mut Box<dyn GroupValues> {
         self.table.clear_shrink(0);
-        self.keys = Vec::new();
-        for column in self.columns.iter_mut() {
+        self.keys.clear_shrink(0);
+        for column in &mut self.columns {
             column.reset();
         }
-        Ok(self.fallback.insert(inner))
+        self.fallback.insert(inner)
     }
 
     /// The key columns of the first `n` groups. A column with a pending
@@ -384,26 +467,40 @@ impl GroupValues for GroupValuesPacked {
         if too_many || (!self.columns.iter().all(|c| c.fits()) && !self.relayout(rows)) {
             return self.fall_back()?.intern(cols, groups);
         }
-        if let ([column], [array]) = (self.columns.as_slice(), cols) {
-            self.keys.resize(rows, 0);
-            column.pack_single(array, &mut self.keys);
-        } else {
-            self.keys.clear();
-            self.keys.resize(rows, 0);
-            for ((column, array), &shift) in
-                self.columns.iter().zip(cols).zip(&self.shifts)
-            {
-                column.pack(array, &mut self.keys, shift);
+        match &mut self.keys {
+            PackBuffer::Single(keys) => {
+                let [array] = cols else {
+                    return internal_err!("single-key interning requires one column");
+                };
+                keys.reserve_exact(rows.saturating_sub(keys.len()));
+                keys.resize(rows, 0);
+                self.columns[0].pack_single(array, keys);
+                self.table.intern_narrow(keys, groups);
+            }
+            PackBuffer::Multi(keys) => {
+                keys.clear();
+                keys.resize(rows, 0);
+                for ((column, array), &shift) in
+                    self.columns.iter().zip(cols).zip(&self.shifts)
+                {
+                    column.pack(array, keys, shift);
+                }
+                self.table.intern(keys, groups);
             }
         }
-        self.table.intern(&self.keys, groups);
         Ok(())
+    }
+
+    fn set_migration_reservation(&mut self, reservation: &MemoryReservation) {
+        if matches!(&self.keys, PackBuffer::Single(_)) {
+            self.migration_reservation = Some(reservation.new_empty());
+        }
     }
 
     fn size(&self) -> usize {
         size_of::<Self>()
             + self.table.size()
-            + self.keys.capacity() * size_of::<u64>()
+            + self.keys.size()
             + self.widths.capacity() * size_of::<u32>()
             + self.shifts.capacity() * size_of::<u32>()
             + self.columns.capacity() * size_of::<Box<dyn KeyColumn>>()
@@ -494,7 +591,7 @@ impl GroupValues for GroupValuesPacked {
             fallback.shrink_to_fit();
         }
         self.table.shrink_to_fit();
-        self.keys = Vec::new();
+        self.keys.clear_shrink(0);
         for column in &mut self.columns {
             column.shrink_to_fit();
         }
@@ -505,8 +602,7 @@ impl GroupValues for GroupValuesPacked {
             return fallback.clear_shrink(num_rows);
         }
         self.table.clear_shrink(num_rows);
-        self.keys.clear();
-        self.keys.shrink_to(num_rows);
+        self.keys.clear_shrink(num_rows);
         for column in self.columns.iter_mut() {
             column.reset();
         }

@@ -16,7 +16,9 @@ use arrow::array::{
 };
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{ArrowNativeType, ArrowNumericType, DataType};
-use datafusion_common::Result;
+use datafusion_common::{Result, internal_err};
+
+use super::super::{GroupValues, GroupValuesPrimitive, HashValue};
 
 /// What `observe` found.
 #[derive(Debug, PartialEq, Eq)]
@@ -60,9 +62,16 @@ pub(super) trait KeyColumn: Send {
     /// OR the codes of the observed batch, shifted by `shift`, into `keys`.
     fn pack(&self, array: &ArrayRef, keys: &mut [u64], shift: u32);
     /// Write one column's codes into the whole key buffer.
-    fn pack_single(&self, array: &ArrayRef, keys: &mut [u64]) {
-        keys.fill(0);
-        self.pack(array, keys, 0);
+    fn pack_single(&self, _array: &ArrayRef, _keys: &mut [u32]) {
+        unreachable!("only integer columns use narrow batch scratch");
+    }
+    /// Additional live bytes when converting stored codes into a primitive map.
+    fn single_migration_bytes(&self, _groups: usize) -> usize {
+        unreachable!("only integer columns have a primitive fallback");
+    }
+    /// Re-intern stored numeric codes in their existing group-ID order.
+    fn fall_back_single(&mut self, _codes: &[u64]) -> Result<Box<dyn GroupValues>> {
+        internal_err!("only integer columns have a primitive fallback")
     }
     /// The column of the groups with these codes.
     fn build(&mut self, codes: &[u64]) -> Result<ArrayRef>;
@@ -205,7 +214,7 @@ impl Range {
 }
 
 /// Native integer types whose values map into `i128` and back.
-pub(super) trait PackNative: ArrowNativeType {
+pub(super) trait PackNative: ArrowNativeType + HashValue {
     const LOW: i128;
     const HIGH: i128;
     fn wide(self) -> i128;
@@ -383,19 +392,60 @@ where
         );
     }
 
-    fn pack_single(&self, array: &ArrayRef, keys: &mut [u64]) {
+    fn pack_single(&self, array: &ArrayRef, keys: &mut [u32]) {
         if self.range.width() == 0 {
             keys.fill(0);
             return;
         }
         let array = array.as_primitive::<T>();
-        let base = self.range.base() as u64;
+        let base = self.range.base() as u32;
         for (key, value) in keys.iter_mut().zip(array.values().iter()) {
-            *key = value.low64().wrapping_sub(base).wrapping_add(1);
+            *key = (value.low64() as u32).wrapping_sub(base).wrapping_add(1);
         }
         if let Some(nulls) = array.nulls().filter(|nulls| nulls.null_count() > 0) {
             for_each_null(nulls, |row| keys[row] = 0);
         }
+    }
+
+    fn single_migration_bytes(&self, groups: usize) -> usize {
+        if groups == 0 {
+            // No old keys are being migrated.
+            return 0;
+        }
+        let capacity = groups.max(GroupValuesPrimitive::<T>::INITIAL_CAPACITY);
+        // Hashbrown uses power-of-two buckets at a 7/8 load. Round up
+        // using 3/4 and include control bytes and SIMD padding. Both
+        // primitive map layouts use at most 16 bytes per bucket.
+        let buckets = capacity
+            .saturating_add(capacity.div_ceil(3))
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX);
+        let native_bytes = size_of::<T::Native>();
+        buckets
+            .saturating_mul(17)
+            .saturating_add(capacity.saturating_mul(native_bytes))
+            .saturating_add(groups.saturating_mul(native_bytes + size_of::<usize>()))
+            .saturating_add(groups.div_ceil(8))
+            .saturating_add(size_of::<GroupValuesPrimitive<T>>() + 256)
+    }
+
+    fn fall_back_single(&mut self, codes: &[u64]) -> Result<Box<dyn GroupValues>> {
+        let count = codes.len();
+        if count == 0 {
+            return Ok(Box::new(GroupValuesPrimitive::<T>::new(
+                self.data_type.clone(),
+            )));
+        }
+        let capacity = count.max(GroupValuesPrimitive::<T>::INITIAL_CAPACITY);
+        let mut primitive =
+            GroupValuesPrimitive::<T>::with_capacity(self.data_type.clone(), capacity);
+        let array = self.build(codes)?;
+        let mut ids = Vec::with_capacity(count);
+        primitive.intern(&[array], &mut ids)?;
+        if ids.len() != count || ids.into_iter().enumerate().any(|(i, id)| i != id) {
+            return internal_err!("primitive interner reassigned packed group ids");
+        }
+        Ok(Box::new(primitive))
     }
 
     fn translate_all(&self, codes: &mut [u64]) {

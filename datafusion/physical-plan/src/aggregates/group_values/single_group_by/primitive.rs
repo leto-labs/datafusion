@@ -164,8 +164,10 @@ pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
 }
 
 impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
+    pub(crate) const INITIAL_CAPACITY: usize = 128;
+
     pub fn new(data_type: DataType) -> Self {
-        Self::with_capacity(data_type, 128)
+        Self::with_capacity(data_type, Self::INITIAL_CAPACITY)
     }
 
     /// A table with room for `capacity` groups before it grows.
