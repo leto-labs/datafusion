@@ -34,6 +34,7 @@ use datafusion_common::utils::{usize_from_wire, usize_to_wire};
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_execution::config::SessionConfig;
 use datafusion_functions::core::file_row_index::FileRowIndexFunc;
 use datafusion_physical_expr::expressions::{Column, DynamicFilterTracking};
 use datafusion_physical_expr::projection::ProjectionExprs;
@@ -65,6 +66,7 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use itertools::Itertools;
 use object_store::ObjectStore;
 use parquet::arrow::RowNumber;
+use parquet::arrow::arrow_reader::{DictionaryFilterMode, DictionaryFilterOptions};
 #[cfg(feature = "parquet_encryption")]
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
@@ -315,9 +317,24 @@ pub struct ParquetSource {
     /// schema. Clones share it; entries are keyed by every input they
     /// depend on, so a clone with another predicate or schema adds its own.
     filter_cache: Arc<crate::opener::filter_cache::PreparedFilterCache>,
+    /// Execution policy bound from the worker's session at open time.
+    dictionary_filter: Option<DictionaryFilterOptions>,
 }
 
+/// Resolves scan-time dictionary filtering from application session options.
+struct DictionaryFilterPolicy(fn(&ConfigOptions) -> Option<DictionaryFilterOptions>);
+
 impl ParquetSource {
+    /// Configure optional dictionary filtering for Parquet scans using this
+    /// session. The resolver sees the current options, including changes made
+    /// after registration. Return `None` to retain ordinary row filtering.
+    pub fn set_dictionary_filter_policy(
+        config: &mut SessionConfig,
+        resolve: fn(&ConfigOptions) -> Option<DictionaryFilterOptions>,
+    ) {
+        config.set_extension(Arc::new(DictionaryFilterPolicy(resolve)));
+    }
+
     /// Create a new ParquetSource to read the data specified in the file scan
     /// configuration with the provided schema.
     ///
@@ -343,6 +360,7 @@ impl ParquetSource {
             reverse_row_groups: false,
             sort_order_for_reorder: None,
             filter_cache: Default::default(),
+            dictionary_filter: None,
         }
     }
 
@@ -647,6 +665,7 @@ impl ParquetSource {
             parquet_file_reader_factory,
             schema_provider: self.schema_provider.clone(),
             pushdown_filters: self.pushdown_filters(),
+            dictionary_filter: self.dictionary_filter,
             reorder_filters: self.reorder_filters(),
             force_filter_selections: self.force_filter_selections(),
             enable_page_index: self.enable_page_index(),
@@ -738,6 +757,24 @@ impl FileSource for ParquetSource {
             .cloned()
             .collect::<Vec<_>>();
         (!exact.is_empty()).then(|| conjunction(exact))
+    }
+
+    fn with_task_context(
+        &self,
+        context: &datafusion_execution::TaskContext,
+    ) -> Option<Arc<dyn FileSource>> {
+        let config = context.session_config();
+        let resolve = config.get_extension::<DictionaryFilterPolicy>()?;
+        let options = (resolve.0)(config.options())?;
+        if options.mode == DictionaryFilterMode::Off
+            || !self.pushdown_filters()
+            || self.predicate.is_none()
+        {
+            return None;
+        }
+        let mut source = self.clone();
+        source.dictionary_filter = Some(options);
+        Some(Arc::new(source))
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
@@ -1164,6 +1201,7 @@ impl FileSource for ParquetSource {
             sort_order_for_reorder,
             // Longbow family OO: execution state, rebuilt on demand.
             filter_cache: _,
+            dictionary_filter: _,
         } = self;
 
         if schema_provider.is_some() {
@@ -1808,6 +1846,7 @@ mod tests {
         use arrow::compute::SortOptions;
         use arrow::datatypes::{DataType, Field, Schema};
         use datafusion_datasource::TableSchema;
+        use datafusion_execution::config::SessionConfig;
         use datafusion_physical_expr::EquivalenceProperties;
         use datafusion_physical_expr::expressions::Column;
         use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
@@ -2188,6 +2227,7 @@ mod tests {
         use arrow::datatypes::{DataType, Field, FieldRef, Schema};
         use datafusion_common::config::ConfigOptions;
         use datafusion_datasource::TableSchema;
+        use datafusion_execution::config::SessionConfig;
         use datafusion_expr::{col, lit as logical_lit};
         use datafusion_functions::core::expr_fn::file_row_index;
         use datafusion_physical_expr::planner::logical2physical;

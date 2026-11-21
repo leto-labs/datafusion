@@ -489,3 +489,84 @@ impl RowFilterSkippedFullyMatchedMetric {
         count.add(1);
     }
 }
+
+/// Per-file dictionary row-filter work. Shared across row-group filter rebuilds.
+#[derive(Debug)]
+pub(crate) struct DictionaryFilterCounters {
+    chunks_verdict: Count,
+    rows_verdict: Count,
+    chunks_value: Count,
+    rows_value: Count,
+    rows_verified: Count,
+    fallback_plain: Count,
+    fallback_limit: Count,
+    fallback_columns: Count,
+    fallback_error: Count,
+    fallback_unsupported: Count,
+    entries_tested: Count,
+    runs_evaluated: Count,
+    row_groups_pruned_dictionary: Count,
+    pruned_row_groups: parking_lot::Mutex<std::collections::HashSet<i64>>,
+}
+
+impl DictionaryFilterCounters {
+    pub(crate) fn new(
+        metrics: &ExecutionPlanMetricsSet,
+        partition: usize,
+        file: &str,
+    ) -> Self {
+        let builder = MetricBuilder::new(metrics)
+            .with_new_label("filename", file.to_owned())
+            .with_category(MetricCategory::Rows);
+        let counter = |name| builder.clone().counter(name, partition);
+        Self {
+            chunks_verdict: counter("dictionary_filter_chunks_verdict"),
+            rows_verdict: counter("dictionary_filter_rows_verdict"),
+            chunks_value: counter("dictionary_filter_chunks_value"),
+            rows_value: counter("dictionary_filter_rows_value"),
+            rows_verified: counter("dictionary_filter_rows_verified"),
+            fallback_plain: counter("dictionary_filter_fallback_plain"),
+            fallback_limit: counter("dictionary_filter_fallback_limit"),
+            fallback_columns: counter("dictionary_filter_fallback_columns"),
+            fallback_error: counter("dictionary_filter_fallback_error"),
+            fallback_unsupported: counter("dictionary_filter_fallback_unsupported"),
+            entries_tested: counter("dictionary_filter_entries_tested"),
+            runs_evaluated: counter("dictionary_filter_runs_evaluated"),
+            row_groups_pruned_dictionary: counter("row_groups_pruned_dictionary"),
+            pruned_row_groups: Default::default(),
+        }
+    }
+
+    pub(crate) fn record(
+        &self,
+        report: &parquet::arrow::arrow_reader::DictionaryFilterMetrics,
+    ) {
+        for (counter, value) in [
+            (&self.chunks_verdict, report.chunks_verdict),
+            (&self.rows_verdict, report.rows_verdict),
+            (&self.chunks_value, report.chunks_value),
+            (&self.rows_value, report.rows_value),
+            (&self.rows_verified, report.rows_verified),
+            (&self.fallback_plain, report.fallback_plain),
+            (&self.fallback_limit, report.fallback_limit),
+            (&self.fallback_columns, report.fallback_columns),
+            (&self.fallback_error, report.fallback_error),
+            (&self.fallback_unsupported, report.fallback_unsupported),
+            (&self.entries_tested, report.entries_tested),
+            (&self.runs_evaluated, report.runs_evaluated),
+        ] {
+            if value != 0 {
+                counter.add(value);
+            }
+        }
+        if !report.pruned_row_group_offsets.is_empty() {
+            let mut seen = self.pruned_row_groups.lock();
+            let newly_pruned = report
+                .pruned_row_group_offsets
+                .iter()
+                .filter(|&&offset| seen.insert(offset))
+                .count();
+            self.row_groups_pruned_dictionary.add(newly_pruned);
+        }
+    }
+}
