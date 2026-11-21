@@ -233,9 +233,13 @@ file's ETag/version (family D).
 ## Family PRM: report Parquet pruning by stage
 
 Purpose: count row groups whose last selected row is eliminated by the page
-index in the shared opener, and expose the file's existing dynamic-pruning
-counter to prepared-scan consumers. Unordered LIMIT pruning is accounted for
-by its separate counters. Dependent Longbow feature: SCAN-PRUNING-REPORT.
+index in the shared opener. Page verdicts count each evaluated predicate
+column's pages separately within a row group. Conjuncts on the same column
+share its page ordinals. Conjuncts on different columns intersect in row
+space for scan selection. Prepared consumers can report whole physical
+groups and individual key-range visits skipped by runtime filters.
+Unordered LIMIT pruning uses separate counters.
+Dependent Longbow feature: SCAN-PRUNING-REPORT.
 Audit classification: UPSTREAMABLE.
 
 ## Family NFC: plan native fetches through charged page leases

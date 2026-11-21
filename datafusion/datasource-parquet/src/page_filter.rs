@@ -6,7 +6,7 @@
 
 //! Contains code to filter entire pages
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::metrics::ParquetFileMetrics;
@@ -288,9 +288,9 @@ impl PagePruningAccessPlanFilter {
 
         // for each row group specified in the access plan
         let row_group_indexes = access_plan.row_group_indexes();
-        // Page index sets, reused across row groups
-        let mut matched_pages_in_group: HashSet<usize> = HashSet::new();
-        let mut matched_pages_indexes: HashSet<usize> = HashSet::new();
+        // Page ordinals are local to a leaf column. Only intersect page
+        // verdicts from predicates on the same column.
+        let mut matched_pages_by_column = HashMap::<usize, Vec<bool>>::new();
         for row_group_index in row_group_indexes {
             // Skip page pruning for fully matched row groups: all rows are
             // known to satisfy the predicate, so page-level pruning is wasted work.
@@ -308,13 +308,7 @@ impl PagePruningAccessPlanFilter {
             // The selection for this particular row group
             let mut overall_selection = None;
 
-            let total_pages_in_group = parquet_metadata
-                .page_index()
-                .and_then(|page_index| page_index.offset_index(row_group_index, 0))
-                .map_or(0, |offset_index| offset_index.page_locations().len());
-            // stores the indexes of the matched pages
-            matched_pages_in_group.clear();
-            matched_pages_in_group.extend(0..total_pages_in_group);
+            matched_pages_by_column.clear();
 
             for predicate in page_index_predicates {
                 let selection = prune_pages_for_predicate(
@@ -326,7 +320,7 @@ impl PagePruningAccessPlanFilter {
                     file_metrics,
                 );
 
-                let Some((selection, pages)) = selection else {
+                let Some((selection, pages, column)) = selection else {
                     trace!("No pages pruned in prune_pages_in_one_row_group");
                     continue;
                 };
@@ -337,10 +331,16 @@ impl PagePruningAccessPlanFilter {
                     predicate.predicate_expr(),
                 );
 
-                matched_pages_indexes.clear();
-                matched_pages_indexes
-                    .extend(pages.into_iter().enumerate().filter(|x| x.1).map(|x| x.0));
-                matched_pages_in_group.retain(|x| matched_pages_indexes.contains(x));
+                match matched_pages_by_column.entry(column) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        for (matched, next) in entry.get_mut().iter_mut().zip(pages) {
+                            *matched &= next;
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(pages);
+                    }
+                }
 
                 overall_selection = update_selection(overall_selection, selection);
 
@@ -385,7 +385,9 @@ impl PagePruningAccessPlanFilter {
                     total_row_groups_skip += match &access_plan.inner()[row_group_index] {
                         RowGroupAccess::Skip => 1,
                         RowGroupAccess::Scan => 0,
-                        RowGroupAccess::Selection(selection) => usize::from(!selection.selects_any()),
+                        RowGroupAccess::Selection(selection) => {
+                            usize::from(!selection.selects_any())
+                        }
                     };
                 }
             } else {
@@ -401,7 +403,7 @@ impl PagePruningAccessPlanFilter {
                 let mut complete = true;
 
                 for predicate in inverted_predicates {
-                    let Some((selection, _)) = prune_pages_for_predicate(
+                    let Some((selection, _, _)) = prune_pages_for_predicate(
                         row_group_index,
                         predicate,
                         arrow_schema,
@@ -442,9 +444,11 @@ impl PagePruningAccessPlanFilter {
                 }
             }
 
-            let pages_matched = matched_pages_in_group.len();
-            total_pages_select += pages_matched;
-            total_pages_skip += total_pages_in_group - pages_matched;
+            for pages in matched_pages_by_column.values() {
+                let matched = pages.iter().filter(|&&keep| keep).count();
+                total_pages_select += matched;
+                total_pages_skip += pages.len() - matched;
+            }
         }
 
         file_metrics.page_index_rows_pruned.add_pruned(total_skip);
@@ -621,7 +625,7 @@ fn prune_pages_for_predicate(
     parquet_schema: &SchemaDescriptor,
     parquet_metadata: &ParquetMetaData,
     metrics: &ParquetFileMetrics,
-) -> Option<(RowSelection, Vec<bool>)> {
+) -> Option<(RowSelection, Vec<bool>, usize)> {
     #[cfg(test)]
     tests::PAGE_PREDICATE_CALLS.set(tests::PAGE_PREDICATE_CALLS.get() + 1);
 
@@ -638,13 +642,15 @@ fn prune_pages_for_predicate(
             }
         };
 
-    prune_pages_in_one_row_group(
+    let leaf = converter.parquet_column_index()?;
+    let (selection, pages) = prune_pages_in_one_row_group(
         row_group_index,
         predicate,
         converter,
         parquet_metadata,
         metrics,
-    )
+    )?;
+    Some((selection, pages, leaf))
 }
 
 /// Returns a [`RowSelection`] for the rows in this row group to scan, in addition to a vec of
@@ -930,13 +936,74 @@ mod tests {
     }
 
     #[test]
+    fn page_pruning_counts_predicate_pages_with_mismatched_boundaries() {
+        use arrow::array::StringArray;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_data_page_size_limit(128)
+            .set_write_batch_size(2)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(Vec::new(), Arc::clone(&schema), Some(props)).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
+                Arc::new(StringArray::from(vec![
+                    "a".repeat(100),
+                    "a".repeat(100),
+                    "b".repeat(100),
+                    "b".repeat(100),
+                    "z".repeat(100),
+                    "z".repeat(100),
+                ])),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            Bytes::from(writer.into_inner().unwrap()),
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
+        )
+        .unwrap();
+        let index = reader.metadata().page_index().unwrap();
+        assert_eq!(index.offset_index(0, 0).unwrap().page_locations().len(), 1);
+        assert_eq!(index.offset_index(0, 1).unwrap().page_locations().len(), 3);
+
+        let column = || Arc::new(Column::new("b", 1));
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(column(), Operator::Gt, lit("m"))),
+            Operator::And,
+            Arc::new(BinaryExpr::new(column(), Operator::Gt, lit("c"))),
+        ));
+        let filter = PagePruningAccessPlanFilter::new(&predicate, Arc::clone(&schema));
+        let metrics = ParquetFileMetrics::new(0, "test", &ExecutionPlanMetricsSet::new());
+        let plan = filter.prune_plan_with_page_index(
+            ParquetAccessPlan::new_all(1),
+            &schema,
+            reader.parquet_schema(),
+            reader.metadata(),
+            &metrics,
+        );
+        assert_eq!(selected_row_count(&plan, reader.metadata().row_groups()), 2);
+        assert_eq!(metrics.page_index_pages_pruned.pruned(), 2);
+        assert_eq!(metrics.page_index_pages_pruned.matched(), 1);
+    }
+
+    #[test]
     fn page_pruning_counts_groups_eliminated_by_an_intersection() {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let props = WriterProperties::builder()
             .set_data_page_row_count_limit(2)
             .set_write_batch_size(2)
             .build();
-        let mut writer = ArrowWriter::try_new(Vec::new(), Arc::clone(&schema), Some(props)).unwrap();
+        let mut writer =
+            ArrowWriter::try_new(Vec::new(), Arc::clone(&schema), Some(props)).unwrap();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(Int32Array::from(vec![0, 1, 10, 11]))],
@@ -969,7 +1036,10 @@ mod tests {
             &metrics,
             None,
         );
-        assert_eq!(selected_row_count(&result.access_plan, reader.metadata().row_groups()), 2);
+        assert_eq!(
+            selected_row_count(&result.access_plan, reader.metadata().row_groups()),
+            2
+        );
         assert_eq!(metrics.page_index_row_groups_pruned.value(), 1);
     }
 
