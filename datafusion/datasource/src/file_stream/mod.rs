@@ -27,7 +27,9 @@ use crate::file_scan_config::FileScanConfig;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::Result;
 use datafusion_execution::RecordBatchStream;
-use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+use datafusion_physical_plan::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet,
+};
 
 use arrow::record_batch::RecordBatch;
 
@@ -49,6 +51,8 @@ pub struct FileStream {
     state: FileStreamState,
     /// runtime baseline metrics
     baseline_metrics: BaselineMetrics,
+    /// For a limited Parquet stream, records observing EOF before the limit.
+    limit_input_exhausted: Option<Count>,
 }
 
 impl FileStream {
@@ -89,6 +93,11 @@ impl FileStream {
                     match action {
                         ScanAndReturn::Continue => {}
                         ScanAndReturn::Done(result) => {
+                            if result.is_none()
+                                && let Some(exhausted) = &self.limit_input_exhausted
+                            {
+                                exhausted.add(1);
+                            }
                             self.state = FileStreamState::Done;
                             return Poll::Ready(result);
                         }

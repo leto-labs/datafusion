@@ -237,8 +237,10 @@ index in the shared opener. Page verdicts count each evaluated predicate
 column's pages separately within a row group. Conjuncts on the same column
 share its page ordinals. Conjuncts on different columns intersect in row
 space for scan selection. Prepared consumers can report whole physical
-groups and individual key-range visits skipped by runtime filters.
-Unordered LIMIT pruning uses separate counters.
+groups and individual key-range visits skipped by runtime filters. Range
+visits are developer metrics. Limited Parquet file streams record whether
+they observe input exhaustion, so report consumers can distinguish a
+complete decoded-row count from one affected by the limit.
 Dependent Longbow feature: SCAN-PRUNING-REPORT.
 Audit classification: UPSTREAMABLE.
 

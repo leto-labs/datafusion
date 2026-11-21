@@ -11,7 +11,9 @@ use crate::file_stream::scan_state::ScanState;
 use crate::file_stream::work_source::{SharedWorkSource, WorkSource};
 use crate::morsel::{FileOpenerMorselizer, Morselizer};
 use datafusion_common::{Result, internal_err};
-use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+use datafusion_physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder,
+};
 
 use super::metrics::FileStreamMetrics;
 use super::{FileOpener, FileStream, FileStreamState, OnError};
@@ -138,6 +140,12 @@ impl<'a> FileStreamBuilder<'a> {
             projected_schema,
             state: FileStreamState::Scan { scan_state },
             baseline_metrics: BaselineMetrics::new(metrics, partition),
+            limit_input_exhausted: (config.limit.is_some()
+                && config.file_source.file_type() == "parquet")
+                .then(|| {
+                    MetricBuilder::new(metrics)
+                        .counter("parquet_limit_input_exhausted", partition)
+                }),
         })
     }
 }

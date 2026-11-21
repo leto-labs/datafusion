@@ -223,7 +223,7 @@ impl ParquetFileMetrics {
             .counter("page_index_row_groups_pruned", partition);
         let row_group_range_visits_pruned_dynamic_filter = builder
             .clone()
-            .with_type(MetricType::Summary)
+            .with_type(MetricType::Dev)
             .counter("row_group_range_visits_pruned_dynamic_filter", partition);
 
         let bytes_scanned = builder
