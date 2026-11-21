@@ -129,7 +129,9 @@ async fn runtime_pruning_builds_one_predicate_per_filter_generation() {
     assert_eq!(builds() - before, 1);
 
     // A tightened filter is seen by the next check of each row group.
-    filter.update(at_least(1_200)).unwrap();
+    filter
+        .update_conservative_while_pending(at_least(1_200))
+        .unwrap();
     assert_eq!(kept(&file), (12..ROW_GROUPS).collect::<Vec<_>>());
     assert_eq!(builds() - before, 2);
 

@@ -33,6 +33,17 @@ use itertools::izip;
 /// Shared [`PhysicalExpr`].
 pub type PhysicalExprRef = Arc<dyn PhysicalExpr>;
 
+/// Whether an expression node can contribute to an irreversible pruning decision.
+#[derive(Debug)]
+pub enum PruningSnapshot {
+    /// This node has no live publication. Its children are checked separately.
+    Static,
+    /// The publisher certifies that rows rejected by this snapshot can be skipped.
+    Ready(PhysicalExprRef),
+    /// This node cannot currently certify a pruning snapshot.
+    Unavailable,
+}
+
 /// [`PhysicalExpr`]s represent expressions such as `A + 1` or `CAST(c1 AS int)`.
 ///
 /// `PhysicalExpr` knows its type, nullability and can be evaluated directly on
@@ -421,6 +432,22 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
         // have any dynamic references or state.
         // This is a safe default behavior.
         Ok(None)
+    }
+
+    /// Return a pruning snapshot only when the publication is complete, or
+    /// when the caller permits a conservative pending publication and the
+    /// publisher can guarantee that it keeps every row the final filter needs.
+    /// Implementations must read the expression and its readiness together.
+    /// The default treats dynamic and snapshotting nodes as unavailable.
+    fn snapshot_for_pruning(
+        &self,
+        _allow_conservative_pending: bool,
+    ) -> Result<PruningSnapshot> {
+        if self.snapshot_generation() != 0 || self.snapshot()?.is_some() {
+            Ok(PruningSnapshot::Unavailable)
+        } else {
+            Ok(PruningSnapshot::Static)
+        }
     }
 
     /// Returns the generation of this `PhysicalExpr` for snapshotting purposes.

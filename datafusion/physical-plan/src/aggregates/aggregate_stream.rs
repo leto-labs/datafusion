@@ -196,7 +196,9 @@ impl AggregateStreamInner {
         // but only if any bound actually changed.
         if bounds_changed {
             let predicate = self.build_dynamic_filter_from_accumulator_bounds()?;
-            filter_state.filter.update(predicate)?;
+            filter_state
+                .filter
+                .update_conservative_while_pending(predicate)?;
         }
 
         Ok(())

@@ -21,6 +21,7 @@ use datafusion_common::{
 use crate::expressions::lit;
 use datafusion_expr::ColumnarValue;
 use datafusion_expr_common::dyn_eq::DynHash;
+use datafusion_physical_expr_common::physical_expr::PruningSnapshot;
 
 mod tracker;
 pub use tracker::{DynamicFilterTracker, DynamicFilterTracking};
@@ -108,7 +109,7 @@ impl std::fmt::Debug for DynamicFilterPhysicalExpr {
 /// `expression_id` lives here because it identifies the actual filter expression `expr`.
 /// Derived `DynamicFilterPhysicalExpr`s (e.g. via [`PhysicalExpr::with_new_children`]) are
 /// the same logical filter and must report the same `expression_id`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct Inner {
     /// A unique identifier for the expression.
     expression_id: u64,
@@ -120,6 +121,21 @@ struct Inner {
     /// This is redundant with the watch channel state, but allows us to return immediately
     /// from `wait_complete()` without subscribing if already complete.
     is_complete: bool,
+    /// This publication is a superset of the final filter's accepted rows.
+    conservative_while_pending: bool,
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Longbow's plan fingerprint uses this representation. The live
+        // pruning guarantee belongs to a publication, outside plan identity.
+        f.debug_struct("Inner")
+            .field("expression_id", &self.expression_id)
+            .field("generation", &self.generation)
+            .field("expr", &self.expr)
+            .field("is_complete", &self.is_complete)
+            .finish()
+    }
 }
 
 impl Inner {
@@ -131,6 +147,7 @@ impl Inner {
             generation: 1,
             expr,
             is_complete: false,
+            conservative_while_pending: false,
         }
     }
 
@@ -276,11 +293,46 @@ impl DynamicFilterPhysicalExpr {
     /// [`Self::update_from`] fires, so we cache the remapped expression per
     /// generation and return it directly on subsequent per-batch calls.
     pub fn current(&self) -> Result<Arc<dyn PhysicalExpr>> {
-        // Fast path: cache hit for the current generation.
         let (expr, generation) = {
             let inner = self.inner.read();
             (Arc::clone(inner.expr()), inner.generation)
         };
+        self.remapped_current(expr, generation)
+    }
+
+    /// Snapshot a publication that can safely reject rows during pruning.
+    /// Read readiness and the expression under the same lock.
+    pub fn current_for_pruning(
+        &self,
+        allow_conservative_pending: bool,
+    ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+        let (expr, generation) = {
+            let inner = self.inner.read();
+            if !(inner.is_complete
+                || allow_conservative_pending && inner.conservative_while_pending)
+            {
+                return Ok(None);
+            }
+            (Arc::clone(inner.expr()), inner.generation)
+        };
+        self.remapped_current(expr, generation).map(Some)
+    }
+
+    /// Pruning also changes when the current expression becomes complete.
+    pub fn pruning_generation(&self) -> u64 {
+        let inner = self.inner.read();
+        inner
+            .generation
+            .wrapping_mul(2)
+            .wrapping_add(u64::from(inner.is_complete))
+    }
+
+    fn remapped_current(
+        &self,
+        expr: Arc<dyn PhysicalExpr>,
+        generation: u64,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        // Fast path: cache hit for the current generation.
         if let Some((cached_gen, cached_expr)) = self.current_cache.read().as_ref()
             && *cached_gen == generation
         {
@@ -323,6 +375,23 @@ impl DynamicFilterPhysicalExpr {
     /// that mapping must be idempotent. Non-idempotent mappings must publish
     /// through the original producer instead.
     pub fn update(&self, new_expr: Arc<dyn PhysicalExpr>) -> Result<()> {
+        self.publish(new_expr, false)
+    }
+
+    /// Update a filter whose future publications can only reject more rows.
+    /// TopK uses this when a full heap establishes a conservative threshold.
+    pub fn update_conservative_while_pending(
+        &self,
+        new_expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<()> {
+        self.publish(new_expr, true)
+    }
+
+    fn publish(
+        &self,
+        new_expr: Arc<dyn PhysicalExpr>,
+        conservative_while_pending: bool,
+    ) -> Result<()> {
         // Remap the children of the new expression to match the original children
         // We still do this again in `current()` but doing it preventively here
         // reduces the work needed in some cases if `current()` is called multiple times
@@ -336,6 +405,7 @@ impl DynamicFilterPhysicalExpr {
         let mut current = self.inner.write();
         current.generation += 1;
         current.expr = new_expr;
+        current.conservative_while_pending = conservative_while_pending;
 
         // Publish while holding the lock so concurrent updates and completion
         // cannot reorder notifications. Retain the state for future subscribers.
@@ -373,6 +443,7 @@ impl DynamicFilterPhysicalExpr {
         current.generation += 1;
         current.expr = source_state.expr;
         current.is_complete = source_state.is_complete;
+        current.conservative_while_pending = source_state.conservative_while_pending;
         self.state_watch.send_replace(current.state());
         Ok(())
     }
@@ -384,6 +455,7 @@ impl DynamicFilterPhysicalExpr {
         current.generation += 1;
         current.expr = lit(true);
         current.is_complete = false;
+        current.conservative_while_pending = false;
         self.state_watch.send_replace(current.state());
     }
 
@@ -621,6 +693,15 @@ impl PhysicalExpr for DynamicFilterPhysicalExpr {
         Ok(Some(self.current()?))
     }
 
+    fn snapshot_for_pruning(
+        &self,
+        allow_conservative_pending: bool,
+    ) -> Result<PruningSnapshot> {
+        Ok(self
+            .current_for_pruning(allow_conservative_pending)?
+            .map_or(PruningSnapshot::Unavailable, PruningSnapshot::Ready))
+    }
+
     fn snapshot_generation(&self) -> u64 {
         // Return the current generation of the expression.
         self.inner.read().generation
@@ -665,6 +746,7 @@ impl PhysicalExpr for DynamicFilterPhysicalExpr {
             generation,
             expr,
             is_complete,
+            conservative_while_pending: _,
         } = inner.read().clone();
         let inner_expr = Box::new(ctx.encode_child(&expr)?);
 
@@ -748,6 +830,9 @@ impl DynamicFilterPhysicalExpr {
             generation: *generation,
             expr: inner_expr,
             is_complete: *is_complete,
+            // Runtime producer guarantee. A decoded pending publication
+            // waits for a live producer to establish it again.
+            conservative_while_pending: false,
         };
 
         Ok(Arc::new(Self::from_parts(

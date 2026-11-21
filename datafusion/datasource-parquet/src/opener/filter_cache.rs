@@ -36,9 +36,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::Result;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
-use datafusion_physical_expr_common::physical_expr::{PhysicalExpr, snapshot_generation};
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_plan::metrics::Count;
 use datafusion_pruning::PruningPredicate;
 
@@ -69,11 +71,27 @@ pub(crate) struct FilterInputs<'a> {
 }
 
 impl FilterInputs<'_> {
-    /// The snapshot generation of the predicate's dynamic filters; zero for
-    /// a static predicate.
+    /// The snapshot generation and readiness of the pruning publications.
     fn generation(&self) -> u64 {
-        self.predicate.map_or(0, snapshot_generation)
+        self.predicate.map_or(0, pruning_generation)
     }
+}
+
+fn pruning_generation(predicate: &Arc<dyn PhysicalExpr>) -> u64 {
+    let mut generation = 0u64;
+    predicate
+        .apply(|expr| {
+            let current = expr
+                .downcast_ref::<DynamicFilterPhysicalExpr>()
+                .map_or_else(
+                    || expr.snapshot_generation().wrapping_mul(2),
+                    DynamicFilterPhysicalExpr::pruning_generation,
+                );
+            generation = generation.wrapping_add(current);
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("generation traversal is infallible");
+    generation
 }
 
 /// A file's adapted predicate and projection with the pruning predicates
@@ -81,6 +99,7 @@ impl FilterInputs<'_> {
 #[derive(Debug)]
 pub(crate) struct PreparedFilters {
     pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
+    pub(crate) pruning_expr: Option<Arc<dyn PhysicalExpr>>,
     pub(crate) projection: ProjectionExprs,
     pub(crate) pruning_predicate: Option<Arc<PruningPredicate>>,
     pub(crate) page_pruning_predicate: Option<Arc<PagePruningAccessPlanFilter>>,
@@ -97,21 +116,23 @@ impl PreparedFilters {
     /// `projection`.
     pub(crate) fn build(
         predicate: Option<Arc<dyn PhysicalExpr>>,
+        dynamic_pruning_expr: Option<Arc<dyn PhysicalExpr>>,
         projection: ProjectionExprs,
         file_schema: &SchemaRef,
         max_in_list_size: usize,
         enable_page_index: bool,
     ) -> Self {
         let errors = Count::new();
+        let pruning_expr = dynamic_pruning_expr.or_else(|| predicate.clone());
         let pruning_predicate = super::build_pruning_predicates(
-            predicate.as_ref(),
+            pruning_expr.as_ref(),
             file_schema,
             &errors,
             max_in_list_size,
         );
         // Only build page pruning predicate if page index is enabled
         let page_pruning_predicate = if enable_page_index {
-            predicate.as_ref().and_then(|predicate| {
+            pruning_expr.as_ref().and_then(|predicate| {
                 let p = super::build_page_pruning_predicate(
                     predicate,
                     file_schema,
@@ -124,6 +145,7 @@ impl PreparedFilters {
         };
         Self {
             predicate,
+            pruning_expr,
             projection,
             pruning_predicate,
             page_pruning_predicate,
@@ -287,7 +309,7 @@ impl PreparedFilterCache {
         logical: &SchemaRef,
         errors: &Count,
     ) -> Option<Arc<PruningPredicate>> {
-        let generation = snapshot_generation(predicate);
+        let generation = pruning_generation(predicate);
         let matches = |entry: &FileLevelEntry| {
             Arc::ptr_eq(&entry.predicate, predicate)
                 && same_schema(&entry.logical, logical)
@@ -312,7 +334,7 @@ impl PreparedFilterCache {
             &local,
         );
         errors.add(local.value());
-        if snapshot_generation(predicate) == generation {
+        if pruning_generation(predicate) == generation {
             let mut entries = self
                 .file_level
                 .lock()

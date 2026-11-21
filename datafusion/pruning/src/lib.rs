@@ -15,4 +15,5 @@ pub use file_pruner::FilePruner;
 pub use pruning_predicate::{
     MAX_IN_LIST_SIZE, PredicateRewriter, PruningPredicate, PruningPredicateBuilder,
     PruningStatistics, RequiredColumns, UnhandledPredicateHook, build_pruning_predicate,
+    has_pruning_publication, pruning_snapshot,
 };

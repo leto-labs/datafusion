@@ -235,7 +235,7 @@ impl RowGroupPruner {
         let dynamic_changed = self
             .tracking
             .watcher()
-            .is_some_and(|tracker| tracker.changed());
+            .is_some_and(|tracker| tracker.pruning_changed());
         if self.needs_initial_build || dynamic_changed {
             self.pruning_predicate = PruningPredicateBuilder::new()
                 .with_file_schema(Arc::clone(&self.arrow_schema))
@@ -947,7 +947,7 @@ mod tests {
         // Tighten the threshold via the dynamic filter — TopK fills its
         // heap and updates the threshold to 2500.
         dynamic
-            .update(gt_predicate(2500))
+            .update_conservative_while_pending(gt_predicate(2500))
             .expect("update threshold");
 
         // After the update the pruner must rebuild its `PruningPredicate`
@@ -965,6 +965,28 @@ mod tests {
             !pruner.should_prune(&[2]),
             "RG2 (2000..3000) still straddles 2500"
         );
+    }
+
+    #[test]
+    fn row_group_pruner_rechecks_completion_without_an_expression_update() {
+        let (meta, schema) = build_three_rg_file();
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(Column::new("v", 0))],
+            gt_predicate(2500),
+        ));
+        let (creation, evaluation) = pruner_error_counters();
+        let mut pruner = RowGroupPruner::new(
+            dynamic.clone(),
+            schema,
+            meta,
+            creation,
+            evaluation,
+            MAX_IN_LIST_SIZE,
+        );
+        assert!(!pruner.should_prune(&[0]));
+        dynamic.mark_complete();
+        assert!(pruner.should_prune(&[0]));
+        assert!(!pruner.should_prune(&[2]));
     }
 
     #[test]

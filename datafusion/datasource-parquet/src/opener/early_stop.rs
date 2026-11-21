@@ -177,18 +177,26 @@ mod tests {
             .with_statistics(Arc::new(statistics))
     }
 
-    fn pruning_filter(schema: &SchemaRef) -> FilePruner {
+    fn pruning_filter(
+        schema: &SchemaRef,
+    ) -> (FilePruner, Arc<DynamicFilterPhysicalExpr>) {
         let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("a", 0)),
             datafusion_expr::Operator::Gt,
             Arc::new(Literal::new(ScalarValue::Int32(Some(100)))),
         ));
-        let dynamic: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
             expr.children().into_iter().map(Arc::clone).collect(),
             expr,
         ));
-        FilePruner::try_new(dynamic, schema, &file_with_stats(), Count::new())
-            .expect("file has statistics, so a pruner can be built")
+        let pruner = FilePruner::try_new(
+            dynamic.clone(),
+            schema,
+            &file_with_stats(),
+            Count::new(),
+        )
+        .expect("file has statistics, so a pruner can be built");
+        (pruner, dynamic)
     }
 
     fn batch(schema: &SchemaRef) -> RecordBatch {
@@ -212,15 +220,16 @@ mod tests {
             dropped: Arc::clone(&dropped),
         };
 
-        let mut early_stopping = EarlyStoppingStream::new(
-            inner,
-            pruning_filter(&schema),
-            PruningMetrics::new(),
-        );
+        let (pruner, publication) = pruning_filter(&schema);
+        let mut early_stopping =
+            EarlyStoppingStream::new(inner, pruner, PruningMetrics::new());
 
+        assert!(early_stopping.next().await.is_some());
+        assert!(!dropped.load(Ordering::Relaxed));
+        publication.mark_complete();
         assert!(
             early_stopping.next().await.is_none(),
-            "the filter prunes every row, so the first batch must end the stream",
+            "the completed filter prunes the rest of the file",
         );
         assert!(
             dropped.load(Ordering::Relaxed),
@@ -241,7 +250,7 @@ mod tests {
 
         let mut early_stopping = EarlyStoppingStream::new(
             inner,
-            pruning_filter(&schema),
+            pruning_filter(&schema).0,
             PruningMetrics::new(),
         );
 

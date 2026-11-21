@@ -120,10 +120,19 @@ impl DynamicFilterTracker {
     /// observed; once every filter has completed this is a no-op that always
     /// returns `false`.
     pub fn changed(&mut self) -> bool {
+        self.observe_changes(false)
+    }
+
+    /// Pruning may begin using an unchanged expression once it completes.
+    pub fn pruning_changed(&mut self) -> bool {
+        self.observe_changes(true)
+    }
+
+    fn observe_changes(&mut self, completion_changes: bool) -> bool {
         let mut changed = false;
         self.subscriptions.retain_mut(|subscription| {
             let change = subscription.observe();
-            changed |= change.changed;
+            changed |= change.changed || completion_changes && change.complete;
             // Keep the subscription only while the filter can still change.
             !change.complete
         });
