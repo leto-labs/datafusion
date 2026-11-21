@@ -606,7 +606,7 @@ impl TopK {
         if let Some(pred) = predicate
             && !pred.eq(&lit(true))
         {
-            filter.expr.update(pred)?;
+            filter.expr.update_conservative_while_pending(pred)?;
         }
 
         Ok(())

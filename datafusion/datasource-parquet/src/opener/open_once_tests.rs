@@ -258,9 +258,14 @@ async fn oo_a_dynamic_filter_update_prepares_filters_again() {
     assert_eq!(morselizer.filter_cache.len(), 1);
 
     dynamic
-        .update(logical2physical(&col("a").gt(lit(50i32)), &schema))
+        .update_conservative_while_pending(logical2physical(
+            &col("a").gt(lit(50i32)),
+            &schema,
+        ))
         .unwrap();
-    let updated = prepared_pruning(&morselizer, file).await.expect("pruning");
+    let updated = prepared_pruning(&morselizer, file.clone())
+        .await
+        .expect("pruning");
     assert!(
         updated.predicate_expr().to_string().contains("50"),
         "the new generation's value: {}",
@@ -271,6 +276,17 @@ async fn oo_a_dynamic_filter_update_prepares_filters_again() {
         1,
         "the new generation replaces"
     );
+
+    // A pending publication can also become usable without advancing its
+    // expression generation. The pending preparation must be invalidated.
+    dynamic
+        .update(logical2physical(&col("a").gt(lit(75i32)), &schema))
+        .unwrap();
+    assert!(prepared_pruning(&morselizer, file.clone()).await.is_none());
+    dynamic.mark_complete();
+    let completed = prepared_pruning(&morselizer, file).await.expect("pruning");
+    assert!(completed.predicate_expr().to_string().contains("75"));
+    assert_eq!(morselizer.filter_cache.len(), 1);
 }
 
 fn lit_true() -> Arc<dyn PhysicalExpr> {

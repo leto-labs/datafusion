@@ -35,9 +35,12 @@ use datafusion_common::{
 };
 use datafusion_expr_common::casts::try_cast_literal_to_type;
 use datafusion_expr_common::operator::Operator;
-use datafusion_physical_expr::utils::{Guarantee, LiteralGuarantee};
-use datafusion_physical_expr::{PhysicalExprRef, expressions as phys_expr};
-use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr_opt;
+use datafusion_physical_expr::utils::{
+    Guarantee, LiteralGuarantee, conjunction, split_conjunction,
+};
+use datafusion_physical_expr::{
+    DynamicFilterTracking, PhysicalExprRef, expressions as phys_expr,
+};
 use datafusion_physical_plan::joins::HashTableLookupExpr;
 use datafusion_physical_plan::{ColumnarValue, PhysicalExpr};
 
@@ -398,6 +401,56 @@ pub fn build_pruning_predicate(
         .build(predicate)
 }
 
+/// Resolve a predicate for irreversible pruning. The second result records
+/// whether any conjunct had to be omitted, so callers cannot use the
+/// weaker predicate to declare rows fully matched.
+pub fn pruning_snapshot(
+    predicate: PhysicalExprRef,
+) -> Result<(Transformed<PhysicalExprRef>, bool)> {
+    let mut changed = false;
+    let mut omitted = false;
+    let mut terms = Vec::new();
+    for conjunct in split_conjunction(&predicate) {
+        // Only a standalone conservative publication can prune while
+        // pending. Negating a tightening predicate can make it widen.
+        let mut pending = false;
+        let resolved = Arc::clone(conjunct).transform_up(|expr| {
+            let snapshot = if let Some(filter) =
+                expr.downcast_ref::<phys_expr::DynamicFilterPhysicalExpr>()
+            {
+                let snapshot =
+                    filter.current_for_pruning(Arc::ptr_eq(conjunct, &expr))?;
+                pending |= snapshot.is_none();
+                snapshot
+            } else {
+                expr.snapshot()?
+            };
+            Ok(match snapshot {
+                Some(snapshot) => Transformed::yes(snapshot),
+                None => Transformed::no(expr),
+            })
+        })?;
+        if pending
+            || resolved.transformed
+                && DynamicFilterTracking::classify(&resolved.data)
+                    .contains_dynamic_filter()
+        {
+            // Drop the whole conjunct. A nested placeholder is unsound
+            // under operators such as NOT or IS FALSE.
+            omitted = true;
+        } else {
+            changed |= resolved.transformed;
+            terms.push(resolved.data);
+        }
+    }
+    let snapshot = if changed || omitted {
+        Transformed::yes(conjunction(terms))
+    } else {
+        Transformed::no(predicate)
+    };
+    Ok((snapshot, omitted))
+}
+
 /// Builder for a [`PruningPredicate`]. Groups optional configuration —
 /// `IN (...)` rewrite cap, error counter — so future additions do not
 /// churn the top-level API.
@@ -515,7 +568,7 @@ impl<'a> PruningPredicateBuilder<'a> {
         // Get a (simpler) snapshot of the physical expr here to use with `PruningPredicate`.
         // In particular this unravels any `DynamicFilterPhysicalExpr`s by snapshotting them
         // so that PruningPredicate can work with a static expression.
-        let tf = snapshot_physical_expr_opt(predicate)?;
+        let (tf, omitted) = pruning_snapshot(predicate)?;
         if tf.transformed {
             // If we had an expression such as Dynamic(part_col < 5 and col < 10)
             // (this could come from something like `select * from t order by part_col, col, limit 10`)
@@ -554,7 +607,8 @@ impl<'a> PruningPredicateBuilder<'a> {
             orig_expr: predicate,
             literal_guarantees,
             max_in_list_size: self.max_in_list_size,
-            can_be_inverted_for_full_match: !properties.has_filter_semantics_only,
+            can_be_inverted_for_full_match: !omitted
+                && !properties.has_filter_semantics_only,
         })
     }
 }
@@ -614,7 +668,7 @@ impl PruningPredicate {
     /// details.
     ///
     /// Note that `PruningPredicate` does not attempt to normalize or simplify
-    /// the input expression unless calling [`snapshot_physical_expr_opt`]
+    /// the input expression unless calling [`pruning_snapshot`]
     /// returns a new expression.
     /// It is recommended that you pass the expressions through [`PhysicalExprSimplifier`]
     /// before calling this method to make sure the expressions can be used for pruning.
@@ -3486,6 +3540,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pending_publication_can_neither_prune_under_not_nor_prove_full_match() {
+        let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, true)]));
+        let statistics = TestStatistics::new()
+            .with("c1", ContainerStats::new_i32(vec![Some(1)], vec![Some(10)]));
+        let key = Arc::new(phys_expr::Column::new("c1", 0));
+        let pending = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![key],
+            logical2physical(&col("c1").eq(lit(40)), &schema),
+        ));
+        let negated = Arc::new(phys_expr::NotExpr::new(pending.clone()));
+        let build = |expr| {
+            PruningPredicateBuilder::new()
+                .with_file_schema(schema.clone())
+                .try_build(expr)
+                .unwrap()
+        };
+        let pruning = build(negated);
+        assert_eq!(pruning.prune(&statistics).unwrap(), vec![true]);
+        assert!(!pruning.can_be_inverted_for_full_match());
+
+        let static_term = logical2physical(&col("c1").gt(lit(0)), &schema);
+        let pruning = build(conjunction(vec![static_term, pending]));
+        assert_eq!(pruning.prune(&statistics).unwrap(), vec![true]);
+        assert!(!pruning.can_be_inverted_for_full_match());
+    }
+
     /// Integration test demonstrating that a dynamic filter with replaced children as literals will be snapshotted, simplified and then pruned correctly.
     #[test]
     fn row_group_predicate_dynamic_filter_with_literals() {
@@ -3502,9 +3583,9 @@ mod tests {
             .iter()
             .map(|c| Arc::new(c.clone()) as Arc<dyn PhysicalExpr>)
             .collect_vec();
-        let dynamic_phys_expr =
-            Arc::new(DynamicFilterPhysicalExpr::new(children, phys_expr))
-                as Arc<dyn PhysicalExpr>;
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(children, phys_expr));
+        dynamic.mark_complete();
+        let dynamic_phys_expr = dynamic as Arc<dyn PhysicalExpr>;
         // Simulate the partition value substitution that would happen in ParquetOpener
         let remapped_expr = dynamic_phys_expr
             .children()

@@ -122,7 +122,7 @@ impl FilePruner {
         // predicate (or one whose dynamic filters have all completed) is checked
         // exactly once.
         let should_build = if self.checked_once {
-            self.tracking.watcher().is_some_and(|w| w.changed())
+            self.tracking.watcher().is_some_and(|w| w.pruning_changed())
         } else {
             self.checked_once = true;
             true

@@ -485,6 +485,8 @@ struct PreparedParquetOpen {
     output_schema: SchemaRef,
     projection: ProjectionExprs,
     predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Pruning keeps live publications through per-file constant folding.
+    pruning_expr: Option<Arc<dyn PhysicalExpr>>,
     /// Per-scan virtual-column state, Arc-cloned from [`ParquetMorselizer`] so
     /// each file shares validated fields, precomputed null replacements, and
     /// the logical-with-virtual schema. `None` when no virtual columns were
@@ -1077,6 +1079,7 @@ impl ParquetMorselizer {
             output_schema,
             projection,
             predicate,
+            pruning_expr: None,
             virtual_state: self.virtual_state.as_ref().map(Arc::clone),
             reorder_predicates: self.reorder_filters,
             pushdown_filters: self.pushdown_filters,
@@ -1358,17 +1361,28 @@ impl MetadataLoadedParquetOpen {
                     Arc::clone(&physical_for_rewrite),
                 )?;
                 let simplifier = PhysicalExprSimplifier::new(&physical_for_rewrite);
-                let predicate = prepared
+                let rewritten = prepared
                     .predicate
                     .clone()
-                    .map(|p| simplifier.simplify(rewriter.rewrite(p)?))
+                    .map(|p| rewriter.rewrite(p))
                     .transpose()?;
+                // Simplifying the decoder's predicate can fold a dynamic
+                // publication once its inputs are file constants. Pruning
+                // must still see the live publication and its readiness.
+                let dynamic_pruning_expr = rewritten
+                    .as_ref()
+                    .filter(|expr| {
+                        DynamicFilterTracking::classify(expr).contains_dynamic_filter()
+                    })
+                    .cloned();
+                let predicate = rewritten.map(|p| simplifier.simplify(p)).transpose()?;
                 let projection = prepared
                     .projection
                     .clone()
                     .try_map_exprs(|p| simplifier.simplify(rewriter.rewrite(p)?))?;
                 Ok(PreparedFilters::build(
                     predicate,
+                    dynamic_pruning_expr,
                     projection,
                     &physical_file_schema,
                     prepared.max_in_list_size,
@@ -1376,6 +1390,7 @@ impl MetadataLoadedParquetOpen {
                 ))
             })?;
             prepared.predicate = filters.predicate.clone();
+            prepared.pruning_expr = filters.pruning_expr.clone();
             prepared.projection = filters.projection.clone();
             prepared
                 .predicate_creation_errors
@@ -1960,12 +1975,13 @@ impl RowGroupsPrunedParquetOpen {
         // runtime pruner may drop future row groups before their boundary:
         // such a stream keeps its work (`RowGroupSharing::wants_work`) and
         // reserves no read-ahead window.
-        let predicate_watching = prepared.predicate.as_ref().is_some_and(|predicate| {
-            matches!(
-                DynamicFilterTracking::classify(predicate),
-                DynamicFilterTracking::Watching(_)
-            )
-        });
+        let predicate_watching =
+            prepared.pruning_expr.as_ref().is_some_and(|predicate| {
+                matches!(
+                    DynamicFilterTracking::classify(predicate),
+                    DynamicFilterTracking::Watching(_)
+                )
+            });
         let row_group_sharing = prepared.shared_work_source.clone().and_then(|source| {
             let selected = access_plan.row_group_index_iter().count();
             let lookahead = if predicate_watching {
@@ -1989,7 +2005,7 @@ impl RowGroupsPrunedParquetOpen {
                 file: prepared.partitioned_file.clone(),
                 plan: access_plan.clone(),
                 metadata: Arc::clone(&file_metadata),
-                predicate: prepared.predicate.clone().filter(|_| predicate_watching),
+                predicate: prepared.pruning_expr.clone().filter(|_| predicate_watching),
                 lookahead,
                 metrics: prepared.metrics.clone(),
                 partition: prepared.partition_index,
@@ -2157,7 +2173,7 @@ impl RowGroupsPrunedParquetOpen {
         // runtime pruning for them is separate from adopting the local API
         // and is tracked in https://github.com/apache/datafusion/issues/24358.
         let row_group_pruner =
-            match (&prepared.predicate, rg_plan.len() > 1, has_row_selection) {
+            match (&prepared.pruning_expr, rg_plan.len() > 1, has_row_selection) {
                 (Some(predicate), true, false)
                     if matches!(
                         DynamicFilterTracking::classify(predicate),
@@ -2254,7 +2270,11 @@ fn stats_alone_unsatisfiable(
     else {
         return false;
     };
-    let Ok(simplified) = PhysicalExprSimplifier::new(schema).simplify(substituted) else {
+    let Ok((snapshot, _)) = datafusion_pruning::pruning_snapshot(substituted) else {
+        return false;
+    };
+    let Ok(simplified) = PhysicalExprSimplifier::new(schema).simplify(snapshot.data)
+    else {
         return false;
     };
     simplified.downcast_ref::<Literal>().is_some_and(|l| {
@@ -3333,10 +3353,12 @@ mod test {
     }
 
     fn make_dynamic_expr(expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
-        Arc::new(DynamicFilterPhysicalExpr::new(
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
             expr.children().into_iter().map(Arc::clone).collect(),
-            expr,
-        ))
+            datafusion_physical_expr::expressions::lit(true),
+        ));
+        dynamic.update_conservative_while_pending(expr).unwrap();
+        dynamic
     }
 
     /// `bytes_processed` reports how much of a file range a scan has finished
@@ -3930,6 +3952,40 @@ mod test {
         let (num_batches, num_rows) = count_batches_and_rows(stream).await;
         assert_eq!(num_batches, 0);
         assert_eq!(num_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn literal_partition_value_keeps_pending_publication_for_pruning() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let file_schema = batch.schema();
+        let data_size =
+            write_parquet(Arc::clone(&store), "part=1/file.parquet", batch).await;
+        let file =
+            PartitionedFile::new("part=1/file.parquet".to_string(), data_size as u64)
+                .with_partition_values(vec![ScalarValue::Int32(Some(1))]);
+        let part = Arc::new(Field::new("part", DataType::Int32, false));
+        let table_schema = TableSchemaBuilder::from(&file_schema)
+            .with_table_partition_cols(vec![part])
+            .build();
+        let predicate =
+            logical2physical(&col("part").eq(lit(2)), table_schema.table_schema());
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            predicate.children().into_iter().map(Arc::clone).collect(),
+            predicate,
+        ));
+        let opener = ParquetMorselizerBuilder::new()
+            .with_store(store)
+            .with_table_schema(table_schema)
+            .with_projection_indices(&[0])
+            .with_predicate(dynamic.clone())
+            .with_row_group_stats_pruning(true)
+            .build();
+        let stream = open_file(&opener, file.clone()).await.unwrap();
+        assert_eq!(count_batches_and_rows(stream).await, (1, 3));
+        dynamic.mark_complete();
+        let stream = open_file(&opener, file).await.unwrap();
+        assert_eq!(count_batches_and_rows(stream).await, (0, 0));
     }
 
     #[tokio::test]
@@ -5075,7 +5131,10 @@ mod test {
                 &[0, 1, 2, 3]
             );
             dynamic
-                .update(logical2physical(&col("a").lt(lit(50i32)), &schema))
+                .update_conservative_while_pending(logical2physical(
+                    &col("a").lt(lit(50i32)),
+                    &schema,
+                ))
                 .unwrap();
 
             // Apply the final predicate as the consumer would. Runtime

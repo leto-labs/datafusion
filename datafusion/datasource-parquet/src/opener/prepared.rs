@@ -513,8 +513,13 @@ fn prepared_scan(pruned: PrunedParquetOpen) -> Result<PreparedParquetScan> {
         .take(metadata.metadata().num_row_groups())
         .collect();
     let pruner = runtime_pruner(
-        dynamic,
-        prepared.predicate.as_ref(),
+        prepared.pruning_expr.as_ref().is_some_and(|predicate| {
+            matches!(
+                DynamicFilterTracking::classify(predicate),
+                DynamicFilterTracking::Watching(_)
+            )
+        }),
+        prepared.pruning_expr.as_ref(),
         &prepared.physical_file_schema,
         &metadata,
         prepared.max_in_list_size,
