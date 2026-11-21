@@ -65,6 +65,7 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use itertools::Itertools;
 use object_store::ObjectStore;
 use parquet::arrow::RowNumber;
+use parquet::arrow::arrow_reader::{DictionaryFilterMode, DictionaryFilterOptions};
 #[cfg(feature = "parquet_encryption")]
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
@@ -315,6 +316,8 @@ pub struct ParquetSource {
     /// schema. Clones share it; entries are keyed by every input they
     /// depend on, so a clone with another predicate or schema adds its own.
     filter_cache: Arc<crate::opener::filter_cache::PreparedFilterCache>,
+    /// Execution policy bound from the worker's session at open time.
+    dictionary_filter: Option<DictionaryFilterOptions>,
 }
 
 impl ParquetSource {
@@ -343,6 +346,7 @@ impl ParquetSource {
             reverse_row_groups: false,
             sort_order_for_reorder: None,
             filter_cache: Default::default(),
+            dictionary_filter: None,
         }
     }
 
@@ -647,6 +651,7 @@ impl ParquetSource {
             parquet_file_reader_factory,
             schema_provider: self.schema_provider.clone(),
             pushdown_filters: self.pushdown_filters(),
+            dictionary_filter: self.dictionary_filter,
             reorder_filters: self.reorder_filters(),
             force_filter_selections: self.force_filter_selections(),
             enable_page_index: self.enable_page_index(),
@@ -738,6 +743,40 @@ impl FileSource for ParquetSource {
             .cloned()
             .collect::<Vec<_>>();
         (!exact.is_empty()).then(|| conjunction(exact))
+    }
+
+    fn with_task_context(
+        &self,
+        context: &datafusion_execution::TaskContext,
+    ) -> Option<Arc<dyn FileSource>> {
+        if !self.pushdown_filters() || self.predicate.is_none() {
+            return None;
+        }
+        let (_, extension) = context
+            .session_config()
+            .options()
+            .extensions
+            .iter()
+            .find(|(prefix, _)| *prefix == "longbow")?;
+        let entries = extension.entries();
+        let option = |key| {
+            entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .and_then(|entry| entry.value.as_deref())
+        };
+        let mode = match option("longbow.execution.dictionary_filter")? {
+            "off" => DictionaryFilterMode::Off,
+            "on" => DictionaryFilterMode::On,
+            "verify" => DictionaryFilterMode::Verify,
+            _ => return None,
+        };
+        let max_percent = option("longbow.execution.dictionary_filter_max_percent")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(25);
+        let mut source = self.clone();
+        source.dictionary_filter = Some(DictionaryFilterOptions { mode, max_percent });
+        Some(Arc::new(source))
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
@@ -1164,6 +1203,7 @@ impl FileSource for ParquetSource {
             sort_order_for_reorder,
             // Longbow family OO: execution state, rebuilt on demand.
             filter_cache: _,
+            dictionary_filter: _,
         } = self;
 
         if schema_provider.is_some() {
