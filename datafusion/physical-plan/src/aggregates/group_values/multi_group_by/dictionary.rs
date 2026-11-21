@@ -9,6 +9,7 @@ use arrow::array::{
 };
 use arrow::compute::take;
 use arrow::datatypes::{ArrowDictionaryKeyType, ArrowNativeType, DataType, Field};
+use arrow::downcast_dictionary_array;
 use arrow::error::ArrowError;
 use datafusion_common::hash_utils::{RandomState, create_hashes};
 use datafusion_common::{DataFusionError, Result, exec_err};
@@ -57,6 +58,19 @@ pub struct DictionaryGroupValuesColumn<K: ArrowDictionaryKeyType + Send + Sync> 
     /// retaining an input dictionary after its batch is released.
     cached_values: Option<Weak<dyn Array>>,
     _phantom: PhantomData<K>,
+}
+
+/// Inspect a referenced value without expanding the validity of its whole dictionary.
+fn value_is_logically_null(values: &dyn Array, row: usize) -> bool {
+    downcast_dictionary_array!(
+        values => values.key(row).is_none_or(|index| {
+            value_is_logically_null(values.values().as_ref(), index)
+        }),
+        DataType::Null => true,
+        DataType::RunEndEncoded(..) | DataType::Union(..) =>
+            values.slice(row, 1).logical_null_count() != 0,
+        _ => values.is_null(row),
+    )
 }
 
 impl<K: ArrowDictionaryKeyType + Send + Sync> DictionaryGroupValuesColumn<K> {
@@ -247,7 +261,7 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> DictionaryGroupValuesColumn<K> {
         val_idx: usize,
         lhs_slot: usize,
     ) -> bool {
-        let equal = if dict_values.is_null(val_idx) {
+        let equal = if value_is_logically_null(dict_values.as_ref(), val_idx) {
             inner.equal_to(lhs_slot, null_array, 0)
         } else {
             inner.equal_to(lhs_slot, dict_values, val_idx)
@@ -296,7 +310,9 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> DictionaryGroupValuesColumn<K> {
             let lhs_slot = group_to_inner[lhs_row];
             let equal = match dict.key(rhs_row) {
                 None => self.inner.equal_to(lhs_slot, &self.null_array, 0),
-                Some(val_idx) if dict_values.is_null(val_idx) => {
+                Some(val_idx)
+                    if value_is_logically_null(dict_values.as_ref(), val_idx) =>
+                {
                     self.inner.equal_to(lhs_slot, &self.null_array, 0)
                 }
                 Some(val_idx) => self.inner.equal_to(lhs_slot, dict_values, val_idx),
@@ -316,7 +332,7 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
         let dict = array.as_dictionary::<K>();
         match dict.key(rhs_row) {
             None => self.inner.equal_to(lhs_slot, &self.null_array, 0),
-            Some(val_idx) if dict.values().is_null(val_idx) => {
+            Some(val_idx) if value_is_logically_null(dict.values().as_ref(), val_idx) => {
                 self.inner.equal_to(lhs_slot, &self.null_array, 0)
             }
             Some(val_idx) => self.inner.equal_to(lhs_slot, dict.values(), val_idx),
@@ -327,7 +343,7 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
         let dict = array.as_dictionary::<K>();
         let inner_slot = match dict.key(row) {
             None => self.find_or_insert_null()?,
-            Some(val_idx) if dict.values().is_null(val_idx) => {
+            Some(val_idx) if value_is_logically_null(dict.values().as_ref(), val_idx) => {
                 self.find_or_insert_null()?
             }
             Some(val_idx) => {
@@ -451,15 +467,16 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
                 let val_idx = raw_keys[row].as_usize();
                 if self.val_to_inner[val_idx] == usize::MAX {
                     // A non-null key can still point to a null value in the values array.
-                    self.val_to_inner[val_idx] = if dict_values.is_null(val_idx) {
-                        self.find_or_insert_null()?
-                    } else {
-                        self.find_or_insert_value(
-                            dict_values,
-                            val_idx,
-                            self.val_hashes[val_idx],
-                        )?
-                    };
+                    self.val_to_inner[val_idx] =
+                        if value_is_logically_null(dict_values.as_ref(), val_idx) {
+                            self.find_or_insert_null()?
+                        } else {
+                            self.find_or_insert_value(
+                                dict_values,
+                                val_idx,
+                                self.val_hashes[val_idx],
+                            )?
+                        };
                 }
                 self.group_to_inner.push(self.val_to_inner[val_idx]);
             }
@@ -471,15 +488,16 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
                 } else {
                     let val_idx = raw_keys[row].as_usize();
                     if self.val_to_inner[val_idx] == usize::MAX {
-                        self.val_to_inner[val_idx] = if dict_values.is_null(val_idx) {
-                            self.find_or_insert_null()?
-                        } else {
-                            self.find_or_insert_value(
-                                dict_values,
-                                val_idx,
-                                self.val_hashes[val_idx],
-                            )?
-                        };
+                        self.val_to_inner[val_idx] =
+                            if value_is_logically_null(dict_values.as_ref(), val_idx) {
+                                self.find_or_insert_null()?
+                            } else {
+                                self.find_or_insert_value(
+                                    dict_values,
+                                    val_idx,
+                                    self.val_hashes[val_idx],
+                                )?
+                            };
                     }
                     self.val_to_inner[val_idx]
                 };
@@ -865,6 +883,39 @@ mod tests {
         let mut buf = all_true(1);
         col.vectorized_equal_to(&[0], &batch2, &[0], &mut buf);
         assert_eq!(bool_vec(&buf), vec![true]);
+    }
+
+    #[test]
+    fn nested_dictionary_nulls_share_one_value_slot() -> Result<()> {
+        let values = i8_dict(&[Some(0), Some(1)], &[None, Some("a")]);
+        let field = Field::new("values", values.data_type().clone(), true);
+        let input: ArrayRef = Arc::new(DictionaryArray::<Int8Type>::try_new(
+            arrow::array::Int8Array::from(vec![None, Some(0), Some(1)]),
+            values,
+        )?);
+        let mut scalar = DictionaryGroupValuesColumn::<Int8Type>::new(
+            Box::new(int8_col()),
+            &field,
+            true,
+        );
+        scalar.append_val(&input, 0)?;
+        scalar.append_val(&input, 1)?;
+        scalar.append_val(&input, 2)?;
+        assert_eq!(scalar.group_to_inner, [0, 0, 1]);
+        assert!(scalar.equal_to(0, &input, 1));
+        assert!(!scalar.equal_to(2, &input, 1));
+
+        let mut vectorized = DictionaryGroupValuesColumn::<Int8Type>::new(
+            Box::new(int8_col()),
+            &field,
+            true,
+        );
+        vectorized.vectorized_append(&input, &[0, 1, 2])?;
+        assert_eq!(vectorized.group_to_inner, [0, 0, 1]);
+        let mut equal = all_true(2);
+        vectorized.vectorized_equal_to(&[0, 2], &input, &[1, 1], &mut equal);
+        assert_eq!(bool_vec(&equal), [true, false]);
+        Ok(())
     }
 
     #[test]
