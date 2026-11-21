@@ -150,32 +150,15 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
         };
 
         match all_null_or_non_null {
-            Nulls::Some => {
-                for &row in rows {
-                    self.append_val_inner(array, row);
-                }
-            }
+            Nulls::Some => self.append_selected_views::<true>(arr, rows)?,
 
             Nulls::None => {
                 self.nulls.append_n_non_nulls(rows.len());
                 if arr.data_buffers().is_empty() {
-                    // Fast path: all strings are inline (≤12 bytes).
-                    // The input array's u128 views are already in the correct format;
-                    // copy them directly instead of going through value() → make_view().
+                    // Inline views already have the right byte layout.
                     self.views.extend(rows.iter().map(|&row| arr.views()[row]));
                 } else {
-                    // Slow path: some strings may be non-inline (>12 bytes).
-                    // Pre-reserve and delegate to do_append_val_inner which
-                    // reads raw views directly and reuses source prefixes.
-                    self.views.try_reserve(rows.len()).map_err(|e| {
-                        datafusion_common::exec_datafusion_err!(
-                            "failed to reserve {0} views: {e}",
-                            rows.len()
-                        )
-                    })?;
-                    for &row in rows {
-                        self.do_append_val_inner(arr, row);
-                    }
+                    self.append_selected_views::<false>(arr, rows)?;
                 }
             }
 
@@ -188,51 +171,104 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
         Ok(())
     }
 
-    fn do_append_val_inner(&mut self, array: &GenericByteViewArray<B>, row: usize)
-    where
-        B: ByteViewType,
-    {
-        // SAFETY: the caller ensures `row` is valid
-        let view = unsafe { *array.views().get_unchecked(row) };
-        let len = view as u32;
-
-        if len <= 12 {
-            // Inline value: the view is already self-contained, push as-is.
-            self.views.push(view);
-        } else {
-            // Non-inline value: copy the buffer data and construct a new view
-            // that points into our own buffers, reusing the source prefix.
-            let src = ByteView::from(view);
-            self.ensure_in_progress_big_enough(len as usize);
-            let new_buffer_index = self.completed.len() as u32;
-            let new_offset = self.in_progress.len() as u32;
-            let src_buf = &array.data_buffers()[src.buffer_index as usize];
-            self.in_progress.extend_from_slice(
-                &src_buf[src.offset as usize..(src.offset + src.length) as usize],
-            );
-            let new_view = ByteView {
-                length: src.length,
-                prefix: src.prefix,
-                buffer_index: new_buffer_index,
-                offset: new_offset,
+    fn append_selected_views<const CHECK_NULLS: bool>(
+        &mut self,
+        array: &GenericByteViewArray<B>,
+        rows: &[usize],
+    ) -> Result<()> {
+        self.views.try_reserve(rows.len()).map_err(|e| {
+            datafusion_common::exec_datafusion_err!(
+                "failed to reserve {0} views: {e}",
+                rows.len()
+            )
+        })?;
+        let Self {
+            views,
+            in_progress,
+            completed,
+            max_block_size,
+            nulls,
+            ..
+        } = self;
+        let input_views = array.views();
+        views.extend(rows.iter().map(|&row| {
+            if CHECK_NULLS {
+                let valid = array.is_valid(row);
+                nulls.append(valid);
+                if !valid {
+                    return 0;
+                }
             }
-            .as_u128();
-            self.views.push(new_view);
-        }
+            Self::copy_view(
+                array,
+                input_views[row],
+                in_progress,
+                completed,
+                *max_block_size,
+            )
+        }));
+        Ok(())
     }
 
-    fn ensure_in_progress_big_enough(&mut self, value_len: usize) {
-        debug_assert!(value_len > 12);
-        let require_cap = self.in_progress.len() + value_len;
+    fn do_append_val_inner(&mut self, array: &GenericByteViewArray<B>, row: usize) {
+        // SAFETY: the caller ensures `row` is valid
+        let view = unsafe { *array.views().get_unchecked(row) };
+        let stored = Self::copy_view(
+            array,
+            view,
+            &mut self.in_progress,
+            &mut self.completed,
+            self.max_block_size,
+        );
+        self.views.push(stored);
+    }
 
-        // If current block isn't big enough, flush it and create a new in progress block
-        if require_cap > self.max_block_size {
-            let flushed_block = replace(
-                &mut self.in_progress,
-                Vec::with_capacity(self.max_block_size),
-            );
-            let buffer = Buffer::from_vec(flushed_block);
-            self.completed.push(buffer);
+    fn copy_view(
+        array: &GenericByteViewArray<B>,
+        view: u128,
+        in_progress: &mut Vec<u8>,
+        completed: &mut Vec<Buffer>,
+        max_block_size: usize,
+    ) -> u128 {
+        let len = view as u32;
+        if len <= 12 {
+            return view;
+        }
+
+        // The view must point to the group's owned payload, even if the input
+        // array is dropped before emit or spill.
+        Self::ensure_in_progress_big_enough(
+            len as usize,
+            in_progress,
+            completed,
+            max_block_size,
+        );
+        let src = ByteView::from(view);
+        let new_buffer_index = completed.len() as u32;
+        let new_offset = in_progress.len() as u32;
+        let src_buf = &array.data_buffers()[src.buffer_index as usize];
+        in_progress.extend_from_slice(
+            &src_buf[src.offset as usize..(src.offset + src.length) as usize],
+        );
+        ByteView {
+            length: src.length,
+            prefix: src.prefix,
+            buffer_index: new_buffer_index,
+            offset: new_offset,
+        }
+        .as_u128()
+    }
+
+    fn ensure_in_progress_big_enough(
+        value_len: usize,
+        in_progress: &mut Vec<u8>,
+        completed: &mut Vec<Buffer>,
+        max_block_size: usize,
+    ) {
+        debug_assert!(value_len > 12);
+        if in_progress.len() + value_len > max_block_size {
+            let flushed_block = replace(in_progress, Vec::with_capacity(max_block_size));
+            completed.push(Buffer::from_vec(flushed_block));
         }
     }
 
@@ -350,7 +386,12 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
             let view = if value.len() <= 12 {
                 make_view(value, 0, 0)
             } else {
-                selected.ensure_in_progress_big_enough(value.len());
+                Self::ensure_in_progress_big_enough(
+                    value.len(),
+                    &mut selected.in_progress,
+                    &mut selected.completed,
+                    selected.max_block_size,
+                );
                 let buffer_index = selected.completed.len() as u32;
                 let offset = selected.in_progress.len() as u32;
                 selected.in_progress.extend_from_slice(value);

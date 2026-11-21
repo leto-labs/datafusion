@@ -206,24 +206,25 @@ where
             Nulls::Some
         };
 
+        let values = arr.values();
         match (NULLABLE, all_null_or_non_null) {
             (true, Nulls::Some) => {
-                for &row in rows {
-                    if array.is_null(row) {
-                        self.nulls.append_null();
-                        self.group_values.push(T::default_value());
+                let nulls = &mut self.nulls;
+                self.group_values.extend(rows.iter().map(|&row| {
+                    let valid = arr.is_valid(row);
+                    nulls.append(valid);
+                    if valid {
+                        values[row].normalize_key()
                     } else {
-                        self.nulls.append_non_null();
-                        self.group_values.push(arr.value(row).normalize_key());
+                        T::default_value()
                     }
-                }
+                }));
             }
 
             (true, Nulls::None) => {
                 self.nulls.append_n_non_nulls(rows.len());
-                for &row in rows {
-                    self.group_values.push(arr.value(row).normalize_key());
-                }
+                self.group_values
+                    .extend(rows.iter().map(|&row| values[row].normalize_key()));
             }
 
             (true, Nulls::All) => {
@@ -233,9 +234,8 @@ where
             }
 
             (false, _) => {
-                for &row in rows {
-                    self.group_values.push(arr.value(row).normalize_key());
-                }
+                self.group_values
+                    .extend(rows.iter().map(|&row| values[row].normalize_key()));
             }
         }
 

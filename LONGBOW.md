@@ -1291,3 +1291,23 @@ policy before execution. With no policy, scan open skips session extension
 lookups, a source clone, eligibility checks and dictionary metrics. The pull
 decoder and prepared scan reuse the same opener. The plan codec continues to
 carry the exact filter.
+
+## Family WBI: batch mixed-column group appends
+
+Purpose: append selected primitive values and byte views directly into
+their flat column vectors and compute the first new group ID once per batch.
+Dependent feature: CORE-AGGREGATION. Audit classification: UPSTREAMABLE.
+
+The non-streaming interner assigns first-seen IDs to new hashes in input
+order. Distinct keys with the same full hash follow the existing equality
+check and subsequent scalar collision pass. That pass preserves its own
+encounter order and can assign an ID after later rows with new hashes.
+The patch preserves those exact IDs. The streaming path retains scalar
+first-seen assignment. Validity bits, primitive normalization, and ownership
+of copied byte payloads follow the existing group-column representation.
+
+Prefix emission removes the first groups and rebases the remaining IDs
+and collision lists. Spill uses the same materialized columns and replay
+interner. The regression tests force a full-hash collision across nullable
+mixed columns, check IDs before and after prefix emission, and verify
+bounded spill replay and reservation release.
