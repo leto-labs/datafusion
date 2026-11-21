@@ -21,6 +21,8 @@ use std::sync::{Arc, Weak};
 
 use crate::aggregates::AGGREGATION_HASH_SEED;
 
+pub(super) mod logical_nulls;
+
 /// [`GroupColumn`] for dictionary-encoded columns with key type `K`.
 ///
 /// `inner` holds one slot per distinct value seen across all batches.
@@ -865,6 +867,45 @@ mod tests {
         let mut buf = all_true(1);
         col.vectorized_equal_to(&[0], &batch2, &[0], &mut buf);
         assert_eq!(bool_vec(&buf), vec![true]);
+    }
+
+    #[test]
+    fn nested_dictionary_nulls_share_one_value_slot() -> Result<()> {
+        let values = i8_dict(&[Some(0), Some(1)], &[None, Some("a")]);
+        let field = Field::new("values", values.data_type().clone(), true);
+        let input: ArrayRef = Arc::new(DictionaryArray::<Int8Type>::try_new(
+            arrow::array::Int8Array::from(vec![None, Some(0), Some(1)]),
+            values,
+        )?);
+        for vectorized in [false, true] {
+            let column = Box::new(DictionaryGroupValuesColumn::<Int8Type>::new(
+                Box::new(int8_col()),
+                &field,
+                true,
+            ));
+            let mut column = logical_nulls::wrap(column, field.data_type());
+            if vectorized {
+                column.vectorized_append(&input, &[0, 1, 2])?;
+                let mut equal = all_true(2);
+                column.vectorized_equal_to(&[0, 2], &input, &[1, 1], &mut equal);
+                assert_eq!(bool_vec(&equal), [true, false]);
+            } else {
+                for row in 0..3 {
+                    column.append_val(&input, row)?;
+                }
+                assert!(column.equal_to(0, &input, 1));
+                assert!(!column.equal_to(2, &input, 1));
+            }
+
+            let output = column.build();
+            let output = output.as_dictionary::<Int8Type>();
+            assert_eq!(
+                output.keys().iter().collect::<Vec<_>>(),
+                [None, None, Some(0)]
+            );
+            assert_eq!(output.values().len(), 1);
+        }
+        Ok(())
     }
 
     #[test]

@@ -1300,3 +1300,10 @@ and preserving reads honor this constraint in both the dictionary group column
 and the row-format fallback. The NULL value consumes one key slot in this
 representation. Dependent feature: CORE-AGGREGATION.
 Audit classification: UPSTREAMABLE.
+
+Both group storage paths treat a null key and a valid key into a logically
+NULL dictionary value as one group. Dictionary hash scatter uses the plain
+value type's NULL contribution, including the Arrow Null sentinel, with both
+hash builders. This keeps raw dictionary and plain keys together through
+repartitioning. Flat dictionary values use the existing physical validity
+checks. Encoded values get logical validity only when they can contain NULLs.

@@ -1015,11 +1015,12 @@ fn make_group_column(field: &Field) -> Result<Box<dyn GroupColumn>> {
             let new_field = Field::new("", *value_dt.clone(), true);
             let inner = make_group_column(&new_field)?;
             macro_rules! dict_col {
-                ($T:ty) => {
-                    Box::new(dictionary::DictionaryGroupValuesColumn::<$T>::new(
+                ($T:ty) => {{
+                    let column = Box::new(dictionary::DictionaryGroupValuesColumn::<$T>::new(
                         inner, &new_field, nullable,
-                    ))
-                };
+                    ));
+                    dictionary::logical_nulls::wrap(column, value_dt)
+                }};
             }
             let col: Box<dyn GroupColumn> = match key_dt.as_ref() {
                 DataType::Int8 => dict_col!(Int8Type),
