@@ -1323,3 +1323,11 @@ Audit classification: UPSTREAMABLE.
 Regressions cover exact group IDs with two forced collisions and aggregate
 counts for naturally colliding nullable keys after memory-pressure output
 from a partial aggregate.
+
+## Family DKN: preserve logical NULL in non-nullable dictionary grouping keys
+
+Purpose: emit a valid index referencing a NULL dictionary value when the
+declared grouping field disallows null indices. Full emission, prefix emission,
+and preserving reads all honor this field constraint. The NULL value consumes
+one key slot in this representation. Dependent feature: CORE-AGGREGATION.
+Audit classification: UPSTREAMABLE.

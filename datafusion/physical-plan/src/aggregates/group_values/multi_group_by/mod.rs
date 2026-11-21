@@ -1017,7 +1017,7 @@ fn make_group_column(field: &Field) -> Result<Box<dyn GroupColumn>> {
             macro_rules! dict_col {
                 ($T:ty) => {
                     Box::new(dictionary::DictionaryGroupValuesColumn::<$T>::new(
-                        inner, &new_field,
+                        inner, &new_field, nullable,
                     ))
                 };
             }
