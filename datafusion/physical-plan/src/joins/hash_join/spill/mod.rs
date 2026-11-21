@@ -70,6 +70,7 @@ use futures::{StreamExt, ready};
 pub(crate) use chunks::ChunkBuild;
 use chunks::ChunkRun;
 pub(crate) use files::SpillFilesExec;
+pub(super) use files::reserve_replay;
 use files::{
     ChunkSignal, Cursor, FileSource, Origin, PartitionFileWriter, PollShortWrite,
     SPILL_WRITER_SLOTS, Stage, short_write_permit,
@@ -617,11 +618,15 @@ impl JoinSpill {
 }
 
 /// A finished spill file, its row count and its size.
+/// A replay keeps one admitted IPC batch (a wide singleton can pass alone).
+const REPLAY_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Clone)]
 pub(crate) struct SpilledFile {
     file: Arc<dyn SpillFile>,
     rows: usize,
     bytes: usize,
+    replay_bytes: usize,
 }
 
 /// Spill manager of one side, scoped to the attempt.
@@ -661,6 +666,7 @@ struct PartWriter {
     /// Bytes of the batches written, counted by this writer (the shared
     /// spill metric also counts concurrent writers).
     bytes: usize,
+    replay_bytes: usize,
     /// A file that a build chunk or a reversed join may build on: no
     /// written batch may need more than its unit when a chunk admits it.
     unit: Option<WriteUnit>,
@@ -759,12 +765,13 @@ struct WriteBatches<'a> {
 
 impl WriteBatches<'_> {
     fn fits(&self, batch: &RecordBatch) -> Result<bool> {
-        Ok(match self.unit {
-            Some(unit) => {
-                WriteUnit::need(Some(unit), batch, self.compressed)? <= unit.bytes
-            }
-            None => true,
-        })
+        if let Some(unit) = self.unit
+            && WriteUnit::need(Some(unit), batch, self.compressed)? > unit.bytes
+        {
+            return Ok(false);
+        }
+        Ok(batch.num_rows() <= 1
+            || footprint::replay_need(batch, self.compressed)? <= REPLAY_BATCH_BYTES)
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
@@ -797,26 +804,27 @@ impl WriteBatches<'_> {
                 return Ok(None);
             }
             let mut end = self.start;
-            let (mut rows, mut bytes) = (0, 0);
+            let (mut rows, mut bytes) = (0, 0usize);
+            let cap = self.unit.map_or(REPLAY_BATCH_BYTES, |unit| {
+                unit.bytes.min(REPLAY_BATCH_BYTES)
+            });
             while end < self.batches.len() && rows < WRITE_BATCH_ROWS {
                 let piece = &self.batches[end];
-                if let Some(unit) = self.unit {
-                    let piece_bytes = piece.get_sliced_size()?;
-                    if end > self.start
-                        && (rows + piece.num_rows() > WRITE_BATCH_ROWS
-                            || 2 * (bytes + piece_bytes) > unit.bytes)
-                    {
-                        break;
-                    }
-                    bytes += piece_bytes;
+                let piece_bytes = piece.get_sliced_size()?;
+                if end > self.start
+                    && (rows + piece.num_rows() > WRITE_BATCH_ROWS
+                        || bytes.saturating_add(piece_bytes).saturating_mul(2) > cap)
+                {
+                    break;
                 }
+                bytes += piece_bytes;
                 rows += piece.num_rows();
                 end += 1;
             }
             let group = &self.batches[self.start..end];
             self.start = end;
             if let [piece] = group {
-                if self.unit.is_none() {
+                if self.unit.is_none() && self.fits(piece)? {
                     return Ok(Some(piece.clone()));
                 }
                 self.stack.push((piece.clone(), false));
@@ -847,6 +855,7 @@ impl PartWriter {
             buffered_bytes: 0,
             rows: 0,
             bytes: 0,
+            replay_bytes: 0,
             unit,
         })
     }
@@ -872,13 +881,23 @@ impl PartWriter {
             stack: vec![],
         };
         let mut bytes = 0;
+        let mut replay_bytes = self.replay_bytes;
         let written = self.file.write(std::iter::from_fn(|| {
-            let next = source.next_batch().transpose()?;
-            if let Ok(batch) = &next {
-                bytes += get_record_batch_memory_size(batch);
-            }
-            Some(next)
+            source
+                .next_batch()
+                .and_then(|batch| {
+                    batch
+                        .map(|batch| {
+                            bytes += get_record_batch_memory_size(&batch);
+                            replay_bytes = replay_bytes
+                                .max(footprint::replay_need(&batch, source.compressed)?);
+                            Ok(batch)
+                        })
+                        .transpose()
+                })
+                .transpose()
         }))?;
+        self.replay_bytes = replay_bytes;
         self.rows += written;
         self.bytes += bytes;
         rows_metric.add(written);
@@ -932,6 +951,7 @@ impl PartWriter {
             bytes: file.size().map_or(bytes, |size| size as usize),
             file,
             rows: self.rows,
+            replay_bytes: self.replay_bytes,
         }))
     }
 }

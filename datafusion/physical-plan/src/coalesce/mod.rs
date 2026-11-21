@@ -200,6 +200,28 @@ impl LimitedBatchCoalescer {
         self.inner.is_empty()
     }
 
+    /// Push a batch directly after flushing previous rows, still applying fetch.
+    pub(crate) fn push_uncoalesced(
+        &mut self,
+        batch: RecordBatch,
+    ) -> Result<PushBatchStatus> {
+        self.flush()?;
+        let limit = self.inner.biggest_coalesce_batch_size();
+        self.inner.set_biggest_coalesce_batch_size(Some(0));
+        let result = self.push_batch(batch);
+        self.inner.set_biggest_coalesce_batch_size(limit);
+        result
+    }
+
+    /// Complete the current buffered batch without closing the coalescer.
+    pub(crate) fn flush(&mut self) -> Result<()> {
+        Ok(self.inner.finish_buffered_batch()?)
+    }
+
+    pub(crate) fn has_buffered_rows(&self) -> bool {
+        self.inner.get_buffered_rows() != 0
+    }
+
     /// Complete the current buffered batch and finish the coalescer
     ///
     /// Any subsequent calls to `push_batch()` will return an Err

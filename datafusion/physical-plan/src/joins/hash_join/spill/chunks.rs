@@ -407,7 +407,8 @@ impl Chunks {
             },
             self.run.build.metrics.clone(),
         );
-        leaf.execute(0, Arc::clone(&self.run.context))
+        let (stream, _) = leaf.execute_replay(0, &self.run.context)?;
+        Ok(stream)
     }
 
     /// Rows `start..` of the probe replay after the last chunk.

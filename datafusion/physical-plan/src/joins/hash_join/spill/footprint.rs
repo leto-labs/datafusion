@@ -169,6 +169,15 @@ pub(crate) fn decoded_bound(batch: &RecordBatch, compressed: bool) -> Result<usi
     Ok(if compressed { 2 * bytes } else { bytes })
 }
 
+/// Resident decode and numbering/filtering space while replaying one IPC
+/// batch. The doubled bound also allows the decoder to retain the previous
+/// batch's dictionaries while it reads replacements.
+pub(super) fn replay_need(batch: &RecordBatch, compressed: bool) -> Result<usize> {
+    Ok(decoded_bound(batch, compressed)?
+        .saturating_mul(2)
+        .saturating_add(batch.num_rows().saturating_mul(32)))
+}
+
 /// An upper bound of the dictionary values of `batch`, nested ones
 /// included, which the IPC reader keeps after the batch is dropped.
 pub(crate) fn dictionary_bound(batch: &RecordBatch) -> Result<usize> {

@@ -21,6 +21,13 @@ fn spill_batches(manager: &SpillManager, batches: &[RecordBatch]) -> Result<Spil
     Ok(SpilledFile {
         bytes: file.size().unwrap() as usize,
         rows: batches.iter().map(RecordBatch::num_rows).sum(),
+        replay_bytes: batches
+            .iter()
+            .map(|batch| footprint::replay_need(batch, false))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(0),
         file,
     })
 }

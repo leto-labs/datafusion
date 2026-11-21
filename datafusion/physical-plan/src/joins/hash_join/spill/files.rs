@@ -27,7 +27,7 @@ use datafusion_common::{
 };
 use datafusion_common::{assert_or_internal_err, internal_err};
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::spill_file::SpillFile;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
 use futures::StreamExt;
@@ -802,6 +802,73 @@ impl SpillFilesExec {
         self
     }
 
+    /// Open a fixed or staged file source as a probe. The reader owns its
+    /// permit until the consumer asks for the next file or drops the stream.
+    /// Keep only one decoder open, including its dictionaries, at a time.
+    pub(in crate::joins::hash_join) fn execute_replay(
+        &self,
+        partition: usize,
+        context: &TaskContext,
+    ) -> Result<(Rows, MemoryReservation)> {
+        assert_or_internal_err!(
+            partition < self.source.partitions(),
+            "SpillFilesExec invalid replay partition {partition} of {}",
+            self.source.partitions()
+        );
+        let mut files = self.source.take(partition)?.into_iter();
+        let manager = self.spill_manager.clone();
+        let grant = MemoryConsumer::new(format!("HashJoinProbeReplay[{partition}]"))
+            .with_can_spill(true)
+            .register(context.memory_pool());
+        let scratch = grant.new_empty();
+        let mut reader: Option<FileRows> = None;
+        let mut start = 0;
+        let row_ids = self.row_ids.clone();
+        let schema = self.schema();
+        let numbered = Arc::clone(&schema);
+        let rows = futures::stream::poll_fn(move |cx| {
+            loop {
+                if let Some(current) = &mut reader
+                    && let Some(next) = std::task::ready!(current.poll_next(cx))
+                {
+                    let next = next.and_then(|batch| {
+                        let Some(ids) = &row_ids else {
+                            return Ok(batch);
+                        };
+                        let first = start;
+                        start += batch.num_rows();
+                        number_rows(&batch, first, &numbered, ids.skip_matched.as_deref())
+                    });
+                    if next.is_err() {
+                        reader = None;
+                        grant.free();
+                    }
+                    return Poll::Ready(Some(next));
+                }
+
+                reader = None;
+                let Some(file) = files.next() else {
+                    grant.free();
+                    return Poll::Ready(None);
+                };
+                // Like the first build read of a chunk, one replay batch
+                // must progress even when the build table fills the pool.
+                reserve_replay(&grant, file.replay_bytes);
+                match file.reader(&manager) {
+                    Ok(next) => reader = Some(next),
+                    Err(error) => {
+                        grant.free();
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                }
+            }
+        });
+        Ok((
+            Box::pin(RecordBatchStreamAdapter::new(schema, rows)),
+            scratch,
+        ))
+    }
+
     pub(super) fn signal(&self) -> Option<&Arc<ChunkSignal>> {
         self.signal.as_ref()
     }
@@ -824,6 +891,17 @@ impl SpillFilesExec {
 
     pub(super) fn metrics(&self) -> &JoinSpillMetrics {
         &self.metrics
+    }
+}
+
+/// Replay has no way to shrink a live build table. Use one already
+/// size-limited grant to guarantee progress on a full pool.
+pub(in crate::joins::hash_join) fn reserve_replay(
+    grant: &MemoryReservation,
+    bytes: usize,
+) {
+    if grant.try_resize(bytes).is_err() {
+        grant.resize(bytes);
     }
 }
 
@@ -922,17 +1000,6 @@ impl ExecutionPlan for SpillFilesExec {
             .map(|file| file.read(&self.spill_manager))
             .collect::<Result<Vec<_>>>()?;
         let rows = futures::stream::iter(streams).flatten();
-        let Some(row_ids) = self.row_ids.clone() else {
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rows)));
-        };
-        let numbered = Arc::clone(&schema);
-        let mut start = 0;
-        let rows = rows.map(move |batch| {
-            let batch = batch?;
-            let first = start;
-            start += batch.num_rows();
-            number_rows(&batch, first, &numbered, row_ids.skip_matched.as_deref())
-        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rows)))
     }
 }

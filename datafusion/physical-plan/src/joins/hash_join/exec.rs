@@ -213,6 +213,8 @@ struct JoinBuildData {
     map: Arc<Map>,
     /// The input rows for the build side.
     batch: RecordBatch,
+    /// Shared across probe partitions, computed only for gathered columns.
+    gather_widths: OnceLock<Box<[OnceLock<usize>]>>,
     /// Evaluated build-side key expressions, with float `-0.0` rewritten to
     /// `+0.0` so probe batches can compare against them without scanning the
     /// build side again. The dynamic filters (`bounds`, `membership`) and
@@ -265,6 +267,16 @@ impl JoinLeftData {
     /// returns a reference to the build side batch
     pub(super) fn batch(&self) -> &RecordBatch {
         &self.build.batch
+    }
+
+    pub(super) fn gather_width(&self, index: usize) -> usize {
+        let widths = self.build.gather_widths.get_or_init(|| {
+            (0..self.batch().num_columns())
+                .map(|_| OnceLock::new())
+                .collect()
+        });
+        *widths[index]
+            .get_or_init(|| super::output::row_width(self.batch().column(index).as_ref()))
     }
 
     /// Returns `true` if the build side physically contains rows.
@@ -1940,7 +1952,13 @@ impl ExecutionPlan for HashJoinExec {
 
         // we have the batches and the hash map with their keys. We can how create a stream
         // over the right that uses this information to issue new batches.
-        let right_stream = self.right.execute(partition, context)?;
+        let (right_stream, replay_scratch) =
+            if let Some(replay) = self.right.downcast_ref::<spill::SpillFilesExec>() {
+                let (stream, scratch) = replay.execute_replay(partition, &context)?;
+                (stream, Some(scratch))
+            } else {
+                (self.right.execute(partition, context)?, None)
+            };
 
         // update column indices to reflect the projection
         let column_indices_after_projection = match self.projection.as_ref() {
@@ -1981,6 +1999,7 @@ impl ExecutionPlan for HashJoinExec {
             self.mode,
             self.fetch,
             spill_stream,
+            replay_scratch,
         )))
     }
 
@@ -4392,6 +4411,7 @@ fn build_in_memory_once(
         build: Arc::new(JoinBuildData {
             map,
             batch,
+            gather_widths: OnceLock::new(),
             values: normalized_values,
             bounds,
             membership,

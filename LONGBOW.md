@@ -891,11 +891,11 @@ UPSTREAMABLE (related upstream: the hybrid-join epic apache/datafusion#24768;
 #26182, in this base, keeps build rows when a build fails; #27399, #27401 and
 #26442 rewrite the files it hooks).
 
-Off by default: `datafusion.execution.enable_hash_join_spilling = false`.
-With it off no code path changes, except that
-`set_dynamic_filter_partitions` also records the range for a join without a
-dynamic filter (the last binding wins; it never fails), and
-`set_open_probe_streams` records only a flag. With it on, a join
+Hybrid spill is off by default
+(`datafusion.execution.enable_hash_join_spilling = false`).
+`set_dynamic_filter_partitions` records the range for a join without a
+dynamic filter (the last binding wins); `set_open_probe_streams` records
+a flag. With spilling enabled, a join
 that fits runs the
 code it runs today: nothing is partitioned, copied or reserved before the
 first refusal, and no spill metric is registered.
@@ -1096,12 +1096,25 @@ Section 3 (lane `leto-mjj.98`):
   receive the same check when they can become build input through reversal.
   Build rows given back to the cursor stay charged. The table's charge
   transfers from the run's grant.
-- Probe replay and output batch bytes are outside the build budget.
-  Replay can allocate for decoding, key evaluation, row numbering and
-  filtering while the chunk table is live. The output batch size is set
-  in rows, so wide or repeated values can produce large batches. IPC I/O
-  buffers, writer compaction and encoding, and small build objects are
-  also outside the build budget.
+- Probe replay and output batching use separate limits from the build
+  budget (lane `leto-rs3`). The writer splits IPC batches above an
+  estimated 8 MiB replay permit. A reader holds the file's largest permit
+  before decoding and keeps it until the next file or stream drop. It
+  charges decoded arrays, dictionaries, row numbering and filtering.
+  Retained key results, hashes and inline keys are charged under the
+  same consumer. Like the first build-chunk read, one probe read can
+  progress when the pool is full. A wide singleton has a correspondingly
+  larger permit.
+- Hash-join output and residual-filter gathers obey a row limit and a
+  separate 8 MiB estimate, including when spilling is disabled. Widths
+  come from the columns that each gather selects. A gather keeps its
+  remaining indices and materializes the next slice once the stream can
+  advance. The output coalescer flushes before its estimated bytes would
+  exceed the target. A row wider than the target is gathered alone.
+- IPC I/O buffers, writer compaction and encoding, arbitrary expression
+  scratch, and output retained by downstream operators are outside these
+  estimates. Shared Arrow backing allocations can also exceed the
+  logical size of an output batch.
 - Metrics `spill_reliefs`, `spill_reversed_runs`, `spill_chunked_runs`,
   `spill_replay_passes`.
 
