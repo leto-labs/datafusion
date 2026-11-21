@@ -17,6 +17,7 @@ use futures::stream::{Stream, StreamExt};
 
 use super::AggregateExec;
 use super::GroupClusteringMode;
+use super::aggregate_hash_table::EvaluatedAggregateBatch;
 use super::aggregate_hash_table::{AggregateHashTable, PartialReduceMarker};
 use super::group_values::packed::migration_needs_memory;
 use crate::SendableRecordBatchStream;
@@ -112,7 +113,7 @@ impl PartialReduceHashAggregateStream {
         let early_emit_count =
             MetricBuilder::new(&agg.metrics).counter("early_emit_count", partition);
 
-        let mut hash_table = AggregateHashTable::<PartialReduceMarker>::new(
+        let hash_table = AggregateHashTable::<PartialReduceMarker>::new(
             agg,
             partition,
             Arc::clone(&schema),
@@ -128,7 +129,6 @@ impl PartialReduceHashAggregateStream {
                 .register(context.memory_pool());
 
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
-        hash_table.set_migration_reservation(&reservation);
         reservation.try_grow(hash_table.memory_size())?;
 
         Ok(Self {
@@ -163,21 +163,28 @@ impl PartialReduceHashAggregateStream {
             let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
 
             while let Some(batch) = self.input.next().await.transpose()? {
-                let mut batch = Some(batch);
+                let timer = elapsed_compute.timer();
+                let mut evaluated = Some(hash_table.evaluate_batch(&batch)?);
+                drop(batch);
+                timer.done();
+
                 loop {
                     let timer = elapsed_compute.timer();
                     let (state, retry) = match self
-                        .handle_input_batch(batch.as_ref().unwrap(), &mut hash_table)
+                        .handle_input_batch(evaluated.as_ref().unwrap(), &mut hash_table)
                     {
                         Ok(state) => (state, false),
-                        Err(error) if migration_needs_memory(&error) => {
+                        Err(error)
+                            if migration_needs_memory(&error)
+                                && hash_table.building_group_count() > 0 =>
+                        {
                             (HandleInputResult::OOM, true)
                         }
                         Err(error) => return Err(error),
                     };
                     if !retry {
                         // The batch was consumed. Drop it before emitting.
-                        batch.take();
+                        evaluated.take();
                     }
                     match state {
                         HandleInputResult::ProcessNext => {}
@@ -220,11 +227,11 @@ impl PartialReduceHashAggregateStream {
     /// Aggregate partial state batch into the hash table
     fn handle_input_batch(
         &mut self,
-        batch: &RecordBatch,
+        batch: &EvaluatedAggregateBatch,
         hash_table: &mut AggregateHashTable<PartialReduceMarker>,
     ) -> Result<HandleInputResult> {
         debug_assert!(hash_table.is_building());
-        hash_table.aggregate_batch(batch)?;
+        hash_table.aggregate_batch(batch, &self.reservation)?;
 
         let resize_result = self.reservation.try_resize(hash_table.memory_size());
         match resize_result {

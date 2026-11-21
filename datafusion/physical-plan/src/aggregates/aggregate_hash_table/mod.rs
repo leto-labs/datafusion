@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -11,6 +13,8 @@ mod final_table;
 mod partial_reduce_table;
 mod partial_table;
 mod single_table;
+
+pub(super) use common::EvaluatedAggregateBatch;
 
 use std::sync::Arc;
 

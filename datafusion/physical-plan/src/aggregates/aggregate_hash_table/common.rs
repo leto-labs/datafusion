@@ -192,18 +192,8 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         })
     }
 
-    pub(in crate::aggregates) fn set_migration_reservation(
-        &mut self,
-        reservation: &MemoryReservation,
-    ) {
-        self.state
-            .building_mut()
-            .group_values
-            .set_migration_reservation(reservation);
-    }
-
     /// See comments in [`EvaluatedAggregateBatch`]
-    pub(super) fn evaluate_batch(
+    pub(in crate::aggregates) fn evaluate_batch(
         &mut self,
         batch: &RecordBatch,
     ) -> Result<EvaluatedAggregateBatch> {
@@ -240,20 +230,22 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
     /// into stored partial states, so [`GroupsAccumulator::update_batch`] is used.
     pub(super) fn aggregate_batch_inner(
         &mut self,
-        batch: &RecordBatch,
+        evaluated_batch: &EvaluatedAggregateBatch,
+        reservation: &MemoryReservation,
         aggregate_fn: AggregateBatchFn,
         accumulator_phase: AccumulatorPhase,
     ) -> Result<()> {
-        let evaluated_batch = self.evaluate_batch(batch)?;
         let accumulator_metrics = Arc::clone(&self.aggregate_accumulator_metrics);
         let group_by_metrics = self.group_by_metrics.clone();
         let state = self.state.building_mut();
 
         for group_values in &evaluated_batch.grouping_set_args {
             group_by_metrics.time_group_key_preparation(|| {
-                state
-                    .group_values
-                    .intern(group_values, &mut state.batch_group_indices)
+                state.group_values.intern_reserved(
+                    group_values,
+                    &mut state.batch_group_indices,
+                    reservation,
+                )
             })?;
 
             // Register groups from the full input. Each filtered aggregate compacts
@@ -603,7 +595,7 @@ pub(super) struct RowAlignedAccumulatorArgs {
 ///
 /// e.g., `select k+1, sum(v*v) from t group by (k+1)`, this function evaluates
 /// `k+1`, `v*v`
-pub(super) struct EvaluatedAggregateBatch {
+pub(in crate::aggregates) struct EvaluatedAggregateBatch {
     /// One entry per grouping set; each entry contains all evaluated group key
     /// arrays for the current input batch.
     pub(super) grouping_set_args: Vec<Vec<ArrayRef>>,

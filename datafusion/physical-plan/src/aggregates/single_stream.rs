@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{DataFusionError, Result, assert_ne_or_internal_err};
+use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{TaskContext, TryEmitter, async_try_stream};
 use futures::stream::StreamExt;
@@ -168,7 +168,7 @@ impl SingleHashAggregateStream {
             AggregateMode::Partial,
         )?);
 
-        let mut hash_table = AggregateHashTable::<SingleMarker>::new(
+        let hash_table = AggregateHashTable::<SingleMarker>::new(
             agg,
             partition,
             Arc::clone(&schema),
@@ -197,7 +197,6 @@ impl SingleHashAggregateStream {
                 .with_can_spill(can_spill)
                 .register(context.memory_pool());
 
-        hash_table.set_migration_reservation(&reservation);
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
         reservation.try_grow(hash_table.memory_size())?;
 
@@ -327,11 +326,9 @@ impl Aggregating {
                 "Single hash aggregate cannot spill because temporary files are not enabled in the DiskManager",
             ));
         };
-        assert_ne_or_internal_err!(
-            self.hash_table.building_group_count(),
-            0,
-            "Single hash aggregate ran out of memory with no aggregated groups"
-        );
+        if self.hash_table.building_group_count() == 0 {
+            return Err(oom);
+        }
         spill_context.sort_and_spill(self.hash_table.take_state_batch()?)?;
         spill_context.retain_merge_workspace(reservation);
         reservation
@@ -365,8 +362,11 @@ impl Aggregating {
 
         while let Some(batch) = self.input.next().await.transpose()? {
             let _timer = elapsed_compute.timer();
+            let evaluated = self.hash_table.evaluate_batch(&batch)?;
             loop {
-                let (result, retry_batch) = match self.hash_table.aggregate_batch(&batch)
+                let (result, retry_batch) = match self
+                    .hash_table
+                    .aggregate_batch(&evaluated, reservation)
                 {
                     Ok(()) => (reservation.try_resize(self.reservation_size()), false),
                     Err(error) if migration_needs_memory(&error) => (Err(error), true),
