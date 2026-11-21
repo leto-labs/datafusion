@@ -10218,6 +10218,55 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn partitioned_null_safe_join_dictionary_null_and_plain_null() -> Result<()> {
+        use arrow::array::NullArray;
+        use datafusion_physical_expr::expressions::{cast, col};
+
+        let key = Arc::new(DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![None, Some(0)]),
+            Arc::new(NullArray::new(1)),
+        )?) as ArrayRef;
+        let left = RecordBatch::try_from_iter([("k", key)])?;
+        let right =
+            RecordBatch::try_from_iter([("k", Arc::new(NullArray::new(2)) as ArrayRef)])?;
+        for partitions in [1, 32, 37] {
+            let repartition = |batch: &RecordBatch| -> Result<Arc<dyn ExecutionPlan>> {
+                let schema = batch.schema();
+                let key = col("k", &schema)?;
+                let source =
+                    TestMemoryExec::try_new_exec(&[vec![batch.clone()]], schema, None)?;
+                Ok(Arc::new(RepartitionExec::try_new(
+                    source,
+                    Partitioning::Hash(vec![key], partitions),
+                )?))
+            };
+            // Compare the same type in the join while routing the raw key
+            // types in the preceding exchanges.
+            let left_schema = left.schema();
+            let left_key = cast(col("k", &left_schema)?, &left_schema, DataType::Null)?;
+            let join = HashJoinExec::try_new(
+                repartition(&left)?,
+                repartition(&right)?,
+                vec![(left_key, col("k", &right.schema())?)],
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNull,
+                false,
+            )?;
+            let batches =
+                crate::collect(Arc::new(join), Arc::new(TaskContext::default())).await?;
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                4,
+                "partition count {partitions}",
+            );
+        }
+        Ok(())
+    }
+
     /// Builds the dictionary-encoded twin of
     /// [`build_two_partition_probe_with_null_in_partition_0`]: the same two
     /// probe partitions, but the join key is a dictionary and partition 0's

@@ -1300,3 +1300,11 @@ and preserving reads honor this constraint in both the dictionary group column
 and the row-format fallback. The NULL value consumes one key slot in this
 representation. Dependent feature: CORE-AGGREGATION.
 Audit classification: UPSTREAMABLE.
+
+Both group storage paths coalesce null indices and indices into NULL
+dictionary values. The shared hash scatter uses the plain value type's NULL
+contribution for top-level dictionary NULLs, including the Arrow Null
+sentinel, with both hash builders. This keeps raw dictionary and plain keys
+together through repartitioning. It uses the original scatter for arrays
+with no physical NULLs in the indices or values. Valid entries and their
+nested children keep their original hash bits.
