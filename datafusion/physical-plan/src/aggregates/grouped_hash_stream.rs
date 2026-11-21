@@ -706,6 +706,9 @@ impl Stream for GroupedHashAggregateStream {
                                         };
                                         self.clear_shrink(0);
                                         self.update_memory_reservation()?;
+                                        // As with the baseline input batch, these
+                                        // evaluated arrays are outside the table
+                                        // reservation and held only until retry.
                                         self.pending_migration_batch = Some(batch);
                                         self.exec_state =
                                             ExecutionState::ProducingOutput(states);

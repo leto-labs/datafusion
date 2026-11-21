@@ -4309,7 +4309,10 @@ mod tests {
         // Keep the normal plan above for the statistics check. The expanded
         // fixture forces runtime spill while retaining the live partial input.
         let merged_aggregate: Arc<dyn ExecutionPlan> = if spill {
-            merged_aggregate.with_new_children(vec![repeat_avg_states(merge)?])?
+            merged_aggregate.replace_children(
+                vec![repeat_avg_states(merge)?],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )?
         } else {
             merged_aggregate
         };

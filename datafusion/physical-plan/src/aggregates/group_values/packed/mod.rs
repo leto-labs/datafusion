@@ -362,13 +362,18 @@ impl GroupValuesPacked {
     /// Move every group, in order, into the general interner.
     fn fall_back(
         &mut self,
+        rows: usize,
         reservation: Option<&MemoryReservation>,
     ) -> Result<&mut Box<dyn GroupValues>> {
         if matches!(&self.keys, PackBuffer::Single(_)) {
             let prior_size = self.size();
             let keys = self.table.keys();
             let column = &mut self.columns[0];
-            let bytes = column.single_migration_bytes(keys.len());
+            // Each incoming row can contribute at most one group. Give the
+            // primitive table room for the whole triggering batch before releasing
+            // the grant's excess, so its first insertions cannot grow the table.
+            let max_groups = keys.len().saturating_add(rows);
+            let bytes = column.single_migration_bytes(keys.len(), max_groups);
             if let Some(owner) = reservation {
                 // The fair pool admits a spillable reservation by its own
                 // total, so charge the overlap directly on the table owner.
@@ -377,7 +382,7 @@ impl GroupValuesPacked {
                     .map_err(|error| error.context(SINGLE_KEY_MIGRATION))?;
             }
 
-            let inner = match column.fall_back_single(keys) {
+            let inner = match column.fall_back_single(keys, max_groups) {
                 Ok(inner) => inner,
                 Err(error) => {
                     if let Some(owner) = reservation {
@@ -462,7 +467,7 @@ impl GroupValuesPacked {
         let rows = cols.first().map_or(0, |c| c.len());
         // Group ids of the table are u32.
         if self.table.len() + rows >= u32::MAX as usize {
-            return self.fall_back(reservation)?.intern(cols, groups);
+            return self.fall_back(rows, reservation)?.intern(cols, groups);
         }
         for (index, array) in cols.iter().enumerate().take(self.columns.len()) {
             let mut observed = self.columns[index].observe(array)?;
@@ -474,7 +479,7 @@ impl GroupValuesPacked {
                 observed = column.observe(array)?;
             }
             if observed == Observed::Costly {
-                return self.fall_back(reservation)?.intern(cols, groups);
+                return self.fall_back(rows, reservation)?.intern(cols, groups);
             }
         }
         let too_many = self
@@ -482,7 +487,7 @@ impl GroupValuesPacked {
             .iter()
             .any(|c| c.cardinality() > MAX_DICTIONARY || c.costly());
         if too_many || (!self.columns.iter().all(|c| c.fits()) && !self.relayout(rows)) {
-            return self.fall_back(reservation)?.intern(cols, groups);
+            return self.fall_back(rows, reservation)?.intern(cols, groups);
         }
         match &mut self.keys {
             PackBuffer::Single(keys) => {

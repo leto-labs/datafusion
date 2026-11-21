@@ -321,19 +321,24 @@ impl PartialHashAggregateStream {
 
             let mut last_state = HandleInputResult::ProcessNext;
             'input: while let Some(batch) = self.input.next().await.transpose()? {
-                let evaluated = {
+                let input_rows = batch.num_rows();
+                // Like the baseline input batch, evaluated arrays are outside
+                // the table reservation. Keep them across an early emission
+                // only if this batch will be retried.
+                let mut evaluated = Some({
                     let _timer = elapsed_compute.timer();
                     hash_table.evaluate_batch(&batch)?
-                };
-                let input_rows = batch.num_rows();
+                });
+                drop(batch);
                 loop {
                     let timer = elapsed_compute.timer();
                     let retry = match self.handle_input_batch(
-                        &evaluated,
+                        evaluated.as_ref().unwrap(),
                         input_rows,
                         &mut hash_table,
                     ) {
                         Ok(state) => {
+                            evaluated.take();
                             last_state = state;
                             false
                         }

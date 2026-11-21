@@ -283,9 +283,13 @@ fn int64_groups() -> Result<Box<dyn GroupValues>> {
     new_group_values(schema, &GroupClustering::None)
 }
 
-#[test]
-fn late_fallback_keeps_replacement_charged_when_competitor_takes_released_bytes()
--> Result<()> {
+#[rstest::rstest]
+#[case::primitive_startup(1, 1)]
+#[case::triggering_batch(128, 8)]
+fn late_fallback_keeps_replacement_charged_when_competitor_takes_released_bytes(
+    #[case] existing: usize,
+    #[case] incoming: usize,
+) -> Result<()> {
     let capacity = 32 * 1024;
     let backing: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(capacity));
     let pool = Arc::new(PoolWithCompetitor {
@@ -296,21 +300,26 @@ fn late_fallback_keeps_replacement_charged_when_competitor_takes_released_bytes(
     let owner = MemoryConsumer::new("group owner")
         .register(&(Arc::clone(&pool) as Arc<dyn MemoryPool>));
     let mut values = int64_groups()?;
-    let mut ids = Vec::with_capacity(2);
-    values.intern_reserved(&[Arc::new(Int64Array::from(vec![0]))], &mut ids, &owner)?;
+    // The ID output is already allocated. Only growth in the replacement
+    // table can require an extra reservation after the migration grant.
+    let mut ids = Vec::with_capacity(existing.max(incoming));
+    let packed = Int64Array::from_iter_values((0..existing).map(|key| key as i64));
+    values.intern_reserved(&[Arc::new(packed)], &mut ids, &owner)?;
     owner.try_resize(values.size())?;
-    values.intern_reserved(
-        &[Arc::new(Int64Array::from(vec![i64::MAX]))],
-        &mut ids,
-        &owner,
-    )?;
-    assert_eq!(ids, vec![1]);
+    let wide =
+        Int64Array::from_iter_values((0..incoming).map(|key| i64::MAX - key as i64));
+    values.intern_reserved(&[Arc::new(wide)], &mut ids, &owner)?;
+    assert_eq!(ids, (existing..existing + incoming).collect::<Vec<_>>());
     assert!(
         pool.competitor.size() > 0,
         "the migration must release scratch"
     );
+    assert_eq!(
+        owner.size(),
+        values.size(),
+        "the triggering batch grew the replacement without reservation"
+    );
     owner.try_resize(values.size())?;
-    assert_eq!(owner.size(), values.size());
     Ok(())
 }
 

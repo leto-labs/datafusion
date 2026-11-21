@@ -66,11 +66,15 @@ pub(super) trait KeyColumn: Send {
         unreachable!("only integer columns use narrow batch scratch");
     }
     /// Additional live bytes when converting stored codes into a primitive map.
-    fn single_migration_bytes(&self, _groups: usize) -> usize {
+    fn single_migration_bytes(&self, _groups: usize, _max_groups: usize) -> usize {
         unreachable!("only integer columns have a primitive fallback");
     }
     /// Re-intern stored numeric codes in their existing group-ID order.
-    fn fall_back_single(&mut self, _codes: &[u64]) -> Result<Box<dyn GroupValues>> {
+    fn fall_back_single(
+        &mut self,
+        _codes: &[u64],
+        _max_groups: usize,
+    ) -> Result<Box<dyn GroupValues>> {
         internal_err!("only integer columns have a primitive fallback")
     }
     /// The column of the groups with these codes.
@@ -407,8 +411,8 @@ where
         }
     }
 
-    fn single_migration_bytes(&self, groups: usize) -> usize {
-        let capacity = groups.max(GroupValuesPrimitive::<T>::INITIAL_CAPACITY);
+    fn single_migration_bytes(&self, groups: usize, max_groups: usize) -> usize {
+        let capacity = max_groups.max(GroupValuesPrimitive::<T>::INITIAL_CAPACITY);
         // Hashbrown uses power-of-two buckets at a 7/8 load. Round up
         // using 3/4 and include control bytes and SIMD padding. Both
         // primitive map layouts use at most 16 bytes per bucket.
@@ -425,16 +429,18 @@ where
             .saturating_add(size_of::<GroupValuesPrimitive<T>>() + 256)
     }
 
-    fn fall_back_single(&mut self, codes: &[u64]) -> Result<Box<dyn GroupValues>> {
-        let count = codes.len();
-        if count == 0 {
-            return Ok(Box::new(GroupValuesPrimitive::<T>::new(
-                self.data_type.clone(),
-            )));
-        }
-        let capacity = count.max(GroupValuesPrimitive::<T>::INITIAL_CAPACITY);
+    fn fall_back_single(
+        &mut self,
+        codes: &[u64],
+        max_groups: usize,
+    ) -> Result<Box<dyn GroupValues>> {
+        let capacity = max_groups.max(GroupValuesPrimitive::<T>::INITIAL_CAPACITY);
         let mut primitive =
             GroupValuesPrimitive::<T>::with_capacity(self.data_type.clone(), capacity);
+        let count = codes.len();
+        if count == 0 {
+            return Ok(Box::new(primitive));
+        }
         let array = self.build(codes)?;
         let mut ids = Vec::with_capacity(count);
         primitive.intern(&[array], &mut ids)?;
