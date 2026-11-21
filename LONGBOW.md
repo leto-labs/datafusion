@@ -1354,3 +1354,7 @@ predicate at its residual. A fully matched row group bypasses staging only
 when the pruning predicate proves all staged conjuncts. Existing row filters
 own their scans; staged decoding uses the other decoder mode. No fields are
 added to the scan's protobuf.
+
+Runtime counters are registered on the first staged vector and shared across
+files of the same partition. Replacing the predicate or projection clears
+the previous staging proof.

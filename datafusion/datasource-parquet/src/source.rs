@@ -12,9 +12,9 @@ use std::sync::Arc;
 use crate::DefaultParquetFileReaderFactory;
 use crate::ParquetFileReaderFactory;
 use crate::ParquetFileSchemaProvider;
-use crate::opener::ParquetMorselizer;
 use crate::opener::build_pruning_predicates;
 use crate::opener::build_virtual_columns_state;
+use crate::opener::{ParquetMorselizer, StagedScanConfig};
 use crate::row_filter::can_expr_be_pushed_down_with_schemas;
 use arrow_schema::Fields;
 use arrow_schema::extension::ExtensionType;
@@ -317,7 +317,7 @@ pub struct ParquetSource {
     filter_cache: Arc<crate::opener::filter_cache::PreparedFilterCache>,
     /// Execution policy bound from the worker's session at open time.
     dictionary_filter: Option<DictionaryFilterOptions>,
-    staged_predicates: Option<Arc<[Arc<dyn PhysicalExpr>]>>,
+    staged_scan: Option<Arc<StagedScanConfig>>,
 }
 
 impl ParquetSource {
@@ -347,7 +347,7 @@ impl ParquetSource {
             sort_order_for_reorder: None,
             filter_cache: Default::default(),
             dictionary_filter: None,
-            staged_predicates: None,
+            staged_scan: None,
         }
     }
 
@@ -357,19 +357,26 @@ impl ParquetSource {
         mut self,
         predicates: Arc<[Arc<dyn PhysicalExpr>]>,
     ) -> Self {
-        self.staged_predicates = Some(predicates);
+        self.staged_scan = Some(Arc::new(StagedScanConfig::new(predicates)));
         self
     }
 
     /// Staging predicates, when bound by the execution plan.
     pub fn staged_predicates(&self) -> Option<&[Arc<dyn PhysicalExpr>]> {
-        self.staged_predicates.as_deref()
+        self.staged_scan
+            .as_ref()
+            .map(|scan| scan.predicates().as_ref())
     }
 
     /// Give an independently executed scan fresh counters. Ordinary plan
     /// transformations retain their existing counters instead.
     pub fn with_new_metrics(mut self) -> Self {
         self.metrics = ExecutionPlanMetricsSet::new();
+        if let Some(scan) = &self.staged_scan {
+            self.staged_scan = Some(Arc::new(StagedScanConfig::new(Arc::clone(
+                scan.predicates(),
+            ))));
+        }
         self
     }
 
@@ -402,6 +409,7 @@ impl ParquetSource {
     pub fn with_predicate(&self, predicate: Arc<dyn PhysicalExpr>) -> Self {
         let mut conf = self.clone();
         conf.predicate = Some(Arc::clone(&predicate));
+        conf.staged_scan = None;
         conf
     }
 
@@ -423,7 +431,7 @@ impl ParquetSource {
         conf.table_schema = table_schema;
         conf.projection = projection;
         conf.predicate = predicate;
-        conf.staged_predicates = None;
+        conf.staged_scan = None;
         conf
     }
 
@@ -477,6 +485,7 @@ impl ParquetSource {
     /// Defaults to false.
     pub fn with_pushdown_filters(mut self, pushdown_filters: bool) -> Self {
         self.table_parquet_options.global.pushdown_filters = pushdown_filters;
+        self.staged_scan = None;
         self
     }
 
@@ -669,7 +678,7 @@ impl ParquetSource {
             schema_provider: self.schema_provider.clone(),
             pushdown_filters: self.pushdown_filters(),
             dictionary_filter: self.dictionary_filter,
-            staged_predicates: self.staged_predicates.clone(),
+            staged_scan: self.staged_scan.clone(),
             reorder_filters: self.reorder_filters(),
             force_filter_selections: self.force_filter_selections(),
             enable_page_index: self.enable_page_index(),
@@ -797,6 +806,8 @@ impl FileSource for ParquetSource {
         projection: &ProjectionExprs,
     ) -> datafusion_common::Result<Option<Arc<dyn FileSource>>> {
         let mut source = self.clone();
+        // The parent proved the original projection total before binding staging.
+        source.staged_scan = None;
 
         // If there's no reference to `FileRowIndexFunc` in the projection, we can just merge
         // both projections as-is, there's no need to modify the projection first.
@@ -1211,7 +1222,7 @@ impl FileSource for ParquetSource {
             // Longbow family OO: execution state, rebuilt on demand.
             filter_cache: _,
             dictionary_filter: _,
-            staged_predicates: _,
+            staged_scan: _,
         } = self;
 
         if schema_provider.is_some() {
