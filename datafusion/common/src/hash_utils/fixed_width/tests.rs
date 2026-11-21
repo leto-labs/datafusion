@@ -229,6 +229,9 @@ fn eligible_dense_batch_uses_the_fast_path() {
         assert!(try_hash_primitive(&array, &mut hashes, &state, false));
         assert!(try_hash_primitive(&array, &mut hashes, &state, true));
     }
+    let decimal = Decimal256Array::from(vec![i256::MAX; 65]);
+    assert!(!try_hash_primitive(&decimal, &mut hashes, &state, false));
+    assert!(!try_hash_primitive(&decimal, &mut hashes, &state, true));
     assert!(!try_hash_primitive(
         &array,
         &mut hashes,

@@ -35,6 +35,46 @@ fn fold(x: u64, y: u64) -> u64 {
 }
 
 pub(super) trait FixedWidthHash: Copy + HashValue {
+    fn try_hash_dense(
+        values: &[Self],
+        hashes: &mut [u64],
+        seed: u64,
+        rehash: bool,
+    ) -> bool;
+}
+
+impl<N: FoldValue> FixedWidthHash for N {
+    fn try_hash_dense(
+        values: &[Self],
+        hashes: &mut [u64],
+        seed: u64,
+        rehash: bool,
+    ) -> bool {
+        if !simd_available() {
+            return false;
+        }
+        // SAFETY: all four AVX-512 features enabled by hash_dense were
+        // detected on this CPU. Loads and stores use safe slice iteration.
+        unsafe {
+            if rehash {
+                hash_dense::<Self, true>(values, hashes, seed);
+            } else {
+                hash_dense::<Self, false>(values, hashes, seed);
+            }
+        }
+        true
+    }
+}
+
+// Decimal256 hashes two dependent widening products per value. The scalar
+// loop is faster for this Arrow layout on the measured AVX-512 host.
+impl FixedWidthHash for i256 {
+    fn try_hash_dense(_: &[Self], _: &mut [u64], _: u64, _: bool) -> bool {
+        false
+    }
+}
+
+trait FoldValue: Copy + HashValue {
     /// Fold one value into the accumulator used by a fresh fast FoldHasher.
     /// Later columns use `hash_write`, which feeds float bytes separately.
     fn fold_value<const REHASH: bool>(self, accumulator: u64) -> u64;
@@ -42,7 +82,7 @@ pub(super) trait FixedWidthHash: Copy + HashValue {
 
 macro_rules! integer_fold {
     ($(($native:ty, $unsigned:ty)),+ $(,)?) => {
-        $(impl FixedWidthHash for $native {
+        $(impl FoldValue for $native {
             #[inline(always)]
             fn fold_value<const REHASH: bool>(self, accumulator: u64) -> u64 {
                 fold(accumulator ^ (self as $unsigned as u64), NUMERIC_SEED)
@@ -69,23 +109,14 @@ fn fold_u128(value: u128, accumulator: u64) -> u64 {
     )
 }
 
-impl FixedWidthHash for i128 {
+impl FoldValue for i128 {
     #[inline(always)]
     fn fold_value<const REHASH: bool>(self, accumulator: u64) -> u64 {
         fold_u128(self as u128, accumulator)
     }
 }
 
-impl FixedWidthHash for i256 {
-    #[inline(always)]
-    fn fold_value<const REHASH: bool>(self, accumulator: u64) -> u64 {
-        // Arrow derives Hash in field order: low u128, high i128.
-        let (low, high) = self.to_parts();
-        fold_u128(high as u128, fold_u128(low, accumulator))
-    }
-}
-
-impl FixedWidthHash for IntervalDayTime {
+impl FoldValue for IntervalDayTime {
     #[inline(always)]
     fn fold_value<const REHASH: bool>(self, accumulator: u64) -> u64 {
         // FoldHasher packs the two i32 writes in order into the sponge.
@@ -95,7 +126,7 @@ impl FixedWidthHash for IntervalDayTime {
     }
 }
 
-impl FixedWidthHash for IntervalMonthDayNano {
+impl FoldValue for IntervalMonthDayNano {
     #[inline(always)]
     fn fold_value<const REHASH: bool>(self, accumulator: u64) -> u64 {
         let packed = u64::from(self.months as u32) | ((self.days as u32 as u64) << 32);
@@ -103,7 +134,7 @@ impl FixedWidthHash for IntervalMonthDayNano {
     }
 }
 
-impl FixedWidthHash for f16 {
+impl FoldValue for f16 {
     #[inline(always)]
     fn fold_value<const REHASH: bool>(self, accumulator: u64) -> u64 {
         let bits = u64::from(hash_input(self).to_bits());
@@ -122,7 +153,7 @@ impl FixedWidthHash for f16 {
 
 macro_rules! float_fold {
     ($(($native:ty, $width:literal)),+ $(,)?) => {
-        $(impl FixedWidthHash for $native {
+        $(impl FoldValue for $native {
             #[inline(always)]
             fn fold_value<const REHASH: bool>(self, accumulator: u64) -> u64 {
                 let bits = u64::from(hash_input(self).to_bits());
@@ -150,20 +181,7 @@ pub(super) fn try_hash_primitive<T: ArrowPrimitiveType<Native: FixedWidthHash>>(
     let Some(seed) = state.fast_foldhash_seed() else {
         return false;
     };
-    if !simd_available() {
-        return false;
-    }
-    let values = array.values().as_ref();
-    // SAFETY: all four AVX-512 features enabled by hash_dense were detected
-    // on this CPU. The kernel uses safe slice iteration for loads and stores.
-    unsafe {
-        if rehash {
-            hash_dense::<T::Native, true>(values, hashes, seed);
-        } else {
-            hash_dense::<T::Native, false>(values, hashes, seed);
-        }
-    }
-    true
+    T::Native::try_hash_dense(array.values().as_ref(), hashes, seed, rehash)
 }
 
 fn simd_available() -> bool {
@@ -176,7 +194,7 @@ fn simd_available() -> bool {
 // Keep the vector loops out of the large scalar array-dispatch function.
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512dq,avx512bw,avx512vl")]
-fn hash_dense<N: FixedWidthHash, const REHASH: bool>(
+fn hash_dense<N: FoldValue, const REHASH: bool>(
     values: &[N],
     hashes: &mut [u64],
     seed: u64,
