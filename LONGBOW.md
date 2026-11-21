@@ -11,6 +11,21 @@ inventory.
 The join visited bitmap (family VB, leto-mjj.68) is pending integration and
 qualification.
 
+## Fixed-width primitive hashing (family VH, leto-mjj.15)
+
+`create_hashes` uses an x86-64 SIMD kernel for dense primitive arrays with
+the foldhash 0.2.0 fast fixed state. It folds the exact low and high halves
+of each product, preserving all 64 bits of the existing hash. Additional
+columns still use the previous hash as their seed and float rehashing still
+uses the byte representation of the normalized value.
+
+The kernel needs AVX-512 F, DQ, BW and VL. The scalar path handles nullable
+arrays, other states, arrays below 32 rows, and every other CPU. Boolean and
+fixed-size binary keep their existing generic hashing. The dependency is
+pinned because the SIMD kernel mirrors foldhash's internal constants and
+write semantics. Update the kernel and compare both paths when changing the
+foldhash version or Arrow primitive hash representations.
+
 ## Reserved protobuf tags
 
 Every protobuf field that a fork family adds uses a tag of 900 or more, so a

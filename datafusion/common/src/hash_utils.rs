@@ -43,6 +43,13 @@ pub trait HashState: BuildHasher {
     type SeededState: BuildHasher;
 
     fn seeded_state(&self, seed: u64) -> Self::SeededState;
+
+    /// Return the initial accumulator for the foldhash 0.2.0 fast fixed
+    /// hasher. A state that cannot use that exact kernel returns `None`.
+    #[doc(hidden)]
+    fn fast_foldhash_seed(&self) -> Option<u64> {
+        None
+    }
 }
 
 impl HashState for FixedState {
@@ -53,6 +60,11 @@ impl HashState for FixedState {
             seed,
             foldhash::SharedSeed::global_fixed(),
         )
+    }
+
+    fn fast_foldhash_seed(&self) -> Option<u64> {
+        // The empty FoldHasher's accumulator is its hash.
+        Some(self.build_hasher().finish())
     }
 }
 
@@ -82,6 +94,8 @@ use crate::utils::offset_span;
 use std::cell::RefCell;
 
 mod build_hasher;
+#[cfg(all(target_arch = "x86_64", not(feature = "force_hash_collisions")))]
+mod fixed_width;
 
 // Combines two hashes into one hash
 #[inline]
@@ -1138,7 +1152,13 @@ fn hash_single_array(
     rehash: bool,
 ) -> Result<()> {
     downcast_primitive_array! {
-        array => hash_array_primitive(array, random_state, hashes_buffer, rehash),
+        array => {
+            #[cfg(target_arch = "x86_64")]
+            if fixed_width::try_hash_primitive(array, hashes_buffer, random_state, rehash) {
+                return Ok(());
+            }
+            hash_array_primitive(array, random_state, hashes_buffer, rehash);
+        }
         DataType::Null => hash_null(random_state, hashes_buffer, rehash),
         DataType::Boolean => hash_array(&as_boolean_array(array)?, random_state, hashes_buffer, rehash),
         DataType::Utf8 => hash_array(&as_string_array(array)?, random_state, hashes_buffer, rehash),

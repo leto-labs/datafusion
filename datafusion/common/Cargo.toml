@@ -73,7 +73,8 @@ arrow = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true, features = ["canonical_extension_types"] }
 chrono = { workspace = true }
-foldhash = "0.2"
+# The fixed-width SIMD kernel mirrors the fast fixed hasher in this version.
+foldhash = "=0.2.0"
 half = { workspace = true }
 hashbrown = { workspace = true }
 hex = { workspace = true, optional = true }
