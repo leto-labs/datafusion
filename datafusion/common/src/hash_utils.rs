@@ -7,7 +7,7 @@
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::*;
 #[cfg(not(feature = "force_hash_collisions"))]
-use arrow::buffer::ScalarBuffer;
+use arrow::buffer::{NullBuffer, ScalarBuffer};
 #[cfg(not(feature = "force_hash_collisions"))]
 use arrow::compute::{nullif, take};
 use arrow::datatypes::*;
@@ -648,6 +648,117 @@ fn dispatch_dictionary_scatter<K: ArrowDictionaryKeyType>(
     }
 }
 
+/// How the plain value type folds a logical NULL into a row hash.
+#[cfg(not(feature = "force_hash_collisions"))]
+#[derive(Clone, Copy)]
+enum NullHash {
+    Skip,
+    Value(u64),
+    UnionChild(u64),
+}
+
+#[cfg(not(feature = "force_hash_collisions"))]
+impl NullHash {
+    fn apply(self, hash: u64, multi_col: bool) -> u64 {
+        match self {
+            Self::Skip => hash,
+            Self::Value(value) if multi_col => combine_hashes(value, hash),
+            Self::Value(value) => value,
+            Self::UnionChild(child) => combine_hashes(hash, child),
+        }
+    }
+}
+
+#[cfg(not(feature = "force_hash_collisions"))]
+fn plain_null_hash(
+    data_type: &DataType,
+    child_hashing: &impl ChildHashing,
+) -> Result<NullHash> {
+    Ok(match data_type {
+        DataType::Null => {
+            let mut hash = [0];
+            child_hashing.create_hashes([&NullArray::new(1) as &dyn Array], &mut hash)?;
+            NullHash::Value(hash[0])
+        }
+        DataType::Dictionary(_, value_type) => {
+            plain_null_hash(value_type, child_hashing)?
+        }
+        DataType::Union(fields, _) => {
+            let Some((_, first)) = fields.iter().next() else {
+                return Ok(NullHash::Skip);
+            };
+            NullHash::UnionChild(
+                plain_null_hash(first.data_type(), child_hashing)?.apply(0, false),
+            )
+        }
+        DataType::RunEndEncoded(_, values) => match values.data_type() {
+            // These children have no physical null bitmap. Run hashing
+            // folds their precomputed value hashes even for logical NULLs.
+            data_type @ (DataType::Null
+            | DataType::RunEndEncoded(..)
+            | DataType::Union(..)) => NullHash::Value(
+                plain_null_hash(data_type, child_hashing)?.apply(0, false),
+            ),
+            _ => NullHash::Skip,
+        },
+        _ => NullHash::Skip,
+    })
+}
+
+#[cfg(not(feature = "force_hash_collisions"))]
+#[cold]
+#[inline(never)]
+fn scatter_encoded_dictionary<K: ArrowDictionaryKeyType>(
+    array: &DictionaryArray<K>,
+    dict_hashes: &[u64],
+    child_hashing: &impl ChildHashing,
+    hashes_buffer: &mut [u64],
+    multi_col: bool,
+) -> Result<()> {
+    let values = array.values();
+    let value_nulls = values
+        .logical_nulls()
+        .filter(|nulls| nulls.null_count() != 0);
+    if array.keys().null_count() == 0 && value_nulls.is_none() {
+        dispatch_dictionary_scatter(array, dict_hashes, hashes_buffer, multi_col);
+        return Ok(());
+    }
+
+    let null_hash = plain_null_hash(values.data_type(), child_hashing)?;
+    for (hash, key) in hashes_buffer.iter_mut().zip(array.keys().iter()) {
+        let key = key.map(|key| key.as_usize()).filter(|&index| {
+            value_nulls
+                .as_ref()
+                .is_none_or(|nulls| nulls.is_valid(index))
+        });
+        *hash = match key {
+            Some(index) if multi_col => combine_hashes(dict_hashes[index], *hash),
+            Some(index) => dict_hashes[index],
+            None => null_hash.apply(*hash, multi_col),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "force_hash_collisions"))]
+#[inline]
+fn dictionary_needs_logical_hashes<K: ArrowDictionaryKeyType>(
+    array: &DictionaryArray<K>,
+) -> bool {
+    let DataType::Dictionary(_, value_type) = array.data_type() else {
+        unreachable!("dictionary array has a dictionary type");
+    };
+    // The normal scatter handles physical validity. These types can
+    // represent a NULL without a physical null bit.
+    matches!(
+        value_type.as_ref(),
+        DataType::Null
+            | DataType::Dictionary(..)
+            | DataType::RunEndEncoded(..)
+            | DataType::Union(..)
+    ) && (array.keys().null_count() != 0 || array.values().is_nullable())
+}
+
 /// Hash the values in a dictionary array.
 #[cfg(not(feature = "force_hash_collisions"))]
 fn hash_dictionary<K: ArrowDictionaryKeyType>(
@@ -656,12 +767,21 @@ fn hash_dictionary<K: ArrowDictionaryKeyType>(
     hashes_buffer: &mut [u64],
     multi_col: bool,
 ) -> Result<()> {
-    // Hash each dictionary value once, and then use that computed
-    // hash for each key value to avoid a potentially expensive
-    // redundant hashing for large dictionary elements (e.g. strings)
+    // Hash each dictionary value once rather than hashing it at every key.
     let dict_values = array.values();
     let mut dict_hashes = vec![0; dict_values.len()];
     create_hashes([dict_values], random_state, &mut dict_hashes)?;
+    if dictionary_needs_logical_hashes(array) {
+        return scatter_encoded_dictionary(
+            array,
+            &dict_hashes,
+            &HashStateChildHashing {
+                hash_state: random_state,
+            },
+            hashes_buffer,
+            multi_col,
+        );
+    }
     dispatch_dictionary_scatter(array, &dict_hashes, hashes_buffer, multi_col);
     Ok(())
 }
@@ -673,9 +793,19 @@ fn hash_dictionary_with_child_hashing<K: ArrowDictionaryKeyType>(
     hashes_buffer: &mut [u64],
     multi_col: bool,
 ) -> Result<()> {
+    // Hash each dictionary value once, even when many rows reference it.
     let dict_values = array.values();
     let mut dict_hashes = vec![0; dict_values.len()];
     child_hashing.create_hashes([dict_values], &mut dict_hashes)?;
+    if dictionary_needs_logical_hashes(array) {
+        return scatter_encoded_dictionary(
+            array,
+            &dict_hashes,
+            child_hashing,
+            hashes_buffer,
+            multi_col,
+        );
+    }
     dispatch_dictionary_scatter(array, &dict_hashes, hashes_buffer, multi_col);
     Ok(())
 }
@@ -854,10 +984,40 @@ fn hash_union_array(
         unreachable!()
     };
 
-    if array.is_dense() {
-        hash_dense_union_array(array, union_fields, child_hashing, hashes_buffer)
+    let nulls = if array.is_nullable() {
+        array
+            .logical_nulls()
+            .filter(|nulls| nulls.null_count() != 0)
     } else {
-        hash_sparse_union_array(array, union_fields, child_hashing, hashes_buffer)
+        None
+    };
+    let null_child_hash = if let Some(nulls) = &nulls {
+        let NullHash::UnionChild(child) =
+            plain_null_hash(array.data_type(), child_hashing)?
+        else {
+            unreachable!("a union with null rows has a child");
+        };
+        Some((nulls, child))
+    } else {
+        None
+    };
+
+    if array.is_dense() {
+        hash_dense_union_array(
+            array,
+            union_fields,
+            child_hashing,
+            hashes_buffer,
+            null_child_hash,
+        )
+    } else {
+        hash_sparse_union_array(
+            array,
+            union_fields,
+            child_hashing,
+            hashes_buffer,
+            null_child_hash,
+        )
     }
 }
 
@@ -869,6 +1029,7 @@ fn hash_dense_union_array(
     union_fields: &UnionFields,
     child_hashing: &impl ChildHashing,
     hashes_buffer: &mut [u64],
+    null_child_hash: Option<(&NullBuffer, u64)>,
 ) -> Result<()> {
     let type_ids = array.type_ids();
     let offsets = array.offsets().expect("dense union has offsets");
@@ -898,10 +1059,17 @@ fn hash_dense_union_array(
         }
     }
 
-    for ((hash, &type_id), &offset) in hashes_buffer.iter_mut().zip(type_ids).zip(offsets)
+    for (row, ((hash, &type_id), &offset)) in hashes_buffer
+        .iter_mut()
+        .zip(type_ids)
+        .zip(offsets)
+        .enumerate()
     {
         let start = spans[type_id as usize].0;
-        let child_hash = child_hashes[type_id as usize][offset as usize - start];
+        let child_hash = match null_child_hash {
+            Some((nulls, child)) if nulls.is_null(row) => child,
+            _ => child_hashes[type_id as usize][offset as usize - start],
+        };
         *hash = combine_hashes(*hash, child_hash);
     }
 
@@ -916,6 +1084,7 @@ fn hash_sparse_union_array(
     union_fields: &UnionFields,
     child_hashing: &impl ChildHashing,
     hashes_buffer: &mut [u64],
+    null_child_hash: Option<(&NullBuffer, u64)>,
 ) -> Result<()> {
     let type_ids = array.type_ids();
     let len = array.len();
@@ -964,6 +1133,14 @@ fn hash_sparse_union_array(
                 for (&row, &hash) in indices.values().iter().zip(&taken_hashes) {
                     child_hashes[row as usize] = hash;
                 }
+            }
+        }
+    }
+
+    if let Some((nulls, child)) = null_child_hash {
+        for (hash, valid) in child_hashes.iter_mut().zip(nulls.iter()) {
+            if !valid {
+                *hash = child;
             }
         }
     }
@@ -1070,6 +1247,13 @@ fn hash_run_array_inner<
     child_hashing
         .create_hashes(std::slice::from_ref(&sliced_values), &mut values_hashes)?;
 
+    let dict_nulls = if matches!(sliced_values.data_type(), DataType::Dictionary(..))
+        && sliced_values.is_nullable()
+    {
+        sliced_values.logical_nulls()
+    } else {
+        None
+    };
     let mut start_in_slice = 0;
     for (adjusted_physical_index, &absolute_run_end) in run_ends_values
         [start_physical_index..end_physical_index]
@@ -1079,7 +1263,11 @@ fn hash_run_array_inner<
         let absolute_run_end = absolute_run_end.as_usize();
         let end_in_slice = (absolute_run_end - array_offset).min(array_len);
 
-        if HAS_NULL_VALUES && sliced_values.is_null(adjusted_physical_index) {
+        if (HAS_NULL_VALUES && sliced_values.is_null(adjusted_physical_index))
+            || dict_nulls
+                .as_ref()
+                .is_some_and(|nulls| nulls.is_null(adjusted_physical_index))
+        {
             start_in_slice = end_in_slice;
             continue;
         }
@@ -1286,6 +1474,7 @@ impl AsDynArray for &ArrayRef {
 ///
 /// The number of rows to hash is determined by `hashes_buffer.len()`.
 /// `hashes_buffer` should be pre-sized appropriately.
+#[inline]
 pub fn create_hashes<'a, I, T>(
     arrays: I,
     random_state: &impl HashState,
@@ -1791,6 +1980,210 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual_hashes, expected_hashes);
+    }
+
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn dictionary_null_hash_matches_plain_value_type() -> Result<()> {
+        let nullable_int = Arc::new(Field::new("item", DataType::Int32, true));
+        let run_ends = Arc::new(Field::new("run_ends", DataType::Int16, false));
+        let map_entries = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Utf8, false)),
+                    Arc::clone(&nullable_int),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        let dictionary_null =
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Null));
+        let union_fields = UnionFields::try_new(
+            [0, 1],
+            [
+                Arc::new(Field::new("null", DataType::Null, true)),
+                Arc::new(Field::new("int", DataType::Int32, true)),
+            ],
+        )?;
+        let types = [
+            DataType::Null,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+            DataType::Float16,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Boolean,
+            DataType::Decimal32(5, 2),
+            DataType::Decimal64(10, 2),
+            DataType::Decimal128(10, 2),
+            DataType::Decimal256(10, 2),
+            DataType::Date32,
+            DataType::Date64,
+            DataType::Time32(TimeUnit::Second),
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Duration(TimeUnit::Millisecond),
+            DataType::Interval(IntervalUnit::YearMonth),
+            DataType::Interval(IntervalUnit::DayTime),
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+            DataType::FixedSizeBinary(5),
+            DataType::List(Arc::clone(&nullable_int)),
+            DataType::LargeList(Arc::clone(&nullable_int)),
+            DataType::ListView(Arc::clone(&nullable_int)),
+            DataType::LargeListView(Arc::clone(&nullable_int)),
+            DataType::FixedSizeList(Arc::clone(&nullable_int), 2),
+            DataType::Struct(vec![nullable_int].into()),
+            DataType::Map(map_entries, false),
+            dictionary_null.clone(),
+            DataType::RunEndEncoded(
+                Arc::clone(&run_ends),
+                Arc::new(Field::new("values", DataType::Null, true)),
+            ),
+            DataType::RunEndEncoded(
+                run_ends,
+                Arc::new(Field::new("values", dictionary_null, true)),
+            ),
+            DataType::Union(union_fields.clone(), UnionMode::Dense),
+            DataType::Union(union_fields, UnionMode::Sparse),
+        ];
+        let prefix = Int32Array::from(vec![17, 17]);
+        let state = RandomState::with_seed(761);
+        let custom = BuildHasherDefault::<TestHasher>::default();
+        for value_type in types {
+            let dictionary = DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![None, Some(0)]),
+                new_null_array(&value_type, 1),
+            )?;
+            let plain = new_null_array(&value_type, 2);
+            for leading in [false, true] {
+                let columns = |key| {
+                    if leading {
+                        vec![&prefix as &dyn Array, key]
+                    } else {
+                        vec![key]
+                    }
+                };
+                let mut dict_hashes = [0; 2];
+                let mut plain_hashes = [0; 2];
+                create_hashes(columns(&dictionary), &state, &mut dict_hashes)?;
+                create_hashes(columns(plain.as_ref()), &state, &mut plain_hashes)?;
+                assert_eq!(dict_hashes, plain_hashes, "{value_type}, prefix={leading}");
+                dict_hashes.fill(0);
+                plain_hashes.fill(0);
+                create_hashes_with_hasher(
+                    columns(&dictionary),
+                    &custom,
+                    &mut dict_hashes,
+                )?;
+                create_hashes_with_hasher(
+                    columns(plain.as_ref()),
+                    &custom,
+                    &mut plain_hashes,
+                )?;
+                assert_eq!(
+                    dict_hashes, plain_hashes,
+                    "{value_type}, prefix={leading}, custom"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn encoded_logical_nulls_have_one_hash() -> Result<()> {
+        let fields = UnionFields::try_new(
+            [0, 1],
+            [
+                Field::new("null", DataType::Null, true),
+                Field::new("int", DataType::Int32, true),
+            ],
+        )?;
+        let dense = UnionArray::try_new(
+            fields.clone(),
+            vec![0, 1].into(),
+            Some(vec![0, 0].into()),
+            vec![
+                Arc::new(NullArray::new(1)),
+                Arc::new(Int32Array::new_null(1)),
+            ],
+        )?;
+        let sparse = UnionArray::try_new(
+            fields,
+            vec![0, 1].into(),
+            None,
+            vec![
+                Arc::new(NullArray::new(2)),
+                Arc::new(Int32Array::new_null(2)),
+            ],
+        )?;
+        let dictionary = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![None, Some(0)]),
+            Arc::new(NullArray::new(1)),
+        )?;
+        let run =
+            RunArray::<Int16Type>::try_new(&Int16Array::from(vec![1, 2]), &dictionary)?;
+        let prefix = Int32Array::from(vec![17, 17]);
+        let state = RandomState::with_seed(761);
+        for array in [&dense as &dyn Array, &sparse, &run] {
+            assert_eq!(array.logical_null_count(), 2);
+            for columns in [vec![array], vec![&prefix, array]] {
+                let mut hashes = [0; 2];
+                create_hashes(columns, &state, &mut hashes)?;
+                assert_eq!(hashes[0], hashes[1], "{}", array.data_type());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn dictionary_logical_nulls_hash_like_null_indices() -> Result<()> {
+        let keys = Int8Array::from(vec![None, Some(0)]);
+        let null_values: ArrayRef = Arc::new(NullArray::new(1));
+        let nested_values: ArrayRef = Arc::new(DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0]),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+        )?);
+        let prefix = Int32Array::from(vec![42, 42]);
+        let state = RandomState::with_seed(0);
+        let custom = BuildHasherDefault::<TestHasher>::default();
+        for values in [null_values, nested_values] {
+            let dictionary = DictionaryArray::<Int8Type>::try_new(keys.clone(), values)?;
+            for columns in [vec![&dictionary as &dyn Array], vec![&prefix, &dictionary]] {
+                let mut hashes = [0; 2];
+                create_hashes(columns.iter().copied(), &state, &mut hashes)?;
+                assert_eq!(hashes[0], hashes[1]);
+                let mut hashes = [0; 2];
+                create_hashes_with_hasher(columns, &custom, &mut hashes)?;
+                assert_eq!(hashes[0], hashes[1]);
+            }
+
+            // In separate batches the valid-index slice takes the scatter
+            // path with no null keys. Both routes must produce the same hash.
+            let left = dictionary.slice(0, 1);
+            let right = dictionary.slice(1, 1);
+            let mut left_hash = [0];
+            let mut right_hash = [0];
+            create_hashes([&left as &dyn Array], &state, &mut left_hash)?;
+            create_hashes([&right as &dyn Array], &state, &mut right_hash)?;
+            assert_eq!(left_hash, right_hash);
+        }
+        Ok(())
     }
 
     #[test]
@@ -2461,7 +2854,7 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "force_hash_collisions"))]
-    fn create_hashes_for_union_arrays_match_selected_values() {
+    fn create_hashes_for_union_arrays_match_selected_values_and_canonical_nulls() {
         // In sparse unions both string children are masked, the others use `take`
         let children = |lens: [usize; 5]| -> Vec<ArrayRef> {
             let ints = |len| {
@@ -2532,7 +2925,8 @@ mod tests {
         }
     }
 
-    /// Asserts each union row contributes the hash of its selected value on its own
+    /// Valid rows contribute their selected value. NULLs contribute the same hash
+    /// as an Arrow-created NULL union, which selects its first child.
     #[cfg(not(feature = "force_hash_collisions"))]
     fn assert_union_hashes_match_selected_values(
         union: &UnionArray,
@@ -2544,10 +2938,20 @@ mod tests {
 
         let mut hashes = vec![0; union.len()];
         create_hashes(&[&prev, union], &mut hashes);
+        let DataType::Union(fields, _) = union.data_type() else {
+            unreachable!()
+        };
+        let (_, first) = fields.iter().next().unwrap();
+        let null_value = new_null_array(first.data_type(), 1);
+        let nulls = union.logical_nulls();
         for (i, hash) in hashes.into_iter().enumerate() {
-            let value = union
-                .child(union.type_id(i))
-                .slice(union.value_offset(i), 1);
+            let value = if nulls.as_ref().is_some_and(|nulls| nulls.is_null(i)) {
+                Arc::clone(&null_value)
+            } else {
+                union
+                    .child(union.type_id(i))
+                    .slice(union.value_offset(i), 1)
+            };
             let mut value_hash = [0];
             create_hashes(&[&value], &mut value_hash);
             let expected = combine_hashes(prev_hashes[i], value_hash[0]);
