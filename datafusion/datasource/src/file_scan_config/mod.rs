@@ -18,6 +18,9 @@ mod proto;
 
 mod preparation;
 
+#[cfg(test)]
+mod filter_pushdown_tests;
+
 use crate::file_groups::FileGroup;
 use crate::{
     PartitionedFile, display::FileGroupsDisplay, file::FileSource,
@@ -42,7 +45,7 @@ use crate::source::OpenArgs;
 use datafusion_common::stats::{Precision, is_known_empty};
 use datafusion_physical_expr::expressions::{BinaryExpr, Column};
 use datafusion_physical_expr::projection::{ProjectionExprs, ProjectionMapping};
-use datafusion_physical_expr::utils::reassign_expr_columns;
+use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{
     EquivalenceProperties, Partitioning, RangePartitioning, split_conjunction,
 };
@@ -55,11 +58,12 @@ use datafusion_physical_plan::execution_plan::SchedulingType;
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType,
     display::{ProjectSchemaDisplay, display_orderings},
-    filter_pushdown::FilterPushdownPropagation,
+    filter_pushdown::{FilterPushdownPropagation, PushedDown},
     metrics::ExecutionPlanMetricsSet,
 };
 use log::{debug, warn};
 use std::any::Any;
+use std::collections::HashSet;
 use std::{fmt::Debug, fmt::Formatter, fmt::Result as FmtResult, sync::Arc};
 
 /// [`FileScanConfig`] represents scanning data from a group of files
@@ -1111,23 +1115,75 @@ impl DataSource for FileScanConfig {
         // `DataSource` has a projection `c1 + c2 as c1_c2`, the filter must be rewritten
         // to refer to the table schema `c1 + c2 > 5`
         let table_schema = self.file_source.table_schema().table_schema();
-        let filters_to_remap = if let Some(projection) = self.file_source.projection() {
-            filters
+        let unproject =
+            |filter: Arc<dyn PhysicalExpr>| match self.file_source.projection() {
+                Some(projection) => projection.unproject_expr(&filter),
+                None => Ok(filter),
+            };
+        // The table schema includes the file fields, partition fields, and
+        // virtual columns. Name lookup can silently move a bound reference
+        // to a different field if any names repeat. Source readers may also
+        // use names to bind predicates to physical file columns.
+        let mut names = HashSet::new();
+        let has_duplicate_names = table_schema
+            .fields()
+            .iter()
+            .any(|field| !names.insert(field.name()));
+        let mut forwarded = Vec::new();
+        let remapped_filters = if has_duplicate_names {
+            let safe_filters: Vec<_> = filters
                 .into_iter()
-                .map(|filter| projection.unproject_expr(&filter))
-                .collect::<Result<Vec<_>>>()?
+                .filter_map(|filter| {
+                    let bound = unproject(filter).ok().filter(|filter| {
+                        collect_columns(filter).iter().all(|column| {
+                            table_schema
+                                .fields()
+                                .get(column.index())
+                                .is_some_and(|field| field.name() == column.name())
+                                && table_schema
+                                    .fields()
+                                    .iter()
+                                    .filter(|field| field.name() == column.name())
+                                    .nth(1)
+                                    .is_none()
+                        })
+                    });
+                    forwarded.push(bound.is_some());
+                    bound
+                })
+                .collect();
+            if safe_filters.is_empty() {
+                return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                    vec![PushedDown::No; forwarded.len()],
+                ));
+            }
+            safe_filters
         } else {
             filters
+                .into_iter()
+                .map(|filter| {
+                    unproject(filter)
+                        .and_then(|bound| reassign_expr_columns(bound, table_schema))
+                })
+                .collect::<Result<Vec<_>>>()?
         };
-        // Now remap column indices to match the table schema.
-        let remapped_filters = filters_to_remap
-            .into_iter()
-            .map(|filter| reassign_expr_columns(filter, table_schema))
-            .collect::<Result<Vec<_>>>()?;
 
-        let result = self
+        let mut result = self
             .file_source
             .try_pushdown_filters(remapped_filters, config)?;
+        if has_duplicate_names {
+            let mut statuses = result.filters.into_iter();
+            result.filters = forwarded
+                .into_iter()
+                .map(|safe| {
+                    if safe {
+                        statuses.next().unwrap_or(PushedDown::No)
+                    } else {
+                        PushedDown::No
+                    }
+                })
+                .collect();
+        }
         match result.updated_node {
             Some(new_file_source) => {
                 let mut new_file_scan_config = self.clone();
