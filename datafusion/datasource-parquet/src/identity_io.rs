@@ -17,8 +17,7 @@ use std::ops::Range;
 
 use bytes::Bytes;
 use object_store::{
-    GetOptions, GetRange, OBJECT_STORE_COALESCE_DEFAULT, ObjectMeta, ObjectStore,
-    ObjectStoreExt, coalesce_ranges,
+    GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, coalesce_ranges,
 };
 
 fn identity_options(meta: &ObjectMeta, range: Range<u64>) -> GetOptions {
@@ -55,7 +54,7 @@ pub(crate) async fn get_range(
 }
 
 /// Read `ranges` of the object `meta` names, of the generation it names.
-/// Close ranges are coalesced as in [`ObjectStore::get_ranges`].
+/// Conditional reads merge close ranges using the registered store's gap.
 #[expect(
     clippy::result_large_err,
     reason = "object_store's own error type; every caller converts it at once"
@@ -64,6 +63,7 @@ pub(crate) async fn get_ranges(
     store: &dyn ObjectStore,
     meta: &ObjectMeta,
     ranges: &[Range<u64>],
+    range_coalesce_gap: u64,
 ) -> object_store::Result<Vec<Bytes>> {
     if !has_identity(meta) {
         return store.get_ranges(&meta.location, ranges).await;
@@ -71,7 +71,7 @@ pub(crate) async fn get_ranges(
     coalesce_ranges(
         ranges,
         |range| get_range(store, meta, range),
-        OBJECT_STORE_COALESCE_DEFAULT,
+        range_coalesce_gap,
     )
     .await
 }
@@ -95,8 +95,10 @@ mod tests {
             .unwrap();
         let planned = store.head(&path).await.unwrap();
         assert!(planned.e_tag.is_some());
+        let ranges = [0..2, 4..6];
+        let gap = 1;
         assert_eq!(
-            get_ranges(store.as_ref(), &planned, &[0..2, 4..6])
+            get_ranges(store.as_ref(), &planned, &ranges, gap)
                 .await
                 .unwrap(),
             vec![Bytes::from_static(b"aa"), Bytes::from_static(b"aa")]
@@ -109,7 +111,7 @@ mod tests {
         let stale = get_range(store.as_ref(), &planned, 0..2).await.unwrap_err();
         assert!(matches!(stale, Error::Precondition { .. }), "{stale}");
         assert!(matches!(
-            get_ranges(store.as_ref(), &planned, &[0..2, 4..6])
+            get_ranges(store.as_ref(), &planned, &ranges, gap)
                 .await
                 .unwrap_err(),
             Error::Precondition { .. }

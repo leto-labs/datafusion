@@ -18,6 +18,9 @@ use object_store::local::LocalFileSystem;
 use std::sync::Arc;
 use url::Url;
 
+/// Coalescing gap in bytes for local reads with object generation validators.
+pub const LOCAL_RANGE_COALESCE_GAP: u64 = 128 * 1024;
+
 /// A parsed URL identifying a particular [`ObjectStore`] instance
 ///
 /// For example:
@@ -176,6 +179,18 @@ pub trait ObjectStoreRegistry: Send + Sync + std::fmt::Debug + 'static {
     ) -> Result<(Arc<dyn ObjectStore>, Option<StoreId>)> {
         Ok((self.get_store(url)?, None))
     }
+
+    /// Resolve the store, its cache identity and its conditional range-read
+    /// gap together. Registries that wrap a resolved store forward the gap
+    /// along with its ID (Longbow family RCG).
+    fn get_store_registration(&self, url: &Url) -> Result<ObjectStoreRegistration> {
+        let (store, id) = self.get_store_with_id(url)?;
+        Ok(ObjectStoreRegistration {
+            store,
+            id,
+            range_coalesce_gap: object_store::OBJECT_STORE_COALESCE_DEFAULT,
+        })
+    }
 }
 
 /// The identity of one store registration (Longbow family OO): assigned from
@@ -213,11 +228,22 @@ impl std::fmt::Display for StoreId {
     }
 }
 
+/// The store and read policy resolved by one registry lookup.
+#[derive(Clone)]
+pub struct ObjectStoreRegistration {
+    /// The store to read from.
+    pub store: Arc<dyn ObjectStore>,
+    /// The identity of the registration, if assigned.
+    pub id: Option<StoreId>,
+    /// The maximum gap in bytes to merge between conditional range reads.
+    pub range_coalesce_gap: u64,
+}
+
 /// The default [`ObjectStoreRegistry`]
 pub struct DefaultObjectStoreRegistry {
     /// A map from scheme to object store that serve list / read operations for the store
-    /// Each with the ID of its registration (Longbow family OO).
-    object_stores: DashMap<String, (Arc<dyn ObjectStore>, Option<StoreId>)>,
+    /// Each with the ID and range policy of its registration.
+    object_stores: DashMap<String, ObjectStoreRegistration>,
 }
 
 impl std::fmt::Debug for DefaultObjectStoreRegistry {
@@ -245,21 +271,43 @@ impl DefaultObjectStoreRegistry {
     /// This will register [`LocalFileSystem`] to handle `file://` paths
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Self {
-        let object_stores: DashMap<String, (Arc<dyn ObjectStore>, Option<StoreId>)> =
-            DashMap::new();
-        object_stores.insert(
-            "file://".to_string(),
-            (Arc::new(LocalFileSystem::new()), StoreId::next()),
-        );
-        Self { object_stores }
+        let registry = Self {
+            object_stores: DashMap::new(),
+        };
+        drop(registry.register_store_with_coalesce_gap(
+            ObjectStoreUrl::local_filesystem().as_ref(),
+            Arc::new(LocalFileSystem::new()),
+            LOCAL_RANGE_COALESCE_GAP,
+        ));
+        registry
     }
 
     /// Default without any backend registered.
     #[cfg(target_arch = "wasm32")]
     pub fn new() -> Self {
-        let object_stores: DashMap<String, (Arc<dyn ObjectStore>, Option<StoreId>)> =
-            DashMap::new();
-        Self { object_stores }
+        Self {
+            object_stores: DashMap::new(),
+        }
+    }
+
+    /// Register a store and its conditional range-read gap in bytes.
+    /// Returns the previous store for this URL, if any.
+    pub fn register_store_with_coalesce_gap(
+        &self,
+        url: &Url,
+        store: Arc<dyn ObjectStore>,
+        range_coalesce_gap: u64,
+    ) -> Option<Arc<dyn ObjectStore>> {
+        self.object_stores
+            .insert(
+                get_url_key(url),
+                ObjectStoreRegistration {
+                    store,
+                    id: StoreId::next(),
+                    range_coalesce_gap,
+                },
+            )
+            .map(|old| old.store)
     }
 }
 
@@ -279,35 +327,40 @@ impl ObjectStoreRegistry for DefaultObjectStoreRegistry {
         url: &Url,
         store: Arc<dyn ObjectStore>,
     ) -> Option<Arc<dyn ObjectStore>> {
-        let s = get_url_key(url);
-        self.object_stores
-            .insert(s, (store, StoreId::next()))
-            .map(|(store, _)| store)
+        self.register_store_with_coalesce_gap(
+            url,
+            store,
+            object_store::OBJECT_STORE_COALESCE_DEFAULT,
+        )
     }
 
     fn deregister_store(&self, url: &Url) -> Result<Arc<dyn ObjectStore>> {
         let s = get_url_key(url);
-        let (_, (object_store, _)) = self.object_stores
+        let (_, registration) = self.object_stores
             .remove(&s)
             .ok_or_else(|| {
                 internal_datafusion_err!("Failed to deregister object store. No suitable object store found for {url}. See `RuntimeEnv::register_object_store`")
             })?;
 
-        Ok(object_store)
+        Ok(registration.store)
     }
 
     fn get_store(&self, url: &Url) -> Result<Arc<dyn ObjectStore>> {
-        Ok(self.get_store_with_id(url)?.0)
+        Ok(self.get_store_registration(url)?.store)
     }
 
     fn get_store_with_id(
         &self,
         url: &Url,
     ) -> Result<(Arc<dyn ObjectStore>, Option<StoreId>)> {
-        let s = get_url_key(url);
+        let registration = self.get_store_registration(url)?;
+        Ok((registration.store, registration.id))
+    }
+
+    fn get_store_registration(&self, url: &Url) -> Result<ObjectStoreRegistration> {
         self.object_stores
-            .get(&s)
-            .map(|o| (Arc::clone(&o.value().0), o.value().1))
+            .get(&get_url_key(url))
+            .map(|entry| entry.value().clone())
             .ok_or_else(|| {
                 internal_datafusion_err!("No suitable object store found for {url}. See `RuntimeEnv::register_object_store`")
             })
@@ -327,6 +380,31 @@ fn get_url_key(url: &Url) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_resolves_the_store_and_its_gap_together() {
+        let registry = DefaultObjectStoreRegistry::new();
+        let url = Url::parse("memory://ranges/").unwrap();
+        let first: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let second: Arc<dyn ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        registry.register_store_with_coalesce_gap(
+            &url,
+            Arc::clone(&first),
+            LOCAL_RANGE_COALESCE_GAP,
+        );
+        let before = registry.get_store_registration(&url).unwrap();
+        registry.register_store(&url, Arc::clone(&second));
+        let after = registry.get_store_registration(&url).unwrap();
+        assert!(Arc::ptr_eq(&before.store, &first));
+        assert_eq!(before.range_coalesce_gap, LOCAL_RANGE_COALESCE_GAP);
+        assert!(Arc::ptr_eq(&after.store, &second));
+        assert_eq!(
+            after.range_coalesce_gap,
+            object_store::OBJECT_STORE_COALESCE_DEFAULT
+        );
+        assert_ne!(before.id, after.id);
+    }
 
     /// Longbow family OO (MJJ96 v5 review): the counter never wraps, so an
     /// exhausted counter issues no ID instead of reusing one.

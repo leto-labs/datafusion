@@ -53,6 +53,21 @@ with the planned footer's offsets. Without a validator the reads are
 upstream's plain range reads. A custom `ParquetFileReaderFactory` owns its
 own checks.
 
+## Family RCG: coalescing gaps for conditional Parquet reads
+
+Purpose: avoid reading unrequested columns on local storage. Dependent
+Longbow feature: LOCAL-PARQUET-SCAN (scale-up 4.7b, leto-mjj.154).
+Audit classification: UPSTREAMABLE.
+
+A store registration binds the conditional range coalescing gap to the
+store and its cache identity. The built-in local filesystem binding uses
+128 KiB. Other registrations default to the object_store gap of 1 MiB.
+Registry wrappers must forward `get_store_registration` to preserve the
+gap. The trait default supplies 1 MiB. A `ParquetSource` without a reader
+factory also uses 1 MiB. Each merged read retains the planned ETag or
+version. Without a validator the reader calls the store's own multi-range
+implementation.
+
 ## Family FD: final aggregate spill replay accounting
 
 Purpose: give the fully clustered replay table of an unordered hash
