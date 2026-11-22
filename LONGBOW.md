@@ -1427,3 +1427,17 @@ the previous staging proof.
 - Verification: the view-bound test compares both bounds against the
   original row formula, including slices, nulls with nonzero descriptor
   lengths, binary values and empty arrays.
+
+## Family BVR: admit an optional empty byte-view table reserve
+
+Bounded native readers admit an empty byte-view map's slot allocation
+before interning a resident radix partition (leto-7h1w). The dependent
+Longbow feature is NATIVE-AGGREGATE. Audit classification is KEEP.
+
+A caller admits the new slot allocation while the empty old allocation
+is still live. A refusal leaves the table empty with its original
+allocation. The hint applies to the current table lifetime.
+
+The inline and batch-code caches forward admission to their canonical
+interner, which can decline this optional reserve. The cached table
+updates and group ordering continue through the ordinary intern path.

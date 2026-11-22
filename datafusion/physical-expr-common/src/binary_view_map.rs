@@ -210,6 +210,35 @@ where
         *self = released;
     }
 
+    /// Reserve the slots of an empty map if the owner admits the allocation
+    /// peak. The old table and the new allocation can overlap during growth.
+    pub fn try_reserve_empty(
+        &mut self,
+        groups: usize,
+        admit: impl FnOnce(usize) -> bool,
+    ) -> bool {
+        if !self.is_empty() || groups < 512 || groups <= self.map.capacity() {
+            return false;
+        }
+
+        // hashbrown allocates power-of-two buckets at a maximum 7/8 load.
+        // At this size the entry array already meets control-byte alignment.
+        let Some(bytes) = groups
+            .checked_mul(8)
+            .and_then(|scaled| (scaled / 7).checked_next_power_of_two())
+            .and_then(|buckets| buckets.checked_mul(size_of::<Entry<V>>() + 1))
+            .and_then(|bytes| bytes.checked_add(64))
+        else {
+            return false;
+        };
+        if !admit(bytes) {
+            return false;
+        }
+        let reserved = self.map.try_reserve(groups, |entry| entry.hash).is_ok();
+        debug_assert!(!reserved || self.map.allocation_size() <= bytes);
+        reserved
+    }
+
     /// Inserts each value from `values` into the map, invoking `payload_fn` for
     /// each value if *not* already present, deferring the allocation of the
     /// payload until it is needed.
@@ -643,6 +672,34 @@ mod tests {
         let strings = strings.as_string_view();
         let state = strings.into_iter().collect::<Vec<_>>();
         assert_eq!(state, expected);
+    }
+
+    #[test]
+    fn empty_table_reserve_admits_the_allocation_peak() {
+        let mut map =
+            ArrowBytesViewMap::<usize>::with_capacity(OutputType::Utf8View, 512);
+        let before = map.size();
+        assert!(!map.try_reserve_empty(8192, |bytes| {
+            assert!(bytes > before);
+            false
+        }));
+        assert_eq!(map.size(), before);
+        assert!(map.try_reserve_empty(8192, |_| true));
+        assert!(map.map.capacity() >= 8192);
+        let key: ArrayRef = Arc::new(StringViewArray::from(vec![None, Some("url")]));
+        let mut ids = vec![];
+        let mut next = 0;
+        map.insert_if_new(
+            &key,
+            |_| {
+                next += 1;
+                next - 1
+            },
+            |id| ids.push(id),
+        );
+        assert_eq!(ids, [0, 1]);
+        assert!(!map.try_reserve_empty(16384, |_| panic!("populated table")));
+        assert_eq!(map.into_state().as_ref(), key.as_ref());
     }
 
     #[test]

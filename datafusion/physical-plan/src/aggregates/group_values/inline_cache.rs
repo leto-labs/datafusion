@@ -184,6 +184,14 @@ impl<const N: usize> GroupValues for InlineCache<N> {
         Ok(())
     }
 
+    fn try_reserve_empty(
+        &mut self,
+        groups: usize,
+        admit: &mut dyn FnMut(usize) -> bool,
+    ) -> bool {
+        self.inner.try_reserve_empty(groups, admit)
+    }
+
     fn size(&self) -> usize {
         self.inner.size()
             + size_of::<Self>()
