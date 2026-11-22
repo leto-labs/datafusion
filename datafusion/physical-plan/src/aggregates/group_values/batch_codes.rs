@@ -152,6 +152,14 @@ impl GroupValues for BatchCodes {
         std::mem::swap(groups, &mut self.codes);
         Ok(())
     }
+    fn try_reserve_empty(
+        &mut self,
+        groups: usize,
+        admit: &mut dyn FnMut(usize) -> bool,
+    ) -> bool {
+        self.inner.try_reserve_empty(groups, admit)
+    }
+
     fn size(&self) -> usize {
         size_of::<Self>()
             + self.inner.size()

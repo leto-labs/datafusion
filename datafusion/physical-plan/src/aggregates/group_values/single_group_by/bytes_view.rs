@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -63,6 +65,14 @@ impl GroupValues for GroupValuesBytesView {
         // ensure we assigned a group to for each row
         assert_eq!(groups.len(), arr.len());
         Ok(())
+    }
+
+    fn try_reserve_empty(
+        &mut self,
+        groups: usize,
+        admit: &mut dyn FnMut(usize) -> bool,
+    ) -> bool {
+        self.map.try_reserve_empty(groups, admit)
     }
 
     fn size(&self) -> usize {

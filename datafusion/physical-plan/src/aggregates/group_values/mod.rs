@@ -103,6 +103,16 @@ pub trait GroupValues: Send {
         self.intern(cols, groups)
     }
 
+    /// Optionally pre-size the slots of an empty table. The caller's admission
+    /// callback covers the allocation peak and can decline the hint.
+    fn try_reserve_empty(
+        &mut self,
+        _groups: usize,
+        _admit: &mut dyn FnMut(usize) -> bool,
+    ) -> bool {
+        false
+    }
+
     /// Returns the number of bytes of memory used by this [`GroupValues`].
     ///
     /// May be expensive; check the implementation before calling on hot paths.
@@ -290,6 +300,47 @@ mod tests {
 
     use super::new_group_values;
     use crate::aggregates::order::GroupClustering;
+
+    #[test]
+    fn cached_utf8_view_groups_forward_empty_reserve() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "key",
+            DataType::Utf8View,
+            true,
+        )]));
+        let mut groups = new_group_values(schema, &GroupClustering::None).unwrap();
+        let before = groups.size();
+        assert!(!groups.try_reserve_empty(8192, &mut |_| false));
+        assert_eq!(groups.size(), before);
+        let mut grants = 0;
+        assert!(groups.try_reserve_empty(8192, &mut |bytes| {
+            assert!(bytes > 0);
+            grants += 1;
+            true
+        }));
+        assert_eq!(grants, 1);
+        assert!(groups.size() > before);
+        let input: ArrayRef = Arc::new(StringViewArray::from_iter((0..2048).map(|i| {
+            [
+                Some("https://example.test/a"),
+                None,
+                Some("https://example.test/b"),
+            ][i % 3]
+        })));
+        let mut ids = Vec::new();
+        groups.intern(&[input], &mut ids).unwrap();
+        assert_eq!(ids, (0..2048).map(|i| i % 3).collect::<Vec<_>>());
+        assert!(!groups.try_reserve_empty(16384, &mut |_| panic!("populated table")));
+        let out = groups.emit(EmitTo::All).unwrap();
+        assert_eq!(
+            out[0].as_string_view().iter().collect::<Vec<_>>(),
+            [
+                Some("https://example.test/a"),
+                None,
+                Some("https://example.test/b")
+            ]
+        );
+    }
 
     #[test]
     fn preserving_values_keep_group_indices_valid() {
