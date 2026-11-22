@@ -604,3 +604,44 @@ async fn fixed_binary_empty_build_keeps_the_legacy_null_extension() -> Result<()
     assert!(nulls.get_buffer_memory_size() >= rows * 4096);
     Ok(())
 }
+
+#[test]
+fn null_view_slots_count_bytes_that_arrow_gc_copies() -> Result<()> {
+    use super::super::{Gather, OutputPieces, OutputRows};
+    use arrow::array::{StringViewArray, UInt32Array, UInt64Array};
+    use arrow::buffer::NullBuffer;
+
+    let value = "x".repeat(16 * 1024);
+    let view = StringViewArray::from(vec![value.as_str()]);
+    // Arrow validates the physical view even when its validity bit is 0.
+    let view = StringViewArray::try_new(
+        view.views().clone(),
+        Arc::clone(view.data_buffers()),
+        Some(NullBuffer::new_null(1)),
+    )?;
+    assert_eq!(view.total_buffer_bytes_used(), value.len());
+    let probe = RecordBatch::try_from_iter([("payload", Arc::new(view) as _)])?;
+    let gather = Gather {
+        build: RecordBatch::new_empty(Arc::new(Schema::empty())),
+        probe: probe.clone(),
+        left: UInt64Array::from_iter_values(std::iter::repeat_n(0, MATCHES as usize)),
+        right: UInt32Array::from_iter_values(std::iter::repeat_n(0, MATCHES as usize)),
+        side: JoinSide::Left,
+        mark: None,
+    };
+    let mut pieces = OutputPieces::new(OutputRows::Gather(Box::new(gather)));
+    let columns = [ColumnIndex {
+        index: 0,
+        side: JoinSide::Right,
+    }];
+    let mut rows = 0;
+    while let Some(batch) =
+        pieces.next(&probe.schema(), &columns, JoinType::Inner, MATCHES as usize)?
+    {
+        assert!(batch.get_array_memory_size() <= BYTE_LIMIT);
+        assert_eq!(batch.column(0).null_count(), batch.num_rows());
+        rows += batch.num_rows();
+    }
+    assert_eq!(rows, MATCHES as usize);
+    Ok(())
+}
