@@ -1139,8 +1139,9 @@ including when the spill option is enabled.
   filters use the same estimate with their own columns. Output includes
   matched rows, null-extended rows and marks, and uses at most the
   configured batch size and an 8 MiB materialized-byte target. A single
-  wider row is emitted alone. Eligible spilled batches bypass row
-  coalescing to keep separate pieces within the target.
+  wider row is emitted alone. The spilled stream coalesces compact
+  pieces up to the row limit and flushes before the next piece would
+  exceed the byte budget.
 - Spill files used for replay contain IPC batches sized against an 8 MiB
   permit. The estimate covers decoding, one flat copy, and probe scratch
   including row numbers, hashes and inline keys. The writer can admit one
@@ -1149,8 +1150,13 @@ including when the spill option is enabled.
   side that becomes the probe.
 - Replay opens one file at a time. It registers and charges the maximum
   permit recorded for that file immediately before opening it, after the
-  build runs. One replay batch can progress in a full pool. The permit is
-  released on file advance, EOF, error or stream drop. IPC I/O, arbitrary
+  build runs. To guarantee progress, one active stream can overcommit a
+  full fair pool by up to `max(8 MiB, 2 × widest replay row)`. Here the
+  replay row includes the decoded IPC upper bound (including compression)
+  and 32 bytes of scratch allowance, so twice that value covers decoding,
+  one flat copy and the full scratch allowance. Unspillable allocations
+  can be refused while this charge is live. The permit is released on file
+  advance, EOF, error or stream drop. IPC I/O, arbitrary
   residual-expression temporaries, materialization scratch and output
   retained downstream have separate lifetimes.
 

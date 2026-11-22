@@ -645,3 +645,79 @@ fn null_view_slots_count_bytes_that_arrow_gc_copies() -> Result<()> {
     assert_eq!(rows, MATCHES as usize);
     Ok(())
 }
+
+#[tokio::test]
+async fn replay_read_error_releases_permit_and_fuses_join() -> Result<()> {
+    use super::super::files::{FileSource, Origin, SpillFilesExec};
+    use super::super::{JoinSpillMetrics, PartWriter, Side, spill_manager};
+    use crate::joins::HashJoinExecBuilder;
+    use crate::metrics::{ExecutionPlanMetricsSet, Gauge};
+    use datafusion_execution::memory_pool::{FairSpillPool, MemoryPool};
+    use futures::StreamExt;
+
+    let row =
+        RecordBatch::try_from_iter([("k", Arc::new(Int32Array::from(vec![7])) as _)])?;
+    let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(1024 * 1024));
+    let context = super::review::pool_context(
+        no_reversal(spill_config(0, 32 * 1024, 2)),
+        Arc::clone(&pool),
+    );
+    let metrics = JoinSpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0, Gauge::new());
+    let manager = spill_manager(&context, &metrics, row.schema());
+    let mut writer =
+        PartWriter::new(&manager, "short probe replay", None)?.with_byte_limits(true);
+    writer.write(std::slice::from_ref(&row), &metrics, Side::Probe)?;
+    let file = writer.finish(&metrics, Side::Probe)?.unwrap();
+    let permit = file.replay_bytes;
+    let mut short_file = file.clone();
+    // A valid IPC prefix ends one row before its recorded total.
+    short_file.rows += 1;
+    let leaf = SpillFilesExec::new(
+        row.schema(),
+        FileSource::Fixed(vec![vec![short_file, file]]),
+        manager,
+        1,
+        Origin {
+            rows: 3,
+            parent_rows: 3,
+        },
+        metrics,
+    )
+    .with_probe_replay(true);
+
+    let mut replay = leaf.execute_replay(0, &context)?;
+    assert_eq!(replay.try_next().await?, Some(row.clone()));
+    assert_eq!(pool.reserved(), permit);
+    let error = replay.try_next().await.unwrap_err();
+    assert!(
+        error.to_string().contains("spill file row count mismatch"),
+        "{error}"
+    );
+    assert_eq!(pool.reserved(), 0);
+    assert!(replay.next().await.is_none());
+    drop(replay);
+
+    let plan = HashJoinExecBuilder::new(
+        memory_input(std::slice::from_ref(&row), 1),
+        Arc::new(leaf),
+        vec![(key(&row.schema()), key(&row.schema()))],
+        JoinType::Inner,
+    )
+    .with_partition_mode(PartitionMode::CollectLeft)
+    .build()?;
+    let mut join = plan.execute(0, Arc::clone(&context))?;
+    // The first replay row produced a buffered match before the EOF
+    // error. Polling again must not flush it or read the next file.
+    let error = join.try_next().await.unwrap_err();
+    assert!(
+        error.to_string().contains("spill file row count mismatch"),
+        "{error}"
+    );
+    for _ in 0..2 {
+        assert!(join.next().await.is_none());
+    }
+    drop(join);
+    drop(plan);
+    assert_eq!(pool.reserved(), 0);
+    Ok(())
+}

@@ -1938,8 +1938,8 @@ impl ExecutionPlan for HashJoinExec {
 
         let batch_size = context.session_config().batch_size();
 
-        // we have the batches and the hash map with their keys. We can how create a stream
-        // over the right that uses this information to issue new batches.
+        // Longbow family JS: the right spill leaf is replayed under a
+        // permit acquired when the stream reads the file.
         let replay = if context
             .session_config()
             .options()

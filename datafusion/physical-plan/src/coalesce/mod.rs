@@ -200,7 +200,13 @@ impl LimitedBatchCoalescer {
         self.inner.is_empty()
     }
 
-    /// Forward a piece the spilled join already sized and materialized,
+    /// Longbow family JS: rows still available to the spilled join's byte coalescer.
+    pub(crate) fn remaining_fetch(&self) -> usize {
+        self.fetch
+            .map_or(usize::MAX, |fetch| fetch.saturating_sub(self.total_rows))
+    }
+
+    /// Longbow family JS: forward a byte-limited batch the join already coalesced,
     /// while preserving the fetch limit and buffered row order.
     pub(crate) fn push_uncoalesced(
         &mut self,

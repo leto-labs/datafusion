@@ -7,12 +7,13 @@
 //! Materialize one bounded piece at a time, using the actual selected rows.
 
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array, UInt64Array};
-use arrow::compute::{filter as filter_array, take_record_batch};
+use arrow::compute::{concat_batches, filter as filter_array, take_record_batch};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{JoinSide, JoinType, Result};
 
 use super::spill::bytes::{BATCH_BYTES, RowBytes, compact_views, prefix};
+use crate::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
 use crate::joins::utils::{
     ColumnIndex, JoinFilter, apply_join_filter_to_indices, build_batch_from_indices,
 };
@@ -157,6 +158,74 @@ impl OutputPieces {
         };
         self.offset += batch.num_rows();
         Ok(Some(compact_views(&batch)?))
+    }
+}
+
+/// Coalesce compact spilled pieces within both budgets. Using Arrow concat
+/// sizes the flat builders to the final row count and selected bytes once.
+#[derive(Default)]
+pub(super) struct SpillCoalescer {
+    batches: Vec<RecordBatch>,
+    rows: usize,
+    bytes: usize,
+}
+
+impl SpillCoalescer {
+    pub(super) fn remaining_rows(
+        &self,
+        output: &LimitedBatchCoalescer,
+        batch_size: usize,
+    ) -> usize {
+        batch_size
+            .min(output.remaining_fetch())
+            .saturating_sub(self.rows)
+    }
+
+    pub(super) fn push(
+        &mut self,
+        batch: RecordBatch,
+        output: &mut LimitedBatchCoalescer,
+        batch_size: usize,
+    ) -> Result<PushBatchStatus> {
+        let rows = batch.num_rows();
+        // Concat borrows view data blocks and sizes flat data/offset buffers
+        // from the selected rows. Allow for a validity bitmap added to an
+        // all-valid piece and up to three 64-byte alignment increments
+        // per column (values, offsets and validity).
+        let bytes = batch.get_array_memory_size().saturating_add(
+            batch
+                .num_columns()
+                .saturating_mul(rows.div_ceil(8) + 3 * 64),
+        );
+        if self.bytes.saturating_add(bytes) > BATCH_BYTES {
+            let status = self.flush(output)?;
+            debug_assert_eq!(status, PushBatchStatus::Continue);
+        }
+        self.rows += rows;
+        self.bytes += bytes;
+        self.batches.push(batch);
+        if self.bytes >= BATCH_BYTES || self.remaining_rows(output, batch_size) == 0 {
+            return self.flush(output);
+        }
+        Ok(PushBatchStatus::Continue)
+    }
+
+    pub(super) fn flush(
+        &mut self,
+        output: &mut LimitedBatchCoalescer,
+    ) -> Result<PushBatchStatus> {
+        let batch = match self.batches.as_slice() {
+            [] => return Ok(PushBatchStatus::Continue),
+            [_] => self.batches.pop().unwrap(),
+            _ => {
+                let batch = concat_batches(&output.schema(), &self.batches)?;
+                self.batches.clear();
+                batch
+            }
+        };
+        self.rows = 0;
+        self.bytes = 0;
+        output.push_uncoalesced(batch)
     }
 }
 

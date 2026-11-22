@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::task::Poll;
 
-use super::output::{self, Gather, OutputPieces, OutputRows};
+use super::output::{self, Gather, OutputPieces, OutputRows, SpillCoalescer};
 use crate::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
 use crate::joins::Map;
 use crate::joins::PartitionMode;
@@ -422,9 +422,10 @@ pub(super) struct HashJoinStream {
     /// Longbow family JS: probe-side spill state of an eligible join, kept
     /// only once its build spilled.
     spill: Option<Box<StreamSpill>>,
-    /// A join over spill files has a permit for the live probe batch and scratch.
+    /// Longbow family JS: a join over spill files holds a live replay permit.
     replay_probe: bool,
-    byte_output: bool,
+    replay_failed: bool,
+    spill_output: Option<Box<SpillCoalescer>>,
     output_pieces: Option<OutputPieces>,
 }
 
@@ -612,7 +613,8 @@ impl HashJoinStream {
             output_buffer,
             spill,
             replay_probe,
-            byte_output: replay_probe,
+            replay_failed: false,
+            spill_output: replay_probe.then(Box::default),
             output_pieces: None,
         }
     }
@@ -716,21 +718,30 @@ impl HashJoinStream {
                 // Longbow family JS: this stream leaves its spilled build.
                 self.spill = None;
                 self.output_pieces = None;
+                self.spill_output = None;
                 if self.replay_probe {
                     self.release_replay_probe();
                 }
                 return Poll::Ready(None);
             }
 
+            // Longbow family JS: coalesce only pieces that fit both bounds.
             if let Some(pieces) = &mut self.output_pieces {
+                let output = self.spill_output.as_mut().expect("byte-limited output");
+                let rows = output.remaining_rows(&self.output_buffer, self.batch_size);
+                if rows == 0 {
+                    self.output_buffer.finish()?;
+                    self.state = HashJoinStreamState::Completed;
+                    continue;
+                }
                 match pieces.next(
                     &self.schema,
                     &self.column_indices,
                     self.join_type,
-                    self.batch_size,
+                    rows,
                 )? {
                     Some(batch) => {
-                        if self.output_buffer.push_uncoalesced(batch)?
+                        if output.push(batch, &mut self.output_buffer, self.batch_size)?
                             == PushBatchStatus::LimitReached
                         {
                             self.output_buffer.finish()?;
@@ -765,13 +776,16 @@ impl HashJoinStream {
                 HashJoinStreamState::Completed if self.spill.is_some() => {
                     handle_state!(ready!(self.join_written_partitions(cx)))
                 }
-                HashJoinStreamState::Completed if !self.output_buffer.is_empty() => {
-                    // Flush any remaining buffered data
+                HashJoinStreamState::Completed => {
+                    if let Some(output) = self.spill_output.as_mut() {
+                        output.flush(&mut self.output_buffer)?;
+                    }
+                    if self.output_buffer.is_empty() {
+                        return Poll::Ready(None);
+                    }
                     self.output_buffer.finish()?;
-                    // Continue loop to emit the flushed batch
                     continue;
                 }
-                HashJoinStreamState::Completed => Poll::Ready(None),
             };
         }
     }
@@ -818,7 +832,9 @@ impl HashJoinStream {
         if let Some(spill) = &mut self.spill {
             let spilled = left_data.spilled();
             if spill.on_build(spilled)? {
-                self.byte_output |= spilled.is_some_and(|build| build.byte_limits());
+                if spilled.is_some_and(|build| build.byte_limits()) {
+                    self.spill_output.get_or_insert_with(Box::default);
+                }
             } else {
                 self.spill = None;
             }
@@ -960,7 +976,7 @@ impl HashJoinStream {
         let is_empty = !build_side.left_data.has_matchable_build_rows();
 
         if is_empty {
-            if self.byte_output {
+            if self.spill_output.is_some() {
                 if !self.join_type.empty_build_side_produces_empty_result() {
                     let rows = state.batch.num_rows();
                     let build = build_side.left_data.batch();
@@ -1111,7 +1127,7 @@ impl HashJoinStream {
 
         // apply join filter if exists
         let (left_indices, right_indices) = if let Some(filter) = &self.filter {
-            if self.byte_output {
+            if self.spill_output.is_some() {
                 output::filter(
                     build_side.left_data.batch(),
                     &state.batch,
@@ -1200,7 +1216,7 @@ impl HashJoinStream {
                 (build_side.left_data.batch(), &state.batch, JoinSide::Left)
             };
 
-        let push_status = if self.byte_output {
+        let push_status = if self.spill_output.is_some() {
             self.output_pieces =
                 Some(OutputPieces::new(OutputRows::Gather(Box::new(Gather {
                     build: build_batch.clone(),
@@ -1269,7 +1285,7 @@ impl HashJoinStream {
             return Poll::Ready(Ok(StatefulStreamResult::Continue));
         };
         match ready!(spill.poll_written(cx)) {
-            Some(Ok(batch)) if self.byte_output => {
+            Some(Ok(batch)) if self.spill_output.is_some() => {
                 self.output_pieces = Some(OutputPieces::new(OutputRows::Batch(batch)));
             }
             Some(Ok(batch)) => {
@@ -1385,7 +1401,7 @@ impl HashJoinStream {
         // Push this chunk of final indices to output buffer
         if !left_side.is_empty() {
             let empty_right_batch = RecordBatch::new_empty(self.right.schema());
-            if self.byte_output {
+            if self.spill_output.is_some() {
                 self.output_pieces =
                     Some(OutputPieces::new(OutputRows::Gather(Box::new(Gather {
                         build: build_side.left_data.batch().clone(),
@@ -1480,9 +1496,16 @@ impl Stream for HashJoinStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
+        // Longbow family JS: terminal replay errors must discard buffered
+        // work. Once an error was delivered, later polls always return EOF.
+        if self.replay_failed {
+            return Poll::Ready(None);
+        }
         let result = self.poll_next_impl(cx);
         if matches!(&result, Poll::Ready(Some(Err(_)))) && self.replay_probe {
+            self.replay_failed = true;
             self.output_pieces = None;
+            self.spill_output = None;
             self.state = HashJoinStreamState::Completed;
             self.spill = None;
             self.release_replay_probe();

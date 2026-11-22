@@ -848,6 +848,7 @@ impl SpillFilesExec {
                     });
                     if next.is_err() {
                         current = None;
+                        files = Default::default();
                     }
                     return Poll::Ready(Some(next));
                 }
@@ -860,6 +861,7 @@ impl SpillFilesExec {
                     continue;
                 }
                 if file.replay_bytes == 0 {
+                    files = Default::default();
                     return Poll::Ready(Some(internal_err!(
                         "hash join spill: probe file without a replay permit"
                     )));
@@ -871,12 +873,17 @@ impl SpillFilesExec {
                     MemoryConsumer::new(format!("HashJoinProbeReplay[{partition}]"))
                         .with_can_spill(true)
                         .register(&pool);
-                // Like the first read of a build chunk, one batch must
-                // make progress when the build has filled the pool.
+                // Like the first build-chunk read, this read must progress
+                // with a full pool. The extra charge per active stream is
+                // at most 8 MiB or twice the largest single-row replay unit
+                // (including IPC and scratch allowances), whichever is larger.
                 permit.grow(file.replay_bytes);
                 match file.reader(&manager) {
                     Ok(reader) => current = Some((reader, permit)),
-                    Err(error) => return Poll::Ready(Some(Err(error))),
+                    Err(error) => {
+                        files = Default::default();
+                        return Poll::Ready(Some(Err(error)));
+                    }
                 }
             }
         });
