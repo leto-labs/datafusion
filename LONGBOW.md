@@ -1358,3 +1358,16 @@ added to the scan's protobuf.
 Runtime counters are registered on the first staged vector and shared across
 files of the same partition. Replacing the predicate or projection clears
 the previous staging proof.
+
+## Family VRB: account for rank byte views by descriptor
+
+- Purpose: remove per-row type and value dispatch from the
+  `PartitionedTopKExec` memory bound for flat UTF-8 and binary view arrays.
+  Gather bounds use the valid and null counts. Encoding bounds sum the
+  descriptor lengths of valid rows, including repeated views.
+- Dependent feature: WINDOW-TOPK (scale-up 5.9b, leto-mjj.146).
+- Classification: KEEP while the Longbow bounded-Top-K family N owns this
+  accounting. The numeric reservations and result semantics are preserved.
+- Verification: the view-bound test compares both bounds against the
+  original row formula, including slices, nulls with nonzero descriptor
+  lengths, binary values and empty arrays.

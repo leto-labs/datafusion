@@ -6,8 +6,8 @@
 
 //! Checked bounds for work performed before retained Top-K state is resized.
 use super::*;
-use arrow::array::{NullArray, downcast_dictionary_array};
-use arrow::datatypes::{DataType, Int16Type, Int32Type, Int64Type};
+use arrow::array::{GenericByteViewArray, NullArray, downcast_dictionary_array};
+use arrow::datatypes::{ByteViewType, DataType, Int16Type, Int32Type, Int64Type};
 use datafusion_common::resources_datafusion_err;
 use datafusion_physical_expr::expressions::Column;
 
@@ -315,8 +315,38 @@ fn child_work(
     }
 }
 
-/// O(1) for fixed-width and offset-based arrays. Only views and nested
-/// values require element visits. No ScalarValue/ArrayData allocation is made.
+/// The same bound as `logical_row` for a byte view. Gather copies the
+/// descriptors and shares their backing buffers. Encoding can expand repeated
+/// views, so count every valid length, without resolving its backing buffer.
+fn view_array_bytes<T: ByteViewType>(
+    array: &GenericByteViewArray<T>,
+    encoding: bool,
+) -> Result<usize> {
+    let null_count = array.null_count();
+    let valid_count = array.len() - null_count;
+    if !encoding {
+        return add(null_count, mul(valid_count, 9 + size_of::<u128>())?);
+    }
+    let sum_lengths = |views: &[u128]| {
+        views
+            .iter()
+            .try_fold(0, |n, view| add(n, *view as u32 as usize))
+    };
+    // A null view can contain a nonzero length. Its contribution is one byte,
+    // regardless of the bits in its descriptor.
+    let lengths = if let Some(nulls) = array.nulls().filter(|_| null_count != 0) {
+        nulls.valid_slices().try_fold(0, |n, (start, end)| {
+            add(n, sum_lengths(&array.views()[start..end])?)
+        })?
+    } else {
+        sum_lengths(array.views())?
+    };
+    add(add(null_count, mul(valid_count, 9)?)?, mul(lengths, 2)?)
+}
+
+/// O(1) for fixed-width, offset-based, and gathered view arrays. Encoded
+/// views and nested values can require element visits. No ScalarValue or
+/// ArrayData allocation is made.
 fn array_bytes(array: &dyn Array, encoding: bool) -> Result<usize> {
     let rows = array.len();
     if let Some(width) = array.data_type().primitive_width() {
@@ -361,6 +391,8 @@ fn array_bytes(array: &dyn Array, encoding: bool) -> Result<usize> {
         };
     }
     match array.data_type() {
+        DataType::Utf8View => view_array_bytes(array.as_string_view(), encoding),
+        DataType::BinaryView => view_array_bytes(array.as_binary_view(), encoding),
         DataType::Null => Ok(if encoding { rows } else { 0 }),
         DataType::Boolean => Ok(if encoding {
             mul(rows, 2)?
@@ -536,7 +568,8 @@ thread_local! { static ELEMENT_VISITS: std::cell::Cell<usize> = const { std::cel
 #[cfg(test)]
 mod complexity_tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray, StringViewArray};
+    use arrow::array::{BinaryViewArray, Int64Array, StringArray, StringViewArray};
+    use arrow::buffer::NullBuffer;
     #[test]
     fn flat_bounds_do_not_visit_elements() -> Result<()> {
         let fixed: ArrayRef = Arc::new(Int64Array::from(vec![1; 8192]));
@@ -545,10 +578,50 @@ mod complexity_tests {
         assert_eq!(encoded_bytes(&fixed)?, 8192 * 9);
         assert!(encoded_bytes(&bytes)? > 8192 * 5);
         assert_eq!(ELEMENT_VISITS.with(|n| n.get()), 0);
-        let views: ArrayRef =
-            Arc::new(StringViewArray::from(vec!["long string view value"; 1024]));
-        encoded_bytes(&views)?;
-        assert_eq!(ELEMENT_VISITS.with(|n| n.get()), 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn byte_view_bounds_match_the_row_formula_without_generic_row_dispatch() -> Result<()>
+    {
+        let strings = StringViewArray::from(vec![
+            "before slice",
+            "inline",
+            "nonzero view length under a null",
+            "out-of-line string value",
+            "",
+            "after slice",
+        ]);
+        let nullable = StringViewArray::try_new(
+            strings.views().clone(),
+            strings.data_buffers().to_vec(),
+            Some(NullBuffer::from(vec![true, true, false, true, true, true])),
+        )?
+        .slice(1, 4);
+        let binary = BinaryViewArray::from(vec![
+            Some(b"outer".as_slice()),
+            None,
+            Some(b"\xff\x00test".as_slice()),
+            Some(b"out-of-line binary value".as_slice()),
+            None,
+        ])
+        .slice(1, 3);
+        let arrays: &[&dyn Array] = &[
+            &strings,
+            &nullable,
+            &binary,
+            &StringViewArray::new_null(4),
+            &BinaryViewArray::new_null(0),
+        ];
+        for array in arrays {
+            for encoding in [false, true] {
+                let expected = (0..array.len())
+                    .try_fold(0, |n, row| add(n, logical_row(*array, row, encoding)?))?;
+                ELEMENT_VISITS.with(|n| n.set(0));
+                assert_eq!(array_bytes(*array, encoding)?, expected);
+                assert_eq!(ELEMENT_VISITS.with(|n| n.get()), 0);
+            }
+        }
         Ok(())
     }
 }
