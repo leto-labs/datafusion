@@ -1428,6 +1428,18 @@ the previous staging proof.
   original row formula, including slices, nulls with nonzero descriptor
   lengths, binary values and empty arrays.
 
+## Family N: charge null byte-view descriptors in bounded Top-K
+
+Every null Utf8View or BinaryView row contributes its 16-byte descriptor to
+the gather and encoding bounds (leto-kliv). Arrow allocates descriptors for
+null rows in both take and interleave. The flat gather still uses row counts
+and the encoding estimator still sums descriptor lengths only for valid rows.
+The dependent feature is WINDOW-TOPK. Audit classification is KEEP.
+
+The larger reservation can make Partial pass through a batch or Final retry
+with smaller chunks. Final can return resource exhaustion if the required
+workspace exceeds the pool.
+
 ## Family BVR: admit an optional empty byte-view table reserve
 
 Bounded native readers admit an empty byte-view map's slot allocation

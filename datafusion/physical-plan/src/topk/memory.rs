@@ -11,6 +11,8 @@ use arrow::datatypes::{ByteViewType, DataType, Int16Type, Int32Type, Int64Type};
 use datafusion_common::resources_datafusion_err;
 use datafusion_physical_expr::expressions::Column;
 
+const VIEW_WIDTH: usize = size_of::<u128>();
+
 pub(super) fn add(a: usize, b: usize) -> Result<usize> {
     a.checked_add(b)
         .ok_or_else(|| resources_datafusion_err!("PartitionedTopK memory size overflow"))
@@ -113,7 +115,10 @@ fn logical_row(array: &dyn Array, row: usize, encoding: bool) -> Result<usize> {
     #[cfg(test)]
     ELEMENT_VISITS.with(|n| n.set(n.get() + 1));
     if array.is_null(row) {
-        return Ok(1);
+        return Ok(match array.data_type() {
+            DataType::Utf8View | DataType::BinaryView => VIEW_WIDTH,
+            _ => 1,
+        });
     }
     let value = match array.data_type() {
         DataType::Utf8 => array.as_string::<i32>().value_length(row) as usize,
@@ -122,7 +127,7 @@ fn logical_row(array: &dyn Array, row: usize, encoding: bool) -> Result<usize> {
         DataType::LargeBinary => array.as_binary::<i64>().value_length(row) as usize,
         DataType::Utf8View if encoding => array.as_string_view().value(row).len(),
         DataType::BinaryView if encoding => array.as_binary_view().value(row).len(),
-        DataType::Utf8View | DataType::BinaryView => 16,
+        DataType::Utf8View | DataType::BinaryView => VIEW_WIDTH,
         DataType::FixedSizeBinary(n) => usize::try_from(*n).map_err(|_| {
             resources_datafusion_err!("PartitionedTopK negative fixed width")
         })?,
@@ -324,16 +329,17 @@ fn view_array_bytes<T: ByteViewType>(
 ) -> Result<usize> {
     let null_count = array.null_count();
     let valid_count = array.len() - null_count;
+    let null_bytes = mul(null_count, VIEW_WIDTH)?;
     if !encoding {
-        return add(null_count, mul(valid_count, 9 + size_of::<u128>())?);
+        return add(null_bytes, mul(valid_count, 9 + VIEW_WIDTH)?);
     }
     let sum_lengths = |views: &[u128]| {
         views
             .iter()
             .try_fold(0, |n, view| add(n, *view as u32 as usize))
     };
-    // A null view can contain a nonzero length. Its contribution is one byte,
-    // regardless of the bits in its descriptor.
+    // A null view still occupies a descriptor. Skip its length bits, which
+    // can be nonzero even though there is no value to encode.
     let lengths = if let Some(nulls) = array.nulls().filter(|_| null_count != 0) {
         nulls.valid_slices().try_fold(0, |n, (start, end)| {
             add(n, sum_lengths(&array.views()[start..end])?)
@@ -341,7 +347,7 @@ fn view_array_bytes<T: ByteViewType>(
     } else {
         sum_lengths(array.views())?
     };
-    add(add(null_count, mul(valid_count, 9)?)?, mul(lengths, 2)?)
+    add(add(null_bytes, mul(valid_count, 9)?)?, mul(lengths, 2)?)
 }
 
 /// O(1) for fixed-width, offset-based, and gathered view arrays. Encoded
@@ -568,8 +574,12 @@ thread_local! { static ELEMENT_VISITS: std::cell::Cell<usize> = const { std::cel
 #[cfg(test)]
 mod complexity_tests {
     use super::*;
-    use arrow::array::{BinaryViewArray, Int64Array, StringArray, StringViewArray};
+    use arrow::array::{
+        BinaryViewArray, Int64Array, StringArray, StringViewArray, UInt32Array,
+    };
     use arrow::buffer::NullBuffer;
+    use arrow::compute::{interleave, take};
+    use datafusion_physical_expr::expressions::col;
     #[test]
     fn flat_bounds_do_not_visit_elements() -> Result<()> {
         let fixed: ArrayRef = Arc::new(Int64Array::from(vec![1; 8192]));
@@ -622,6 +632,93 @@ mod complexity_tests {
                 assert_eq!(ELEMENT_VISITS.with(|n| n.get()), 0);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn null_byte_view_gather_bounds_cover_allocated_buffers() -> Result<()> {
+        const ROWS: usize = 8192;
+        let indices = UInt32Array::from_iter_values((0..ROWS as u32).rev());
+        let coordinates = (0..ROWS).rev().map(|row| (0, row)).collect::<Vec<_>>();
+
+        for sliced in [false, true] {
+            let len = ROWS + usize::from(sliced) * 4;
+            let strings = StringViewArray::from_iter(
+                (0..len).map(|row| (row % 128 == 0).then_some("out-of-line string")),
+            );
+            let binaries = BinaryViewArray::from_iter((0..len).map(|row| {
+                (row % 128 == 0).then_some(b"out-of-line binary\xff".as_slice())
+            }));
+            let arrays: [ArrayRef; 4] = [
+                Arc::new(StringViewArray::new_null(len)),
+                Arc::new(BinaryViewArray::new_null(len)),
+                Arc::new(strings),
+                Arc::new(binaries),
+            ];
+            for array in arrays {
+                let array = if sliced { array.slice(2, ROWS) } else { array };
+                let take_bound = mul(array_bytes(array.as_ref(), false)?, 2)?;
+                let interleave_bound = (0..ROWS).try_fold(0, |bytes, row| {
+                    add(bytes, mul(logical_row(array.as_ref(), row, false)?, 2)?)
+                })?;
+                for (kernel, bound, output) in [
+                    ("take", take_bound, take(array.as_ref(), &indices, None)?),
+                    (
+                        "interleave",
+                        interleave_bound,
+                        interleave(&[array.as_ref()], &coordinates)?,
+                    ),
+                ] {
+                    // The kernels share the variadic data buffers. The first
+                    // buffer and the validity bitmap are newly allocated.
+                    let allocated = output.to_data().buffers()[0].capacity()
+                        + output.nulls().unwrap().buffer().capacity();
+                    assert!(
+                        bound >= allocated,
+                        "{kernel} {:?}, sliced={sliced}, nulls={}: bound {bound}, allocated {allocated}",
+                        array.data_type(),
+                        array.null_count(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn null_byte_view_batch_admission_honors_tight_limit() -> Result<()> {
+        const ROWS: usize = 8192;
+        let batch = RecordBatch::try_from_iter([(
+            "key",
+            Arc::new(StringViewArray::new_null(ROWS)) as ArrayRef,
+        )])?;
+        let schema = batch.schema();
+        let empty_strings = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringViewArray::from(vec![""; ROWS]))],
+        )?;
+        let state = PartitionedTopK::try_new(
+            0,
+            &schema,
+            vec![],
+            vec![],
+            LexOrdering::new([PhysicalSortExpr::new_default(col("key", &schema)?)])
+                .unwrap(),
+            1,
+            ROWS,
+            &Arc::new(RuntimeEnv::default()),
+            &ExecutionPlanMetricsSet::new(),
+            None,
+        )?;
+        assert!(state.try_admit_batch(&empty_strings, None)?);
+        let control = state.reserved_bytes();
+        // An empty string contributes 9 encoding and 25 gather bytes. A
+        // null contributes 16 to each. The weights are four and two.
+        let needed = control + ROWS * (4 * (16 - 9) - 2 * (25 - 16));
+        assert!(!state.try_admit_batch(&batch, Some(needed - 1))?);
+        assert_eq!(state.reserved_bytes(), control);
+        assert!(state.try_admit_batch(&batch, Some(needed))?);
+        assert_eq!(state.reserved_bytes(), needed);
         Ok(())
     }
 }
