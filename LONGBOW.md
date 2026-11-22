@@ -1453,3 +1453,36 @@ allocation. The hint applies to the current table lifetime.
 The inline and batch-code caches forward admission to their canonical
 interner, which can decline this optional reserve. The cached table
 updates and group ordering continue through the ordinary intern path.
+
+## Family FL: bound unordered final COUNT aggregation
+
+Dependent feature: UNORDERED-FINAL-COUNT (scale-up 6.18).
+Audit classification: KEEP.
+Lane: leto-edfb.
+
+A `CoalescePartitionsExec` with a fetch can bound each directly consumed
+final aggregate stream. The coalescer still enforces the global fetch.
+An eligible child has all of the following properties:
+
+- Its mode is `Final` or `FinalPartitioned` and its clustering mode is
+  `GroupClusteringMode::None`.
+- It has a single grouping set and at least one aggregate, all of which
+  are non-DISTINCT built-in `COUNT` expressions.
+- Its grouping keys are plain column references, including at least one
+  `Int64` or `UInt64` column.
+- The fetch is between 1 and 32 inclusive, and
+  `enable_migration_aggregate` is enabled.
+
+The low 12 bits of the integer grouping key select one of 4,096 buckets.
+Equal grouping tuples always select the same bucket. If the first nonempty
+partial-state batch contains at least `fetch` distinct buckets from non-null
+keys, each of the selected `fetch` buckets witnesses a distinct group.
+Merge all rows from the selected buckets through input EOF, including
+collisions and contributions from later batches. This retains complete
+counts and supplies at least the requested number of groups. If the first
+batch provides too few buckets, merge every group before applying the cap.
+
+The in-memory final aggregate materializes up to the fetch count. If it
+spills, it retains the same bucket selection for every run. Ordered replay
+finishes each group's count and stops emitting at the per-partition cap.
+The tracked coalescer producers continue to own cancellation and teardown.

@@ -71,7 +71,11 @@ impl AggregateHashTable<FinalMarker> {
         )
     }
 
-    pub(in crate::aggregates) fn start_output(&mut self) -> Result<()> {
+    pub(in crate::aggregates) fn start_output(
+        &mut self,
+        fetch: Option<usize>,
+    ) -> Result<()> {
+        self.output_group_limit = fetch;
         self.start_outputting();
         Ok(())
     }
