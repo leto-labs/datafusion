@@ -99,18 +99,24 @@ impl<'a> RowBytes<'a> {
     }
 
     pub(in crate::joins::hash_join) fn payload(&self, row: Option<usize>) -> usize {
-        let row = match row {
-            Some(row) if !self.array.is_null(row) => row,
-            _ => return 0,
+        let Some(row) = row else {
+            return 0;
         };
         match self.layout {
-            Layout::Fixed(_) => 0,
-            Layout::Bytes32(offsets) => (offsets[row + 1] - offsets[row]) as usize,
-            Layout::Bytes64(offsets) => (offsets[row + 1] - offsets[row]) as usize,
+            // Arrow take preserves the raw view for a valid gather index
+            // even if the selected array slot is null. The view compactor
+            // copies its out-of-line bytes regardless of that validity bit.
             Layout::View(views) => {
                 let len = views[row] as u32 as usize;
                 if len > 12 { len } else { 0 }
             }
+            Layout::Bytes32(offsets) if !self.array.is_null(row) => {
+                (offsets[row + 1] - offsets[row]) as usize
+            }
+            Layout::Bytes64(offsets) if !self.array.is_null(row) => {
+                (offsets[row + 1] - offsets[row]) as usize
+            }
+            _ => 0,
         }
     }
 
