@@ -26,6 +26,7 @@ use super::aggregate_hash_table::{
     PartialSkipMarker,
 };
 use super::bounded_partial::{BoundedPartial, configured_groups};
+use super::final_group_limit::{FinalGroupFilter, FinalGroupLimit};
 use super::group_values::packed::migration_needs_memory;
 use super::order::GroupClusteringMode;
 use super::skip_partial::SkipAggregationProbe;
@@ -198,6 +199,7 @@ pub(crate) struct FinalHashAggregateStream {
     ///
     /// This will be None when creating the stream
     hash_table: Option<AggregateHashTable<FinalMarker>>,
+    group_limit: Option<FinalGroupLimit>,
     /// `None` if spilling is not supported by the configured `DiskManager`.
     spill_context: Option<Box<AggregateSpill>>,
 }
@@ -708,8 +710,14 @@ impl FinalHashAggregateStream {
             reservation,
             group_values_soft_limit: agg.limit_options().map(|config| config.limit()),
             hash_table: Some(hash_table),
+            group_limit: None,
             spill_context,
         })
+    }
+
+    pub(super) fn with_group_limit(mut self, limit: FinalGroupLimit) -> Self {
+        self.group_limit = Some(limit);
+        self
     }
 
     pub(crate) fn into_stream(self) -> SendableRecordBatchStream {
@@ -793,8 +801,21 @@ impl FinalHashAggregateStream {
     ) -> Result<()> {
         let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
 
-        'input: while let Some(batch) = self.input.next().await.transpose()? {
+        let mut pending_selection = self.group_limit.as_ref();
+        let mut group_filter = None;
+        'input: while let Some(mut batch) = self.input.next().await.transpose()? {
             let _timer = elapsed_compute.timer();
+            if batch.num_rows() != 0
+                && let Some(limit) = pending_selection.take()
+            {
+                group_filter = FinalGroupFilter::try_new(limit, &batch);
+            }
+            if let Some(filter) = &group_filter {
+                batch = filter.filter(&batch)?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+            }
             let evaluated = hash_table.evaluate_batch(&batch)?;
             loop {
                 let migration_error =
@@ -916,7 +937,11 @@ impl FinalHashAggregateStream {
         // Not wrapping in a timer and not record output batches since this is now `merge_stream` responsibility
         // we just pass through
         while let Some(batch) = output_stream.next().await.transpose()? {
+            let (batch, done) = self.cap_output(batch);
             emitter.emit(batch).await;
+            if done {
+                return Ok(());
+            }
         }
 
         Ok(())
@@ -954,7 +979,10 @@ impl FinalHashAggregateStream {
         let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
 
         let mut timer = elapsed_compute.timer();
-        hash_table.start_output()?;
+        // Materialize at most this many groups from the table. Spill replay,
+        // which can interleave input consumption and output, caps each batch.
+        let fetch = self.group_limit.as_ref().map(|limit| limit.remaining);
+        hash_table.start_output(fetch)?;
 
         loop {
             let Some(batch) = hash_table.next_output_batch()? else {
@@ -1001,6 +1029,13 @@ impl FinalHashAggregateStream {
                 .emit(batch.record_output(&self.baseline_metrics))
                 .await;
             timer = elapsed_compute.timer();
+        }
+    }
+
+    fn cap_output(&mut self, batch: RecordBatch) -> (RecordBatch, bool) {
+        match &mut self.group_limit {
+            Some(limit) => limit.take_output(batch),
+            None => (batch, false),
         }
     }
 }

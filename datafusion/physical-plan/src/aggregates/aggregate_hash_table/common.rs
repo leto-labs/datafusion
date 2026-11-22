@@ -18,7 +18,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, internal_err};
 use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
-use datafusion_expr::{AggregateMetrics, EmitTo, GroupsAccumulator};
+use datafusion_expr::{AggregateMetrics, EmitTo, GroupSelection, GroupsAccumulator};
 use datafusion_physical_expr::GroupsAccumulatorAdapter;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use log::debug;
@@ -124,6 +124,9 @@ pub(in crate::aggregates) struct AggregateHashTable<AggrMode> {
     /// Maximum rows per emitted output batch, from config `batch_size`.
     pub(super) batch_size: usize,
 
+    /// Maximum group count materialized at the final output boundary.
+    pub(super) output_group_limit: Option<usize>,
+
     /// Lifecycle-specific state: building stage / outputting stage.
     pub(super) state: AggregateHashTableState,
 
@@ -182,6 +185,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
             output_schema,
             state_schema,
             batch_size,
+            output_group_limit: None,
             state: AggregateHashTableState::Building(AggregateHashTableBuffer {
                 group_by: Arc::clone(agg.group_by()),
                 group_values,
@@ -295,11 +299,25 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
                         return Ok(None);
                     }
 
-                    // Accumulator output consumes internal state. Materialize all
-                    // groups once, then slice the materialized batch on later polls.
-                    let emit_to = EmitTo::All;
+                    // Materialize the requested groups once and slice the
+                    // resulting batch on later polls.
+                    let fetch = self
+                        .output_group_limit
+                        .filter(|&fetch| fetch < state.group_values.len());
+                    let emit_to = fetch.map_or(EmitTo::All, EmitTo::First);
                     let columns = self.group_by_metrics.time_emitting(|| {
-                        let mut columns = state.group_values.emit(emit_to)?;
+                        let mut columns = if let Some(fetch) = fetch
+                            && state.group_values.supports_values_preserving()
+                        {
+                            let indices: Vec<_> = (0..fetch).collect();
+                            let selection = GroupSelection::try_from_indices(
+                                &indices,
+                                state.group_values.len(),
+                            )?;
+                            state.group_values.values_preserving(selection)?
+                        } else {
+                            state.group_values.emit(emit_to)?
+                        };
                         for (idx, acc) in state.accumulators.iter_mut().enumerate() {
                             columns.extend(accumulator_metrics.time(
                                 idx,

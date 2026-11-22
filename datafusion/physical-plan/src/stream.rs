@@ -325,6 +325,24 @@ impl RecordBatchReceiverStreamBuilder {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<()> {
+        self.run_input_with(input, partition, context, |input, partition, context| {
+            input.execute(partition, context)
+        })
+    }
+
+    pub(crate) fn run_input_with(
+        &mut self,
+        input: Arc<dyn ExecutionPlan>,
+        partition: usize,
+        context: Arc<TaskContext>,
+        execute: impl FnOnce(
+            &dyn ExecutionPlan,
+            usize,
+            Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream>
+        + Send
+        + 'static,
+    ) -> Result<()> {
         let scope = AttemptTasks::from_task(&context);
         self.inner.scope.clone_from(&scope);
         let output_scope = scope.clone();
@@ -336,7 +354,7 @@ impl RecordBatchReceiverStreamBuilder {
         };
 
         let producer = async move {
-            let mut stream = match input.execute(partition, context) {
+            let mut stream = match execute(input.as_ref(), partition, context) {
                 Err(e) => {
                     // If send fails, the plan being torn down, there
                     // is no place to send the error and no reason to continue.

@@ -213,6 +213,7 @@ mod clustered_partial_stream;
 mod clustered_single_stream;
 #[cfg(test)]
 mod clustered_test_util;
+mod final_group_limit;
 pub mod group_values;
 mod grouped_hash_stream;
 mod grouped_topk_stream;
@@ -1335,6 +1336,33 @@ impl AggregateExec {
     /// Get the input schema before any aggregates are applied
     pub fn input_schema(&self) -> SchemaRef {
         Arc::clone(&self.input_schema)
+    }
+
+    /// A directly consuming unordered coalescer may request at most `fetch`
+    /// groups per partition. All partition streams remain independent.
+    pub(crate) fn execute_with_final_group_limit(
+        &self,
+        partition: usize,
+        context: &Arc<TaskContext>,
+        fetch: usize,
+    ) -> Result<Option<SendableRecordBatchStream>> {
+        let Some(limit) = final_group_limit::FinalGroupLimit::try_new(self, fetch) else {
+            return Ok(None);
+        };
+        if !context
+            .session_config()
+            .options()
+            .execution
+            .enable_migration_aggregate
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            FinalHashAggregateStream::new(self, context, partition)?
+                .with_group_limit(limit)
+                .into_stream(),
+        ))
     }
 
     /// Aggregation has multiple specialized implementations optimized for

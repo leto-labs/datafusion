@@ -17,6 +17,7 @@ use super::{
     DisplayAs, ExecutionPlanProperties, PlanProperties, SendableRecordBatchStream,
     Statistics,
 };
+use crate::aggregates::AggregateExec;
 use crate::execution_plan::LimitBehavior;
 use crate::execution_plan::{CardinalityEffect, EvaluationType, SchedulingType};
 use crate::filter_pushdown::{FilterDescription, FilterPushdownPhase};
@@ -69,6 +70,22 @@ impl CoalescePartitionsExec {
     /// Input execution plan
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
+    }
+
+    fn execute_input(
+        input: &dyn ExecutionPlan,
+        partition: usize,
+        context: Arc<TaskContext>,
+        fetch: Option<usize>,
+    ) -> Result<SendableRecordBatchStream> {
+        if let Some(fetch) = fetch
+            && let Some(aggregate) = input.downcast_ref::<AggregateExec>()
+            && let Some(stream) =
+                aggregate.execute_with_final_group_limit(partition, &context, fetch)?
+        {
+            return Ok(stream);
+        }
+        input.execute(partition, context)
     }
 
     /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
@@ -206,7 +223,8 @@ impl ExecutionPlan for CoalescePartitionsExec {
             1 => {
                 // single-partition path: execute child directly, but ensure fetch is respected
                 // (wrap with ObservedStream only if fetch is present so we don't add overhead otherwise)
-                let child_stream = self.input.execute(0, context)?;
+                let child_stream =
+                    Self::execute_input(self.input.as_ref(), 0, context, self.fetch)?;
                 if self.fetch.is_some() {
                     let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
                     return Ok(Box::pin(ObservedStream::new(
@@ -229,7 +247,12 @@ impl ExecutionPlan for CoalescePartitionsExec {
 
                     let mut streams = Vec::with_capacity(input_partitions);
                     for i in 0..input_partitions {
-                        streams.push(self.input.execute(i, Arc::clone(&context))?);
+                        streams.push(Self::execute_input(
+                            self.input.as_ref(),
+                            i,
+                            Arc::clone(&context),
+                            self.fetch,
+                        )?);
                     }
                     let merged = futures::stream::select_all(streams);
                     return Ok(Box::pin(ObservedStream::new(
@@ -252,11 +275,15 @@ impl ExecutionPlan for CoalescePartitionsExec {
 
                 // spawn independent tasks whose resulting streams (of batches)
                 // are sent to the channel for consumption.
+                let fetch = self.fetch;
                 for part_i in 0..input_partitions {
-                    builder.run_input(
+                    builder.run_input_with(
                         Arc::clone(&self.input),
                         part_i,
                         Arc::clone(&context),
+                        move |input, partition, context| {
+                            Self::execute_input(input, partition, context, fetch)
+                        },
                     )?;
                 }
 
