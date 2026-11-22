@@ -27,7 +27,7 @@ use datafusion_common::{
 };
 use datafusion_common::{assert_or_internal_err, internal_err};
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::spill_file::SpillFile;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
 use futures::StreamExt;
@@ -758,6 +758,7 @@ pub(crate) struct SpillFilesExec {
     signal: Option<Arc<ChunkSignal>>,
     /// A probe leaf of a chunk join: number the rows.
     row_ids: Option<RowIds>,
+    probe_replay: bool,
     cache: Arc<PlanProperties>,
 }
 
@@ -785,6 +786,7 @@ impl SpillFilesExec {
             metrics,
             signal: None,
             row_ids: None,
+            probe_replay: false,
             cache: Arc::new(cache),
         }
     }
@@ -800,6 +802,85 @@ impl SpillFilesExec {
     pub(super) fn with_row_ids(mut self, row_ids: RowIds) -> Self {
         self.row_ids = Some(row_ids);
         self
+    }
+
+    /// Both leaves may become the probe if the join reverses its roles.
+    /// Only the actual probe asks for a replay stream.
+    pub(super) fn with_probe_replay(mut self, enabled: bool) -> Self {
+        self.probe_replay = enabled;
+        self
+    }
+
+    pub(in crate::joins::hash_join) fn probe_replay(&self) -> bool {
+        self.probe_replay
+    }
+
+    pub(in crate::joins::hash_join) fn execute_replay(
+        &self,
+        partition: usize,
+        context: &TaskContext,
+    ) -> Result<Rows> {
+        assert_or_internal_err!(
+            partition < self.source.partitions(),
+            "SpillFilesExec invalid replay partition {partition} of {}",
+            self.source.partitions()
+        );
+        let mut files = self.source.take(partition)?.into_iter();
+        let manager = self.spill_manager.clone();
+        let pool = Arc::clone(context.memory_pool());
+        let mut current: Option<(FileRows, MemoryReservation)> = None;
+        let row_ids = self.row_ids.clone();
+        let schema = self.schema();
+        let numbered = Arc::clone(&schema);
+        let mut start = 0;
+        let rows = futures::stream::poll_fn(move |cx| {
+            loop {
+                if let Some((reader, _permit)) = &mut current
+                    && let Some(next) = std::task::ready!(reader.poll_next(cx))
+                {
+                    let next = next.and_then(|batch| {
+                        let Some(ids) = &row_ids else {
+                            return Ok(batch);
+                        };
+                        let first = start;
+                        start += batch.num_rows();
+                        number_rows(&batch, first, &numbered, ids.skip_matched.as_deref())
+                    });
+                    if next.is_err() {
+                        current = None;
+                    }
+                    return Poll::Ready(Some(next));
+                }
+
+                current = None;
+                let Some(file) = files.next() else {
+                    return Poll::Ready(None);
+                };
+                if file.rows == 0 {
+                    continue;
+                }
+                if file.replay_bytes == 0 {
+                    return Poll::Ready(Some(internal_err!(
+                        "hash join spill: probe file without a replay permit"
+                    )));
+                }
+                // The build runs before this poll. Register the consumer
+                // only when it can charge a real read, so an idle leaf
+                // never reduces the build's FairSpillPool share.
+                let permit =
+                    MemoryConsumer::new(format!("HashJoinProbeReplay[{partition}]"))
+                        .with_can_spill(true)
+                        .register(&pool);
+                // Like the first read of a build chunk, one batch must
+                // make progress when the build has filled the pool.
+                permit.grow(file.replay_bytes);
+                match file.reader(&manager) {
+                    Ok(reader) => current = Some((reader, permit)),
+                    Err(error) => return Poll::Ready(Some(Err(error))),
+                }
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rows)))
     }
 
     pub(super) fn signal(&self) -> Option<&Arc<ChunkSignal>> {

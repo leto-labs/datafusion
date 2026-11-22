@@ -1940,7 +1940,22 @@ impl ExecutionPlan for HashJoinExec {
 
         // we have the batches and the hash map with their keys. We can how create a stream
         // over the right that uses this information to issue new batches.
-        let right_stream = self.right.execute(partition, context)?;
+        let replay = if context
+            .session_config()
+            .options()
+            .execution
+            .enable_hash_join_spilling
+        {
+            self.right
+                .downcast_ref::<spill::SpillFilesExec>()
+                .filter(|leaf| leaf.probe_replay())
+        } else {
+            None
+        };
+        let right_stream = match replay {
+            Some(leaf) => leaf.execute_replay(partition, &context)?,
+            None => self.right.execute(partition, context)?,
+        };
 
         // update column indices to reflect the projection
         let column_indices_after_projection = match self.projection.as_ref() {
@@ -1981,6 +1996,7 @@ impl ExecutionPlan for HashJoinExec {
             self.mode,
             self.fetch,
             spill_stream,
+            replay.is_some(),
         )))
     }
 

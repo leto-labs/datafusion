@@ -200,6 +200,20 @@ impl LimitedBatchCoalescer {
         self.inner.is_empty()
     }
 
+    /// Forward a piece the spilled join already sized and materialized,
+    /// while preserving the fetch limit and buffered row order.
+    pub(crate) fn push_uncoalesced(
+        &mut self,
+        batch: RecordBatch,
+    ) -> Result<PushBatchStatus> {
+        self.inner.finish_buffered_batch()?;
+        let limit = self.inner.biggest_coalesce_batch_size();
+        self.inner.set_biggest_coalesce_batch_size(Some(0));
+        let result = self.push_batch(batch);
+        self.inner.set_biggest_coalesce_batch_size(limit);
+        result
+    }
+
     /// Complete the current buffered batch and finish the coalescer
     ///
     /// Any subsequent calls to `push_batch()` will return an Err

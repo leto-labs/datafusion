@@ -20,6 +20,13 @@ fn spill_batches(manager: &SpillManager, batches: &[RecordBatch]) -> Result<Spil
         .expect("non-empty spill");
     Ok(SpilledFile {
         bytes: file.size().unwrap() as usize,
+        replay_bytes: batches.iter().try_fold(0usize, |peak, batch| {
+            super::super::super::bytes::replay_need(
+                batch,
+                manager.compression != SpillCompression::Uncompressed,
+            )
+            .map(|need| peak.max(need))
+        })?,
         rows: batches.iter().map(RecordBatch::num_rows).sum(),
         file,
     })

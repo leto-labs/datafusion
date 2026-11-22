@@ -182,6 +182,7 @@ impl ChunkRun {
             chunks: 0,
             current: None,
             rest: None,
+            pending_output: None,
             done: false,
         };
         let rows = futures::stream::unfold(state, |mut state| async move {
@@ -202,6 +203,7 @@ struct Chunks {
     current: Option<SendableRecordBatchStream>,
     /// The pass after the last chunk, and the row number of its next row.
     rest: Option<(SendableRecordBatchStream, usize)>,
+    pending_output: Option<super::OutputPieces>,
     done: bool,
 }
 
@@ -215,12 +217,20 @@ impl Chunks {
             self.done = true;
             self.current = None;
             self.rest = None;
+            self.pending_output = None;
         }
         item
     }
 
     async fn advance(&mut self) -> Option<Result<RecordBatch>> {
         loop {
+            if let Some(pieces) = &mut self.pending_output {
+                match self.run.output.next_piece(pieces) {
+                    Ok(Some(batch)) => return Some(Ok(batch)),
+                    Ok(None) => self.pending_output = None,
+                    Err(error) => return Some(Err(error)),
+                }
+            }
             if let Some((stream, start)) = &mut self.rest {
                 let batch = match stream.next().await? {
                     Ok(batch) => batch,
@@ -360,7 +370,7 @@ impl Chunks {
 
     /// A chunk's output batch: marks its probe rows, and returns the rows
     /// the join outputs.
-    fn chunk_rows(&self, batch: RecordBatch) -> Result<Option<RecordBatch>> {
+    fn chunk_rows(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>> {
         let batch = match &self.bits {
             Some(bits) if self.plan.ids => {
                 let last = batch.num_columns() - 1;
@@ -381,6 +391,10 @@ impl Chunks {
         let output = &self.run.output;
         Ok(Some(match self.run.kind {
             Output::Own => output.own(batch)?,
+            Output::Unmatched if self.run.build.byte_limits() => {
+                self.pending_output = Some(output.build_pieces(batch));
+                return Ok(None);
+            }
             Output::Unmatched => output.emit(&batch)?,
             // A Full run's Left chunks declare the build columns as the
             // build side does; the join declares them nullable.
@@ -407,12 +421,16 @@ impl Chunks {
             },
             self.run.build.metrics.clone(),
         );
-        leaf.execute(0, Arc::clone(&self.run.context))
+        if self.run.build.byte_limits() {
+            leaf.execute_replay(0, &self.run.context)
+        } else {
+            leaf.execute(0, Arc::clone(&self.run.context))
+        }
     }
 
     /// Rows `start..` of the probe replay after the last chunk.
     fn rest_rows(
-        &self,
+        &mut self,
         batch: &RecordBatch,
         start: usize,
     ) -> Result<Option<RecordBatch>> {
@@ -428,10 +446,19 @@ impl Chunks {
                 if rows.num_rows() == 0 {
                     return Ok(None);
                 }
+                if self.run.build.byte_limits() {
+                    self.pending_output = Some(output.probe_pieces(rows, None));
+                    return Ok(None);
+                }
                 output.emit_probe(&rows, None)?
             }
             Rest::Mark => {
                 let mark: ArrayRef = Arc::new(matched);
+                if self.run.build.byte_limits() {
+                    self.pending_output =
+                        Some(output.probe_pieces(batch.clone(), Some(mark)));
+                    return Ok(None);
+                }
                 output.emit_probe(batch, Some(&mark))?
             }
             Rest::None => return Ok(None),

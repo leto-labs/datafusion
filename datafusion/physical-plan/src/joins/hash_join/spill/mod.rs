@@ -34,12 +34,16 @@
 //!
 //! The hooks in `exec.rs` and `stream.rs` are marked "Longbow family JS".
 
+use super::output::{Gather, OutputPieces, OutputRows};
+
+pub(super) mod bytes;
 mod chunks;
 mod files;
 mod footprint;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -63,6 +67,7 @@ use datafusion_execution::memory_pool::{
 };
 use datafusion_execution::{SpillFile, TaskContext};
 use datafusion_physical_expr::PhysicalExprRef;
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::stream::BoxStream;
 use futures::{StreamExt, ready};
@@ -302,6 +307,28 @@ struct SubJoinTemplate {
     null_equality: NullEquality,
     build_schema: SchemaRef,
     probe_schema: SchemaRef,
+}
+
+impl SubJoinTemplate {
+    fn byte_limits(&self) -> bool {
+        if !bytes::supported_schema(&self.build_schema)
+            || !bytes::supported_schema(&self.probe_schema)
+        {
+            return false;
+        }
+        // Direct columns borrow the decoded batch. Check each key column
+        // once so that normalization cannot allocate repeated copies of
+        // a single float column.
+        let mut left_keys = HashSet::new();
+        let mut right_keys = HashSet::new();
+        self.on.iter().all(|(left, right)| {
+            left.downcast_ref::<Column>()
+                .is_some_and(|col| left_keys.insert(col.index()))
+                && right
+                    .downcast_ref::<Column>()
+                    .is_some_and(|col| right_keys.insert(col.index()))
+        })
+    }
 }
 
 /// Build-side shapes whose allocations fit the chunk budget. Reversal
@@ -622,6 +649,8 @@ pub(crate) struct SpilledFile {
     file: Arc<dyn SpillFile>,
     rows: usize,
     bytes: usize,
+    /// Maximum admission of one batch, zero for the row-based path.
+    replay_bytes: usize,
 }
 
 /// Spill manager of one side, scoped to the attempt.
@@ -664,6 +693,8 @@ struct PartWriter {
     /// A file that a build chunk or a reversed join may build on: no
     /// written batch may need more than its unit when a chunk admits it.
     unit: Option<WriteUnit>,
+    byte_limits: bool,
+    replay_bytes: usize,
 }
 
 /// The largest admission need ([`footprint::write_need`]) of a written
@@ -750,6 +781,7 @@ struct WriteBatches<'a> {
     batches: &'a [RecordBatch],
     unit: Option<&'a WriteUnit>,
     compressed: bool,
+    byte_limits: bool,
     /// Rows already given to IPC or to the stack.
     start: usize,
     /// Ranges still to write, the next on top, and whether each is a half
@@ -759,6 +791,12 @@ struct WriteBatches<'a> {
 
 impl WriteBatches<'_> {
     fn fits(&self, batch: &RecordBatch) -> Result<bool> {
+        if self.byte_limits
+            && batch.num_rows() > 1
+            && bytes::replay_need(batch, self.compressed)? > bytes::BATCH_BYTES
+        {
+            return Ok(false);
+        }
         Ok(match self.unit {
             Some(unit) => {
                 WriteUnit::need(Some(unit), batch, self.compressed)? <= unit.bytes
@@ -800,11 +838,17 @@ impl WriteBatches<'_> {
             let (mut rows, mut bytes) = (0, 0);
             while end < self.batches.len() && rows < WRITE_BATCH_ROWS {
                 let piece = &self.batches[end];
-                if let Some(unit) = self.unit {
+                let limit = self
+                    .unit
+                    .map(|unit| unit.bytes)
+                    .into_iter()
+                    .chain(self.byte_limits.then_some(bytes::BATCH_BYTES))
+                    .min();
+                if let Some(limit) = limit {
                     let piece_bytes = piece.get_sliced_size()?;
                     if end > self.start
                         && (rows + piece.num_rows() > WRITE_BATCH_ROWS
-                            || 2 * (bytes + piece_bytes) > unit.bytes)
+                            || 2 * (bytes + piece_bytes) > limit)
                     {
                         break;
                     }
@@ -816,13 +860,18 @@ impl WriteBatches<'_> {
             let group = &self.batches[self.start..end];
             self.start = end;
             if let [piece] = group {
-                if self.unit.is_none() {
+                if self.unit.is_none() && !self.byte_limits {
                     return Ok(Some(piece.clone()));
                 }
                 self.stack.push((piece.clone(), false));
                 continue;
             }
             let batch = concat_batches(&self.schema, group)?;
+            let batch = if self.byte_limits {
+                bytes::compact_views(&batch)?
+            } else {
+                batch
+            };
             if self.fits(&batch)? {
                 return Ok(Some(batch));
             }
@@ -848,7 +897,14 @@ impl PartWriter {
             rows: 0,
             bytes: 0,
             unit,
+            byte_limits: false,
+            replay_bytes: 0,
         })
+    }
+
+    fn with_byte_limits(mut self, byte_limits: bool) -> Self {
+        self.byte_limits = byte_limits;
+        self
     }
 
     /// Writes `batches` as batches of up to [`WRITE_BATCH_ROWS`] rows and,
@@ -868,17 +924,24 @@ impl PartWriter {
             batches,
             unit: self.unit.as_ref(),
             compressed: self.file.compressed(),
+            byte_limits: self.byte_limits,
             start: 0,
             stack: vec![],
         };
         let mut bytes = 0;
+        let mut replay_bytes = self.replay_bytes;
         let written = self.file.write(std::iter::from_fn(|| {
             let next = source.next_batch().transpose()?;
-            if let Ok(batch) = &next {
-                bytes += get_record_batch_memory_size(batch);
-            }
-            Some(next)
+            Some(next.and_then(|batch| {
+                bytes += get_record_batch_memory_size(&batch);
+                if source.byte_limits {
+                    replay_bytes =
+                        replay_bytes.max(bytes::replay_need(&batch, source.compressed)?);
+                }
+                Ok(batch)
+            }))
         }))?;
+        self.replay_bytes = replay_bytes;
         self.rows += written;
         self.bytes += bytes;
         rows_metric.add(written);
@@ -932,6 +995,7 @@ impl PartWriter {
             bytes: file.size().map_or(bytes, |size| size as usize),
             file,
             rows: self.rows,
+            replay_bytes: self.replay_bytes,
         }))
     }
 }
@@ -995,6 +1059,7 @@ pub(super) struct BuildSpill {
     /// Raised by a refusal that the floor of such a partition cannot cover.
     signal: Option<Arc<ChunkSignal>>,
     active: bool,
+    byte_limits: bool,
     /// One part per partition, then the unmatchable part.
     parts: Vec<Part>,
     /// Build rows each key partition received.
@@ -1073,6 +1138,7 @@ impl BuildSpill {
             depth_limit: eligible.depth_limit.clone(),
             signal: eligible.signal.clone(),
             active: false,
+            byte_limits: false,
             parts,
             rows_seen: vec![0; eligible.options.partitions],
             counter: RecordBatchMemoryCounter::new(),
@@ -1176,6 +1242,7 @@ impl BuildSpill {
         reservation: &MemoryReservation,
     ) -> Result<()> {
         self.active = true;
+        self.byte_limits = self.template.byte_limits();
         self.metrics = self.lazy_metrics.get().clone();
         self.manager = Some(spill_manager(
             &self.context,
@@ -1369,7 +1436,8 @@ impl BuildSpill {
                 )
             })
             .transpose()?;
-        let mut writer = PartWriter::new(manager, "HashJoin build partition", unit)?;
+        let mut writer = PartWriter::new(manager, "HashJoin build partition", unit)?
+            .with_byte_limits(self.byte_limits);
         writer.write(&batches, &self.metrics, Side::Build)?;
         drop(batches);
         self.parts[part] = Part::Writing(Box::new(writer));
@@ -1598,6 +1666,7 @@ impl BuildSpill {
             parent_rows,
             build_files: Mutex::new(build_files),
             template: self.template,
+            byte_limits: self.byte_limits,
             skew: self.skew,
             build_manager: manager,
             metrics: self.metrics,
@@ -1858,6 +1927,7 @@ pub(crate) struct SpilledBuild {
     /// One file per partition, then the unmatchable partition's.
     build_files: Mutex<Vec<Option<SpilledFile>>>,
     template: SubJoinTemplate,
+    byte_limits: bool,
     skew: SkewSupport,
     build_manager: SpillManager,
     metrics: JoinSpillMetrics,
@@ -1873,6 +1943,10 @@ pub(crate) struct SpilledBuild {
 }
 
 impl SpilledBuild {
+    pub(super) fn byte_limits(&self) -> bool {
+        self.byte_limits
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Members> {
         self.members.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -2347,8 +2421,8 @@ impl SpilledBuild {
     ) -> Result<Arc<HashJoinExec>> {
         let template = &self.template;
         let join = HashJoinExecBuilder::new(
-            Arc::new(build),
-            Arc::new(probe),
+            Arc::new(build.with_probe_replay(self.byte_limits())),
+            Arc::new(probe.with_probe_replay(self.byte_limits())),
             template.on.clone(),
             join_type,
         )
@@ -2362,20 +2436,13 @@ impl SpilledBuild {
 
     /// `Last`: the rows of the unmatchable partition, each an unmatched
     /// build row.
-    fn unmatched_rows(
-        &self,
-        output: Arc<UnmatchedOutput>,
-    ) -> Result<SendableRecordBatchStream> {
-        let file = self.take_final(self.partitions)?;
-        let schema = Arc::clone(&output.schema);
-        let rows = match file {
-            Some(file) => file
-                .read(&self.build_manager)?
-                .map(move |batch| batch.and_then(|batch| output.emit(&batch)))
-                .boxed(),
-            None => futures::stream::empty().boxed(),
-        };
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rows)))
+    fn unmatched_rows(&self) -> Result<SendableRecordBatchStream> {
+        match self.take_final(self.partitions)? {
+            Some(file) => file.read(&self.build_manager),
+            None => Ok(Box::pin(EmptyRecordBatchStream::new(Arc::clone(
+                &self.template.build_schema,
+            )))),
+        }
     }
 }
 
@@ -2627,6 +2694,40 @@ struct UnmatchedOutput {
 }
 
 impl UnmatchedOutput {
+    fn build_pieces(&self, batch: RecordBatch) -> OutputPieces {
+        let rows = batch.num_rows();
+        OutputPieces::new(OutputRows::Gather(Box::new(Gather {
+            build: batch,
+            probe: RecordBatch::new_empty(Arc::clone(&self.probe_schema)),
+            left: UInt64Array::from_iter_values(0..rows as u64),
+            right: UInt32Array::new_null(rows),
+            side: JoinSide::Left,
+            mark: None,
+        })))
+    }
+
+    fn probe_pieces(&self, batch: RecordBatch, mark: Option<ArrayRef>) -> OutputPieces {
+        let rows = batch.num_rows();
+        OutputPieces::new(OutputRows::Gather(Box::new(Gather {
+            build: RecordBatch::new_empty(Arc::clone(&self.build_schema)),
+            probe: batch,
+            left: UInt64Array::new_null(rows),
+            right: UInt32Array::from_iter_values(0..rows as u32),
+            side: JoinSide::Left,
+            mark,
+        })))
+    }
+
+    fn next_piece(&self, pieces: &mut OutputPieces) -> Result<Option<RecordBatch>> {
+        // The parent HashJoinStream applies its configured row limit.
+        pieces.next(
+            &self.schema,
+            &self.column_indices,
+            self.join_type,
+            usize::MAX,
+        )
+    }
+
     fn emit(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let rows = batch.num_rows();
         build_batch_from_indices(
@@ -2783,6 +2884,9 @@ impl StreamSpill {
             build.partitions,
             &mut router.hashes,
         )?;
+        if build.byte_limits() {
+            router.hashes = Vec::new();
+        }
         let goes = |part: u32| {
             (part as usize) < build.partitions && build.is_written(part as usize)
         };
@@ -2827,11 +2931,14 @@ impl StreamSpill {
                     } else {
                         None
                     };
-                    slot.insert(PartWriter::new(
-                        &router.manager,
-                        "HashJoin probe partition",
-                        unit,
-                    )?)
+                    slot.insert(
+                        PartWriter::new(
+                            &router.manager,
+                            "HashJoin probe partition",
+                            unit,
+                        )?
+                        .with_byte_limits(build.byte_limits()),
+                    )
                 }
             };
             // A buffered piece is charged; one the pool refuses is written
@@ -2954,6 +3061,7 @@ impl StreamSpill {
             output: Arc::clone(&self.output),
             context: Arc::clone(&self.context),
             current: None,
+            pending_output: None,
             failed: false,
         };
         Ok(futures::stream::unfold(state, |mut state| async move {
@@ -3002,6 +3110,7 @@ struct Written {
     output: Arc<UnmatchedOutput>,
     context: Arc<TaskContext>,
     current: Option<Current>,
+    pending_output: Option<OutputPieces>,
     failed: bool,
 }
 
@@ -3039,11 +3148,28 @@ impl Written {
             return None;
         }
         loop {
+            if let Some(pieces) = &mut self.pending_output {
+                match self.output.next_piece(pieces) {
+                    Ok(Some(batch)) => return Some(Ok(batch)),
+                    Ok(None) => self.pending_output = None,
+                    Err(error) => {
+                        self.failed = true;
+                        self.current = None;
+                        self.pending_output = None;
+                        return Some(Err(error));
+                    }
+                }
+            }
             if let Some(current) = &mut self.current {
                 match current.stream.next().await {
                     Some(Ok(batch)) => {
                         current.yielded = true;
                         let batch = match current.output {
+                            Output::Unmatched if self.seat.build.byte_limits() => {
+                                self.pending_output =
+                                    Some(self.output.build_pieces(batch));
+                                continue;
+                            }
                             Output::Own => self.output.own(batch),
                             Output::Unmatched => self.output.emit(&batch),
                             Output::Same => Ok(batch),
@@ -3094,8 +3220,8 @@ impl Written {
             let started = match self.runs[0] {
                 Run::Own(part) => self.start_own(part),
                 Run::Final(part) if part == build.partitions => build
-                    .unmatched_rows(Arc::clone(&self.output))
-                    .map(|stream| Current::new(stream, None, Output::Same, None)),
+                    .unmatched_rows()
+                    .map(|stream| Current::new(stream, None, Output::Unmatched, None)),
                 Run::Final(part) => self.start_final(part),
             };
             match started {

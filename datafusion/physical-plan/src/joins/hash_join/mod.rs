@@ -19,6 +19,7 @@ pub use partitioned_hash_eval::{HashExpr, SeededRandomState};
 mod exec;
 mod inlist_builder;
 mod not_in;
+mod output;
 mod partitioned_hash_eval;
 mod shared_bounds;
 mod spill;

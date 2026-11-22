@@ -1110,14 +1110,49 @@ Section 3 (lane `leto-mjj.98`):
   receive the same check when they can become build input through reversal.
   Build rows given back to the cursor stay charged. The table's charge
   transfers from the run's grant.
-- Probe replay and output batch bytes are outside the build budget.
-  Replay can allocate for decoding, key evaluation, row numbering and
-  filtering while the chunk table is live. The output batch size is set
-  in rows, so wide or repeated values can produce large batches. IPC I/O
-  buffers, writer compaction and encoding, and small build objects are
-  also outside the build budget.
+- IPC I/O buffers, writer compaction and encoding, and small build objects
+  are outside the build budget. Replay and output have their own contract
+  below.
 - Metrics `spill_reliefs`, `spill_reversed_runs`, `spill_chunked_runs`,
   `spill_replay_passes`.
+
+### Family JS follow-up: byte limits for probe replay and output
+
+Lane `leto-rs3`, feature JOIN-SPILL, classification UPSTREAMABLE.
+
+After a build enters spill mode, the byte path is available when **both**
+input schemas contain only the following Arrow layouts and each side's
+join keys are distinct direct columns.
+
+| Supported layout | Materialization estimate |
+| --- | --- |
+| Null, Boolean, integers, floats, temporal, interval and decimal primitives | Fixed slot width and validity |
+| Utf8, Binary, LargeUtf8 and LargeBinary | Offsets, validity and selected value lengths |
+| Utf8View and BinaryView | Views, validity and selected out-of-line value lengths |
+
+Dictionary, nested, FixedSizeBinary and all other layouts use the existing
+row-based path. Computed or repeated keys also use that path. An ordinary
+join that stays in memory uses its existing gather and row coalescer,
+including when the spill option is enabled.
+
+- A gather counts the actual selected rows before taking columns. Residual
+  filters use the same estimate with their own columns. Output includes
+  matched rows, null-extended rows and marks, and uses at most the
+  configured batch size and an 8 MiB materialized-byte target. A single
+  wider row is emitted alone. Eligible spilled batches bypass row
+  coalescing to keep separate pieces within the target.
+- Spill files used for replay contain IPC batches sized against an 8 MiB
+  permit. The estimate covers decoding, one flat copy, and probe scratch
+  including row numbers, hashes and inline keys. The writer can admit one
+  indivisible row above this target, subject to the separate build chunk
+  limit if the file can become a build. Role reversal uses permits on the
+  side that becomes the probe.
+- Replay opens one file at a time. It registers and charges the maximum
+  permit recorded for that file immediately before opening it, after the
+  build runs. One replay batch can progress in a full pool. The permit is
+  released on file advance, EOF, error or stream drop. IPC I/O, arbitrary
+  residual-expression temporaries, materialization scratch and output
+  retained downstream have separate lifetimes.
 
 Tests (`spill/tests.rs`, `exec.rs`, `core/tests/memory_limit`): every join
 type, both null equalities, with and without a join filter, in `CollectLeft`
