@@ -248,6 +248,7 @@ pub(crate) fn has_nan_unsafe_float_stats<'a>(
 pub struct DFParquetMetadata<'a> {
     /// Source of the Parquet file's bytes.
     store: &'a dyn ObjectStore,
+    range_coalesce_gap: u64,
     /// Location, size and last-modified time of the target Parquet file.
     object_meta: &'a ObjectMeta,
     /// Hint for the number of trailing bytes to prefetch before parsing the
@@ -310,6 +311,7 @@ impl<'a> DFParquetMetadata<'a> {
     pub fn new(store: &'a dyn ObjectStore, object_meta: &'a ObjectMeta) -> Self {
         Self {
             store,
+            range_coalesce_gap: object_store::OBJECT_STORE_COALESCE_DEFAULT,
             object_meta,
             metadata_size_hint: None,
             decryption_properties: None,
@@ -386,6 +388,11 @@ impl<'a> DFParquetMetadata<'a> {
     /// is not used.
     pub fn with_store_id(mut self, id: Option<StoreId>) -> Self {
         self.store_id = id;
+        self
+    }
+
+    pub(crate) fn with_range_coalesce_gap(mut self, range_coalesce_gap: u64) -> Self {
+        self.range_coalesce_gap = range_coalesce_gap;
         self
     }
 
@@ -608,6 +615,7 @@ impl<'a> DFParquetMetadata<'a> {
                 self.store,
                 self.object_meta,
                 std::slice::from_ref(&prefetch_range),
+                self.range_coalesce_gap,
             )
             .await
             .map_err(DataFusionError::from)?;
@@ -625,6 +633,7 @@ impl<'a> DFParquetMetadata<'a> {
                         self.store,
                         self.object_meta,
                         &ranges,
+                        self.range_coalesce_gap,
                     )
                     .await
                     .map_err(DataFusionError::from)?;
@@ -684,6 +693,7 @@ impl<'a> DFParquetMetadata<'a> {
                         self.store,
                         self.object_meta,
                         &ranges,
+                        self.range_coalesce_gap,
                     )
                     .await
                     .map_err(DataFusionError::from)?;

@@ -20,7 +20,7 @@ use datafusion_physical_plan::metrics::Count;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use object_store::ObjectStore;
+use object_store::{OBJECT_STORE_COALESCE_DEFAULT, ObjectStore};
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::push_decoder::ScanPlan;
@@ -185,9 +185,10 @@ fn reader_file_metrics(
 /// This implementation:
 /// 1. Reads parquet directly from an underlying [`ObjectStore`] instance.
 /// 2. Reads the footer and page metadata on demand.
-/// 3. Does not cache metadata or coalesce I/O operations.
+/// 3. Does not cache metadata.
 pub struct DefaultParquetFileReaderFactory {
     store: Arc<dyn ObjectStore>,
+    range_coalesce_gap: u64,
 }
 
 /// Does not format the store, whose configuration can name its URL or hold
@@ -202,7 +203,16 @@ impl Debug for DefaultParquetFileReaderFactory {
 impl DefaultParquetFileReaderFactory {
     /// Create a new `DefaultParquetFileReaderFactory`.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            range_coalesce_gap: OBJECT_STORE_COALESCE_DEFAULT,
+        }
+    }
+
+    /// Use the gap in bytes from the store registration.
+    pub fn with_range_coalesce_gap(mut self, range_coalesce_gap: u64) -> Self {
+        self.range_coalesce_gap = range_coalesce_gap;
+        self
     }
 }
 
@@ -222,7 +232,8 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
             Arc::clone(&self.store),
             partitioned_file,
         )
-        .with_metadata_hint(metadata_size_hint);
+        .with_metadata_hint(metadata_size_hint)
+        .with_range_coalesce_gap(self.range_coalesce_gap);
         Ok(Box::new(reader))
     }
 }
@@ -239,6 +250,7 @@ pub struct CachedParquetFileReaderFactory {
     /// The registration of `store`, which namespaces the cache (Longbow
     /// family OO). Without it the cache is not used.
     store_id: Option<StoreId>,
+    range_coalesce_gap: u64,
     metadata_cache: Arc<FileMetadataCache>,
     derived_copies: usize,
 }
@@ -255,6 +267,7 @@ impl CachedParquetFileReaderFactory {
         Self {
             store,
             store_id: None,
+            range_coalesce_gap: OBJECT_STORE_COALESCE_DEFAULT,
             metadata_cache,
             derived_copies: 0,
         }
@@ -262,15 +275,18 @@ impl CachedParquetFileReaderFactory {
 
     /// A factory over the store registered for `url` in `registry`, with
     /// the store and its registration from one lookup
-    /// ([`ObjectStoreRegistry::get_store_with_id`]), so that the entries
-    /// its readers share are that store's (Longbow family OO).
+    /// ([`ObjectStoreRegistry::get_store_registration`]), so that readers
+    /// share only that store's entries and use its conditional range gap.
     pub fn from_registry(
         registry: &dyn ObjectStoreRegistry,
         url: &ObjectStoreUrl,
         metadata_cache: Arc<FileMetadataCache>,
     ) -> datafusion_common::Result<Self> {
-        let (store, id) = registry.get_store_with_id(url.as_ref())?;
-        Ok(Self::new(store, metadata_cache).with_store_id(id))
+        let registration = registry.get_store_registration(url.as_ref())?;
+        let mut factory =
+            Self::new(registration.store, metadata_cache).with_store_id(registration.id);
+        factory.range_coalesce_gap = registration.range_coalesce_gap;
+        Ok(factory)
     }
 
     /// Key the cache by `id`, the registration of this factory's store as
@@ -330,6 +346,7 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         .with_metadata_hint(metadata_size_hint)
         .with_metadata_cache(Some(Arc::clone(&self.metadata_cache)))
         .with_store_id(self.store_id)
+        .with_range_coalesce_gap(self.range_coalesce_gap)
         .with_derived_copies(self.derived_copies);
 
         Ok(Box::new(reader))
@@ -347,9 +364,8 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
 ///
 /// # Notes
 ///
-/// This implementation does not coalesce I/O operations or cache bytes. Such
-/// optimizations can be done either at the object store level or by providing
-/// a custom implementation of [`ParquetFileReaderFactory`].
+/// Conditional multi-range reads coalesce using the store registration's
+/// gap. Reads without a validator delegate multi-range I/O to the store.
 pub struct ParquetFileReader {
     file_metrics: ParquetFileMetrics,
     /// Bytes this reader fetched. The metrics can be shared by the readers
@@ -357,6 +373,7 @@ pub struct ParquetFileReader {
     /// each reader's own bytes, not the shared counter.
     scanned: usize,
     store: Arc<dyn ObjectStore>,
+    range_coalesce_gap: u64,
     partitioned_file: PartitionedFile,
     metadata_cache: Option<Arc<FileMetadataCache>>,
     /// The registration of `store`, which namespaces `metadata_cache`;
@@ -388,6 +405,7 @@ impl ParquetFileReader {
             file_metrics,
             scanned: 0,
             store,
+            range_coalesce_gap: OBJECT_STORE_COALESCE_DEFAULT,
             partitioned_file,
             metadata_cache: None,
             store_id: None,
@@ -395,6 +413,11 @@ impl ParquetFileReader {
             metadata_size_hint: None,
             footer: None,
         }
+    }
+
+    fn with_range_coalesce_gap(mut self, range_coalesce_gap: u64) -> Self {
+        self.range_coalesce_gap = range_coalesce_gap;
+        self
     }
 
     /// Returns the metrics tracked while reading this file.
@@ -475,6 +498,7 @@ impl AsyncFileReader for ParquetFileReader {
                 self.store.as_ref(),
                 &self.partitioned_file.object_meta,
                 &ranges,
+                self.range_coalesce_gap,
             )
             .await
             .map_err(|e| ParquetError::External(Box::new(e)))
@@ -532,6 +556,7 @@ impl AsyncFileReader for ParquetFileReader {
                 .with_decryption_properties(file_decryption_properties)
                 .with_file_metadata_cache(metadata_cache)
                 .with_store_id(store_id)
+                .with_range_coalesce_gap(self.range_coalesce_gap)
                 .with_derived_copies(self.derived_copies)
                 .with_metadata_size_hint(self.metadata_size_hint)
                 .with_page_index_request(request)
