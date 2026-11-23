@@ -225,6 +225,8 @@ pub mod order;
 #[cfg(test)]
 mod partial_reduce_sets_tests;
 mod partial_reduce_stream;
+#[cfg(test)]
+mod resize_refusal_tests;
 mod single_stream;
 #[cfg(test)]
 mod sk_memory_tests;

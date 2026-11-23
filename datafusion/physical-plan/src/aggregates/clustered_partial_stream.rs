@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -314,8 +316,14 @@ impl Aggregating {
                         // Only the active group remains after the emit. Release the
                         // capacity the table grew for this batch so that reserving
                         // the table can succeed.
-                        let batch =
-                            self.table.take_completed_state_batch()?.ok_or(oom)?;
+                        let batch = match self.table.take_completed_state_batch()? {
+                            Some(batch) => batch,
+                            // No group is complete yet. A partial stage may
+                            // emit the active group's state: the final stage
+                            // merges it with the group's later states, which
+                            // follow it in key order.
+                            None => self.table.take_state_batch()?.ok_or(oom)?,
+                        };
                         self.table.shrink_to_fit();
                         Some(batch)
                     } else {
@@ -386,7 +394,15 @@ impl Outputting {
             Err(DataFusionError::ResourcesExhausted(_)) => {
                 // If we cannot hold the batch while slicing, hand it off whole.
                 // Only the retained table needs to remain reserved.
-                reservation.try_resize(table_memory)?;
+                match reservation.try_resize(table_memory) {
+                    Err(DataFusionError::ResourcesExhausted(_)) => {
+                        // The retained table already owns this memory. Account
+                        // for it without another admission: the final stage
+                        // merges groups that repeat across partial batches.
+                        reservation.resize(table_memory);
+                    }
+                    result => result?,
+                }
                 context.reduction_factor.add_part(batch.num_rows());
                 timer.done();
                 emitter.emit(batch).await;

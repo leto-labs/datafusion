@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -313,6 +315,27 @@ impl Aggregating {
         }
     }
 
+    /// Spills every retained group after `reservation` refused the table.
+    ///
+    /// A final stage cannot emit incomplete groups, so the refusal `oom` is
+    /// returned when spilling is disabled or no group remains to spill.
+    fn spill_retained(
+        &mut self,
+        reservation: &MemoryReservation,
+        oom: DataFusionError,
+    ) -> Result<()> {
+        let Some(spill_context) = self.spill_context.as_mut() else {
+            return Err(oom);
+        };
+        if self.table.is_empty() {
+            return Err(oom);
+        }
+        spill_context.sort_and_spill(self.table.take_state_batch()?)?;
+        reservation
+            .try_resize(self.table.memory_size())
+            .map_err(|e| e.context("Decreasing allocation after spilling should succeed"))
+    }
+
     /// Merges partial states until final results are ready or spill replay begins.
     async fn handle_stage(
         mut self,
@@ -331,23 +354,11 @@ impl Aggregating {
             let oom = match reservation.try_resize(self.reservation_size()) {
                 Ok(()) => None,
                 Err(oom @ DataFusionError::ResourcesExhausted(_)) => {
-                    match self.spill_context.as_mut() {
-                        None => Some(oom),
-                        Some(spill_context) => {
-                            if self.table.is_empty() {
-                                return Err(oom);
-                            }
-                            spill_context
-                                .sort_and_spill(self.table.take_state_batch()?)?;
-                            reservation.try_resize(self.table.memory_size()).map_err(
-                                |e| {
-                                    e.context(
-                                        "Decreasing allocation after spilling should succeed",
-                                    )
-                                },
-                            )?;
-                            continue;
-                        }
+                    if self.spill_context.is_none() {
+                        Some(oom)
+                    } else {
+                        self.spill_retained(reservation, oom)?;
+                        continue;
                     }
                 }
                 Err(e) => return Err(e),
@@ -417,25 +428,34 @@ impl Outputting {
         reservation: &MemoryReservation,
         emitter: &mut TryEmitter<RecordBatch, DataFusionError>,
     ) -> Result<Option<ExecutionStage>> {
-        let Self { mut batch, resume } = self;
+        let Self {
+            mut batch,
+            mut resume,
+        } = self;
         let elapsed_compute = context.baseline_metrics.elapsed_compute();
         let mut timer = elapsed_compute.timer();
-        let (table_memory, next_stage) = match resume {
-            Some(aggregating) => (
-                aggregating.reservation_size(),
-                Some(ExecutionStage::Aggregating(aggregating)),
-            ),
-            None => (0, None),
-        };
+        let table_memory = resume.as_ref().map_or(0, Aggregating::reservation_size);
         let batch_memory = batch.get_array_memory_size();
         match reservation.try_resize(table_memory + batch_memory) {
             Ok(()) => {}
             Err(DataFusionError::ResourcesExhausted(_)) => {
                 // If we cannot hold the batch while slicing, hand it off whole.
-                reservation.try_resize(table_memory)?;
+                match reservation.try_resize(table_memory) {
+                    Ok(()) => {}
+                    Err(oom @ DataFusionError::ResourcesExhausted(_)) => {
+                        // `batch` holds only completed groups, so it can still
+                        // be emitted. The retained groups are incomplete: spill
+                        // them, or fail when spilling is impossible.
+                        let Some(aggregating) = resume.as_mut() else {
+                            return Err(oom);
+                        };
+                        aggregating.spill_retained(reservation, oom)?;
+                    }
+                    Err(e) => return Err(e),
+                }
                 timer.done();
                 emitter.emit(batch).await;
-                return Ok(next_stage);
+                return Ok(resume.map(ExecutionStage::Aggregating));
             }
             Err(e) => return Err(e),
         }
@@ -453,7 +473,7 @@ impl Outputting {
         reservation.try_shrink(batch_memory)?;
         timer.done();
         emitter.emit(batch).await;
-        Ok(next_stage)
+        Ok(resume.map(ExecutionStage::Aggregating))
     }
 }
 
@@ -767,5 +787,155 @@ mod tests {
             sum_over_sorted_input(AggregateMode::Final, &["k"], single_key_batches())?;
         let limit = held_memory(&plan).await?;
         assert_resources_exhausted_under_limit(&plan, limit).await
+    }
+
+    /// Admits growth until `refuse` is set, then refuses every growth of a
+    /// reservation that already holds memory.
+    #[derive(Debug, Default)]
+    struct RefuseWhenSet {
+        inner: datafusion_execution::memory_pool::UnboundedMemoryPool,
+        refuse: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for RefuseWhenSet {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.name())
+        }
+    }
+
+    impl MemoryPool for RefuseWhenSet {
+        fn name(&self) -> &str {
+            "RefuseWhenSet"
+        }
+
+        fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+            self.inner.grow(reservation, additional);
+        }
+
+        fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+            self.inner.shrink(reservation, shrink);
+        }
+
+        fn try_grow(
+            &self,
+            reservation: &MemoryReservation,
+            additional: usize,
+        ) -> Result<()> {
+            if reservation.size() != 0
+                && self.refuse.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(datafusion_common::resources_datafusion_err!(
+                    "no lending headroom"
+                ));
+            }
+            self.inner.try_grow(reservation, additional)
+        }
+
+        fn reserved(&self) -> usize {
+            self.inner.reserved()
+        }
+    }
+
+    /// A handoff of completed groups can find the table larger than its
+    /// reservation, for example after an unspilled refusal. If the pool then
+    /// refuses both the batch and the table, the completed groups are still
+    /// final: the stream emits them and spills the incomplete groups it
+    /// retains. Without spill files it must return the refusal, because a
+    /// final output cannot repeat a group.
+    #[tokio::test]
+    async fn refused_handoff_spills_the_retained_groups() -> Result<()> {
+        for spill in [true, false] {
+            let keys: Vec<i64> = (0..8193).collect();
+            let second = keys.iter().map(|k| k % 5).collect();
+            let plan = sum_over_sorted_input(
+                AggregateMode::Final,
+                &["k", "j"],
+                vec![vec![keys, second]],
+            )?;
+            assert_eq!(
+                plan.group_clustering_mode(),
+                &GroupClusteringMode::Partial(vec![0])
+            );
+            let pool = Arc::new(RefuseWhenSet::default());
+            let mut runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>);
+            if !spill {
+                runtime = runtime.with_disk_manager_builder(
+                    datafusion_execution::disk_manager::DiskManagerBuilder::default()
+                        .with_mode(
+                            datafusion_execution::disk_manager::DiskManagerMode::Disabled,
+                        ),
+                );
+            }
+            let context = Arc::new(
+                TaskContext::default()
+                    .with_session_config(SessionConfig::new().with_batch_size(256))
+                    .with_runtime(runtime.build_arc()?),
+            );
+            let input = collect(plan.input().execute(0, Arc::clone(&context))?).await?;
+            let stream = ClusteredFinalAggregateStream::new_with_input(
+                &plan,
+                &context,
+                0,
+                plan.input().execute(0, Arc::clone(&context))?,
+                plan.group_clustering_mode(),
+            )?;
+            let ClusteredFinalAggregateStream {
+                reservation,
+                context: stream_context,
+                stage: ExecutionStage::Aggregating(mut aggregating),
+            } = stream
+            else {
+                unreachable!("a new stream starts by aggregating");
+            };
+            assert_eq!(aggregating.spill_context.is_some(), spill);
+            // Merge without resizing, so the reservation falls behind the table.
+            aggregating.table.aggregate_batch(&input[0])?;
+            let completed = aggregating
+                .table
+                .take_completed_result_batch()?
+                .expect("every key but the last is complete");
+            assert!(!aggregating.table.is_empty());
+            assert!(aggregating.reservation_size() > reservation.size());
+            pool.refuse
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+
+            let completed_rows = completed.num_rows();
+            let outputting = Outputting {
+                batch: completed,
+                resume: Some(aggregating),
+            };
+            let output: Vec<Result<RecordBatch>> =
+                async_try_stream(|mut emitter| async move {
+                    let next = outputting
+                        .handle_stage(&stream_context, &reservation, &mut emitter)
+                        .await?;
+                    let Some(ExecutionStage::Aggregating(aggregating)) = next else {
+                        return internal_err!("aggregation must resume after a handoff");
+                    };
+                    assert!(aggregating.spill_context.as_ref().unwrap().has_spills());
+                    assert!(aggregating.table.is_empty());
+                    assert_eq!(reservation.size(), aggregating.table.memory_size());
+                    Ok(())
+                })
+                .collect()
+                .await;
+            if spill {
+                let [Ok(batch)] = output.as_slice() else {
+                    panic!("expected one completed batch, got {output:?}");
+                };
+                assert_eq!(batch.num_rows(), completed_rows);
+            } else {
+                assert!(
+                    matches!(
+                        output.as_slice(),
+                        [Err(DataFusionError::ResourcesExhausted(_))]
+                    ),
+                    "expected ResourcesExhausted, got {output:?}"
+                );
+            }
+            assert_eq!(pool.reserved(), 0);
+        }
+        Ok(())
     }
 }

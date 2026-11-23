@@ -548,7 +548,16 @@ impl PartialHashAggregateStream {
         {
             Ok(()) => {}
             Err(DataFusionError::ResourcesExhausted(_)) => {
-                self.reservation.try_resize(hash_table_mem_size)?;
+                // Emit the whole state batch without retaining it for slicing.
+                match self.reservation.try_resize(hash_table_mem_size) {
+                    Err(DataFusionError::ResourcesExhausted(_)) => {
+                        // The emptied table already owns this memory. Account
+                        // for it without another admission: the final stage
+                        // merges groups that repeat across partial batches.
+                        self.reservation.resize(hash_table_mem_size);
+                    }
+                    result => result?,
+                }
                 self.reduction_factor.add_part(remaining_groups.num_rows());
                 emitter
                     .emit(remaining_groups.record_output(&self.baseline_metrics))

@@ -1541,3 +1541,45 @@ The in-memory final aggregate materializes up to the fetch count. If it
 spills, it retains the same bucket selection for every run. Ordered replay
 finishes each group's count and stops emitting at the per-partition cap.
 The tracked coalescer producers continue to own cancellation and teardown.
+
+## Family ARR: keep aggregate streams progressing after a resize refusal
+
+Purpose: keep the Partial hash and clustered aggregate streams progressing
+when a pool refuses the resize for a retained table, as the adaptive pool
+does when its lending headroom is exhausted. The dependent Longbow feature
+is the speed-budget governor (scale-up 5.20a, leto-7yq5). Audit
+classification is UPSTREAMABLE. Family PRG makes the same change in the
+partial-reduce stream.
+
+When a stream cannot hold a materialized batch while it slices it, it
+emits the batch whole. Before this family, a second refusal, of the
+retained table alone, failed the query. That table already owns the
+memory, so:
+
+- The Partial hash and clustered partial streams charge the retained
+  table without another admission and emit the batch. A partial output may
+  repeat a group in a later batch; the final stage merges it.
+- Under full group clustering, a refused clustered partial stream with no
+  completed group emits the active group's state instead of failing. Its
+  later states follow it in key order, so the declared ordering holds.
+- The clustered final stream emits the batch, which holds only completed
+  groups. It spills the retained incomplete groups, as its ordinary
+  pressure spill does. Without a spill file it returns the refusal as
+  `ResourcesExhausted`, because a final output cannot repeat a group.
+
+`aggregate_batch_inner` debug-asserts that a refused single-key migration
+happens on the first grouping set. The stream retries the whole batch, so
+a later set would merge the earlier sets twice. A grouping-set schema adds
+the grouping ID column, so that migration cannot occur there.
+
+`resize_refusal_tests` numbers the growth requests of established
+reservations. Partial and non-spilling final plans run once per admission
+point, refusing every later request. The spilling final plan refuses each
+request alone, with the next one, or with a later window of two, since
+spill replay needs memory of its own. A refused handoff refuses both the
+batch and the table, which can outgrow its reservation when completed
+groups are taken or after an earlier refusal. Each run must match the unlimited sums by key; final
+outputs must have unique groups and clustered outputs their key order. The
+Partial and partial-reduce migration tests refuse the migration grant
+once, which must emit the table and retry the batch, and always, which
+must return the refusal instead of retrying an empty table.
