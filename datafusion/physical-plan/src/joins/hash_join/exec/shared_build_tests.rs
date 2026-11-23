@@ -10,7 +10,8 @@
 use std::any::Any;
 
 use super::shared_build::{
-    self, OPTION, ParallelBuild, ShardedJoinHashMap, configured_rows,
+    self, OPTION, ParallelBuild, ShardedJoinHashMap, TestAllocation, TestFault,
+    configured_rows,
 };
 use super::*;
 use crate::attempt_tasks::AttemptTasks;
@@ -1576,6 +1577,100 @@ async fn native_build_compaction_replaces_the_batch_charge() -> Result<()> {
     Ok(())
 }
 
+#[rstest::rstest]
+#[case(900, 2048)]
+#[case(1023, 2048)]
+#[case(1024, 2048)]
+#[case(1025, 4096)]
+#[tokio::test]
+async fn parallel_build_admits_exact_shard_charge(
+    #[case] rows_per_shard: usize,
+    #[case] slots_per_shard: usize,
+) -> Result<()> {
+    let random_state = RandomState::with_seed(0);
+    let candidates = vec![Arc::new(Int32Array::from_iter_values(0..64)) as ArrayRef];
+    let mut hashes = vec![0; candidates[0].len()];
+    create_hashes(&candidates, &random_state, &mut hashes)?;
+    let keys = [0, 1].map(|shard| {
+        hashes
+            .iter()
+            .position(|&hash| shared_build::shard_of(hash, 1) == shard)
+            .expect("one key for each shard") as i32
+    });
+
+    // The build is large enough for two shards, but only the non-NULL
+    // rows size their heads. Every row gets an entry in the shared chain.
+    let rows = 1 << 17;
+    let (schema, batches) =
+        int_batches(rows, |row| keys.get(row / rows_per_shard).copied());
+    let on: Vec<PhysicalExprRef> = vec![Arc::new(Column::new("k", 0))];
+    let concat_bytes =
+        batches
+            .iter()
+            .flat_map(RecordBatch::columns)
+            .try_fold(0, |bytes, column| {
+                Ok::<_, DataFusionError>(
+                    bytes + column.to_data().get_slice_memory_size()?,
+                )
+            })?;
+    let transient = 12 * rows;
+    let heads = slots_per_shard * size_of::<u64>();
+    let chain = rows * size_of::<u32>();
+    let table = 2 * heads + chain;
+    let input_charge = 128;
+
+    for (limit, fits) in [
+        (input_charge + transient + table + concat_bytes, true),
+        (input_charge + transient + table - 1, false),
+    ] {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let mut reservation = MemoryConsumer::new("HashJoinInput").register(&pool);
+        reservation.try_grow(input_charge)?;
+        let fault = Arc::new(TestFault {
+            allocation_pool: Some(Arc::clone(&pool)),
+            ..Default::default()
+        });
+        let built = ParallelBuild::for_test(1, 2)
+            .with_fault(Arc::clone(&fault))
+            .build(
+                &batches,
+                rows,
+                &schema,
+                &on,
+                &random_state,
+                NullEquality::NullEqualsNothing,
+                &mut reservation,
+            )
+            .await?;
+        if fits {
+            let (map, _, copies) = built.expect("exactly enough for the parallel build");
+            assert_eq!(map.allocated_array_bytes(), table);
+            assert_eq!(
+                reservation.size(),
+                input_charge + map.allocated_array_bytes()
+            );
+            assert_eq!(copies.size(), concat_bytes);
+            assert_eq!(
+                fault.allocations.lock().unwrap().as_slice(),
+                [
+                    (TestAllocation::Chain(chain), limit),
+                    (TestAllocation::Heads(heads), limit),
+                    (TestAllocation::Heads(heads), limit),
+                ],
+                "the pool must hold the build charge when each array is allocated",
+            );
+        } else {
+            assert!(built.is_none());
+            assert!(fault.allocations.lock().unwrap().is_empty());
+            assert_eq!(reservation.size(), input_charge);
+            assert_eq!(pool.reserved(), input_charge);
+        }
+        drop(reservation);
+        assert_eq!(pool.reserved(), 0);
+    }
+    Ok(())
+}
+
 /// A pool that admits the input but not the parallel build's hashes and row
 /// lists, or not its tables, gets the native build (`None`, nothing charged
 /// beyond the input) instead of an error the native build could avoid. An
@@ -1681,7 +1776,7 @@ async fn refused_transient_or_table_memory_falls_back_to_the_native_build() -> R
 async fn a_column_task_panic_surfaces_after_every_table_task() -> Result<()> {
     let (schema, batches) = int_batches(BUILD_ROWS, |i| Some(i as i32));
     let on: Vec<PhysicalExprRef> = vec![Arc::new(Column::new("k", 0))];
-    let fault = Arc::new(shared_build::TestFault {
+    let fault = Arc::new(TestFault {
         panic_columns: true,
         table_delay: std::time::Duration::from_millis(200),
         ..Default::default()

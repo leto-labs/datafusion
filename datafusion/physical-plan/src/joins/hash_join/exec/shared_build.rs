@@ -57,9 +57,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_data::ByteView;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::hash_utils::{RandomState, create_hashes};
-use datafusion_common::utils::memory::{
-    estimate_memory_size, get_record_batch_memory_size,
-};
+use datafusion_common::utils::memory::get_record_batch_memory_size;
 use datafusion_common::{DataFusionError, NullEquality, Result, internal_datafusion_err};
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryReservation;
@@ -128,7 +126,7 @@ pub(super) struct ParallelBuild {
     fault: Option<Arc<TestFault>>,
 }
 
-/// Test-only fault injection for the build's second task set.
+/// Test-only controls and observations for the build's second task set.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(super) struct TestFault {
@@ -138,6 +136,29 @@ pub(super) struct TestFault {
     pub(super) table_delay: std::time::Duration,
     /// Table tasks that finished filling their shard.
     pub(super) tables_done: std::sync::atomic::AtomicUsize,
+    pub(super) allocation_pool:
+        Option<Arc<dyn datafusion_execution::memory_pool::MemoryPool>>,
+    pub(super) allocations: std::sync::Mutex<Vec<(TestAllocation, usize)>>,
+}
+
+/// Array payload bytes and the pool charge at the allocation site.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum TestAllocation {
+    Chain(usize),
+    Heads(usize),
+}
+
+#[cfg(test)]
+impl TestFault {
+    fn record_allocation(&self, allocation: TestAllocation) {
+        if let Some(pool) = &self.allocation_pool {
+            self.allocations
+                .lock()
+                .unwrap()
+                .push((allocation, pool.reserved()));
+        }
+    }
 }
 
 impl ParallelBuild {
@@ -338,12 +359,18 @@ impl ParallelBuild {
         let counts: Vec<usize> = (0..shards)
             .map(|shard| groups.iter().map(|group| group.rows[shard].len()).sum())
             .collect();
-        let mut table_bytes = num_rows * size_of::<u32>();
-        for &count in &counts {
-            // Longbow patch (JT 9): an inline shard can exceed the estimate.
-            table_bytes += estimate_memory_size::<(u64, u32)>(count, 0)?
-                .max(HeadTable::<W>::bytes_for(count));
-        }
+        // Every build row owns a chain entry. Each head table sizes its
+        // slots from the matchable rows routed to that shard.
+        let table_bytes = num_rows
+            .checked_mul(size_of::<u32>())
+            .and_then(|chain_bytes| {
+                counts.iter().try_fold(chain_bytes, |bytes, &count| {
+                    bytes.checked_add(HeadTable::<W>::checked_bytes_for(count)?)
+                })
+            })
+            .ok_or_else(|| {
+                internal_datafusion_err!("parallel hash build size overflow")
+            })?;
         if !admitted(reservation.try_grow(table_bytes))? {
             // Every group task has finished: release the lists and any
             // compacted views before the native build runs.
@@ -352,8 +379,6 @@ impl ParallelBuild {
             return Ok(None);
         }
 
-        let next: Arc<Vec<AtomicU32>> =
-            Arc::new((0..num_rows).map(|_| AtomicU32::new(0)).collect());
         // Charge every concatenated column before any is allocated: views
         // copy 16 bytes per row (their data stays in the group buffers
         // charged above), other columns copy their slices.
@@ -374,6 +399,16 @@ impl ParallelBuild {
             reservation.shrink(transient + table_bytes);
             return Ok(None);
         }
+        let next: Arc<Vec<AtomicU32>> = Arc::new({
+            let next: Vec<_> = (0..num_rows).map(|_| AtomicU32::new(0)).collect();
+            #[cfg(test)]
+            if let Some(fault) = &self.fault {
+                fault.record_allocation(TestAllocation::Chain(
+                    next.capacity() * size_of::<AtomicU32>(),
+                ));
+            }
+            next
+        });
         let mut tables = Vec::with_capacity(shards);
         for (shard, count) in counts.into_iter().enumerate() {
             let groups = Arc::clone(&groups);
@@ -385,7 +420,15 @@ impl ParallelBuild {
                 if let Some(fault) = &fault {
                     tokio::time::sleep(fault.table_delay).await;
                 }
-                let table = fill_shard::<W>(&groups, shard, count, layout, &next);
+                let table = fill_shard::<W>(
+                    &groups,
+                    shard,
+                    count,
+                    layout,
+                    &next,
+                    #[cfg(test)]
+                    fault.as_deref(),
+                );
                 #[cfg(test)]
                 if let Some(fault) = &fault {
                     fault.tables_done.fetch_add(1, Ordering::Relaxed);
@@ -990,7 +1033,7 @@ pub(super) fn compact_views(
 }
 
 #[inline]
-fn shard_of(hash: u64, mask: usize) -> usize {
+pub(super) fn shard_of(hash: u64, mask: usize) -> usize {
     (hash >> SHARD_SHIFT) as usize & mask
 }
 
@@ -1096,8 +1139,13 @@ fn fill_shard<W: HeadWord<Chain = u32>>(
     count: usize,
     layout: SlotLayout,
     next: &[AtomicU32],
+    #[cfg(test)] fault: Option<&TestFault>,
 ) -> Result<(HeadTable<W>, bool)> {
     let mut table = HeadTable::with_layout(count, layout);
+    #[cfg(test)]
+    if let Some(fault) = fault {
+        fault.record_allocation(TestAllocation::Heads(table.bytes()));
+    }
     let mut chained = false;
     let rows = groups.iter().rev().flat_map(|group| {
         group.rows[shard].iter().rev().map(move |&row| {
@@ -1158,6 +1206,12 @@ impl<W: HeadWord> ShardedJoinHashMap<W> {
     #[cfg(test)]
     pub(super) fn is_chained(&self) -> bool {
         self.chained
+    }
+
+    #[cfg(test)]
+    pub(super) fn allocated_array_bytes(&self) -> usize {
+        self.shards.iter().map(HeadTable::bytes).sum::<usize>()
+            + self.next.capacity() * size_of::<u32>()
     }
 }
 

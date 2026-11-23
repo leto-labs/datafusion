@@ -1149,7 +1149,8 @@ impl<T: HeadWord> HeadTable<T> {
         capacity.checked_mul(2)?.max(2).checked_next_power_of_two()
     }
 
-    fn checked_bytes_for(capacity: usize) -> Option<usize> {
+    /// Bytes of the slots of a table made for `capacity` rows, if representable.
+    pub(crate) fn checked_bytes_for(capacity: usize) -> Option<usize> {
         let words = Self::slots_for(capacity)?.checked_mul(T::WORDS)?;
         Some(Layout::array::<u64>(words).ok()?.size())
     }
