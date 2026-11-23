@@ -718,6 +718,17 @@ one base page; a refused mapping (test hook) falls back to a zeroed heap
 array; dropped tables (after a full and after a failed build) leave no
 advised mapping; an `ArrayMap` of 4.8 MB is mapped; the switch's values.
 
+### JT follow-up: skip advice under synchronous THP defrag
+
+Purpose: avoid direct THP compaction during join build first touch
+(scale-up 5.2, `leto-mjj.167`). Classification: UPSTREAMABLE.
+The default `LONGBOW_JOIN_TABLE_HUGE_PAGES=auto` advises mappings only when
+THP is available and the active defrag policy is `defer` or `never`.
+With `always`, `madvise` or `defer+madvise`, an advised allocation can
+compact memory in the faulting build thread. When the policy cannot be
+read, automatic mode uses the heap. Explicit on and off overrides retain
+their JT 6 behavior. An unrecognized value warns and uses automatic mode.
+
 ### JT 7: one probe loop per prefetch mode
 
 Purpose: keep the probe of small tables at its pre-JT cost. Classification:

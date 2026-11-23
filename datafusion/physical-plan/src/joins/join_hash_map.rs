@@ -777,9 +777,10 @@ pub fn contain_hashes<T>(map: &HashTable<(u64, T)>, hash_values: &[u64]) -> Bool
 // `PREFETCH_DISTANCE` rows ahead, and the build keeps that many rows in
 // flight, so their cache misses overlap instead of following each other.
 // The slots and the chain from `HUGE_PAGE_BYTES` on ask the kernel for 2 MiB
-// pages (`MADV_HUGEPAGE`; the host's THP mode is `madvise`), which removes
-// most of the TLB misses of a random probe; `LONGBOW_JOIN_TABLE_HUGE_PAGES=off`
-// turns that off. Such an array has its own anonymous mapping
+// pages (`MADV_HUGEPAGE`) when the advice is enabled. The default follows
+// the host's THP defrag policy to avoid direct compaction in the build
+// thread; `LONGBOW_JOIN_TABLE_HUGE_PAGES` can override it.
+// Such an array has its own anonymous mapping
 // ([`ZeroedArray`]), unmapped when the table is dropped, so the advice ends
 // with the table. Advice on allocator memory outlived the table: the
 // allocator reused the freed range for other operators, and their faults
@@ -807,56 +808,72 @@ const PREFETCH_DISTANCE: usize = 16;
 /// huge pages, when the advice is on ([`huge_page_advice`]).
 const HUGE_PAGE_BYTES: usize = 4 << 20;
 
-/// The environment variable that turns the huge-page advice off: `off`,
-/// `0`, `false`, `no` or `disabled`, in any case. Read once per process.
+/// Explicitly enables or disables join-table huge-page advice. The default
+/// (`auto`) follows the kernel's THP defrag policy. Read once per process.
 pub const HUGE_PAGES_ENV: &str = "LONGBOW_JOIN_TABLE_HUGE_PAGES";
 
-/// Whether a value of [`HUGE_PAGES_ENV`] leaves the advice on: unset, empty,
-/// `on`, `1`, `true`, `yes` or `enabled` (any case) leave it on; `off`, `0`,
-/// `false`, `no` or `disabled` turn it off. Any other value leaves it on and
-/// logs a warning.
-fn huge_pages_requested(value: Option<&str>) -> bool {
-    let Some(value) = value.map(str::trim) else {
-        return true;
-    };
+/// An explicit override of the default, or `None` for automatic advice.
+fn huge_pages_requested(value: Option<&str>) -> Option<bool> {
+    let value = value?.trim();
     let is = |words: &[&str]| words.iter().any(|w| value.eq_ignore_ascii_case(w));
     if is(&["off", "0", "false", "no", "disabled"]) {
-        false
-    } else if value.is_empty() || is(&["on", "1", "true", "yes", "enabled"]) {
-        true
-    } else {
-        log::warn!(
-            "{HUGE_PAGES_ENV}={value:?} is not recognized; the 2 MiB-page advice \
-             stays on (use off, 0, false, no or disabled to turn it off)"
-        );
-        true
+        return Some(false);
     }
+    if is(&["on", "1", "true", "yes", "enabled"]) {
+        return Some(true);
+    }
+    if !value.is_empty() && !value.eq_ignore_ascii_case("auto") {
+        log::warn!("{HUGE_PAGES_ENV}={value:?} is not recognized; using auto");
+    }
+    None
 }
 
 /// Whether the kernel can give an advised mapping huge pages: transparent
 /// huge pages exist and are not `never` (`enabled` reads `[always]` or
 /// `[madvise]`).
 fn transparent_huge_pages_available(enabled: Option<&str>) -> bool {
-    enabled.is_some_and(|mode| !mode.contains("[never]"))
+    enabled.is_some_and(|modes| {
+        modes
+            .split_ascii_whitespace()
+            .any(|mode| matches!(mode, "[always]" | "[madvise]"))
+    })
 }
 
-/// Whether join tables ask for 2 MiB pages: on unless [`HUGE_PAGES_ENV`]
-/// turns them off, and only where the kernel has transparent huge pages
-/// that are not `never`. Read once per process.
+fn should_advise_huge_pages(
+    requested: Option<bool>,
+    enabled: Option<&str>,
+    defrag: Option<&str>,
+) -> bool {
+    transparent_huge_pages_available(enabled)
+        && requested.unwrap_or_else(|| {
+            // The other defrag modes can perform direct compaction when a
+            // query first writes to a MADV_HUGEPAGE mapping.
+            defrag.is_some_and(|modes| {
+                modes
+                    .split_ascii_whitespace()
+                    .any(|mode| matches!(mode, "[defer]" | "[never]"))
+            })
+        })
+}
+
+/// Whether join tables ask for 2 MiB pages. In automatic mode, advice is
+/// enabled only when THP is available and the active defrag policy is
+/// `defer` or `never`. Read once per process.
 ///
-/// With the advice on, the first touch of an advised table can compact
-/// memory synchronously in the query thread; how often depends on the host's
-/// THP `defrag` setting and free contiguous memory (`madvise`, the default,
-/// compacts for advised mappings).
+/// [`HUGE_PAGES_ENV`] can opt into advice even when first touch can compact
+/// memory synchronously under the host's defrag policy.
 pub fn huge_page_advice() -> bool {
     static ADVICE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ADVICE.get_or_init(|| {
-        huge_pages_requested(std::env::var(HUGE_PAGES_ENV).ok().as_deref())
-            && transparent_huge_pages_available(
-                std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
-                    .ok()
-                    .as_deref(),
-            )
+        let enabled =
+            std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").ok();
+        let defrag =
+            std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/defrag").ok();
+        should_advise_huge_pages(
+            huge_pages_requested(std::env::var(HUGE_PAGES_ENV).ok().as_deref()),
+            enabled.as_deref(),
+            defrag.as_deref(),
+        )
     })
 }
 
@@ -3203,26 +3220,18 @@ mod tests {
     }
 
     #[test]
-    fn huge_page_advice_is_on_unless_turned_off() {
+    fn huge_page_advice_accepts_overrides() {
         for value in [
             "off", "0", "false", " off ", "OFF", "Off", "no", "NO", "disabled",
             "Disabled",
         ] {
-            assert!(!huge_pages_requested(Some(value)), "{value:?}");
+            assert_eq!(huge_pages_requested(Some(value)), Some(false), "{value:?}");
         }
-        for value in [
-            None,
-            Some(""),
-            Some("on"),
-            Some("ON"),
-            Some("1"),
-            Some("true"),
-            Some("yes"),
-            Some("enabled"),
-            // Unrecognized: stays on, with a warning.
-            Some("maybe"),
-        ] {
-            assert!(huge_pages_requested(value), "{value:?}");
+        for value in ["on", "ON", "1", "true", "yes", "enabled"] {
+            assert_eq!(huge_pages_requested(Some(value)), Some(true), "{value:?}");
+        }
+        for value in [None, Some(""), Some(" AUTO "), Some("maybe")] {
+            assert_eq!(huge_pages_requested(value), None, "{value:?}");
         }
         assert!(transparent_huge_pages_available(Some(
             "always [madvise] never\n"
@@ -3234,15 +3243,45 @@ mod tests {
             "always madvise [never]\n"
         )));
         assert!(!transparent_huge_pages_available(None));
-        // The process's setting: on unless the variable turns it off or the
-        // kernel has no usable transparent huge pages.
-        let thp =
+        let enabled =
             std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").ok();
+        let defrag =
+            std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/defrag").ok();
         assert_eq!(
             huge_page_advice(),
-            huge_pages_requested(std::env::var(HUGE_PAGES_ENV).ok().as_deref())
-                && transparent_huge_pages_available(thp.as_deref())
+            should_advise_huge_pages(
+                huge_pages_requested(std::env::var(HUGE_PAGES_ENV).ok().as_deref()),
+                enabled.as_deref(),
+                defrag.as_deref(),
+            )
         );
+    }
+
+    #[test]
+    fn automatic_huge_page_advice_avoids_direct_compaction() {
+        let enabled = Some("always [madvise] never\n");
+        for (mode, expected) in [
+            ("[always] defer defer+madvise madvise never", false),
+            ("always [defer] defer+madvise madvise never", true),
+            ("always defer [defer+madvise] madvise never", false),
+            ("always defer defer+madvise [madvise] never", false),
+            ("always defer defer+madvise madvise [never]", true),
+            ("always defer defer+madvise madvise never", false),
+        ] {
+            assert_eq!(
+                should_advise_huge_pages(None, enabled, Some(mode)),
+                expected
+            );
+            assert!(should_advise_huge_pages(Some(true), enabled, Some(mode)));
+            assert!(!should_advise_huge_pages(Some(false), enabled, Some(mode)));
+        }
+        assert!(!should_advise_huge_pages(None, enabled, None));
+        assert!(!should_advise_huge_pages(Some(true), None, Some("[defer]")));
+        assert!(!should_advise_huge_pages(
+            Some(true),
+            Some("always madvise [never]"),
+            Some("[defer]")
+        ));
     }
 
     /// The partitioned build gives the maps of the row-by-row build of
