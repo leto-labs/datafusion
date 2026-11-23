@@ -525,8 +525,8 @@ struct PreparedParquetOpen {
     enable_bloom_filter: bool,
     enable_row_group_stats_pruning: bool,
     /// True when substituting the columns `constant_columns_from_stats`
-    /// proved constant for this file is on its own enough to collapse the
-    /// predicate to a constant no row can satisfy — see `prune_row_groups`.
+    /// proved constant for this file is on its own enough to collapse a
+    /// predicate conjunct to a literal no row can satisfy.
     ///
     /// Provisional until `prepare_filters` has the physical file schema: see
     /// `stats_constant_columns_in_predicate`.
@@ -1036,9 +1036,8 @@ impl ParquetMorselizer {
         );
         // Whether the statistics substitution *itself* proves the predicate
         // unsatisfiable has to be decided here, before the partition-value
-        // and missing-column rewriting below: a predicate can collapse to a
-        // constant through either of those too, and only a collapse the
-        // file's own statistics produced is proof for `prune_row_groups`.
+        // and missing-column rewriting below. Only a rejecting conjunct
+        // proved by this file's own statistics qualifies for `prune_row_groups`.
         // The referenced columns are recorded alongside the flag because this
         // is also too early to know whether they exist in the file at all —
         // `prepare_filters` re-checks them against the physical file schema.
@@ -1554,8 +1553,8 @@ impl FiltersPreparedParquetOpen {
         }
 
         // Substituting the columns file statistics proved constant
-        // (`constant_columns_from_stats`) collapsed the predicate to a
-        // constant that can never be true (`false`, or NULL — filters treat
+        // (`constant_columns_from_stats`) collapsed a conjunct to a constant
+        // that can never be true (`false`, or NULL — filters treat
         // NULL as false), so the file's own statistics have proven that no
         // row can match: skip every remaining row group, credited to
         // statistics pruning. Without this, the substitution is strictly
@@ -2337,9 +2336,9 @@ fn row_group_bytes(rg_meta: &RowGroupMetaData) -> u64 {
 type ConstantColumns = HashMap<String, ScalarValue>;
 
 /// True when substituting `stats_constants` — the columns this file's
-/// statistics prove constant — is on its own enough to collapse `predicate`
-/// to a constant no row can satisfy (`false`, or NULL, which filters treat
-/// as false).
+/// statistics prove constant — is on its own enough to collapse a conjunct of
+/// `predicate` to a constant no row can satisfy (`false`, or NULL, which filters
+/// treat as false).
 ///
 /// Only the statistics substitution is applied, so a predicate that needs
 /// the missing-column adapter or partition-value folding to collapse does
@@ -2367,9 +2366,14 @@ fn stats_alone_unsatisfiable(
     else {
         return false;
     };
-    simplified.downcast_ref::<Literal>().is_some_and(|l| {
-        l.value().is_null() || l.value() == &ScalarValue::Boolean(Some(false))
-    })
+    datafusion_physical_expr::split_conjunction(&simplified)
+        .into_iter()
+        .any(|conjunct| {
+            conjunct.downcast_ref::<Literal>().is_some_and(|literal| {
+                literal.value().is_null()
+                    || literal.value() == &ScalarValue::Boolean(Some(false))
+            })
+        })
 }
 
 /// Extract constant column values from statistics, keyed by column name in the logical file schema.
@@ -7044,5 +7048,47 @@ mod test {
     /// Longbow family OO.
     mod open_once {
         include!("open_once_tests.rs");
+    }
+
+    #[test]
+    fn all_null_file_statistics_reject_completed_in_list_conjunct() {
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::BinaryExpr;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sold_date", DataType::Int32, true),
+            Field::new("item", DataType::Int32, false),
+        ]));
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(Column::new("sold_date", 0))],
+            logical2physical(
+                &col("sold_date").in_list((1..=31).map(lit).collect(), false),
+                &schema,
+            ),
+        ));
+        let item = logical2physical(&col("item").gt(lit(0)), &schema);
+        let predicate = |op| {
+            Arc::new(BinaryExpr::new(dynamic.clone(), op, Arc::clone(&item)))
+                as Arc<dyn PhysicalExpr>
+        };
+        let constants =
+            HashMap::from([("sold_date".to_owned(), ScalarValue::Int32(None))]);
+
+        assert!(!stats_alone_unsatisfiable(
+            &predicate(Operator::And),
+            &constants,
+            &schema,
+        ));
+        dynamic.mark_complete();
+        assert!(stats_alone_unsatisfiable(
+            &predicate(Operator::And),
+            &constants,
+            &schema,
+        ));
+        assert!(!stats_alone_unsatisfiable(
+            &predicate(Operator::Or),
+            &constants,
+            &schema,
+        ));
     }
 }
