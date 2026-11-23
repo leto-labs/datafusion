@@ -41,7 +41,7 @@ use parquet::arrow::async_reader::MetadataFetch;
 use parquet::arrow::parquet_to_arrow_schema;
 use parquet::basic::{ColumnOrder, SortOrder, Type as PhysicalType};
 use parquet::errors::ParquetError;
-use parquet::file::metadata::page_index::PageIndexProvider;
+use parquet::file::metadata::page_index::{PageIndex, PageIndexProvider};
 use parquet::file::metadata::{
     ColumnChunkMask, PageIndexPolicy, ParquetMetaData, ParquetMetaDataPushDecoder,
     ParquetMetaDataReader, RowGroupMetaData, SortingColumn,
@@ -49,6 +49,8 @@ use parquet::file::metadata::{
 use parquet::file::statistics::Statistics as ParquetStatistics;
 use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
 use std::any::Any;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
 /// Minimum fraction of row groups that must report NDV statistics for the
@@ -249,6 +251,7 @@ pub struct DFParquetMetadata<'a> {
     /// Source of the Parquet file's bytes.
     store: &'a dyn ObjectStore,
     range_coalesce_gap: u64,
+    page_index_coalesce_gap: Option<u64>,
     /// Location, size and last-modified time of the target Parquet file.
     object_meta: &'a ObjectMeta,
     /// Hint for the number of trailing bytes to prefetch before parsing the
@@ -312,6 +315,7 @@ impl<'a> DFParquetMetadata<'a> {
         Self {
             store,
             range_coalesce_gap: object_store::OBJECT_STORE_COALESCE_DEFAULT,
+            page_index_coalesce_gap: None,
             object_meta,
             metadata_size_hint: None,
             decryption_properties: None,
@@ -396,6 +400,11 @@ impl<'a> DFParquetMetadata<'a> {
         self
     }
 
+    pub(crate) fn with_page_index_coalesce_gap(mut self, gap: Option<u64>) -> Self {
+        self.page_index_coalesce_gap = gap;
+        self
+    }
+
     /// Counts the bytes of page index reads into `counter` (Longbow family
     /// OO), so that a cold index load is charged to the open that caused it.
     pub fn with_page_index_bytes(mut self, counter: Option<Count>) -> Self {
@@ -410,10 +419,8 @@ impl<'a> DFParquetMetadata<'a> {
         self
     }
 
-    /// Sets the page index entries to fetch (Longbow family OO). With a
-    /// [`FileMetadataCache`], the first request of a file generation that its
-    /// cached metadata does not cover loads the complete page index once and
-    /// writes it back; without one, only the requested entries are loaded.
+    /// Sets the page index entries to fetch. Shared metadata retains the
+    /// footer and can serve any request covered by a full cached index.
     pub(crate) fn with_page_index_request(
         mut self,
         page_index_request: Option<PageIndexRequest>,
@@ -448,29 +455,9 @@ impl<'a> DFParquetMetadata<'a> {
     /// falls back to reading from the object store via
     /// [`ParquetMetaDataPushDecoder`] on a cache miss.
     pub async fn fetch_metadata(&self) -> Result<Arc<ParquetMetaData>> {
-        // fetch_metadata
-        // │
-        // ├─ cache = cache, store identity and no decryption, else none
-        // ├─ request = caller override OR default
-        // │
-        // ├─ CACHE HIT (same store, path and generation)?
-        // │   │
-        // │   ├─ cached metadata covers the request?  → validate, return cache
-        // │   │
-        // │   └─ else (footer only, wants index)
-        // │         → load the complete page index (index bytes, counted)
-        // │         → write back, validate the request, return
-        // │
-        // └─ CACHE MISS
-        //       → fetch the footer from the store
-        //       → load the requested index (complete when cached; counted)
-        //       → write back if cached, validate the request, return
-        //
-        // Longbow family OO: entries are keyed by store registration and path
-        // (`file_metadata_cache_key`) and validated against the listed
-        // generation, so a footer of one store never meets another store's
-        // index. A `Required` request is validated against the caller's own
-        // selection on every path, as Arrow validates a load.
+        // The footer and its index entries must belong to the listed
+        // generation and the same store registration. Narrow requests use
+        // independent entries, so they cannot replace the shared footer.
         let cache_metadata =
             !cfg!(feature = "parquet_encryption") || self.decryption_properties.is_none();
         let cache = self
@@ -498,38 +485,116 @@ impl<'a> DFParquetMetadata<'a> {
             if request.is_covered_by(cached_metadata.as_ref()) {
                 return Ok(cached_metadata);
             }
-            // Longbow family OO: the first request of this file generation
-            // that the cached footer does not cover loads the complete page
-            // index once and writes it back, so later opens parse nothing.
-            let footer_bytes = cached_parquet.footer_bytes;
-            let metadata = request
-                .complete()
-                .load_with(cached_metadata, self.index_fetch())
-                .await?;
-            self.cache_metadata(key, Arc::clone(&metadata), footer_bytes);
-            request.validate(&metadata)?;
-            return Ok(metadata);
+            if complete_cache_load(&request, &cached_metadata) {
+                // Keep the established single-read path for a compact index.
+                let metadata = PageIndexRequest::all(PageIndexPolicy::Optional)
+                    .load_with(cached_metadata, self.index_fetch())
+                    .await?;
+                self.cache_metadata(
+                    key,
+                    Arc::clone(&metadata),
+                    cached_parquet.footer_bytes,
+                );
+                return Ok(metadata);
+            }
+            return self
+                .load_cached_sparse_index(
+                    file_metadata_cache.as_ref(),
+                    key,
+                    cached_metadata,
+                    cached_parquet.footer_bytes,
+                    &request,
+                    None,
+                )
+                .await;
         }
 
         let (footer, prefetched) = self.fetch_footer_from_store().await?;
+        request.validate(&footer)?;
         let footer_bytes = footer.memory_size();
-        let metadata = if request.wants_index() {
-            // A cache gets the complete index; a request without one gets
-            // only its entries.
-            let load = if cache.is_some() {
-                request.complete()
-            } else {
-                request.clone()
-            };
-            self.load_index_from_store(footer, &load, prefetched)
-                .await?
+        if !request.wants_index() {
+            let metadata = Arc::new(footer);
+            if let Some((_, key)) = cache.as_ref() {
+                self.cache_metadata(key, Arc::clone(&metadata), footer_bytes);
+            }
+            return Ok(metadata);
+        }
+        let load = if cache.is_some() && complete_cache_load(&request, &footer) {
+            PageIndexRequest::all(PageIndexPolicy::Optional)
         } else {
-            Arc::new(footer)
+            request
         };
-        if let Some((_, key)) = cache.as_ref() {
+        if let Some((cache, key)) = cache.as_ref()
+            && !load.requests_complete_index()
+        {
+            let footer = Arc::new(footer);
+            self.cache_metadata(key, Arc::clone(&footer), footer_bytes);
+            return self
+                .load_cached_sparse_index(
+                    cache.as_ref(),
+                    key,
+                    footer,
+                    footer_bytes,
+                    &load,
+                    prefetched,
+                )
+                .await;
+        }
+        let metadata = self
+            .load_index_from_store(footer, &load, prefetched)
+            .await?;
+        if let Some((_, key)) = cache.as_ref()
+            && load.has_complete_index(&metadata)
+        {
             self.cache_metadata(key, Arc::clone(&metadata), footer_bytes);
         }
-        request.validate(&metadata)?;
+        Ok(metadata)
+    }
+
+    /// Cache only the decoded index, then attach it to the validated footer
+    /// the reader already holds. Each mask competes for the existing LRU
+    /// budget independently of the footer and any other mask.
+    async fn load_cached_sparse_index(
+        &self,
+        cache: &FileMetadataCache,
+        key: &Path,
+        footer: Arc<ParquetMetaData>,
+        footer_bytes: usize,
+        request: &PageIndexRequest,
+        prefetched: Option<Prefetched>,
+    ) -> Result<Arc<ParquetMetaData>> {
+        let index_key = request.sparse_cache_key(key, self.object_meta);
+        if let Some(entry) = cache.get(&index_key)
+            && entry.is_valid_for(self.object_meta)
+            && let Some(index) = entry
+                .file_metadata
+                .as_any()
+                .downcast_ref::<CachedSparsePageIndex>()
+        {
+            let metadata = footer
+                .as_ref()
+                .clone()
+                .into_builder()
+                .set_page_index(Some(Arc::clone(&index.index)))
+                .build();
+            // Verify the actual coverage even if two masks hash alike.
+            if request.is_covered_by(&metadata) {
+                return Ok(Arc::new(metadata));
+            }
+        }
+        let metadata = self
+            .load_index_from_store(Arc::unwrap_or_clone(footer), request, prefetched)
+            .await?;
+        if request.has_complete_index(&metadata) {
+            self.cache_metadata(key, Arc::clone(&metadata), footer_bytes);
+        } else if let Some(index) = metadata.page_index()
+            && let Some(entry) = CachedSparsePageIndex::new(index)
+        {
+            cache.put(
+                &index_key,
+                CachedFileMetadataEntry::new(self.object_meta.clone(), Arc::new(entry)),
+            );
+        }
         Ok(metadata)
     }
 
@@ -657,7 +722,7 @@ impl<'a> DFParquetMetadata<'a> {
     /// bytes the footer read prefetched where they cover them, and from the
     /// store otherwise. Only the store reads count as page index bytes
     /// (Longbow family OO).
-    async fn load_index_from_store(
+    pub(crate) async fn load_index_from_store(
         &self,
         footer: ParquetMetaData,
         request: &PageIndexRequest,
@@ -668,6 +733,7 @@ impl<'a> DFParquetMetadata<'a> {
             footer,
         )
         .map_err(DataFusionError::from)?
+        .with_sparse_page_index(!request.requests_complete_index())
         .with_column_index_policy(request.column_policy)
         .with_offset_index_policy(request.offset_policy)
         .with_column_index_mask(request.column_mask.clone())
@@ -689,14 +755,7 @@ impl<'a> DFParquetMetadata<'a> {
             {
                 DecodeResult::Data(decoded) => break decoded,
                 DecodeResult::NeedsData(ranges) => {
-                    let buffers = crate::identity_io::get_ranges(
-                        self.store,
-                        self.object_meta,
-                        &ranges,
-                        self.range_coalesce_gap,
-                    )
-                    .await
-                    .map_err(DataFusionError::from)?;
+                    let buffers = self.read_page_index_ranges(&ranges).await?;
                     if let Some(counter) = &self.page_index_bytes {
                         counter.add(buffers.iter().map(|buffer| buffer.len()).sum());
                     }
@@ -720,6 +779,34 @@ impl<'a> DFParquetMetadata<'a> {
                 )
                 .build(),
         ))
+    }
+
+    /// The local reader can keep all sparse reads on the descriptor opened by
+    /// the conditional GET. Remote readers keep their normal range requests.
+    async fn read_page_index_ranges(
+        &self,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Result<Vec<bytes::Bytes>> {
+        #[cfg(unix)]
+        if let Some(gap) = self.page_index_coalesce_gap {
+            return crate::identity_io::get_local_metadata_ranges(
+                self.store,
+                self.object_meta,
+                ranges,
+                gap,
+            )
+            .await
+            .map_err(DataFusionError::from);
+        }
+        crate::identity_io::get_ranges(
+            self.store,
+            self.object_meta,
+            ranges,
+            self.page_index_coalesce_gap
+                .unwrap_or(self.range_coalesce_gap),
+        )
+        .await
+        .map_err(DataFusionError::from)
     }
 
     /// Fetch this file's [`ParquetMetaData`] and convert its embedded Thrift
@@ -1422,6 +1509,23 @@ pub(crate) struct PageIndexRequest {
 }
 
 impl PageIndexRequest {
+    fn sparse_cache_key(&self, footer: &Path, meta: &ObjectMeta) -> Path {
+        let mut hash = DefaultHasher::new();
+        (self.column_policy as u8, self.offset_policy as u8).hash(&mut hash);
+        self.column_mask.hash(&mut hash);
+        self.offset_mask.hash(&mut hash);
+        (meta.size, meta.last_modified, &meta.e_tag, &meta.version).hash(&mut hash);
+        let mask_and_generation = format!("{:016x}", hash.finish());
+        Path::from_iter(
+            [
+                PathPart::from("parquet-page-index"),
+                PathPart::from(mask_and_generation.as_str()),
+            ]
+            .into_iter()
+            .chain(footer.parts()),
+        )
+    }
+
     /// Every entry of both structures under `policy`.
     pub(crate) fn all(policy: PageIndexPolicy) -> Self {
         Self {
@@ -1457,12 +1561,19 @@ impl PageIndexRequest {
             || self.offset_policy != PageIndexPolicy::Skip
     }
 
-    /// The complete index of a file, for a cache: both structures for every
-    /// column chunk, loaded optionally. The caller's own request is
-    /// validated against the result ([`Self::validate`]), so a required
-    /// structure is enforced only within the caller's selection.
-    pub(crate) fn complete(&self) -> Self {
-        Self::all(PageIndexPolicy::Optional)
+    /// Whether the masks ask for both indexes everywhere by construction.
+    fn requests_complete_index(&self) -> bool {
+        self.column_policy != PageIndexPolicy::Skip
+            && self.column_mask.is_all()
+            && self.offset_policy != PageIndexPolicy::Skip
+            && self.offset_mask.is_all()
+    }
+
+    /// A masked request can cover the whole index on a narrow file. Keep that
+    /// result so short scans can reuse it without reloading the same entries.
+    fn has_complete_index(&self, metadata: &ParquetMetaData) -> bool {
+        self.requests_complete_index()
+            || Self::all(PageIndexPolicy::Optional).is_covered_by(metadata)
     }
 
     /// Arrow's `Required` rule for the offset index, from the footer alone:
@@ -1568,10 +1679,35 @@ fn masked_chunks<'a>(
         })
 }
 
+/// Prefer keeping the entire index when one small read covers it. Larger
+/// enclosing spans are loaded only for the caller's selection.
+fn complete_cache_load(request: &PageIndexRequest, metadata: &ParquetMetaData) -> bool {
+    const MAX_COMPLETE_INDEX_SPAN: u64 = 16 * 1024;
+    if request.requests_complete_index() {
+        return true;
+    }
+    let mut start = u64::MAX;
+    let mut end = 0;
+    for range in metadata
+        .row_groups()
+        .iter()
+        .flat_map(|group| group.columns())
+        .flat_map(|column| [column.column_index_range(), column.offset_index_range()])
+        .flatten()
+    {
+        start = start.min(range.start);
+        end = end.max(range.end);
+        if end - start > MAX_COMPLETE_INDEX_SPAN {
+            return false;
+        }
+    }
+    true
+}
+
 /// The byte range a footer read prefetched, and its bytes.
 type Prefetched = (std::ops::Range<u64>, Vec<bytes::Bytes>);
 
-/// A [`MetadataFetch`] that counts the bytes it returns (Longbow family OO).
+/// A metadata fetch that counts the bytes returned to the decoder.
 struct CountedFetch<F> {
     inner: F,
     counter: Option<Count>,
@@ -1591,6 +1727,38 @@ impl<F: MetadataFetch + Send> MetadataFetch for CountedFetch<F> {
             Ok(bytes)
         }
         .boxed()
+    }
+}
+
+/// A cached CPI index owns no footer. Its size is fixed at insertion so
+/// cache accounting needs no index walk while the cache lock is held.
+struct CachedSparsePageIndex {
+    index: Arc<dyn PageIndexProvider>,
+    bytes: usize,
+}
+
+impl CachedSparsePageIndex {
+    fn new(index: &Arc<dyn PageIndexProvider>) -> Option<Self> {
+        let decoded = index.as_any().downcast_ref::<PageIndex>()?;
+        Some(Self {
+            index: Arc::clone(index),
+            // Two Arc headers, one for FileMetadata and one for PageIndex.
+            bytes: size_of::<Self>() + 4 * size_of::<usize>() + decoded.memory_size(),
+        })
+    }
+}
+
+impl FileMetadata for CachedSparsePageIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn memory_size(&self) -> usize {
+        self.bytes
+    }
+
+    fn extra_info(&self) -> HashMap<String, String> {
+        HashMap::from([("partial_page_index".to_owned(), "true".to_owned())])
     }
 }
 
@@ -1823,6 +1991,108 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::compute::SortOptions;
     use arrow::datatypes::Field;
+
+    #[test]
+    fn sparse_cache_key_changes_when_only_etag_changes() {
+        let location = Path::from("indexed.parquet");
+        let old = ObjectMeta {
+            location: location.clone(),
+            last_modified: Default::default(),
+            size: 1024,
+            e_tag: Some("old".into()),
+            version: None,
+        };
+        let current = ObjectMeta {
+            e_tag: Some("current".into()),
+            ..old.clone()
+        };
+        let request = PageIndexRequest {
+            column_mask: ColumnChunkMask::row_groups([0]),
+            ..PageIndexRequest::all(PageIndexPolicy::Optional)
+        };
+
+        assert_ne!(
+            request.sparse_cache_key(&location, &old),
+            request.sparse_cache_key(&location, &current)
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_cache_rejects_old_generation_under_current_key() {
+        use arrow::record_batch::RecordBatch;
+        use datafusion_execution::runtime_env::RuntimeEnv;
+        use object_store::ObjectStoreExt;
+        use object_store::memory::InMemory;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let batch = RecordBatch::try_from_iter([(
+            "a",
+            Arc::new(Int32Array::from_iter_values(0..20)) as ArrayRef,
+        )])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(10))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(Vec::new(), batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        let bytes = bytes::Bytes::from(writer.into_inner().unwrap());
+        let location = Path::from("indexed.parquet");
+        let store = InMemory::new();
+        store.put(&location, bytes.clone().into()).await.unwrap();
+        let old = store.head(&location).await.unwrap();
+        let request = PageIndexRequest {
+            column_mask: ColumnChunkMask::row_groups([0]),
+            offset_mask: ColumnChunkMask::row_groups([0]),
+            ..PageIndexRequest::all(PageIndexPolicy::Optional)
+        };
+        let old_loader = DFParquetMetadata::new(&store, &old);
+        let (old_footer, _) = old_loader.fetch_footer_from_store().await.unwrap();
+        let stale = old_loader
+            .load_index_from_store(old_footer, &request, None)
+            .await
+            .unwrap();
+        assert!(request.is_covered_by(&stale));
+        let stale_index = stale.page_index().unwrap();
+
+        store.put(&location, bytes.into()).await.unwrap();
+        let current = store.head(&location).await.unwrap();
+        assert_ne!(old.e_tag, current.e_tag);
+        let cache = RuntimeEnv::default()
+            .cache_manager
+            .get_file_metadata_cache();
+        let current_key = request.sparse_cache_key(&location, &current);
+        let entry = CachedSparsePageIndex::new(stale_index).unwrap();
+        cache.put(
+            &current_key,
+            CachedFileMetadataEntry::new(old, Arc::new(entry)),
+        );
+
+        let index_bytes = Count::new();
+        let loader = DFParquetMetadata::new(&store, &current)
+            .with_page_index_bytes(Some(index_bytes.clone()));
+        let (footer, _) = loader.fetch_footer_from_store().await.unwrap();
+        let footer_bytes = footer.memory_size();
+        let loaded = loader
+            .load_cached_sparse_index(
+                cache.as_ref(),
+                &location,
+                Arc::new(footer),
+                footer_bytes,
+                &request,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            index_bytes.value() > 0,
+            "the old index must be fetched again"
+        );
+        assert!(request.is_covered_by(&loaded));
+        assert!(!Arc::ptr_eq(stale_index, loaded.page_index().unwrap()));
+        assert!(cache.get(&current_key).unwrap().is_valid_for(&current));
+    }
 
     #[test]
     fn test_lex_ordering_to_sorting_columns_uses_writer_schema() -> Result<()> {

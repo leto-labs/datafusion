@@ -251,6 +251,7 @@ pub struct CachedParquetFileReaderFactory {
     /// family OO). Without it the cache is not used.
     store_id: Option<StoreId>,
     range_coalesce_gap: u64,
+    page_index_coalesce_gap: Option<u64>,
     metadata_cache: Arc<FileMetadataCache>,
     derived_copies: usize,
 }
@@ -268,6 +269,7 @@ impl CachedParquetFileReaderFactory {
             store,
             store_id: None,
             range_coalesce_gap: OBJECT_STORE_COALESCE_DEFAULT,
+            page_index_coalesce_gap: None,
             metadata_cache,
             derived_copies: 0,
         }
@@ -286,6 +288,12 @@ impl CachedParquetFileReaderFactory {
         let mut factory =
             Self::new(registration.store, metadata_cache).with_store_id(registration.id);
         factory.range_coalesce_gap = registration.range_coalesce_gap;
+        if url == &ObjectStoreUrl::local_filesystem() {
+            // A payload gap bridges almost every index in a wide file.
+            // Group only nearby index bytes on the local filesystem.
+            factory.page_index_coalesce_gap =
+                Some(registration.range_coalesce_gap.min(4 * 1024));
+        }
         Ok(factory)
     }
 
@@ -347,6 +355,7 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         .with_metadata_cache(Some(Arc::clone(&self.metadata_cache)))
         .with_store_id(self.store_id)
         .with_range_coalesce_gap(self.range_coalesce_gap)
+        .with_page_index_coalesce_gap(self.page_index_coalesce_gap)
         .with_derived_copies(self.derived_copies);
 
         Ok(Box::new(reader))
@@ -374,6 +383,7 @@ pub struct ParquetFileReader {
     scanned: usize,
     store: Arc<dyn ObjectStore>,
     range_coalesce_gap: u64,
+    page_index_coalesce_gap: Option<u64>,
     partitioned_file: PartitionedFile,
     metadata_cache: Option<Arc<FileMetadataCache>>,
     /// The registration of `store`, which namespaces `metadata_cache`;
@@ -406,6 +416,7 @@ impl ParquetFileReader {
             scanned: 0,
             store,
             range_coalesce_gap: OBJECT_STORE_COALESCE_DEFAULT,
+            page_index_coalesce_gap: None,
             partitioned_file,
             metadata_cache: None,
             store_id: None,
@@ -436,6 +447,11 @@ impl ParquetFileReader {
         metadata_cache: Option<Arc<FileMetadataCache>>,
     ) -> Self {
         self.metadata_cache = metadata_cache;
+        self
+    }
+
+    fn with_page_index_coalesce_gap(mut self, gap: Option<u64>) -> Self {
+        self.page_index_coalesce_gap = gap;
         self
     }
 
@@ -534,35 +550,41 @@ impl AsyncFileReader for ParquetFileReader {
                 ))
             };
 
-            // Longbow family OO: without a shared cache, a later request for
-            // page index entries adds them to the footer this reader already
-            // returned instead of reading the footer again.
-            if !shares_metadata
-                && let Some(request) = request.as_ref()
-                && let Some(footer) = self.footer.clone()
-            {
-                // Through this reader, so the bytes count as scanned.
-                let metadata =
-                    request.load_with(footer, &mut *self).await.map_err(error)?;
-                request.validate(&metadata).map_err(error)?;
-                self.footer = Some(Arc::clone(&metadata));
-                return Ok(metadata);
-            }
-
-            // Longbow family OO: page index bytes that the metadata layer
-            // reads for this open are charged to it.
             let index_bytes = Count::new();
-            let fetched = DFParquetMetadata::new(&self.store, &object_meta)
+            let metadata_reader = DFParquetMetadata::new(&self.store, &object_meta)
                 .with_decryption_properties(file_decryption_properties)
                 .with_file_metadata_cache(metadata_cache)
                 .with_store_id(store_id)
                 .with_range_coalesce_gap(self.range_coalesce_gap)
+                .with_page_index_coalesce_gap(self.page_index_coalesce_gap)
                 .with_derived_copies(self.derived_copies)
                 .with_metadata_size_hint(self.metadata_size_hint)
-                .with_page_index_request(request)
-                .with_page_index_bytes(Some(index_bytes.clone()))
-                .fetch_metadata()
-                .await;
+                .with_page_index_bytes(Some(index_bytes.clone()));
+
+            // The default reader without a shared cache can reuse the footer
+            // it returned earlier and still coalesce the selected ranges.
+            let fetched = if !shares_metadata
+                && let Some(request) = request.as_ref()
+                && let Some(footer) = self.footer.clone()
+            {
+                request.validate(&footer).map_err(error)?;
+                if request.is_covered_by(&footer) {
+                    Ok(footer)
+                } else {
+                    metadata_reader
+                        .load_index_from_store(
+                            Arc::unwrap_or_clone(footer),
+                            request,
+                            None,
+                        )
+                        .await
+                }
+            } else {
+                metadata_reader
+                    .with_page_index_request(request)
+                    .fetch_metadata()
+                    .await
+            };
             self.file_metrics.bytes_scanned.add(index_bytes.value());
             self.scanned = self.scanned.saturating_add(index_bytes.value());
             let metadata = fetched.map_err(error)?;
@@ -639,5 +661,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(factory.range_coalesce_gap, registration.range_coalesce_gap);
+        assert_eq!(factory.page_index_coalesce_gap, Some(4 * 1024));
     }
 }

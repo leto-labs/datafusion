@@ -81,6 +81,32 @@ under the ordinary simplifier, and the opener still verifies that the
 statistics-derived columns exist in the physical schema. Both scan
 engines use the shared opener.
 
+## Family CPI: fetch page indexes for the surviving scan
+
+Purpose: reduce cold read amplification on wide indexed Parquet files
+(leto-m7oo, leto-gk79, scale-up 5.23c). Dependent feature: DATA-SKIPPING.
+Audit classification: UPSTREAMABLE. Requires Arrow family CPI.
+
+Bloom pruning precedes the scan's page-index request. A cache-backed reader
+uses one enclosing read for an index spanning at most 16 KiB, then keeps it
+with the cached footer. Wider indexes are loaded only for the requested
+entries. A masked result that covers every recorded entry can also be reused.
+The existing file-metadata LRU stores decoded partial indexes in separate
+entries keyed by store, location, generation, and the requested masks. It
+charges each decoded index by its owned allocation. The entry has no footer
+of its own. A hit attaches the index to the validated canonical footer after
+checking coverage. The compact path keeps its complete index in the footer
+entry. Object generation checks apply to fetched spans. Local conditional
+metadata reads coalesce across gaps of at most 4 KiB. Other stores and local
+payload reads use the configured gap.
+
+For sparse local metadata on Unix, one conditional GET opens the validated
+file descriptor. One blocking task reads the coalesced ranges through that
+descriptor. This keeps the same sparse byte ranges while avoiding two
+blocking-pool submissions per range. The reader checks the descriptor's
+size and modification time again after the batch. It uses ordinary
+conditional reads if they changed or the store returns a streaming payload.
+
 ## Family FD: final aggregate spill replay accounting
 
 Purpose: give the fully clustered replay table of an unordered hash
@@ -1279,23 +1305,15 @@ which a wrapping factory hides; #24288 (open) asks for masked loading and
 caching. Arrow 60.1 already decodes masked page indexes (`ColumnChunkMask`
 in `ArrowReaderOptions`).
 
-1. **Page index once per file generation.** The opener asks for the page
-   index entries it needs through `AsyncFileReader::get_metadata`, with the
-   column-index mask (page-pruning predicate leaves) and the offset-index
-   mask (read leaves, predicate leaves and leaf 0 for page counts), each in
-   the row groups that statistics kept (`PageIndexRequest`). A reader of a
-   shared metadata cache (`DFParquetMetadata::fetch_metadata`) returns cached
-   metadata that covers the request; otherwise it loads the complete page
-   index of the generation once and writes it back, so later opens and
-   queries parse nothing. A reader without a cache keeps the footer it
-   returned and loads only the requested entries onto it, through itself;
-   the footer is cloned only when it is shared. A reader that ignores the
-   request is followed by a masked load from the reader. A changed file has
-   another `ObjectMeta`, so `is_valid_for` rejects its cached footer and the
-   new generation is parsed again. Prepared scans (family PQ) request the
-   offset indexes of their read columns the same way. Page-index bytes that
-   the cached path reads go to the store directly and are not in
-   `bytes_scanned`.
+1. **Page index requests reuse the file footer.** The opener asks for the
+   page index entries it needs through `AsyncFileReader::get_metadata`,
+   with masks for predicate columns, offset indexes and surviving row groups.
+   Family CPI describes how masked requests load after statistics and Bloom
+   pruning. A changed file carries a different `ObjectMeta`, so cache
+   validation rejects the prior generation. Readers without a cache reuse
+   their last footer. Readers that ignore a mask are followed by a masked
+   load from the reader. Prepared scans (family PQ) request the offset
+   indexes of their read columns through the same interface.
 2. **Filters once per scan and physical schema.** `ParquetSource` holds a
    `PreparedFilterCache` that its clones and every partition's morselizer
    share. An entry holds the adapted predicate and projection, the
@@ -1350,12 +1368,11 @@ Review fixes (MJJ96 independent review, 2026-11-19):
   `Required` rule for the offset index (with any selected index range, every
   selected chunk needs an offset index) from the footer, on cache hits and
   loads alike; coverage includes it. A warm request that the footer rules out fails before
-  any index read. The complete load for the cache is
-  optional, so a required request is enforced only within its own selection.
-- **Index bytes.** On a cache miss the footer is read first and the index
-  after it; index reads in the metadata layer go through a counting fetch
-  (`with_page_index_bytes`), and the reader adds them to `bytes_scanned` and
-  its scan-efficiency part. A warm hit adds nothing.
+  any index read. A required request is enforced only within its selection.
+- **Index bytes.** Index reads in the metadata layer count the returned
+  ranges (`with_page_index_bytes`), which the reader adds to `bytes_scanned`
+  and its scan-efficiency part. A cache hit that covers the request adds
+  nothing.
 - **Derived copies.** `CachedParquetMetaData::with_derived_copies` reserves
   slots for copies derived from the entry's metadata (for example an
   engine's copies with page-cache handles), charged at the footer's size in

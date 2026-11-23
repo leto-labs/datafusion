@@ -5,9 +5,8 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-// Family OO: the page index is parsed once per file generation, filters are
-// prepared once per scan and physical schema, and a file open registers one
-// set of file metrics.
+// Family OO: full indexes are reused per file generation, filters are prepared
+// once per scan and physical schema, and a file open registers one set of metrics.
 
 use super::*;
 use datafusion_physical_expr::expressions::col as physical_col;
@@ -71,7 +70,7 @@ async fn oo_page_index_is_parsed_once_per_file_generation() {
     let (_, rows) =
         count_batches_and_rows(open_file(&morselizer, file.clone()).await.unwrap()).await;
     assert_eq!(rows, 10, "page pruning keeps the last page");
-    // The open wrote the complete page index back to the footer's entry.
+    // The masked request covered the complete index, so the open cached it.
     let first = cached_metadata(&store, &cache, "t.parquet");
     assert!(PageIndexRequest::all(PageIndexPolicy::Required).is_covered_by(&first));
 
@@ -98,31 +97,50 @@ async fn oo_page_index_is_parsed_once_per_file_generation() {
 
 #[tokio::test]
 async fn oo_uncached_reader_loads_only_the_requested_entries() {
+    check_masked_index_load(false).await;
+}
+
+#[tokio::test]
+async fn cached_reader_loads_only_the_requested_entries() {
+    check_masked_index_load(true).await;
+}
+
+async fn check_masked_index_load(cached: bool) {
+    // Make the complete index larger than the single-read cache threshold.
+    let group_rows = 1024;
     let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
     let batches = (0..2)
         .map(|group| {
-            let values: Vec<i32> = (0..100).map(|v| v + 100 * group).collect();
+            let values: Vec<i32> = (0..group_rows)
+                .map(|v| (v + group_rows * group) as i32)
+                .collect();
             record_batch!(("a", Int32, values.clone()), ("b", Int32, values)).unwrap()
         })
         .collect::<Vec<_>>();
     let schema = batches[0].schema();
     let props = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(100))
-        .set_data_page_row_count_limit(10)
-        .set_write_batch_size(10)
+        .set_max_row_group_row_count(Some(group_rows))
+        .set_data_page_row_count_limit(1)
+        .set_write_batch_size(1)
         .build();
-    let len =
-        write_parquet_batches(Arc::clone(&store), "m.parquet", batches, Some(props))
-            .await;
+    write_parquet_batches(Arc::clone(&store), "m.parquet", batches, Some(props)).await;
     let metrics = ExecutionPlanMetricsSet::new();
-    let morselizer = ParquetMorselizerBuilder::new()
-        .with_store(store)
+    let mut builder = ParquetMorselizerBuilder::new()
+        .with_store(Arc::clone(&store))
         .with_schema(schema)
-        .with_metrics(metrics.clone())
-        .build();
-    let file = PartitionedFile::new("m.parquet".to_string(), len as u64);
+        .with_metrics(metrics.clone());
+    let cache: Arc<FileMetadataCache> =
+        Arc::new(DefaultCache::<Path, CachedFileMetadataEntry>::new(1 << 20));
+    if cached {
+        builder = builder.with_parquet_file_reader_factory(Arc::new(
+            test_cached_factory(&store, &cache),
+        ));
+    }
+    let morselizer = builder.build();
+    let path = Path::from("m.parquet");
+    let file = PartitionedFile::from(store.head(&path).await.unwrap());
     let mut loaded = morselizer
-        .prepare_open_file(file)
+        .prepare_open_file(file.clone())
         .unwrap()
         .load()
         .await
@@ -134,6 +152,10 @@ async fn oo_uncached_reader_loads_only_the_requested_entries() {
         offset_policy: PageIndexPolicy::Optional,
         offset_mask: ColumnChunkMask::row_groups_and_columns([0], [1]),
     };
+    let footer = loaded.reader_metadata.metadata();
+    let column = footer.row_group(1).column(0).column_index_range().unwrap();
+    let offset = footer.row_group(0).column(1).offset_index_range().unwrap();
+    let expected_bytes = (column.end - column.start + offset.end - offset.start) as usize;
     let options = loaded.options.clone();
     let metadata = load_requested_page_index(
         &loaded.reader_metadata,
@@ -156,8 +178,13 @@ async fn oo_uncached_reader_loads_only_the_requested_entries() {
             .is_covered_by(metadata.metadata())
     );
 
+    if cached {
+        let reused = cached_metadata(&store, &cache, "m.parquet");
+        assert!(Arc::ptr_eq(loaded.reader_metadata.metadata(), &reused));
+    }
     // Covered entries need no I/O.
     let scanned = counter_metric_value(&metrics, "bytes_scanned");
+    assert_eq!(scanned, expected_bytes);
     let again = load_requested_page_index(
         &metadata,
         &mut loaded.prepared.async_file_reader,
@@ -168,6 +195,60 @@ async fn oo_uncached_reader_loads_only_the_requested_entries() {
     .unwrap();
     assert!(Arc::ptr_eq(metadata.metadata(), again.metadata()));
     assert_eq!(counter_metric_value(&metrics, "bytes_scanned"), scanned);
+
+    if cached {
+        // A fresh reader starts with the canonical footer. The auxiliary
+        // entry reuses the decoded index without any bytes from the store.
+        let next = |file| {
+            let morselizer = &morselizer;
+            let request = &request;
+            async move {
+                let mut loaded = morselizer
+                    .prepare_open_file(file)
+                    .unwrap()
+                    .load()
+                    .await
+                    .unwrap();
+                load_requested_page_index(
+                    &loaded.reader_metadata,
+                    &mut loaded.prepared.async_file_reader,
+                    &loaded.options,
+                    request,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let reused = next(file.clone()).await;
+        assert!(Arc::ptr_eq(index, reused.metadata().page_index().unwrap()));
+        assert_eq!(counter_metric_value(&metrics, "bytes_scanned"), scanned);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.list_entries().values().any(|entry| {
+            entry.size_bytes > 0
+                && entry
+                    .value
+                    .file_metadata
+                    .extra_info()
+                    .contains_key("partial_page_index")
+        }));
+
+        // Change the object generation while holding the size and the masks
+        // fixed. The prior auxiliary entry remains resident.
+        let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
+        store.put(&path, bytes.into()).await.unwrap();
+        let replacement = PartitionedFile::from(store.head(&path).await.unwrap());
+        assert_eq!(replacement.object_meta.size, file.object_meta.size);
+        assert_ne!(replacement.object_meta.e_tag, file.object_meta.e_tag);
+        let replaced = next(replacement).await;
+        assert!(!Arc::ptr_eq(
+            index,
+            replaced.metadata().page_index().unwrap()
+        ));
+        assert_eq!(
+            counter_metric_value(&metrics, "bytes_scanned"),
+            scanned + expected_bytes
+        );
+    }
 }
 
 /// The pruning predicate of `file` after filter preparation.
@@ -299,7 +380,7 @@ async fn oo_one_set_of_file_metrics_per_open() {
     let schema = int_schema();
     let len = write_pages(&store, "f.parquet", (1..=100).collect()).await;
     let metrics = ExecutionPlanMetricsSet::new();
-    // Bloom filters on: the open replaces its reader after the filter I/O.
+    // Bloom filters use a separate reader with the open's metrics.
     let morselizer = ParquetMorselizerBuilder::new()
         .with_store(store)
         .with_schema(Arc::clone(&schema))

@@ -32,8 +32,7 @@ impl PreparedParquetScan {
     /// caller's scheduling threshold. Ordinary row groups add no metadata I/O.
     pub async fn with_page_index_if_oversized(mut self, rows: usize) -> Result<Self> {
         // Longbow family OO: the offset indexes of the columns this scan
-        // reads, in its row groups; a shared metadata cache loads the file's
-        // complete page index once.
+        // reads, in its row groups.
         let request = PageIndexRequest {
             column_policy: PageIndexPolicy::Skip,
             column_mask: ColumnChunkMask::none(),
@@ -451,9 +450,9 @@ impl crate::source::ParquetSource {
                 ParquetOpenState::LoadMetadata(f) => {
                     ParquetOpenState::PrepareFilters(Box::new(f.await?))
                 }
-                ParquetOpenState::LoadPageIndex(f) => ParquetOpenState::LoadBloomFilters(
-                    f.await?.load_bloom_filters().boxed(),
-                ),
+                ParquetOpenState::LoadPageIndex(f) => {
+                    ParquetOpenState::BuildStream(Box::new(f.await?))
+                }
                 ParquetOpenState::LoadBloomFilters(f) => {
                     ParquetOpenState::PruneWithBloomFilters(Box::new(f.await?))
                 }

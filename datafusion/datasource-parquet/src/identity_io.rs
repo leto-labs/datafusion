@@ -76,6 +76,92 @@ pub(crate) async fn get_ranges(
     .await
 }
 
+/// Read sparse local metadata using one generation-validated descriptor and
+/// one blocking read task. The descriptor remains tied to the file it opened
+/// even if its path is replaced between reads.
+#[cfg(unix)]
+pub(crate) async fn get_local_metadata_ranges(
+    store: &dyn ObjectStore,
+    meta: &ObjectMeta,
+    ranges: &[Range<u64>],
+    range_coalesce_gap: u64,
+) -> object_store::Result<Vec<Bytes>> {
+    use std::os::unix::fs::FileExt;
+
+    use object_store::{Error, GetResultPayload};
+
+    let [first, rest @ ..] = ranges else {
+        return Ok(Vec::new());
+    };
+    if rest.is_empty() || !has_identity(meta) {
+        return get_ranges(store, meta, ranges, range_coalesce_gap).await;
+    }
+
+    let result = store
+        .get_opts(&meta.location, identity_options(meta, first.clone()))
+        .await?;
+    let GetResultPayload::File(file, _) = result.payload else {
+        // A custom file:// store may return a stream instead. Retain its
+        // conditional read contract and consume the response already open.
+        let (first, mut rest) = futures::try_join!(
+            result.bytes(),
+            get_ranges(store, meta, rest, range_coalesce_gap)
+        )?;
+        rest.insert(0, first);
+        return Ok(rest);
+    };
+    let file_size = result.meta.size;
+    let opened_at = std::time::SystemTime::from(result.meta.last_modified);
+    let batch = ranges.to_vec();
+    let (interest, reader) = tokio::sync::oneshot::channel::<()>();
+    let read = async move {
+        let io_error = |source| Error::Generic {
+            store: "Parquet page index",
+            source: Box::new(source),
+        };
+        let fetch = |range: Range<u64>| {
+            let bytes = (|| {
+                // A running blocking task cannot be aborted. Stop before
+                // reading the next span if the scan dropped its future.
+                if interest.is_closed() {
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                let len = isize::try_from(range.end - range.start)
+                    .map_err(|_| std::io::ErrorKind::InvalidData)?
+                    as usize;
+                if range.end > file_size {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                }
+                let mut bytes = vec![0; len];
+                file.read_exact_at(&mut bytes, range.start)?;
+                Ok(Bytes::from(bytes))
+            })()
+            .map_err(io_error);
+            std::future::ready(bytes)
+        };
+        let bytes = coalesce_ranges(&batch, fetch, range_coalesce_gap).await?;
+        let current = file.metadata().map_err(io_error)?;
+        let unchanged = current.len() == file_size
+            && current.modified().map_err(io_error)? == opened_at;
+        Ok::<_, Error>(unchanged.then_some(bytes))
+    };
+    let bytes = match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime
+                .spawn_blocking(move || futures::executor::block_on(read))
+                .await?
+        }
+        Err(_) => read.await,
+    }?;
+    drop(reader);
+    match bytes {
+        Some(bytes) => Ok(bytes),
+        // Discard bytes if an in-place write changed the descriptor.
+        // The normal path also handles stores with synthetic timestamps.
+        None => get_ranges(store, meta, ranges, range_coalesce_gap).await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -84,6 +170,55 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::{Error, ObjectStoreExt, PutPayload};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_metadata_batch_retains_order_and_rejects_replaced_file() {
+        use object_store::local::LocalFileSystem;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let path = Path::from("page-index");
+        let data = b"0123456789abcdef";
+        store
+            .put(&path, PutPayload::from_static(data))
+            .await
+            .unwrap();
+        let planned = store.head(&path).await.unwrap();
+        let ranges = [12..16, 2..5, 4..7, 2..5];
+        let expected = ranges
+            .iter()
+            .map(|range| {
+                Bytes::from_static(&data[range.start as usize..range.end as usize])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            get_local_metadata_ranges(&store, &planned, &ranges, 1)
+                .await
+                .unwrap(),
+            expected
+        );
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let actual = futures::executor::block_on(get_local_metadata_ranges(
+                        &store, &planned, &ranges, 1,
+                    ))
+                    .unwrap();
+                    assert_eq!(actual, expected);
+                })
+                .join()
+                .unwrap();
+        });
+        store
+            .put(&path, PutPayload::from_static(b"fedcba9876543210"))
+            .await
+            .unwrap();
+        let error = get_local_metadata_ranges(&store, &planned, &ranges, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Precondition { .. }), "{error}");
+    }
 
     #[tokio::test]
     async fn identity_reads_fail_after_a_same_size_overwrite() {
@@ -99,6 +234,13 @@ mod tests {
         let gap = 1;
         assert_eq!(
             get_ranges(store.as_ref(), &planned, &ranges, gap)
+                .await
+                .unwrap(),
+            vec![Bytes::from_static(b"aa"), Bytes::from_static(b"aa")]
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            get_local_metadata_ranges(store.as_ref(), &planned, &ranges, gap)
                 .await
                 .unwrap(),
             vec![Bytes::from_static(b"aa"), Bytes::from_static(b"aa")]

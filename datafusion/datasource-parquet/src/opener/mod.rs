@@ -46,7 +46,6 @@ use filter_cache::{FilterInputs, PreparedFilterCache, PreparedFilters};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::mem;
 use std::sync::{Arc, OnceLock};
 
 use arrow::datatypes::{FieldRef, Schema, SchemaRef, TimeUnit};
@@ -401,13 +400,13 @@ impl Morselizer for ParquetMorselizer {
 /// PruneWithStatistics
 ///        |
 ///        v
-///   LoadPageIndex?   (skipped when all surviving row groups are fully matched)
-///        |
-///        v
 ///  LoadBloomFilters
 ///        |
 ///        v
 /// PruneWithBloomFilters
+///        |
+///        v
+///   LoadPageIndex?   (only for surviving row groups)
 ///        |
 ///        v
 ///   BuildStream
@@ -782,33 +781,13 @@ impl ParquetOpenState {
                 )))
             }
             ParquetOpenState::PruneWithStatistics(prepared) => {
-                let mut prepared_row_groups = (*prepared).prune_row_groups()?;
+                let prepared_row_groups = (*prepared).prune_row_groups()?;
                 if prepared_row_groups.row_groups.is_fully_pruned() {
                     return Ok(ParquetOpenState::Done);
                 }
-                if prepared_row_groups.should_load_page_index()? {
-                    Ok(ParquetOpenState::LoadPageIndex(
-                        prepared_row_groups.load_page_index().boxed(),
-                    ))
-                } else {
-                    if prepared_row_groups
-                        .prepared
-                        .page_pruning_predicate
-                        .is_some()
-                        && !prepared_row_groups.row_groups.is_empty()
-                    {
-                        let prepared = &prepared_row_groups.prepared.loaded.prepared;
-                        ParquetFileMetrics::add_page_index_load_skipped(
-                            &prepared.metrics,
-                            prepared.partition_index,
-                            &prepared.file_name,
-                            1,
-                        );
-                    }
-                    Ok(ParquetOpenState::LoadBloomFilters(
-                        prepared_row_groups.load_bloom_filters().boxed(),
-                    ))
-                }
+                Ok(ParquetOpenState::LoadBloomFilters(
+                    prepared_row_groups.load_bloom_filters().boxed(),
+                ))
             }
             ParquetOpenState::LoadPageIndex(future) => {
                 Ok(ParquetOpenState::LoadPageIndex(future))
@@ -817,9 +796,25 @@ impl ParquetOpenState {
                 Ok(ParquetOpenState::LoadBloomFilters(future))
             }
             ParquetOpenState::PruneWithBloomFilters(loaded) => {
-                let pruned = loaded.prune_bloom_filters();
+                let mut pruned = loaded.prune_bloom_filters();
                 if pruned.row_groups.is_fully_pruned() {
                     return Ok(ParquetOpenState::Done);
+                }
+                if pruned.should_load_page_index()? {
+                    return Ok(ParquetOpenState::LoadPageIndex(
+                        pruned.load_page_index().boxed(),
+                    ));
+                }
+                if pruned.prepared.page_pruning_predicate.is_some()
+                    && !pruned.row_groups.is_empty()
+                {
+                    let prepared = &pruned.prepared.loaded.prepared;
+                    ParquetFileMetrics::add_page_index_load_skipped(
+                        &prepared.metrics,
+                        prepared.partition_index,
+                        &prepared.file_name,
+                        1,
+                    );
                 }
                 Ok(ParquetOpenState::BuildStream(Box::new(pruned)))
             }
@@ -930,9 +925,7 @@ impl MorselPlanner for ParquetMorselPlanner {
             }
             ParquetOpenState::LoadPageIndex(future) => {
                 Ok(Some(Self::schedule_io(async move {
-                    Ok(ParquetOpenState::LoadBloomFilters(
-                        future.await?.load_bloom_filters().boxed(),
-                    ))
+                    Ok(ParquetOpenState::BuildStream(Box::new(future.await?)))
                 })))
             }
             ParquetOpenState::LoadBloomFilters(future) => {
@@ -1718,8 +1711,8 @@ impl RowGroupsPrunedParquetOpen {
 
     /// The page index entries this open needs (Longbow family OO): column
     /// indexes of the page-pruning predicate's columns, and offset indexes
-    /// of every column it reads or prunes plus the first column (page
-    /// counts), each in the row groups that statistics did not prune.
+    /// of every column it reads or prunes. The first column supplies the
+    /// page count if statistics fully match any of the surviving groups.
     fn page_index_request(&mut self) -> Result<PageIndexRequest> {
         if self.decoder_read_plans.is_none() {
             self.decoder_read_plans = Some(DecoderReadPlans::try_new(
@@ -1741,15 +1734,23 @@ impl RowGroupsPrunedParquetOpen {
             })
             .collect();
         let row_groups: Vec<usize> = self.row_groups.row_group_indexes().collect();
+        let fully_matched = self.row_groups.is_fully_matched();
+        let count_fully_matched_pages = self.prepared.page_pruning_predicate.is_some()
+            && row_groups.iter().any(|&group| fully_matched[group]);
         let offset_leaves = (0..parquet_schema.num_columns()).filter(|&leaf| {
-            leaf == 0 || read_plans.reads_leaf(leaf) || predicate_leaves.contains(&leaf)
+            (leaf == 0 && count_fully_matched_pages)
+                || read_plans.reads_leaf(leaf)
+                || predicate_leaves.contains(&leaf)
         });
         let (column_policy, column_mask) =
             if self.prepared.page_pruning_predicate.is_some() {
                 (
                     PageIndexPolicy::Optional,
                     ColumnChunkMask::row_groups_and_columns(
-                        row_groups.iter().copied(),
+                        row_groups
+                            .iter()
+                            .copied()
+                            .filter(|&group| !fully_matched[group]),
                         predicate_leaves.iter().copied(),
                     ),
                 )
@@ -1783,7 +1784,7 @@ impl RowGroupsPrunedParquetOpen {
     }
 
     /// Load bloom filters needed for pruning when enabled and a pruning predicate exists.
-    async fn load_bloom_filters(mut self) -> Result<BloomFiltersLoadedParquetOpen> {
+    async fn load_bloom_filters(self) -> Result<BloomFiltersLoadedParquetOpen> {
         let num_row_groups = self
             .prepared
             .loaded
@@ -1802,23 +1803,21 @@ impl RowGroupsPrunedParquetOpen {
                 .row_group_indexes()
                 .any(|idx| !self.row_groups.access_plan().is_fully_matched(idx))
         {
-            // Use the existing reader for bloom filter I/O;
-            // replace with a fresh reader for decoding below.
-            let reader_metadata = self.prepared.loaded.reader_metadata.clone();
-            let replacement_reader = {
-                let prepared = &self.prepared.loaded.prepared;
+            // Keep the original reader's footer for the later page-index
+            // request. Bloom I/O uses a separate reader with the same metrics.
+            let prepared = &self.prepared.loaded.prepared;
+            let predicate_errors =
+                prepared.file_metrics.predicate_evaluation_errors.clone();
+            let reader: Box<dyn AsyncFileReader> =
                 prepared.parquet_file_reader_factory.create_reader(
                     prepared.partition_index,
                     reader_file(&prepared.partitioned_file, &prepared.file_metrics),
                     prepared.metadata_size_hint,
                     &prepared.metrics,
-                )?
-            };
-
-            let prepared = &mut self.prepared.loaded.prepared;
+                )?;
             let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
-                mem::replace(&mut prepared.async_file_reader, replacement_reader),
-                reader_metadata,
+                reader,
+                self.prepared.loaded.reader_metadata.clone(),
             );
             let parquet_columns: Vec<(String, usize, Type, i32)> = predicate
                 .literal_columns()
@@ -1858,7 +1857,7 @@ impl RowGroupsPrunedParquetOpen {
                         Ok(None) => continue,
                         Err(e) => {
                             debug!("Ignoring error reading bloom filter: {e}");
-                            prepared.file_metrics.predicate_evaluation_errors.add(1);
+                            predicate_errors.add(1);
                             continue;
                         }
                     };
@@ -2548,11 +2547,8 @@ fn reader_file(file: &PartitionedFile, metrics: &ParquetFileMetrics) -> Partitio
 ///
 /// Metadata that holds them is returned unchanged. Otherwise the entries
 /// are requested from `input` through [`AsyncFileReader::get_metadata`]: a
-/// reader of a shared metadata cache (`CachedParquetFileReaderFactory`)
-/// loads the complete page index of the file generation once and writes it
-/// back, and one without a cache loads only the requested entries onto the
-/// footer it returned before. A reader that ignores the request is followed
-/// by a load of only the requested entries from `input`.
+/// built-in reader reuses the footer and loads the selected entries. A
+/// reader that ignores the request is followed by a masked load from `input`.
 pub(crate) async fn load_requested_page_index<T: AsyncFileReader>(
     reader_metadata: &ArrowReaderMetadata,
     input: &mut T,
@@ -3960,7 +3956,7 @@ mod test {
         let props = WriterProperties::builder()
             .set_max_row_group_row_count(Some(3))
             .set_bloom_filter_enabled(true)
-            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .set_statistics_enabled(EnabledStatistics::Page)
             .build();
         let data_size = write_parquet_batches(
             Arc::clone(&store),
@@ -3971,23 +3967,33 @@ mod test {
         .await;
         let file = PartitionedFile::new("test.parquet".to_string(), data_size as u64);
 
-        let morsels = |expr: Expr| {
+        let morsels = |expr: Expr, enable_page_index| {
+            let metrics = ExecutionPlanMetricsSet::new();
             let morselizer = ParquetMorselizerBuilder::new()
                 .with_store(Arc::clone(&store))
                 .with_schema(Arc::clone(&schema))
                 .with_predicate(logical2physical(&expr, &schema))
                 .with_row_group_stats_pruning(true)
                 .with_enable_bloom_filter(true)
+                .with_enable_page_index(enable_page_index)
+                .with_metrics(metrics.clone())
                 .build();
             let file = file.clone();
-            async move { count_morsels(&morselizer, file).await.unwrap() }
+            async move {
+                let count = count_morsels(&morselizer, file).await.unwrap();
+                (count, counter_metric_value(&metrics, "bytes_scanned"))
+            }
         };
 
         // Statistics prune both row groups.
-        assert_eq!(morsels(col("a").gt(lit(10))).await, 0);
+        assert_eq!(morsels(col("a").gt(lit(10)), true).await, (0, 0));
         // Statistics keep both row groups; their Bloom filters prune both.
-        assert_eq!(morsels(col("a").eq(lit(1))).await, 0);
-        assert_eq!(morsels(col("a").eq(lit(2))).await, 1);
+        let absent = col("a").eq(lit(1));
+        let bloom_only = morsels(absent.clone(), false).await;
+        assert_eq!(bloom_only.0, 0);
+        assert!(bloom_only.1 > 0);
+        assert_eq!(morsels(absent, true).await, bloom_only);
+        assert_eq!(morsels(col("a").eq(lit(2)), true).await.0, 1);
     }
 
     #[tokio::test]
@@ -6966,9 +6972,9 @@ mod test {
                 ParquetOpenState::LoadMetadata(f) => {
                     ParquetOpenState::PrepareFilters(Box::new(f.await.unwrap()))
                 }
-                ParquetOpenState::LoadPageIndex(f) => ParquetOpenState::LoadBloomFilters(
-                    f.await.unwrap().load_bloom_filters().boxed(),
-                ),
+                ParquetOpenState::LoadPageIndex(f) => {
+                    ParquetOpenState::BuildStream(Box::new(f.await.unwrap()))
+                }
                 ParquetOpenState::LoadBloomFilters(f) => {
                     ParquetOpenState::PruneWithBloomFilters(Box::new(f.await.unwrap()))
                 }
