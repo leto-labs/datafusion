@@ -26,6 +26,7 @@ use datafusion_execution::memory_pool::{
     MemoryPool, MemoryReservation, UnboundedMemoryPool,
 };
 use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+use datafusion_functions_aggregate::array_agg::array_agg_udaf;
 use datafusion_functions_aggregate::count::count_udaf;
 use datafusion_physical_expr::aggregate::AggregateExprBuilder;
 use datafusion_physical_expr::expressions::col;
@@ -493,6 +494,178 @@ async fn clustered_final_spills_when_the_retained_table_is_refused() -> Result<(
         );
     }
     Ok(())
+}
+
+/// Limits a final hash table so that it spills, and numbers the growth
+/// requests of the spill replay table, refusing every request from `admit` on.
+/// The replay merge has its own consumer and is admitted, so only the replay
+/// table runs without lending headroom.
+#[derive(Debug)]
+struct RefuseReplayTable {
+    inner: UnboundedMemoryPool,
+    table_limit: usize,
+    admit: usize,
+    requests: AtomicUsize,
+    refused: AtomicUsize,
+}
+
+impl RefuseReplayTable {
+    fn new(table_limit: usize, admit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: UnboundedMemoryPool::default(),
+            table_limit,
+            admit,
+            requests: AtomicUsize::new(0),
+            refused: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl fmt::Display for RefuseReplayTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl MemoryPool for RefuseReplayTable {
+    fn name(&self) -> &str {
+        "RefuseReplayTable"
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.inner.grow(reservation, additional);
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.inner.shrink(reservation, shrink);
+    }
+
+    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
+        let name = reservation.consumer().name();
+        if name.starts_with("AggregateSpillReplayTable") && reservation.size() != 0 {
+            if self.requests.fetch_add(1, Ordering::Relaxed) >= self.admit {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+                return Err(resources_datafusion_err!("no lending headroom"));
+            }
+        } else if name.starts_with("FinalHashAggregateStream")
+            && reservation.size() + additional > self.table_limit
+        {
+            return Err(resources_datafusion_err!("table limit"));
+        }
+        self.inner.try_grow(reservation, additional)
+    }
+
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+}
+
+/// Spill replay merges the runs through a fully clustered final stream that
+/// cannot spill. When its table is refused from any admission point on, the
+/// replay must still finish with the unlimited result: it emits its completed
+/// groups and charges the memory the active group already holds.
+///
+/// `array_agg` states grow as replay merges a key's states from the runs, so
+/// the active group can outgrow the reservation admitted before the batch.
+#[tokio::test]
+async fn spill_replay_finishes_when_its_table_is_refused() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    // Each partition holds every key, so each key has one state per
+    // partition, and the states recur across spill runs.
+    let partitions = (0..64)
+        .map(|partition| {
+            let rows = 0..64 * 128;
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(rows.clone().map(|i| i % 64))),
+                    Arc::new(Int64Array::from_iter_values(
+                        rows.map(|i| partition * 64 * 128 + i),
+                    )),
+                ],
+            )
+            .map(|batch| vec![batch])
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let array_agg = AggregateExprBuilder::new(array_agg_udaf(), vec![col("v", &schema)?])
+        .schema(Arc::clone(&schema))
+        .alias("array_agg")
+        .build()?;
+    let partial = AggregateExec::try_new(
+        AggregateMode::Partial,
+        PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".into())]),
+        vec![Arc::new(array_agg)],
+        vec![None],
+        TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?,
+        Arc::clone(&schema),
+    )?;
+    let unlimited_context = context(RefuseAfter::unlimited(), true)?;
+    let mut states = vec![];
+    for partition in 0..partitions.len() {
+        let stream = partial.execute(partition, Arc::clone(&unlimited_context))?;
+        states.extend(crate::common::collect(stream).await?);
+    }
+    let plan = AggregateExec::try_new(
+        AggregateMode::Final,
+        partial.group_by().as_final(),
+        partial.aggr_expr().to_vec(),
+        vec![None],
+        TestMemoryExec::try_new_exec(&[states], partial.schema(), None)?,
+        Arc::clone(&partial.input_schema),
+    )?;
+    assert!(matches!(
+        plan.execute_typed(0, &unlimited_context)?,
+        StreamType::FinalHash(_)
+    ));
+    let expected = lists(&run(&plan, RefuseAfter::unlimited() as _, true).await?);
+    assert_eq!(expected.len(), 64);
+
+    // Small enough to spill several runs. The merge reservation is a sibling
+    // of the hash table's, so the limit must also fit the merge.
+    const TABLE_LIMIT: usize = 4 * 1024 * 1024;
+    let admitted = RefuseReplayTable::new(TABLE_LIMIT, usize::MAX);
+    let output = run(&plan, Arc::clone(&admitted) as _, true).await?;
+    assert!(plan.metrics().unwrap().spill_count().unwrap() > 1);
+    assert_eq!(lists(&output), expected);
+    let requests = admitted.requests.load(Ordering::Relaxed);
+    assert!(requests > 0, "the replay table must grow");
+
+    for admit in 0..requests {
+        let pool = RefuseReplayTable::new(TABLE_LIMIT, admit);
+        let output = run(&plan, Arc::clone(&pool) as _, true)
+            .await
+            .unwrap_or_else(|error| panic!("admitting {admit} of {requests}: {error}"));
+        assert!(pool.refused.load(Ordering::Relaxed) > 0);
+        assert_eq!(lists(&output), expected, "admitting {admit}");
+    }
+    Ok(())
+}
+
+/// The sorted `array_agg` values of each key in a final output, which must
+/// not repeat a key.
+fn lists(output: &[RecordBatch]) -> BTreeMap<i64, Vec<i64>> {
+    let mut lists = BTreeMap::new();
+    for batch in output {
+        let keys = batch.column(0).as_primitive::<Int64Type>();
+        let values = batch.column(1).as_list::<i32>();
+        for row in 0..batch.num_rows() {
+            let mut list = values
+                .value(row)
+                .as_primitive::<Int64Type>()
+                .values()
+                .to_vec();
+            list.sort_unstable();
+            let key = keys.value(row);
+            assert!(
+                lists.insert(key, list).is_none(),
+                "final output repeats group {key}"
+            );
+        }
+    }
+    lists
 }
 
 #[tokio::test]

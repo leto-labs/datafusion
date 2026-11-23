@@ -1605,3 +1605,47 @@ with the Partial hash stream's bounded sketch. The clustered final stream
 must emit its completed groups and spill the rest. Its test then drives the
 resumed stage through EOF and replay, and requires unique groups with the
 unlimited sums.
+
+### Spill replay under a refusal (leto-zym4)
+
+Spill replay merges the sorted runs through a fully clustered final stream
+that cannot spill. Before this commit, a refused handoff in replay returned
+`ResourcesExhausted` and discarded every run, so an adaptive pool without
+lending headroom could fail a query that had already spilled. A handoff
+emits the completed groups, then reserves the retained table. The replay
+now builds its stream with `HeldMemory::Charge`:
+
+- When the pool refuses both the completed groups' batch and the retained
+  table, the stream emits the batch, releases the table's spare capacity
+  and charges the memory the table already holds, without another
+  admission. Under full clustering the table then holds only the active
+  group, which began within the last batch. The reservation follows that
+  one group's size and does not accumulate.
+- A refusal with no completed group still returns `ResourcesExhausted`.
+  The single active group then needs more memory than the pool grants, and
+  charging it batch after batch would grow without admission, for example
+  an `array_agg` on one skewed key.
+- The replay table is still admitted when it is created, as the upstream
+  `test_oom` and `test_sort_reservation_fails_during_spill` require.
+
+No group is emitted twice and the key order holds, because only complete
+groups are emitted. The spill merge is unchanged: reading a run allocates new
+memory, so a merge refusal remains `ResourcesExhausted`. Streams that are not
+replays keep `HeldMemory::Refuse`, so a non-spilling final stage still
+returns the refusal.
+
+After a spilling stream spills its refused table, the emptied table can
+still own more than its reservation. That memory is now charged without
+another admission. Before, a refusal there was returned wrapped in a
+`Context` error, which hid the `ResourcesExhausted` type. The same wrap in
+the hash and single hash streams' spill paths is unchanged.
+
+`spill_replay_finishes_when_its_table_is_refused` spills an unordered final
+`array_agg`, whose states grow as replay merges them. Its pool refuses
+every replay-table growth from each admission point on, and every run must
+match the unlimited lists with unique keys. The stage tests refuse every
+growth of a replay stream after its initial table: distinct keys must
+finish with the unlimited output, and a single key must return
+`ResourcesExhausted`. They also check that a refused handoff charges
+exactly the active group's memory, that a spill charges the emptied
+table, and that a zero-limit pool refuses to start a replay.

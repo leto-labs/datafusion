@@ -21,7 +21,7 @@ use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use futures::StreamExt;
 
 use super::aggregate_hash_table::ClusteredAggregateTableMetrics;
-use super::clustered_final_stream::ClusteredFinalAggregateStream;
+use super::clustered_final_stream::{ClusteredFinalAggregateStream, HeldMemory};
 use super::order::GroupClusteringMode;
 use super::{AggregateExec, AggregateMode};
 use crate::SendableRecordBatchStream;
@@ -381,6 +381,9 @@ impl AggregateSpill {
             metrics,
             None,
             replay_reservation,
+            // Replay cannot spill. A refusal of the groups it already holds
+            // would discard every run, so it charges them and continues.
+            HeldMemory::Charge,
         )?;
         Ok(replay.into_stream())
     }

@@ -78,6 +78,25 @@ struct ClusteredFinalAggregateContext {
     schema: SchemaRef,
     batch_size: usize,
     baseline_metrics: BaselineMetrics,
+    /// Set for spill replay, see [`HeldMemory::Charge`].
+    charge_held_memory: bool,
+}
+
+/// How a fully clustered final stream without a spill path answers a refused
+/// handoff, in which the pool refuses both the completed groups' batch and
+/// the retained table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::aggregates) enum HeldMemory {
+    /// Return the refusal as `ResourcesExhausted`.
+    Refuse,
+    /// Emit the completed groups and charge the memory the retained table
+    /// already holds, without another admission. Spill replay uses this: it
+    /// cannot spill, and failing would discard every spilled run. Under full
+    /// clustering the table then retains only the active group, which began
+    /// within the last batch, so the charge follows one group's size and does
+    /// not accumulate. A refusal with no completed group, the initial table
+    /// and any other growth still need admission.
+    Charge,
 }
 
 impl ClusteredFinalAggregateStream {
@@ -125,6 +144,7 @@ impl ClusteredFinalAggregateStream {
             metrics,
             Some(spill_metrics),
             reservation,
+            HeldMemory::Refuse,
         )
     }
 
@@ -134,7 +154,8 @@ impl ClusteredFinalAggregateStream {
     )]
     /// Builds the stream with the reservation of its logical aggregate operator.
     /// Replay callers pass a sibling of the reservation used by the merge input,
-    /// keeping both components under one memory-consumer registration.
+    /// keeping both components under one memory-consumer registration, and
+    /// [`HeldMemory::Charge`].
     pub(in crate::aggregates) fn new_with_input_and_metrics(
         agg: &AggregateExec,
         context: &Arc<TaskContext>,
@@ -145,6 +166,7 @@ impl ClusteredFinalAggregateStream {
         metrics: ClusteredAggregateTableMetrics,
         spill_metrics: Option<SpillMetrics>,
         reservation: MemoryReservation,
+        held_memory: HeldMemory,
     ) -> Result<Self> {
         debug_assert!(matches!(
             agg.mode,
@@ -186,7 +208,19 @@ impl ClusteredFinalAggregateStream {
             metrics,
         )?;
 
+        let charge_held_memory = held_memory == HeldMemory::Charge;
+        if charge_held_memory && spill_context.is_some() {
+            return internal_err!(
+                "a spilling clustered final stream cannot charge held memory"
+            );
+        }
+        if charge_held_memory && *group_clustering_mode != GroupClusteringMode::Full {
+            return internal_err!("only full group clustering charges held memory");
+        }
+
         // Reserve memory for the initial hash table. that we hold for the lifetime of the stream.
+        // Replay is admitted here like any new table, so a hard memory limit
+        // can still refuse it before it starts.
         reservation.try_grow(table.memory_size())?;
 
         Ok(Self {
@@ -195,6 +229,7 @@ impl ClusteredFinalAggregateStream {
                 schema,
                 batch_size,
                 baseline_metrics,
+                charge_held_memory,
             },
             stage: ExecutionStage::Aggregating(Aggregating {
                 input,
@@ -330,7 +365,10 @@ impl Aggregating {
     /// Spills every retained group after `reservation` refused the table.
     ///
     /// A final stage cannot emit incomplete groups, so the refusal `oom` is
-    /// returned when spilling is disabled or no group remains to spill.
+    /// returned when spilling is disabled or no group remains to spill. The
+    /// emptied table can still own more than `reservation` holds, for example
+    /// after an earlier refusal. It already holds that memory, so it is
+    /// charged without another admission: refusing it frees nothing.
     fn spill_retained(
         &mut self,
         reservation: &MemoryReservation,
@@ -343,9 +381,26 @@ impl Aggregating {
             return Err(oom);
         }
         spill_context.sort_and_spill(self.table.take_state_batch()?)?;
-        reservation
-            .try_resize(self.table.memory_size())
-            .map_err(|e| e.context("Decreasing allocation after spilling should succeed"))
+        reservation.resize(self.table.memory_size());
+        Ok(())
+    }
+
+    /// Charges the memory the table already holds after `reservation`
+    /// refused a handoff, when `context` allows it (see
+    /// [`HeldMemory::Charge`]), or returns the refusal `oom`. Spare capacity is
+    /// released first.
+    fn charge_held(
+        &mut self,
+        context: &ClusteredFinalAggregateContext,
+        reservation: &MemoryReservation,
+        oom: DataFusionError,
+    ) -> Result<()> {
+        if !context.charge_held_memory {
+            return Err(oom);
+        }
+        self.table.shrink_to_fit();
+        reservation.resize(self.reservation_size());
+        Ok(())
     }
 
     /// Merges partial states until final results are ready or spill replay begins.
@@ -382,6 +437,10 @@ impl Aggregating {
                 continue;
             }
             let Some(batch) = self.table.take_completed_result_batch()? else {
+                // Every retained group is incomplete, so nothing can be
+                // released. Even spill replay fails here: its single active
+                // group outgrows the pool, and charging it batch after batch
+                // would grow without any admission.
                 match oom {
                     Some(oom) => return Err(oom),
                     None => continue,
@@ -461,7 +520,11 @@ impl Outputting {
                         let Some(aggregating) = resume.as_mut() else {
                             return Err(oom);
                         };
-                        aggregating.spill_retained(reservation, oom)?;
+                        if aggregating.spill_context.is_some() {
+                            aggregating.spill_retained(reservation, oom)?;
+                        } else {
+                            aggregating.charge_held(context, reservation, oom)?;
+                        }
                     }
                     Err(e) => return Err(e),
                 }
@@ -918,6 +981,265 @@ mod tests {
             }
             assert_eq!(pool.reserved(), 0);
         }
+        Ok(())
+    }
+
+    /// After a refused table spills, the emptied table can still own more than
+    /// its reservation, here shrunk to one byte. Refusing that memory frees
+    /// nothing, so the stream charges it and continues instead of returning a
+    /// context-wrapped refusal.
+    #[tokio::test]
+    async fn spill_charges_the_emptied_table() -> Result<()> {
+        let keys: Vec<i64> = (0..8192).chain([8192; 64]).collect();
+        let second = (0..8192).map(|k| k % 5).chain(0..64).collect();
+        let plan = sum_over_sorted_input(
+            AggregateMode::Final,
+            &["k", "j"],
+            vec![vec![keys, second]],
+        )?;
+        let expected = final_sums(
+            &collect(plan.execute(0, Arc::new(TaskContext::default()))?).await?,
+        );
+        let pool = Arc::new(RefuseWhenSet::default());
+        let context = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_batch_size(256))
+                .with_runtime(
+                    RuntimeEnvBuilder::new()
+                        .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
+                        .build_arc()?,
+                ),
+        );
+        let input = collect(plan.input().execute(0, Arc::clone(&context))?).await?;
+        let stream = ClusteredFinalAggregateStream::new_with_input(
+            &plan,
+            &context,
+            0,
+            Box::pin(crate::stream::EmptyRecordBatchStream::new(
+                plan.input().schema(),
+            )),
+            plan.group_clustering_mode(),
+        )?;
+        let ClusteredFinalAggregateStream {
+            reservation,
+            context: stream_context,
+            stage: ExecutionStage::Aggregating(mut aggregating),
+        } = stream
+        else {
+            unreachable!("a new stream starts by aggregating");
+        };
+        aggregating.table.aggregate_batch(&input[0])?;
+        reservation.resize(1);
+        pool.refuse
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        aggregating.spill_retained(
+            &reservation,
+            datafusion_common::resources_datafusion_err!("refused"),
+        )?;
+        assert!(aggregating.spill_context.as_ref().unwrap().has_spills());
+        assert!(aggregating.table.is_empty());
+        assert!(aggregating.table.memory_size() > 1);
+        assert_eq!(reservation.size(), aggregating.table.memory_size());
+
+        pool.refuse
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let output: Vec<RecordBatch> = async_try_stream(|mut emitter| async move {
+            ExecutionStage::Aggregating(aggregating)
+                .run(&stream_context, &reservation, &mut emitter)
+                .await
+        })
+        .try_collect()
+        .await?;
+        assert_eq!(final_sums(&output), expected);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    /// Admits only the first growth of each reservation, as a pool without
+    /// lending headroom admits a new table and refuses its later growth.
+    fn refuse_established() -> Arc<RefuseWhenSet> {
+        let pool = RefuseWhenSet::default();
+        pool.refuse
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Arc::new(pool)
+    }
+
+    /// A replay stream, which has full group clustering and no spill path,
+    /// finishes when the pool refuses every growth after its initial table:
+    /// distinct keys give refused handoffs, and the stream emits completed
+    /// groups and charges the active group's memory. A single key gives the
+    /// refusal with no completed group. That one group needs more memory than
+    /// the pool grants, so both modes return `ResourcesExhausted`.
+    #[tokio::test]
+    async fn replay_finishes_when_every_later_growth_is_refused() -> Result<()> {
+        for (single_key, batches) in [
+            (true, single_key_batches()),
+            (false, distinct_key_batches()),
+            (false, full_batches()),
+        ] {
+            let plan = sum_over_sorted_input(AggregateMode::Final, &["k"], batches)?;
+            assert_eq!(plan.group_clustering_mode(), &GroupClusteringMode::Full);
+            let expected =
+                collect(plan.execute(0, Arc::new(TaskContext::default()))?).await?;
+            for held_memory in [HeldMemory::Charge, HeldMemory::Refuse] {
+                let pool: Arc<dyn MemoryPool> = refuse_established();
+                let context = Arc::new(
+                    TaskContext::default()
+                        .with_session_config(SessionConfig::new().with_batch_size(256))
+                        .with_runtime(
+                            RuntimeEnvBuilder::new()
+                                .with_memory_pool(Arc::clone(&pool))
+                                .build_arc()?,
+                        ),
+                );
+                let result = async {
+                    let input = plan.input().execute(0, Arc::clone(&context))?;
+                    let stream =
+                        ClusteredFinalAggregateStream::new_with_input_and_metrics(
+                            &plan,
+                            &context,
+                            0,
+                            input,
+                            &GroupClusteringMode::Full,
+                            BaselineMetrics::new(&plan.metrics, 0),
+                            ClusteredAggregateTableMetrics::new(&plan, 0),
+                            None,
+                            MemoryConsumer::new("replay").register(&pool),
+                            held_memory,
+                        )?;
+                    collect(stream.into_stream()).await
+                }
+                .await;
+                match result {
+                    Ok(output) => {
+                        assert!(
+                            !single_key,
+                            "a refused group that never completes must fail"
+                        );
+                        let keys: Vec<i64> = output
+                            .iter()
+                            .flat_map(|batch| {
+                                batch
+                                    .column(0)
+                                    .as_primitive::<arrow::datatypes::Int64Type>()
+                                    .values()
+                                    .to_vec()
+                            })
+                            .collect();
+                        assert!(
+                            keys.is_sorted() && keys.windows(2).all(|w| w[0] != w[1]),
+                            "replay must emit each group once, in key order"
+                        );
+                        assert_eq!(
+                            arrow::util::pretty::pretty_format_batches(&output)?
+                                .to_string(),
+                            arrow::util::pretty::pretty_format_batches(&expected)?
+                                .to_string()
+                        );
+                    }
+                    Err(DataFusionError::ResourcesExhausted(_))
+                        if held_memory == HeldMemory::Refuse || single_key => {}
+                    Err(error) => panic!("{held_memory:?}: unexpected {error}"),
+                }
+                assert_eq!(pool.reserved(), 0);
+            }
+        }
+        Ok(())
+    }
+
+    /// The replay table is admitted like any new table, so a hard limit that
+    /// cannot hold it refuses the replay before it starts.
+    #[tokio::test]
+    async fn replay_table_needs_admission() -> Result<()> {
+        let plan = sum_over_sorted_input(AggregateMode::Final, &["k"], full_batches())?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(0));
+        let context = Arc::new(
+            TaskContext::default().with_runtime(
+                RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::clone(&pool))
+                    .build_arc()?,
+            ),
+        );
+        let result = ClusteredFinalAggregateStream::new_with_input_and_metrics(
+            &plan,
+            &context,
+            0,
+            Box::pin(crate::stream::EmptyRecordBatchStream::new(
+                plan.input().schema(),
+            )),
+            &GroupClusteringMode::Full,
+            BaselineMetrics::new(&plan.metrics, 0),
+            ClusteredAggregateTableMetrics::new(&plan, 0),
+            None,
+            MemoryConsumer::new("replay").register(&pool),
+            HeldMemory::Charge,
+        );
+        assert!(
+            matches!(result, Err(DataFusionError::ResourcesExhausted(_))),
+            "the replay table must be admitted"
+        );
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    /// A refused replay handoff charges exactly the memory the retained table
+    /// holds after releasing its spare capacity. The test charges a table
+    /// that holds one active group, as a handoff leaves it.
+    #[tokio::test]
+    async fn refused_replay_charges_the_active_group() -> Result<()> {
+        let plan =
+            sum_over_sorted_input(AggregateMode::Final, &["k"], single_key_batches())?;
+        let pool: Arc<dyn MemoryPool> = refuse_established();
+        let context = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_batch_size(256))
+                .with_runtime(
+                    RuntimeEnvBuilder::new()
+                        .with_memory_pool(Arc::clone(&pool))
+                        .build_arc()?,
+                ),
+        );
+        let input = collect(plan.input().execute(0, Arc::clone(&context))?).await?;
+        let stream = ClusteredFinalAggregateStream::new_with_input_and_metrics(
+            &plan,
+            &context,
+            0,
+            Box::pin(crate::stream::EmptyRecordBatchStream::new(
+                plan.input().schema(),
+            )),
+            &GroupClusteringMode::Full,
+            BaselineMetrics::new(&plan.metrics, 0),
+            ClusteredAggregateTableMetrics::new(&plan, 0),
+            None,
+            MemoryConsumer::new("replay").register(&pool),
+            HeldMemory::Charge,
+        )?;
+        let ClusteredFinalAggregateStream {
+            reservation,
+            context: stream_context,
+            stage: ExecutionStage::Aggregating(mut aggregating),
+        } = stream
+        else {
+            unreachable!("a new stream starts by aggregating");
+        };
+        assert_eq!(reservation.size(), aggregating.table.memory_size());
+        aggregating.table.aggregate_batch(&input[0])?;
+        assert!(aggregating.reservation_size() > reservation.size());
+        assert!(
+            reservation
+                .try_resize(aggregating.reservation_size())
+                .is_err()
+        );
+        aggregating.charge_held(
+            &stream_context,
+            &reservation,
+            datafusion_common::resources_datafusion_err!("refused"),
+        )?;
+        assert_eq!(aggregating.table.num_groups(), 1);
+        assert_eq!(reservation.size(), aggregating.reservation_size());
+        drop(aggregating);
+        drop(reservation);
+        assert_eq!(pool.reserved(), 0);
         Ok(())
     }
 
