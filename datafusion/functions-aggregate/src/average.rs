@@ -51,6 +51,7 @@ use datafusion_functions_aggregate_common::aggregate::groups_accumulator::nulls:
 };
 use datafusion_functions_aggregate_common::utils::DecimalAverager;
 use datafusion_macros::user_doc;
+use datafusion_physical_expr::aggregate::SlidingFrameAccumulator;
 use log::debug;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -693,14 +694,30 @@ impl AggregateUDFImpl for Avg {
         &self,
         args: AccumulatorArgs,
     ) -> Result<Box<dyn Accumulator>> {
-        if self.logical_input.is_none()
-            && !args.is_distinct
-            && args.expr_fields[0].data_type() == &DataType::Float64
-        {
-            Ok(Box::new(crate::sum::SlidingFloatSumAccumulator::new(true)))
-        } else {
-            self.accumulator(args)
+        if self.logical_input.is_some() || args.is_distinct {
+            return self.accumulator(args);
         }
+
+        macro_rules! narrow_sliding {
+            ($ty:ty) => {
+                Box::new(SlidingFrameAccumulator::new(
+                    NarrowAvgAccumulator::<$ty>::new(),
+                ))
+            };
+        }
+
+        Ok(match args.expr_fields[0].data_type() {
+            DataType::Float64 => Box::new(SlidingFrameAccumulator::new(
+                crate::sum::SlidingFloatSumAccumulator::new(true),
+            )),
+            DataType::Int8 => narrow_sliding!(Int8Type),
+            DataType::Int16 => narrow_sliding!(Int16Type),
+            DataType::Int32 => narrow_sliding!(Int32Type),
+            DataType::UInt8 => narrow_sliding!(UInt8Type),
+            DataType::UInt16 => narrow_sliding!(UInt16Type),
+            DataType::UInt32 => narrow_sliding!(UInt32Type),
+            _ => return self.accumulator(args),
+        })
     }
 
     fn aliases(&self) -> &[String] {

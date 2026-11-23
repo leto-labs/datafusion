@@ -7,7 +7,9 @@
 //! Defines `SUM` and `SUM DISTINCT` aggregate accumulators
 
 use crate::sum_widening::{WideningSumAccumulator, WideningSumGroupsAccumulator};
-use arrow::array::{Array, ArrayRef, ArrowNativeTypeOp, ArrowNumericType, AsArray};
+use arrow::array::{
+    Array, ArrayRef, ArrowNativeTypeOp, ArrowNumericType, AsArray, Float64Array,
+};
 use arrow::datatypes::Field;
 use arrow::datatypes::{
     ArrowNativeType, DECIMAL32_MAX_PRECISION, DECIMAL64_MAX_PRECISION,
@@ -37,8 +39,10 @@ use datafusion_expr::{
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::prim_op::PrimitiveGroupsAccumulator;
 use datafusion_functions_aggregate_common::aggregate::sum_distinct::DistinctSumAccumulator;
 use datafusion_macros::user_doc;
+use datafusion_physical_expr::aggregate::{SlidingFrame, SlidingFrameAccumulator};
 use datafusion_physical_expr::expressions::{CastExpr, Column};
 use std::mem::{size_of, size_of_val};
+use std::ops::Range;
 
 make_udaf_expr_and_func!(
     Sum,
@@ -400,7 +404,9 @@ impl AggregateUDFImpl for Sum {
             }
         } else {
             if args.return_type() == &DataType::Float64 {
-                return Ok(Box::new(SlidingFloatSumAccumulator::new(false)));
+                return Ok(Box::new(SlidingFrameAccumulator::new(
+                    SlidingFloatSumAccumulator::new(false),
+                )));
             }
             // non‐distinct path: existing sliding sum
             macro_rules! helper {
@@ -792,8 +798,8 @@ impl SlidingFloatSumAccumulator {
         }
     }
 
-    fn apply(&mut self, values: &[ArrayRef], retract: bool) {
-        for value in values[0].as_primitive::<Float64Type>().iter().flatten() {
+    fn apply(&mut self, values: impl Iterator<Item = f64>, retract: bool) {
+        for value in values {
             if retract {
                 self.count -= 1;
             } else {
@@ -807,16 +813,62 @@ impl SlidingFloatSumAccumulator {
             self.finite_sum = CompensatedSum::default();
         }
     }
+
+    fn apply_range(&mut self, values: &Float64Array, range: Range<usize>, retract: bool) {
+        if range.is_empty() {
+            return;
+        }
+
+        let start = range.start;
+        let input = &values.values()[range];
+        if let Some(nulls) = values.nulls() {
+            self.apply(
+                input
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &value)| nulls.is_valid(start + i).then_some(value)),
+                retract,
+            );
+        } else {
+            self.apply(input.iter().copied(), retract);
+        }
+    }
+}
+
+impl SlidingFrame for SlidingFloatSumAccumulator {
+    fn advance(
+        &mut self,
+        values: &ArrayRef,
+        leaving: Range<usize>,
+        entering: Range<usize>,
+        retract_first: bool,
+    ) -> Result<ScalarValue> {
+        let values = values.as_primitive::<Float64Type>();
+        if retract_first {
+            self.apply_range(values, leaving, true);
+            self.apply_range(values, entering, false);
+        } else {
+            self.apply_range(values, entering, false);
+            self.apply_range(values, leaving, true);
+        }
+        self.evaluate()
+    }
 }
 
 impl Accumulator for SlidingFloatSumAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
-        self.apply(values, false);
+        self.apply(
+            values[0].as_primitive::<Float64Type>().iter().flatten(),
+            false,
+        );
         Ok(())
     }
 
     fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
-        self.apply(values, true);
+        self.apply(
+            values[0].as_primitive::<Float64Type>().iter().flatten(),
+            true,
+        );
         Ok(())
     }
 
@@ -1358,6 +1410,120 @@ mod sliding_nonfinite_tests {
     );
     recovery_test!(sliding_nonfinite_min, crate::min_max::Min::new(), 1);
     recovery_test!(sliding_nonfinite_max, crate::min_max::Max::new(), 1);
+
+    #[test]
+    fn borrowed_sliding_ranges_match_sliced_batches() -> Result<()> {
+        use arrow::array::{Int32Array, Int64Array, UInt32Array};
+        use arrow::record_batch::RecordBatch;
+        use datafusion_expr::{WindowFrame, WindowFrameBound, WindowFrameUnits};
+        use datafusion_physical_expr::PhysicalSortExpr;
+        use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+        use datafusion_physical_expr::expressions::lit;
+        use datafusion_physical_expr::window::{SlidingAggregateWindowExpr, WindowExpr};
+
+        let avg = crate::average::avg_udaf();
+        let float: ArrayRef = Arc::new(Float64Array::from(vec![
+            None,
+            Some(f64::MAX),
+            Some(f64::MAX),
+            None,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(1.0e16),
+            Some(1.0),
+            Some(-1.0e16),
+            None,
+            Some(-0.0),
+            Some(0.0),
+        ]));
+        let signed: ArrayRef = Arc::new(Int32Array::from(vec![
+            None,
+            Some(i32::MAX),
+            Some(i32::MIN),
+            None,
+            Some(i32::MAX),
+            Some(i32::MAX),
+            Some(-1),
+            Some(0),
+            None,
+            Some(10),
+            Some(11),
+            None,
+            Some(12),
+        ]));
+        let unsigned: ArrayRef = Arc::new(UInt32Array::from(vec![
+            None,
+            Some(u32::MAX),
+            Some(u32::MAX),
+            None,
+            Some(u32::MAX),
+            Some(u32::MAX),
+            Some(1),
+            Some(0),
+            None,
+            Some(10),
+            Some(11),
+            None,
+            Some(12),
+        ]));
+
+        for (fun, values) in [
+            (sum_udaf(), Arc::clone(&float)),
+            (Arc::clone(&avg), float),
+            (Arc::clone(&avg), signed),
+            (avg, unsigned),
+        ] {
+            let keys = Int64Array::from(vec![0, 1, 1, 3, 4, 5, 7, 7, 8, 10, 11, 15, 16]);
+            let batch = RecordBatch::try_from_iter([
+                ("k", Arc::new(keys) as ArrayRef),
+                ("v", values),
+            ])?
+            .slice(1, 12);
+            let aggregate = Arc::new(
+                AggregateExprBuilder::new(fun, vec![Arc::new(Column::new("v", 1))])
+                    .schema(batch.schema())
+                    .alias("v")
+                    .build()?,
+            );
+            use WindowFrameBound::{CurrentRow, Following, Preceding};
+            use WindowFrameUnits::{Groups, Range, Rows};
+
+            for (units, start, end) in [
+                (Rows, CurrentRow, CurrentRow),
+                (Rows, Preceding(2_u64.into()), Following(1_u64.into())),
+                (Range, Following(1_i64.into()), Following(3_i64.into())),
+                (Groups, Preceding(1_u64.into()), CurrentRow),
+            ] {
+                let frame = Arc::new(WindowFrame::new_bounds(units, start, end));
+                let eval = |filter| {
+                    SlidingAggregateWindowExpr::new(
+                        Arc::clone(&aggregate),
+                        &[],
+                        &[PhysicalSortExpr {
+                            expr: Arc::new(Column::new("k", 0)),
+                            options: Default::default(),
+                        }],
+                        Arc::clone(&frame),
+                        filter,
+                    )
+                    .evaluate(&batch)
+                };
+                let actual = eval(None)?;
+                // An all-true filter takes the sliced-array path with the same inputs.
+                let expected = eval(Some(lit(true)))?;
+                let to_bits = |array: ArrayRef| {
+                    array
+                        .as_primitive::<Float64Type>()
+                        .iter()
+                        .map(|value| value.map(f64::to_bits))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(to_bits(actual), to_bits(expected), "{units:?}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn sliding_nonfinite_sum_avg_frames() -> Result<()> {

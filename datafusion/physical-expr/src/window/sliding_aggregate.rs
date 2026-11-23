@@ -202,13 +202,14 @@ impl AggregateWindowExpr for SlidingAggregateWindowExpr {
 
         let leaving = last_range.start..last_range.end.min(cur_range.start);
         let entering = cur_range.start.max(last_range.end)..cur_range.end;
+        let retract_first = last_range.end <= cur_range.start;
         if let ([values], None, false) = (value_slice, filter_mask, cur_range.is_empty())
             && let Some(frame) = SlidingFrameAccumulator::as_sliding(accumulator)
         {
-            return frame.advance(values, leaving, entering);
+            return frame.advance(values, leaving, entering, retract_first);
         }
 
-        if last_range.end <= cur_range.start {
+        if retract_first {
             // Skip rows between disjoint frames. Drain before adding the new
             // frame so that the aggregate never evaluates skipped rows.
             with_frame_values(value_slice, filter_mask, leaving, |values| {
