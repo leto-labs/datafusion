@@ -1940,6 +1940,32 @@ mod tests {
     }
 
     #[test]
+    fn partitioned_bounds_only_keeps_membership_on_other_routes() -> Result<()> {
+        let mut acc = make_partitioned_expr_accumulator_for_test(2);
+        acc.probe_range_partitioning = Some(RangePartitioning::try_new(
+            [PhysicalSortExpr::new_default(Arc::clone(&acc.on_right[0]))].into(),
+            vec![SplitPoint::new(vec![ScalarValue::Int32(Some(10))])],
+        )?);
+        acc.build_filter(FinalizeInput::Partitioned(vec![
+            reported(PushdownStrategy::BoundsOnly, bounds(1, 8)),
+            reported(in_list(&[10, 18]), bounds(10, 18)),
+        ]))?;
+
+        let probe = RecordBatch::try_new(
+            test_probe_schema(),
+            vec![Arc::new(Int32Array::from(vec![0, 1, 4, 8, 9, 10, 14, 18]))],
+        )?;
+        let matched = current_expr(&acc)
+            .evaluate(&probe)?
+            .into_array(probe.num_rows())?;
+        assert_eq!(
+            matched.as_boolean(),
+            &BooleanArray::from(vec![false, true, true, true, false, true, false, true])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn partitioned_range_dynamic_filter_routes_compound_nullable_keys() -> Result<()> {
         let probe_schema = Arc::new(Schema::new(vec![
             Field::new("probe_key", DataType::Int32, true),
