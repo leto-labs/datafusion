@@ -1515,3 +1515,17 @@ The in-memory final aggregate materializes up to the fetch count. If it
 spills, it retains the same bucket selection for every run. Ordered replay
 finishes each group's count and stops emitting at the per-partition cap.
 The tracked coalescer producers continue to own cancellation and teardown.
+
+## Family PRG: emit partial-reduce state under lending pressure
+
+Purpose: keep partial reduction progressing when a pool denies the resize
+for an emptied table's retained buffers. The dependent Longbow feature is
+the speed-budget governor (scale-up 5.20a, leto-ej67). Audit classification
+is UPSTREAMABLE.
+
+If the stream cannot reserve its materialized state for slicing, it emits
+the entire batch. A further refusal to resize the retained table charges
+the memory the table already holds and still emits the batch. No additional
+table capacity is allocated on that path. The vendored pressure test
+denies growth of a nonempty reservation, checks the combined group counts
+across two inputs, and verifies the reservation is released at EOF.

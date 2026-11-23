@@ -270,10 +270,15 @@ impl PartialReduceHashAggregateStream {
                 // Continue with slicing
             }
             Err(DataFusionError::ResourcesExhausted(_)) => {
-                // Fail to reserve memory for the hash table + state batch while slicing so emit a huge batch
-
-                // Try resize without holding the state batch, if it fails there is nothing we can do
-                self.reservation.try_resize(hash_table_mem_size)?;
+                // Emit the whole state batch without retaining it for slicing.
+                match self.reservation.try_resize(hash_table_mem_size) {
+                    Err(DataFusionError::ResourcesExhausted(_)) => {
+                        // The emptied table already owns this memory. Account
+                        // for it without requiring another admission to emit.
+                        self.reservation.resize(hash_table_mem_size);
+                    }
+                    result => result?,
+                }
 
                 emitter
                     .emit(remaining_groups.record_output(&self.baseline_metrics))
@@ -361,16 +366,23 @@ mod tests {
     use crate::aggregates::partial_reduce_stream::PartialReduceHashAggregateStream;
     use crate::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use crate::test::exec::BarrierExec;
-    use arrow::array::{AsArray, Int32Array, Int64Array, RecordBatch};
-    use arrow::datatypes::Int32Type;
+    use arrow::array::{AsArray, Int32Array, Int64Array, RecordBatch, StringViewArray};
+    use arrow::datatypes::{Int32Type, Int64Type};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion_common::resources_datafusion_err;
+    use datafusion_execution::memory_pool::{
+        GreedyMemoryPool, MemoryPool, MemoryReservation,
+    };
+    use datafusion_execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
     use datafusion_execution::{SendableRecordBatchStream, TaskContext};
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
     use datafusion_physical_expr::expressions::col;
     use futures::StreamExt;
+    use std::collections::BTreeMap;
+    use std::fmt;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     /// Builds a partial reduce hash aggregate stream over a single input batch of
@@ -387,7 +399,7 @@ mod tests {
     ) -> datafusion_common::Result<(
         SendableRecordBatchStream,
         Arc<BarrierExec>,
-        Arc<datafusion_execution::runtime_env::RuntimeEnv>,
+        Arc<RuntimeEnv>,
     )> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("group_col", DataType::Int32, false),
@@ -404,12 +416,20 @@ mod tests {
                 Arc::new(Int64Array::from(values)),
             ],
         )?;
-        let input_partitions = vec![vec![batch]];
-
         let runtime = RuntimeEnvBuilder::default()
             .with_memory_limit(memory_limit, 1.0)
             .build_arc()?;
+        let (stream, input) =
+            partial_reduce_stream(vec![batch], batch_size, Arc::clone(&runtime))?;
+        Ok((stream, input, runtime))
+    }
 
+    fn partial_reduce_stream(
+        batches: Vec<RecordBatch>,
+        batch_size: usize,
+        runtime: Arc<RuntimeEnv>,
+    ) -> datafusion_common::Result<(SendableRecordBatchStream, Arc<BarrierExec>)> {
+        let schema = batches[0].schema();
         let mut task_ctx = TaskContext::default().with_runtime(Arc::clone(&runtime));
         let session_config = task_ctx.session_config().clone().set(
             "datafusion.execution.batch_size",
@@ -418,8 +438,10 @@ mod tests {
         task_ctx = task_ctx.with_session_config(session_config);
         let task_ctx = Arc::new(task_ctx);
 
-        // Create aggregate: COUNT(*) GROUP BY group_col
-        let group_expr = vec![(col("group_col", &schema)?, "group_col".to_string())];
+        let group_expr = schema.fields()[..schema.fields().len() - 1]
+            .iter()
+            .map(|field| Ok((col(field.name(), &schema)?, field.name().clone())))
+            .collect::<datafusion_common::Result<Vec<_>>>()?;
         let aggr_expr = vec![Arc::new(
             AggregateExprBuilder::new(
                 count_udaf(),
@@ -431,7 +453,7 @@ mod tests {
         )];
 
         let input = Arc::new(
-            BarrierExec::new(input_partitions, Arc::clone(&schema))
+            BarrierExec::new(vec![batches], Arc::clone(&schema))
                 .without_start_barrier()
                 .with_finish_barrier()
                 .with_log(false),
@@ -450,7 +472,137 @@ mod tests {
             PartialReduceHashAggregateStream::new(&aggregate_exec, &task_ctx, 0)?
                 .into_stream();
 
-        Ok((stream, input, runtime))
+        Ok((stream, input))
+    }
+
+    /// Model a pool whose spillable lending headroom is exhausted while the
+    /// initial reservation can still be granted.
+    #[derive(Debug)]
+    struct RefuseEstablishedGrowth {
+        pool: GreedyMemoryPool,
+        refusals: AtomicUsize,
+    }
+
+    impl fmt::Display for RefuseEstablishedGrowth {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.pool.fmt(f)
+        }
+    }
+
+    impl MemoryPool for RefuseEstablishedGrowth {
+        fn name(&self) -> &str {
+            "refuse established growth"
+        }
+
+        fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+            self.pool.grow(reservation, additional);
+        }
+
+        fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+            self.pool.shrink(reservation, shrink);
+        }
+
+        fn try_grow(
+            &self,
+            reservation: &MemoryReservation,
+            additional: usize,
+        ) -> datafusion_common::Result<()> {
+            if reservation.size() != 0 {
+                self.refusals.fetch_add(1, Ordering::Relaxed);
+                return Err(resources_datafusion_err!("no spillable lending headroom"));
+            }
+            self.pool.try_grow(reservation, additional)
+        }
+
+        fn reserved(&self) -> usize {
+            self.pool.reserved()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partial_reduce_emits_when_the_retained_table_resize_is_refused()
+    -> datafusion_common::Result<()> {
+        let pool = Arc::new(RefuseEstablishedGrowth {
+            pool: GreedyMemoryPool::new(8 * 1024),
+            refusals: AtomicUsize::new(0),
+        });
+        let runtime = RuntimeEnvBuilder::default()
+            .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
+            .build_arc()?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+            Field::new("label", DataType::Utf8View, false),
+            Field::new("value_col_state", DataType::Int64, false),
+        ]));
+        // Wide keys force the packed interner to retain its general fallback
+        // even after the groups have been emitted.
+        let keys: Vec<_> = (0..64)
+            .map(|i| {
+                if i % 2 == 0 {
+                    i64::MIN + i
+                } else {
+                    i64::MAX - i
+                }
+            })
+            .collect();
+        let labels: Vec<_> = (0..keys.len())
+            .map(|i| format!("value-{}", i % 9))
+            .collect();
+        let batch = |count: i64| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(keys.clone())),
+                    Arc::new(Int64Array::from(keys.clone())),
+                    Arc::new(StringViewArray::from_iter_values(&labels)),
+                    Arc::new(Int64Array::from(vec![count; keys.len()])),
+                ],
+            )
+        };
+        let (mut stream, input) =
+            partial_reduce_stream(vec![batch(1)?, batch(2)?], 8, runtime)?;
+        let initial = pool.reserved();
+        let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("memory pressure should emit the first batch")
+            .expect("stream ended before emitting its groups");
+        assert_eq!(
+            pool.refusals.load(Ordering::Relaxed),
+            3,
+            "the building table, sliced output, and retained table must each be refused",
+        );
+        let first = first?;
+        assert_eq!(first.num_rows(), keys.len());
+        assert!(
+            pool.reserved() > initial,
+            "the live table remains accounted"
+        );
+        input.wait_finish().await;
+        let mut groups = BTreeMap::new();
+        let mut record = |batch: RecordBatch| {
+            let a = batch.column(0).as_primitive::<Int64Type>();
+            let b = batch.column(1).as_primitive::<Int64Type>();
+            let label = batch.column(2).as_string_view();
+            let counts = batch.column(3).as_primitive::<Int64Type>();
+            for row in 0..batch.num_rows() {
+                *groups
+                    .entry((a.value(row), b.value(row), label.value(row).to_owned()))
+                    .or_default() += counts.value(row);
+            }
+        };
+        record(first);
+        while let Some(batch) = stream.next().await {
+            record(batch?);
+        }
+        let expected: BTreeMap<_, _> = keys
+            .into_iter()
+            .zip(labels)
+            .map(|(key, label)| ((key, key, label), 3_i64))
+            .collect();
+        assert_eq!(groups, expected);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
     }
 
     #[tokio::test]
