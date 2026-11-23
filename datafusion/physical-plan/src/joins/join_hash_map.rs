@@ -8,6 +8,7 @@
 //! is used to store the mapping between hash values based on the build side
 //! ["on" values] to a list of indices with this key's value.
 
+use std::alloc::Layout;
 use std::fmt::{self, Debug};
 use std::ops::Sub;
 
@@ -224,6 +225,23 @@ impl JoinHashMapU32 {
             next: zeroed_with_huge_pages(cap),
             chained: false,
         }
+    }
+
+    /// Bytes of the map, its head slots and one chain entry per build row.
+    pub(crate) fn reservation_bytes(capacity: usize) -> Result<usize> {
+        HeadTable::<u32>::checked_bytes_for(capacity)
+            .and_then(|heads| {
+                let chain = capacity.checked_mul(size_of::<u32>())?;
+                heads.checked_add(chain)?.checked_add(size_of::<Self>())
+            })
+            .ok_or_else(|| {
+                datafusion_common::exec_datafusion_err!("Hash join table size overflow")
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        size_of::<Self>() + self.table.bytes() + size_of_val(&*self.next)
     }
 }
 
@@ -767,11 +785,10 @@ pub fn contain_hashes<T>(map: &HashTable<(u64, T)>, hash_values: &[u64]) -> Bool
 // so this is recorded, not mitigated.
 //
 // Memory: `slots = max(2, next_power_of_two(2 * capacity))`, 8 bytes each for
-// `u32` (at most `16 * next_power_of_two(capacity)` bytes, below the 17 bytes
-// for each of hashbrown's `next_power_of_two(capacity * 8 / 7)` buckets that
-// `estimate_memory_size::<(u32, u64)>` reserves) and 16 for `u64` (up to 1.9
-// times that estimate, so the `u64` build reserves the larger of the two:
-// [`JoinHashMapU64::table_bytes`]).
+// `u32` and 16 for `u64`. The `u32` build charges its slot array and chain
+// directly ([`JoinHashMapU32::reservation_bytes`]). The `u64` build reserves
+// the larger of its slot array ([`JoinHashMapU64::table_bytes`]) and the
+// hashbrown estimate.
 //
 // Above `PREFETCH_BYTES` the probe prefetches the slot of the row
 // `PREFETCH_DISTANCE` rows ahead, and the build keeps that many rows in
@@ -1128,17 +1145,18 @@ pub(crate) struct HeadTable<T: HeadWord> {
 }
 
 impl<T: HeadWord> HeadTable<T> {
-    fn slots_for(capacity: usize) -> usize {
-        capacity
-            .saturating_mul(2)
-            .max(2)
-            .checked_next_power_of_two()
-            .expect("join table capacity")
+    fn slots_for(capacity: usize) -> Option<usize> {
+        capacity.checked_mul(2)?.max(2).checked_next_power_of_two()
+    }
+
+    fn checked_bytes_for(capacity: usize) -> Option<usize> {
+        let words = Self::slots_for(capacity)?.checked_mul(T::WORDS)?;
+        Some(Layout::array::<u64>(words).ok()?.size())
     }
 
     /// Bytes of the slots of a table made for `capacity` rows.
     pub(crate) fn bytes_for(capacity: usize) -> usize {
-        Self::slots_for(capacity) * T::WORDS * size_of::<u64>()
+        Self::checked_bytes_for(capacity).expect("join table capacity")
     }
 
     pub(crate) fn with_capacity(capacity: usize) -> Self {
@@ -1147,7 +1165,7 @@ impl<T: HeadWord> HeadTable<T> {
 
     /// Longbow patch (JT 9): a table whose slots have `layout`.
     pub(crate) fn with_layout(capacity: usize, layout: SlotLayout) -> Self {
-        let slots = Self::slots_for(capacity);
+        let slots = Self::slots_for(capacity).expect("join table capacity");
         let words = zeroed_with_huge_pages(slots * T::WORDS);
         Self {
             prefetch: prefetch_pays(words.len() * size_of::<u64>()),
@@ -1447,7 +1465,8 @@ macro_rules! partitioned_build {
     ($map:ty, $width:ty) => {
         impl PartitionedBuild for $map {
             fn partitions_build(capacity: usize) -> bool {
-                HeadTable::<$width>::bytes_for(capacity) > PARTITIONED_BUILD_BYTES
+                HeadTable::<$width>::checked_bytes_for(capacity)
+                    .is_some_and(|bytes| bytes > PARTITIONED_BUILD_BYTES)
             }
 
             fn update_partitioned(&mut self, rows: &BuildRows<'_>) -> Result<()> {
@@ -2984,6 +3003,40 @@ mod tests {
                 "{bytes}: rss {rss} charged {charged}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resident_u32_join_table_fits_its_reservation() -> Result<()> {
+        if !huge_page_advice() {
+            return Ok(());
+        }
+        // Both arrays use their own mappings. The chain is a whole number of
+        // base pages even on Linux targets with 64 KiB pages.
+        let rows = (1 << 20) + (1 << 14);
+        let mut map = JoinHashMapU32::with_capacity(rows);
+        assert!(map.table.words.is_mapped() && map.next.is_mapped());
+        map.table.words.fill(1);
+        map.next.fill(1);
+        let arrays = [
+            map.table.words.as_ptr() as usize,
+            map.next.as_ptr() as usize,
+        ];
+        let resident: usize = mappings()
+            .into_iter()
+            .filter(|(low, high, _, _)| arrays.iter().any(|ptr| low <= ptr && ptr < high))
+            .map(|(_, _, _, rss)| rss)
+            .sum();
+        let reserved = JoinHashMapU32::reservation_bytes(rows)?;
+        assert_eq!(
+            resident,
+            map.allocated_bytes() - size_of::<JoinHashMapU32>()
+        );
+        assert_eq!(reserved, resident + size_of::<JoinHashMapU32>());
+        println!(
+            "{rows} rows: {resident} resident array bytes, {reserved} reserved bytes"
+        );
+        Ok(())
     }
 
     /// Review S4 (leto-mjj.61): a refused mapping falls back to a zeroed,

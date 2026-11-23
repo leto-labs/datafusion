@@ -641,6 +641,13 @@ and overfill it. On 56 the maps keep upstream's `chained` flag (set by any
 insert that finds a head): rows left out for NULL keys keep the unique-key
 path, and the head-table probe resumes with `ProbeOffset`.
 
+The `leto-uwlm` follow-up charges the `u32` map's actual head-slot and
+duplicate-chain allocations plus its fixed struct size. The ordinary and
+partitioned builds use the same pre-allocation check. Admission tests compare
+the charge with the allocated map on both sides of slot-sizing boundaries.
+The spill floor and chunk allowances still cover the table: fewer than
+32 head bytes and 4 chain bytes per nonempty row, plus the fixed struct.
+
 ### JT 3: partitioned build above 4 MiB
 
 Purpose: build a table larger than the caches with inserts that hit L2.

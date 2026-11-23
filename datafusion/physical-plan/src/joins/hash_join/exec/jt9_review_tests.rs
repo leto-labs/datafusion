@@ -1763,7 +1763,11 @@ async fn jt9_rereview_memory_priority() {
         [VisitedBitmap::size_bytes(270_000), 270_000 * 20]
     );
     assert!(retry.outcome.is_ok());
-    assert!(retry.peak_after_fault >= 15_393_056 + 270_000 * size_of::<u64>());
+    let rows = case.build.rows();
+    // Two Int32 keys, an Int64 row ID, and the Int32 filter column.
+    let input_bytes = rows * (size_of::<i64>() + 3 * size_of::<i32>());
+    let map_bytes = JoinHashMapU32::with_capacity(rows).allocated_bytes();
+    assert!(retry.peak_after_fault >= input_bytes + map_bytes + rows * size_of::<u64>());
 
     inline_keys::set_inline_keys_for_test(None);
 }

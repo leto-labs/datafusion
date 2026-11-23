@@ -3198,23 +3198,15 @@ fn new_join_hashmap_inline(
     Ok((JoinHashMapInline::with_capacity(num_rows, keys), bytes))
 }
 
-/// Longbow patch (JT): the `u32` map of [`new_join_hashmap`], with the same
-/// reservation, for the partitioned build of `collect_left_input`.
+/// Longbow patch (JT): admit the `u32` map before either build path allocates it.
 fn new_join_hashmap_u32(
     num_rows: usize,
     reservation: &mut MemoryReservation,
     metrics: &BuildProbeJoinMetrics,
 ) -> Result<JoinHashMapU32> {
-    let fixed_size_u32 = size_of::<JoinHashMapU32>();
-    let estimated_hashtable_size =
-        estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?
-            // Each build row also owns an index in the duplicate-key chain.
-            .checked_add(num_rows * size_of::<u32>())
-            .ok_or_else(|| {
-                datafusion_common::exec_datafusion_err!("Hash join table size overflow")
-            })?;
-    reservation.try_grow(estimated_hashtable_size)?;
-    metrics.build_mem_used.add(estimated_hashtable_size);
+    let bytes = JoinHashMapU32::reservation_bytes(num_rows)?;
+    reservation.try_grow(bytes)?;
+    metrics.build_mem_used.add(bytes);
     Ok(JoinHashMapU32::with_capacity(num_rows))
 }
 
@@ -4093,11 +4085,8 @@ fn build_in_memory_once(
 
         (Map::ArrayMap(array_map), batch, left_values)
     } else {
-        // Estimation of memory size, required for hashtable, prior to allocation.
-        // Final result can be verified using `RawTable.allocation_info()`
-        // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
-        // `u64` indice variant
-        // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
+        // Reserve the map before allocation, using u32 indices when
+        // num_rows <= u32::MAX and u64 otherwise.
         // Longbow patch (JT): a `u32` table above a few MiB is built
         // partition by partition, with the same rows, row numbers and chains
         // as the loop below. A pool that refuses the partitioning's transient
@@ -4527,22 +4516,29 @@ mod tests {
     use rstest::*;
     use rstest_reuse::*;
 
-    #[test]
-    fn hash_map_admits_row_indices_before_allocation() -> Result<()> {
-        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-
-        let rows = 1024;
-        let buckets =
-            estimate_memory_size::<(u32, u64)>(rows, size_of::<JoinHashMapU32>())?;
-        let bytes = buckets + rows * size_of::<u32>();
+    #[rstest]
+    fn hash_map_admits_row_indices_before_allocation(
+        #[values(0, 1, 2, 3, 895, 896, 897, 1023, 1024, 1025, 262143, 262144, 262145)]
+        rows: usize,
+        #[values(false, true)] partitioned: bool,
+    ) -> Result<()> {
+        let bytes = JoinHashMapU32::with_capacity(rows).allocated_bytes();
         for (limit, succeeds) in [(bytes - 1, false), (bytes, true)] {
             let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
             let mut reservation = MemoryConsumer::new("row indices").register(&pool);
             let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
-            let result = new_join_hashmap(rows, &mut reservation, &metrics);
+            let result = if partitioned {
+                new_join_hashmap_u32(rows, &mut reservation, &metrics).map(|map| {
+                    assert_eq!(map.allocated_bytes(), bytes);
+                    Box::new(map) as Box<dyn JoinHashMapType>
+                })
+            } else {
+                new_join_hashmap(rows, &mut reservation, &metrics)
+            };
             if succeeds {
                 let map = result?;
                 assert_eq!(reservation.size(), bytes);
+                assert_eq!(pool.reserved(), bytes);
                 assert_eq!(metrics.build_mem_used.value(), bytes);
                 drop(map);
             } else {
@@ -9400,8 +9396,7 @@ mod tests {
         let map = if use_perfect_hash_join_as_possible {
             ArrayMap::estimate_memory_size(0, num_rows as u64 - 1, build_rows)
         } else {
-            estimate_memory_size::<(u32, u64)>(build_rows, size_of::<JoinHashMapU32>())?
-                + build_rows * size_of::<u32>()
+            JoinHashMapU32::with_capacity(build_rows).allocated_bytes()
         };
 
         for (limit, fits) in [(map + inputs * 3 / 2, false), (map + inputs * 3, true)] {
@@ -9468,10 +9463,7 @@ mod tests {
         let map = if use_perfect_hash_join_as_possible {
             ArrayMap::estimate_memory_size(1, num_rows as u64, num_rows as usize)
         } else {
-            estimate_memory_size::<(u32, u64)>(
-                num_rows as usize,
-                size_of::<JoinHashMapU32>(),
-            )? + num_rows as usize * size_of::<u32>()
+            JoinHashMapU32::with_capacity(num_rows as usize).allocated_bytes()
         };
 
         for (computed_key, limit, fits) in [
