@@ -548,7 +548,16 @@ impl PartialHashAggregateStream {
         {
             Ok(()) => {}
             Err(DataFusionError::ResourcesExhausted(_)) => {
-                self.reservation.try_resize(hash_table_mem_size)?;
+                // Emit the whole state batch without retaining it for slicing.
+                match self.reservation.try_resize(hash_table_mem_size) {
+                    Err(DataFusionError::ResourcesExhausted(_)) => {
+                        // The emptied table already owns this memory. Account
+                        // for it without another admission: the final stage
+                        // merges groups that repeat across partial batches.
+                        self.reservation.resize(hash_table_mem_size);
+                    }
+                    result => result?,
+                }
                 self.reduction_factor.add_part(remaining_groups.num_rows());
                 emitter
                     .emit(remaining_groups.record_output(&self.baseline_metrics))
@@ -1445,6 +1454,57 @@ mod tests {
             PartialHashAggregateStream::new(&aggregate_exec, &task_ctx, 0)?.into_stream();
 
         Ok((stream, input, runtime))
+    }
+
+    /// When the pool refuses both the state batch and the emptied table, the
+    /// stream must still emit the batch and charge exactly what the table and
+    /// its bounded sketch retain, not more and not less.
+    #[tokio::test]
+    async fn refused_handoff_charges_the_retained_table() -> Result<()> {
+        use crate::aggregates::resize_refusal_tests::{RefuseWhenSet, count_wide_keys};
+        use std::sync::atomic::Ordering;
+
+        let plan = count_wide_keys(AggregateMode::Partial)?;
+        let pool = Arc::new(RefuseWhenSet::default());
+        let context = Arc::new(
+            TaskContext::default().with_runtime(
+                RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
+                    .build_arc()?,
+            ),
+        );
+        let input = collect(plan.input().execute(0, Arc::clone(&context))?).await?;
+        let mut stream = PartialHashAggregateStream::new(&plan, &context, 0)?;
+        let mut table = stream.hash_table.take().unwrap();
+        // Merge without resizing, as a refused table resize leaves it.
+        let evaluated = table.evaluate_batch(&input[0])?;
+        table.aggregate_batch(&evaluated, &stream.reservation)?;
+        let states = table.take_state_batch()?.unwrap();
+        let retained = table.memory_size() + stream.bounded.memory_size();
+        assert!(
+            retained > stream.reservation.size(),
+            "the emptied table must retain more than its reservation"
+        );
+        pool.refuse.store(true, Ordering::Relaxed);
+
+        let rows = states.num_rows();
+        let output: Vec<Result<RecordBatch>> =
+            async_try_stream(|mut emitter| async move {
+                stream
+                    .emit_on_memory_pressure(states, &mut emitter, retained)
+                    .await?;
+                assert_eq!(stream.reservation.size(), retained);
+                Ok(())
+            })
+            .collect()
+            .await;
+        let [Ok(batch)] = output.as_slice() else {
+            panic!("expected the whole state batch, got {output:?}");
+        };
+        assert_eq!(batch.num_rows(), rows);
+        drop(table);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
     }
 
     #[tokio::test]

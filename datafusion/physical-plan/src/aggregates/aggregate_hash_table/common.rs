@@ -25,6 +25,7 @@ use log::debug;
 
 use crate::PhysicalExpr;
 use crate::aggregates::aggregate_argument::AggregateArgument;
+use crate::aggregates::group_values::packed::migration_needs_memory;
 use crate::aggregates::group_values::{
     AccumulatorPhase, AggregateAccumulatorMetrics, AggregateArgumentMetrics,
     GroupByMetrics, GroupValues, new_group_values,
@@ -243,14 +244,29 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         let group_by_metrics = self.group_by_metrics.clone();
         let state = self.state.building_mut();
 
-        for group_values in &evaluated_batch.grouping_set_args {
-            group_by_metrics.time_group_key_preparation(|| {
-                state.group_values.intern_reserved(
-                    group_values,
-                    &mut state.batch_group_indices,
-                    reservation,
-                )
-            })?;
+        for (set_index, group_values) in
+            evaluated_batch.grouping_set_args.iter().enumerate()
+        {
+            group_by_metrics
+                .time_group_key_preparation(|| {
+                    state.group_values.intern_reserved(
+                        group_values,
+                        &mut state.batch_group_indices,
+                        reservation,
+                    )
+                })
+                .inspect_err(|error| {
+                    // A refused migration makes the stream emit the table and
+                    // retry the whole batch. That retry is exact only when no
+                    // grouping set of the batch has been merged yet: a refusal
+                    // after set 0 would merge the earlier sets twice. The
+                    // single-key migration cannot occur with several sets,
+                    // because their group schema adds the grouping ID column.
+                    debug_assert!(
+                        set_index == 0 || !migration_needs_memory(error),
+                        "grouping set {set_index} refused a migration after earlier sets merged the batch"
+                    );
+                })?;
 
             // Register groups from the full input. Each filtered aggregate compacts
             // this row-aligned vector independently immediately before its update.

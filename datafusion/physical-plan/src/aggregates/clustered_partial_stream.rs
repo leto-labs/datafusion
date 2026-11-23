@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
@@ -314,8 +316,14 @@ impl Aggregating {
                         // Only the active group remains after the emit. Release the
                         // capacity the table grew for this batch so that reserving
                         // the table can succeed.
-                        let batch =
-                            self.table.take_completed_state_batch()?.ok_or(oom)?;
+                        let batch = match self.table.take_completed_state_batch()? {
+                            Some(batch) => batch,
+                            // No group is complete yet. A partial stage may
+                            // emit the active group's state: the final stage
+                            // merges it with the group's later states, which
+                            // follow it in key order.
+                            None => self.table.take_state_batch()?.ok_or(oom)?,
+                        };
                         self.table.shrink_to_fit();
                         Some(batch)
                     } else {
@@ -386,7 +394,15 @@ impl Outputting {
             Err(DataFusionError::ResourcesExhausted(_)) => {
                 // If we cannot hold the batch while slicing, hand it off whole.
                 // Only the retained table needs to remain reserved.
-                reservation.try_resize(table_memory)?;
+                match reservation.try_resize(table_memory) {
+                    Err(DataFusionError::ResourcesExhausted(_)) => {
+                        // The retained table already owns this memory. Account
+                        // for it without another admission: the final stage
+                        // merges groups that repeat across partial batches.
+                        reservation.resize(table_memory);
+                    }
+                    result => result?,
+                }
                 context.reduction_factor.add_part(batch.num_rows());
                 timer.done();
                 emitter.emit(batch).await;
@@ -647,6 +663,78 @@ mod tests {
             GroupClusteringMode::Partial(_)
         ));
         collect_under_limit(&plan, 64 * 1024).await?;
+        Ok(())
+    }
+
+    /// When the pool refuses both a state batch and the table it leaves, the
+    /// stream must still emit the batch and charge exactly what the retained
+    /// table holds, not more and not less.
+    #[tokio::test]
+    async fn refused_handoff_charges_the_retained_table() -> Result<()> {
+        use crate::aggregates::clustered_test_util::distinct_key_batches;
+        use crate::aggregates::resize_refusal_tests::RefuseWhenSet;
+        use crate::common::collect;
+        use std::sync::atomic::Ordering;
+
+        let plan = sum_over_sorted_input(
+            AggregateMode::Partial,
+            &["k"],
+            distinct_key_batches(),
+        )?;
+        let pool = Arc::new(RefuseWhenSet::default());
+        let context = Arc::new(
+            TaskContext::default().with_runtime(
+                RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
+                    .build_arc()?,
+            ),
+        );
+        let input = collect(plan.input().execute(0, Arc::clone(&context))?).await?;
+        let ClusteredPartialAggregateStream {
+            reservation,
+            context: stream_context,
+            stage: ExecutionStage::Aggregating(mut aggregating),
+        } = ClusteredPartialAggregateStream::new(&plan, &context, 0)?
+        else {
+            unreachable!("a new stream starts by aggregating");
+        };
+        // Merge without resizing, so the reservation falls behind the table,
+        // which keeps the capacity it grew for the batch.
+        aggregating.table.aggregate_batch(&input[0])?;
+        let completed = aggregating
+            .table
+            .take_completed_state_batch()?
+            .expect("every key but the last is complete");
+        let retained = aggregating.table.memory_size();
+        assert!(retained > reservation.size());
+        pool.refuse.store(true, Ordering::Relaxed);
+
+        let rows = completed.num_rows();
+        let outputting = Outputting {
+            batch: completed,
+            resume: Some(aggregating),
+        };
+        let output: Vec<Result<RecordBatch>> =
+            async_try_stream(|mut emitter| async move {
+                let next = outputting
+                    .handle_stage(&stream_context, &reservation, &mut emitter)
+                    .await?;
+                let Some(ExecutionStage::Aggregating(aggregating)) = next else {
+                    return datafusion_common::internal_err!(
+                        "aggregation must resume after a handoff"
+                    );
+                };
+                assert_eq!(aggregating.table.memory_size(), retained);
+                assert_eq!(reservation.size(), retained);
+                Ok(())
+            })
+            .collect()
+            .await;
+        let [Ok(batch)] = output.as_slice() else {
+            panic!("expected the whole state batch, got {output:?}");
+        };
+        assert_eq!(batch.num_rows(), rows);
+        assert_eq!(pool.reserved(), 0);
         Ok(())
     }
 }
