@@ -57,9 +57,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_data::ByteView;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::hash_utils::{RandomState, create_hashes};
-use datafusion_common::utils::memory::{
-    estimate_memory_size, get_record_batch_memory_size,
-};
+use datafusion_common::utils::memory::get_record_batch_memory_size;
 use datafusion_common::{DataFusionError, NullEquality, Result, internal_datafusion_err};
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryReservation;
@@ -338,12 +336,18 @@ impl ParallelBuild {
         let counts: Vec<usize> = (0..shards)
             .map(|shard| groups.iter().map(|group| group.rows[shard].len()).sum())
             .collect();
-        let mut table_bytes = num_rows * size_of::<u32>();
-        for &count in &counts {
-            // Longbow patch (JT 9): an inline shard can exceed the estimate.
-            table_bytes += estimate_memory_size::<(u64, u32)>(count, 0)?
-                .max(HeadTable::<W>::bytes_for(count));
-        }
+        // Every build row owns a chain entry. Each head table sizes its
+        // slots from the matchable rows routed to that shard.
+        let table_bytes = num_rows
+            .checked_mul(size_of::<u32>())
+            .and_then(|chain_bytes| {
+                counts.iter().try_fold(chain_bytes, |bytes, &count| {
+                    bytes.checked_add(HeadTable::<W>::checked_bytes_for(count)?)
+                })
+            })
+            .ok_or_else(|| {
+                internal_datafusion_err!("parallel hash build size overflow")
+            })?;
         if !admitted(reservation.try_grow(table_bytes))? {
             // Every group task has finished: release the lists and any
             // compacted views before the native build runs.
@@ -352,8 +356,6 @@ impl ParallelBuild {
             return Ok(None);
         }
 
-        let next: Arc<Vec<AtomicU32>> =
-            Arc::new((0..num_rows).map(|_| AtomicU32::new(0)).collect());
         // Charge every concatenated column before any is allocated: views
         // copy 16 bytes per row (their data stays in the group buffers
         // charged above), other columns copy their slices.
@@ -374,6 +376,8 @@ impl ParallelBuild {
             reservation.shrink(transient + table_bytes);
             return Ok(None);
         }
+        let next: Arc<Vec<AtomicU32>> =
+            Arc::new((0..num_rows).map(|_| AtomicU32::new(0)).collect());
         let mut tables = Vec::with_capacity(shards);
         for (shard, count) in counts.into_iter().enumerate() {
             let groups = Arc::clone(&groups);
@@ -990,7 +994,7 @@ pub(super) fn compact_views(
 }
 
 #[inline]
-fn shard_of(hash: u64, mask: usize) -> usize {
+pub(super) fn shard_of(hash: u64, mask: usize) -> usize {
     (hash >> SHARD_SHIFT) as usize & mask
 }
 
@@ -1158,6 +1162,12 @@ impl<W: HeadWord> ShardedJoinHashMap<W> {
     #[cfg(test)]
     pub(super) fn is_chained(&self) -> bool {
         self.chained
+    }
+
+    #[cfg(test)]
+    pub(super) fn allocated_array_bytes(&self) -> usize {
+        self.shards.iter().map(HeadTable::bytes).sum::<usize>()
+            + self.next.capacity() * size_of::<u32>()
     }
 }
 

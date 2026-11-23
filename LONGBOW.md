@@ -661,6 +661,13 @@ the charge with the allocated map on both sides of slot-sizing boundaries.
 The spill floor and chunk allowances still cover the table: fewer than
 32 head bytes and 4 chain bytes per nonempty row, plus the fixed struct.
 
+The `leto-5tgc` follow-up uses the same checked slot sizing for each
+parallel shared-build shard, including packed inline shards. Before
+allocating the arrays, the build reserves the sum of those slot bytes and
+one shared chain entry per build row. Each shard sizes its heads from
+matchable rows. Tests cover exact admission at the slot-sizing boundary
+and the release of parallel charges when the pool is one byte short.
+
 ### JT 3: partitioned build above 4 MiB
 
 Purpose: build a table larger than the caches with inserts that hit L2.
