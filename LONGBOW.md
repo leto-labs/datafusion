@@ -1015,6 +1015,9 @@ Change (`datafusion/physical-plan/src/joins/hash_join/`):
   `hash_join_spill_relief_divisor` (8) and `hash_join_spill_role_reversal`
   (true) of section 3.
 - `spill/chunks.rs` (section 3): the build-chunk join, below.
+- Regression coverage checks prepared-build ineligibility, pressure-driven
+  spill for a single probe partition, and partitioned filters with both
+  bounds-only and membership branches (`leto-33m6`).
 
 Partition function: `(hash * K[level]) >> (64 - log2(16))` over the join
 hash (`HASH_JOIN_SEED`), with one odd multiplier per level that is not the
