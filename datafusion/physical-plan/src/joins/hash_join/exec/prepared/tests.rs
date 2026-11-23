@@ -415,6 +415,59 @@ async fn prepared_build_errors_and_cancellation_release_reservations() -> Result
 }
 
 #[tokio::test]
+async fn prepared_build_stays_unspillable_when_spill_is_enabled() -> Result<()> {
+    let build = batch(vec![Some(1), Some(2)]);
+    let base = join(build.schema(), build.clone())?;
+    let mut config = datafusion_execution::config::SessionConfig::new();
+    let execution = &mut config.options_mut().execution;
+    execution.enable_hash_join_spilling = true;
+    execution.hash_join_spill_test_force_rows = 1;
+    let context = Arc::new(TaskContext::default().with_session_config(config));
+    let disk = &context.runtime_env().disk_manager;
+    assert!(disk.tmp_files_enabled());
+
+    // Preparation has its own durable reservation, acquired before the join runs.
+    let exhausted: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(0));
+    let error = base
+        .prepare_build(
+            input(vec![build.clone()], build.schema()),
+            Arc::clone(&exhausted),
+            Arc::clone(context.session_config().options()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
+    assert!(
+        error.to_string().contains("PreparedHashJoinBuild"),
+        "{error}"
+    );
+    assert_eq!(exhausted.reserved(), 0);
+
+    let prepared = prepare(&base, vec![build], Arc::clone(context.memory_pool())).await?;
+    let task = base.builder().with_prepared_build(prepared).build()?;
+    let eligibility = JoinSpill::decide(
+        &task,
+        task.prepared_build.is_some(),
+        &task.metrics,
+        &task.spill_shared,
+        0,
+        &context,
+        task.random_state.random_state(),
+        &task.left_fut,
+    )?;
+    assert!(
+        matches!(eligibility, JoinSpill::Ineligible(reason) if reason == "it uses a prepared build")
+    );
+    let output = common::collect(task.execute(0, Arc::clone(&context))?).await?;
+    assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    drop(task);
+    assert_eq!(context.memory_pool().reserved(), 0);
+    assert_eq!(disk.spilling_progress().active_files_count, 0);
+    assert_eq!(disk.used_disk_space(), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn prepared_build_shares_single_batch_but_owns_output() -> Result<()> {
     for array in [
         Arc::new(Int64Array::from(vec![

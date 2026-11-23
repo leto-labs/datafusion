@@ -332,7 +332,11 @@ async fn forced_spill_keeps_every_join_type() -> Result<()> {
 async fn memory_pressure_spills_and_keeps_every_join_type() -> Result<()> {
     let build = table("b", 6000, 3001, 0, 200);
     let probe = table("p", 3000, 4001, 3, 200);
-    for case in all_cases(&[Shape::CollectLeft(2), Shape::Partitioned(2)]) {
+    for case in all_cases(&[
+        Shape::CollectLeft(1),
+        Shape::CollectLeft(2),
+        Shape::Partitioned(2),
+    ]) {
         let plan = join_plan(&case, &build, &probe)?;
         let context = task_context(spill_config(0, 4096, 3), Some(96 * 1024), true);
         let label = format!(
@@ -545,7 +549,10 @@ async fn ineligible_joins_fail_with_their_reason() -> Result<()> {
     ];
     for (plan, disk, reason) in cases {
         let context = task_context(spill_config(0, 1024, 3), Some(1000), disk);
-        let error = run(&plan, context).await.unwrap_err().to_string();
+        let error = run(&plan, Arc::clone(&context))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("Resources exhausted"), "{error}");
         assert!(error.contains("HashJoinInput"), "{error}");
         if let Some(reason) = reason {
@@ -554,6 +561,8 @@ async fn ineligible_joins_fail_with_their_reason() -> Result<()> {
                 "{error}"
             );
         }
+        assert_eq!(spill_metrics(&plan).0, 0);
+        assert_eq!(context.runtime_env().disk_manager.used_disk_space(), 0);
     }
 
     // Spilling off: the failure and its message are unchanged.
