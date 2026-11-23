@@ -12,6 +12,8 @@
 use super::*;
 use arrow::array::{Float64Array, Int32Array, Int64Array, new_null_array};
 use datafusion_functions_aggregate_common::utils::GenericDistinctBuffer;
+use datafusion_physical_expr::aggregate::SlidingFrame;
+use std::ops::Range;
 
 #[derive(Debug, Clone, Copy)]
 enum Sum {
@@ -165,7 +167,72 @@ impl<I: ArrowNumericType> NarrowAvgAccumulator<I> {
         self.count = count;
         Ok(())
     }
+    fn retract(&mut self, sum: Sum, rows: i64) -> Result<()> {
+        let count = self
+            .count
+            .checked_sub(rows)
+            .filter(|count| *count >= 0)
+            .ok_or_else(|| exec_datafusion_err!("Integer AVG retract count underflow"))?;
+        let sum = self.sum.add(sum, true)?;
+        self.sum = sum;
+        self.count = count;
+        Ok(())
+    }
 }
+
+impl<I: ArrowNumericType> NarrowAvgAccumulator<I>
+where
+    I::Native: Into<i64> + Into<i128>,
+{
+    fn apply_range(
+        &mut self,
+        values: &PrimitiveArray<I>,
+        range: Range<usize>,
+        retract: bool,
+    ) -> Result<()> {
+        let (sum, rows) = match range.len() {
+            0 => return Ok(()),
+            1 if values.is_valid(range.start) => {
+                (Sum::Narrow(values.value(range.start).into()), 1)
+            }
+            1 => return Ok(()),
+            len => {
+                let values = values.slice(range.start, len);
+                (batch_sum(&values), (len - values.null_count()) as i64)
+            }
+        };
+
+        if retract {
+            self.retract(sum, rows)
+        } else {
+            self.add(sum, rows)
+        }
+    }
+}
+
+impl<I: ArrowNumericType + Debug + Send + Sync> SlidingFrame for NarrowAvgAccumulator<I>
+where
+    I::Native: Into<i64> + Into<i128>,
+{
+    fn advance(
+        &mut self,
+        values: &ArrayRef,
+        leaving: Range<usize>,
+        entering: Range<usize>,
+        retract_first: bool,
+    ) -> Result<ScalarValue> {
+        let values = values.as_primitive::<I>();
+        if retract_first {
+            self.apply_range(values, leaving, true)?;
+            self.apply_range(values, entering, false)?;
+        } else {
+            self.apply_range(values, entering, false)?;
+            self.apply_range(values, leaving, true)?;
+        }
+        self.evaluate()
+    }
+}
+
 impl<I: ArrowNumericType + Debug + Send + Sync> Accumulator for NarrowAvgAccumulator<I>
 where
     I::Native: Into<i64> + Into<i128>,
@@ -192,15 +259,10 @@ where
     }
     fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         let values = values[0].as_primitive::<I>();
-        let count = self
-            .count
-            .checked_sub((values.len() - values.null_count()) as i64)
-            .filter(|count| *count >= 0)
-            .ok_or_else(|| exec_datafusion_err!("Integer AVG retract count underflow"))?;
-        let sum = self.sum.add(batch_sum(values), true)?;
-        self.sum = sum;
-        self.count = count;
-        Ok(())
+        self.retract(
+            batch_sum(values),
+            (values.len() - values.null_count()) as i64,
+        )
     }
     fn supports_retract_batch(&self) -> bool {
         true

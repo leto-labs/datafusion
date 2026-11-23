@@ -803,6 +803,7 @@ where
         values: &ArrayRef,
         leaving: Range<usize>,
         entering: Range<usize>,
+        _retract_first: bool,
     ) -> Result<ScalarValue> {
         let values = values.as_primitive::<T>();
         let frame = self.frame.as_mut().expect("sliding frame was initialized");
