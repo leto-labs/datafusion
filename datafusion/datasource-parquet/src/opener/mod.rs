@@ -525,8 +525,8 @@ struct PreparedParquetOpen {
     enable_bloom_filter: bool,
     enable_row_group_stats_pruning: bool,
     /// True when substituting the columns `constant_columns_from_stats`
-    /// proved constant for this file is on its own enough to collapse the
-    /// predicate to a constant no row can satisfy — see `prune_row_groups`.
+    /// proved constant for this file is on its own enough to collapse a
+    /// predicate conjunct to a literal no row can satisfy.
     ///
     /// Provisional until `prepare_filters` has the physical file schema: see
     /// `stats_constant_columns_in_predicate`.
@@ -1036,9 +1036,8 @@ impl ParquetMorselizer {
         );
         // Whether the statistics substitution *itself* proves the predicate
         // unsatisfiable has to be decided here, before the partition-value
-        // and missing-column rewriting below: a predicate can collapse to a
-        // constant through either of those too, and only a collapse the
-        // file's own statistics produced is proof for `prune_row_groups`.
+        // and missing-column rewriting below. Only a rejecting conjunct
+        // proved by this file's own statistics qualifies for `prune_row_groups`.
         // The referenced columns are recorded alongside the flag because this
         // is also too early to know whether they exist in the file at all —
         // `prepare_filters` re-checks them against the physical file schema.
@@ -1554,8 +1553,8 @@ impl FiltersPreparedParquetOpen {
         }
 
         // Substituting the columns file statistics proved constant
-        // (`constant_columns_from_stats`) collapsed the predicate to a
-        // constant that can never be true (`false`, or NULL — filters treat
+        // (`constant_columns_from_stats`) collapsed a conjunct to a constant
+        // that can never be true (`false`, or NULL — filters treat
         // NULL as false), so the file's own statistics have proven that no
         // row can match: skip every remaining row group, credited to
         // statistics pruning. Without this, the substitution is strictly
@@ -2337,9 +2336,9 @@ fn row_group_bytes(rg_meta: &RowGroupMetaData) -> u64 {
 type ConstantColumns = HashMap<String, ScalarValue>;
 
 /// True when substituting `stats_constants` — the columns this file's
-/// statistics prove constant — is on its own enough to collapse `predicate`
-/// to a constant no row can satisfy (`false`, or NULL, which filters treat
-/// as false).
+/// statistics prove constant — is on its own enough to collapse a conjunct of
+/// `predicate` to a constant no row can satisfy (`false`, or NULL, which filters
+/// treat as false).
 ///
 /// Only the statistics substitution is applied, so a predicate that needs
 /// the missing-column adapter or partition-value folding to collapse does
@@ -2367,9 +2366,14 @@ fn stats_alone_unsatisfiable(
     else {
         return false;
     };
-    simplified.downcast_ref::<Literal>().is_some_and(|l| {
-        l.value().is_null() || l.value() == &ScalarValue::Boolean(Some(false))
-    })
+    datafusion_physical_expr::split_conjunction(&simplified)
+        .into_iter()
+        .any(|conjunct| {
+            conjunct.downcast_ref::<Literal>().is_some_and(|literal| {
+                literal.value().is_null()
+                    || literal.value() == &ScalarValue::Boolean(Some(false))
+            })
+        })
 }
 
 /// Extract constant column values from statistics, keyed by column name in the logical file schema.
@@ -4286,6 +4290,152 @@ mod test {
         assert_eq!(num_batches, 1);
         assert_eq!(num_rows, 3);
         assert_eq!(pruned_row_groups_statistics(&metrics), 0);
+    }
+
+    #[tokio::test]
+    async fn all_null_file_statistics_preserve_null_tolerant_conjuncts() {
+        use datafusion_expr::{Operator, binary_expr, not, when};
+        use datafusion_functions::core::expr_fn::coalesce;
+        use datafusion_physical_expr::expressions::BinaryExpr;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch = record_batch!(
+            ("item", Int32, vec![1, 2, 3]),
+            ("sold_date", Int32, vec![None::<i32>; 3])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let (size, statistics) = write_parquet_with_collected_statistics(
+            Arc::clone(&store),
+            "all-null.parquet",
+            batch,
+            &schema,
+        )
+        .await;
+        assert_eq!(statistics.num_rows, Precision::Exact(3));
+        assert_eq!(
+            statistics.column_statistics[1].null_count,
+            Precision::Exact(3)
+        );
+        let file = PartitionedFile::new("all-null.parquet".to_owned(), size as u64);
+        let mut file_with_statistics = file.clone();
+        file_with_statistics.statistics = Some(Arc::new(statistics));
+
+        let run = |predicate: Arc<dyn PhysicalExpr>, file: PartitionedFile| {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let morselizer = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_schema(Arc::clone(&schema))
+                .with_projection_indices(&[0])
+                .with_predicate(predicate)
+                .with_pushdown_filters(true)
+                .with_row_group_stats_pruning(file.statistics.is_some())
+                .with_metrics(metrics.clone())
+                .build();
+            async move {
+                let batches = open_file(&morselizer, file)
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let rows: Vec<i32> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch.column(0).as_primitive::<Int32Type>().values()
+                    })
+                    .copied()
+                    .collect();
+                (rows, pruned_row_groups_statistics(&metrics))
+            }
+        };
+        let check =
+            |name: String, predicate: Arc<dyn PhysicalExpr>, expected: &'static [i32]| {
+                let without_statistics = run(Arc::clone(&predicate), file.clone());
+                let with_statistics = run(predicate, file_with_statistics.clone());
+                async move {
+                    let (oracle, oracle_pruned) = without_statistics.await;
+                    assert_eq!(oracle_pruned, 0);
+                    let (actual, pruned) = with_statistics.await;
+                    assert_eq!(oracle, expected, "{name}: rows without file statistics");
+                    assert_eq!(actual, oracle, "{name}: rows with file statistics");
+                    assert_eq!(
+                        pruned,
+                        usize::from(expected.is_empty()),
+                        "{name}: pruned groups"
+                    );
+                }
+            };
+
+        let key = col("sold_date");
+        let key_matches = key.clone().eq(lit(1));
+        let key_in_list = key.clone().in_list(vec![lit(1), lit(2)], false);
+        let item_filter = col("item").gt(lit(1));
+        let retained: &[i32] = &[2, 3];
+        let rejected: &[i32] = &[];
+        // Every predicate has a separate, variable conjunct. Its rejected first
+        // row shows that row filtering is active with and without file statistics.
+        for (expr, expected) in [
+            (key.clone().is_null(), retained),
+            (key.clone().is_not_null(), rejected),
+            (key_matches.clone().or(key.clone().is_null()), retained),
+            (key_matches.clone().or(col("item").eq(lit(2))), &[2]),
+            (key.clone().in_list(vec![lit(1), lit(2)], true), rejected),
+            (key_in_list.clone(), rejected),
+            (
+                binary_expr(
+                    key.clone(),
+                    Operator::IsNotDistinctFrom,
+                    lit(ScalarValue::Int32(None)),
+                ),
+                retained,
+            ),
+            (
+                binary_expr(key.clone(), Operator::IsDistinctFrom, lit(1)),
+                retained,
+            ),
+            (
+                binary_expr(key.clone(), Operator::IsNotDistinctFrom, lit(1)),
+                rejected,
+            ),
+            (coalesce(vec![key.clone(), lit(5)]).eq(lit(5)), retained),
+            (
+                when(key.clone().is_null(), lit(true))
+                    .otherwise(key_matches.clone())
+                    .unwrap(),
+                retained,
+            ),
+            (not(key_matches.clone()), rejected),
+            (key_matches.clone().is_not_true(), retained),
+            (key_matches.is_unknown(), retained),
+            (key.clone().lt(lit(10)), rejected),
+        ] {
+            let expr = expr.and(item_filter.clone());
+            check(expr.to_string(), logical2physical(&expr, &schema), expected).await;
+        }
+
+        let item_filter = logical2physical(&item_filter, &schema);
+        for (name, expr, expected) in [
+            (
+                "join filter with NULL escape",
+                key.is_null().or(key_in_list.clone()),
+                retained,
+            ),
+            ("join filter without NULL escape", key_in_list, rejected),
+            ("unrestricted join filter", lit(true), retained),
+        ] {
+            let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+                vec![Arc::new(Column::new("sold_date", 1))],
+                logical2physical(&expr, &schema),
+            ));
+            dynamic.mark_complete();
+            let predicate = Arc::new(BinaryExpr::new(
+                dynamic,
+                Operator::And,
+                Arc::clone(&item_filter),
+            ));
+            check(name.to_owned(), predicate, expected).await;
+        }
     }
 
     #[tokio::test]
@@ -7044,5 +7194,47 @@ mod test {
     /// Longbow family OO.
     mod open_once {
         include!("open_once_tests.rs");
+    }
+
+    #[test]
+    fn all_null_file_statistics_reject_completed_in_list_conjunct() {
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::BinaryExpr;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sold_date", DataType::Int32, true),
+            Field::new("item", DataType::Int32, false),
+        ]));
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(Column::new("sold_date", 0))],
+            logical2physical(
+                &col("sold_date").in_list((1..=31).map(lit).collect(), false),
+                &schema,
+            ),
+        ));
+        let item = logical2physical(&col("item").gt(lit(0)), &schema);
+        let predicate = |op| {
+            Arc::new(BinaryExpr::new(dynamic.clone(), op, Arc::clone(&item)))
+                as Arc<dyn PhysicalExpr>
+        };
+        let constants =
+            HashMap::from([("sold_date".to_owned(), ScalarValue::Int32(None))]);
+
+        assert!(!stats_alone_unsatisfiable(
+            &predicate(Operator::And),
+            &constants,
+            &schema,
+        ));
+        dynamic.mark_complete();
+        assert!(stats_alone_unsatisfiable(
+            &predicate(Operator::And),
+            &constants,
+            &schema,
+        ));
+        assert!(!stats_alone_unsatisfiable(
+            &predicate(Operator::Or),
+            &constants,
+            &schema,
+        ));
     }
 }

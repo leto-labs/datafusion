@@ -68,6 +68,19 @@ factory also uses 1 MiB. Each merged read retains the planned ETag or
 version. Without a validator the reader calls the store's own multi-range
 implementation.
 
+## Family FNP: file statistics and NULL filter conjuncts
+
+Purpose: allow exact Parquet file statistics to reject a file's row
+groups when a required filter conjunct becomes NULL after substituting
+file constants and resolving a completed runtime filter. Dependent
+Longbow feature: RUNTIME-PRUNING (scale-up 5.23b, leto-n0x5).
+Audit classification: UPSTREAMABLE.
+
+The proof applies to top-level AND terms. OR and negation remain
+under the ordinary simplifier, and the opener still verifies that the
+statistics-derived columns exist in the physical schema. Both scan
+engines use the shared opener.
+
 ## Family FD: final aggregate spill replay accounting
 
 Purpose: give the fully clustered replay table of an unordered hash
