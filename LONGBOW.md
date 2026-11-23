@@ -417,7 +417,7 @@ Regressions (fail on stock 56 with 6_299_999 for 0.9 of `0..8 * 1e6`; the
 decimal ones fail on the first QI commit 0fee7b30c):
 `scripts/vendored-tests.py datafusion-functions-aggregate -E 'test(percentile_cont::tests)'`.
 
-## Family SW: sliding percentile and Boolean frames
+## Family SW: pull sliding frames
 
 Family SW maintains exact rolling `percentile_cont` and `MEDIAN` in sorted
 blocks for forward-moving frames. The dependent Longbow feature is **pull
@@ -439,6 +439,12 @@ classification is **UPSTREAMABLE**.
   There are no saved partial results. Evaluation takes at most one scan per
   frame. The fallback requires an explicit opt-in and a non-DISTINCT
   physical aggregate. It does not extend existing float or DISTINCT support.
+- Lane leto-z3hu passes borrowed input ranges to Float64 SUM/AVG and to
+  AVG over integer inputs up to 32 bits in unfiltered moving frames. The
+  window still supplies the original order for updates and retractions.
+  Compensated float arithmetic, narrow integer promotion, and accumulator
+  state fields use the existing implementations. Larger narrow-integer
+  deltas use a typed Arrow slice on the stack.
 
 ## Family RBC: owned boundary prefix on upstream Top-K heaps
 

@@ -1163,18 +1163,21 @@ fn replace_fn_name_clause(aggr_name: &mut String, fn_name_old: &str, fn_name_new
 
 /// Opt-in for an aggregate with specialized state for bounded sliding frames.
 pub trait SlidingFrame: Accumulator {
-    /// Initialize the sliding representation before the first row arrives.
-    fn enable_sliding(&mut self);
+    /// Initialize a specialized sliding representation before the first row arrives.
+    fn enable_sliding(&mut self) {}
 
-    /// Attach a child of the window operator reservation before any input.
-    fn set_frame_reservation(&mut self, reservation: MemoryReservation);
+    /// Attach a child of the window operator reservation for frame-owned allocations.
+    fn set_frame_reservation(&mut self, _reservation: MemoryReservation) {}
 
     /// Apply the frame delta for a single unfiltered input and return its result.
+    /// Order-sensitive transitions drain the previous frame first when
+    /// `retract_first` is true (for disjoint frames).
     fn advance(
         &mut self,
         values: &ArrayRef,
         leaving: Range<usize>,
         entering: Range<usize>,
+        retract_first: bool,
     ) -> Result<ScalarValue>;
 }
 
@@ -1214,8 +1217,9 @@ impl SlidingFrameAccumulator {
         values: &ArrayRef,
         leaving: Range<usize>,
         entering: Range<usize>,
+        retract_first: bool,
     ) -> Result<ScalarValue> {
-        self.inner.advance(values, leaving, entering)
+        self.inner.advance(values, leaving, entering, retract_first)
     }
 }
 
