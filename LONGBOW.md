@@ -954,7 +954,7 @@ iterations, every answer verified
 | Condition of the node | TPC-H, 22 queries | TPC-DS, 99 queries | TPC-H Q9 |
 | --- | ---: | ---: | ---: |
 | No free 2 MiB page at each start | 0.869 | 0.982 and 0.961 (two halves) | 0.656 in the suite, 0.863 alone |
-| 9 to 12 GiB free in 2 MiB pages | 0.956 | 1.000 and 1.002 | 0.790 in the suite, 0.910 alone |
+| 8 to 12 GiB free in 2 MiB pages | 0.956 | 1.000 and 1.002 | 0.790 in the suite, 0.910 alone |
 
 Other options on Q9 in one screen of the same kind (ratio to `on`, two
 rounds; the first round without free huge pages on the baseline side in both
