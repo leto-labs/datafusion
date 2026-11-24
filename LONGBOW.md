@@ -754,8 +754,9 @@ stay below the charged bytes plus one base page. Smaller arrays, other
 targets, a refused mapping or a refused advice use a `Vec`, as do kernels
 whose THP mode is `never` or that have no THP. The advice is on unless
 `LONGBOW_JOIN_TABLE_HUGE_PAGES` is `off`, `0`, `false`, `no` or `disabled`
-(any case; another value warns and leaves it on). `ZeroedValue` is an
-`unsafe trait`: its zero bit pattern must be a valid value.
+(any case). JT 10 adds the values `auto` and `populate` and changes what an
+unset variable means. `ZeroedValue` is an `unsafe trait`: its zero bit
+pattern must be a valid value.
 
 Host dependency: with the advice on, the first touch of an advised table can
 compact memory synchronously in the query thread. How often depends on the
@@ -901,6 +902,94 @@ Tests:
   - `encode_row` agrees with `encode`;
   - the property test's expected pairs compare the key columns
     themselves.
+
+### JT 10: back advised tables when made, while huge pages are free
+
+Purpose: keep the 2 MiB pages of join tables without compacting memory in the
+build thread (leto-o7z0). Classification: UPSTREAMABLE. JT 6 advises a
+table's mapping before its first write, so each first write to a 2 MiB region
+allocates it. Without a free huge page the kernel reclaims and compacts in the
+writing thread (THP `defrag` `madvise`), and most attempts fail. On worker-01
+one such region took 2.4 ms of thread CPU time at the median and up to 340 ms,
+and 475 of 512 regions still got base pages; a free huge page takes 0.1 ms.
+
+`LONGBOW_JOIN_TABLE_HUGE_PAGES` (read once per process) now names four modes
+(`huge_page_policy.rs`):
+
+| Value | Arrays from 4 MiB on |
+| --- | --- |
+| `off`, `0`, `false`, `no`, `disabled` | Heap, no advice. |
+| `on`, `1`, `true`, `yes`, `enabled` | JT 6: own mapping, advised, allocated by its first writes. |
+| `populate` | Own mapping, advised, and every whole 2 MiB region backed when the array is made. A diagnostic: the advice without the stall rule. |
+| `auto`, unset, empty | As `populate` while regions get free huge pages; heap while they do not. |
+
+An unrecognized value warns and selects the default. Where THP is `never` or
+absent every mode is off; `auto` is also off where the kernel's huge pages are
+not 2 MiB (`hpage_pmd_size`).
+
+A region is backed by a write of zero to its first byte, which makes the
+kernel allocate the huge page, or one base page when it has none. A second
+write, to the middle of the region, faults only in the second case
+(`getrusage(RUSAGE_THREAD)` is read before, between and after the writes). In
+`auto` a region that got base pages, or took more than 16 ms of thread CPU
+time, has stalled. The first stall closes a process-wide gate (`StallGate`):
+the rest of that mapping loses its advice (`MADV_NOHUGEPAGE`) and gets base
+pages at its writes, tables that other threads are backing stop at their next
+region, and new tables use the heap. After a pause one table probes: its
+first region reopens the gate or closes it again. The pause is 1 s; a stalled
+probe doubles it, and so does a stall that follows a reopening by less than
+the last pause, up to 64 s.
+
+A chain array (`next`) is written only for rows whose hash already has a row,
+so a build with unique keys never touches it. In `populate` and `auto` a chain
+is mapped without advice and is advised and backed by its first write
+(`ZeroedArray::back_chain`); until then it takes no memory.
+
+Measured on worker-01 (Linux 7.0, THP and defrag `madvise`), SF100, 24 threads
+on one NUMA node with memory bound to it, `auto` against `on` in one
+executable (fork `731856a49`), ABBA of fresh processes, three timed
+iterations, every answer verified
+(`~/data/longbow/benchmarks/JOIN-THP-ADVISE-20261124/HANDOFF.md`):
+
+| Condition of the node | TPC-H, 22 queries | TPC-DS, 99 queries | TPC-H Q9 |
+| --- | ---: | ---: | ---: |
+| No free 2 MiB page at each start | 0.869 | 0.982 and 0.961 (two halves) | 0.656 in the suite, 0.863 alone |
+| 9 to 12 GiB free in 2 MiB pages | 0.956 | 1.000 and 1.002 | 0.790 in the suite, 0.910 alone |
+
+Other options on Q9 in one screen of the same kind (ratio to `on`, two
+rounds; the first round without free huge pages on the baseline side in both
+conditions): heap 0.964 / 0.688 and 0.859 / 1.090; advice after the build is
+complete 1.043 / 0.667 and 0.975 / 1.220 (`khugepaged` collapsed 9 to 11
+regions per visit); `MADV_COLLAPSE` after the build 1.492 / 0.817 and
+1.328 / 2.059; `populate` 1.573 / 1.599 and 0.774 / 1.004.
+
+Costs and limits:
+
+- A probe is one region attempt in a build thread, and it can take as long as
+  any first write of JT 6. One probe took 615 ms of CPU time and made one
+  execution of TPC-DS q50 848 ms instead of about 235 ms. In the TPC-DS run
+  without free huge pages eight short queries were 3% to 12% slower
+  (q20, q21, q50, q64, q79, q83, q84, q85); none of them was slower again in
+  a repeat with one process per query.
+- The 16 ms bound is calibrated on worker-01 only (zeroing a free huge page
+  took up to 4.4 ms with 24 threads) and counts CPU time only: a region that
+  sleeps in reclaim and then gets a huge page is not a stall. Other hosts,
+  the AWS workers included, are unmeasured.
+- While the gate is closed, tables that JT 6 would have given huge pages after
+  compaction get base pages. The gate is one per process: a stall on one NUMA
+  node also sends tables on other nodes to the heap.
+- With `auto`, the pages of a table depend on the host's free memory when the
+  table is made, so two runs of one query can differ in page-table walks.
+
+Tests: the switch's values and the mode on hosts without 2 MiB huge pages; the
+stall rule; the gate (one stall closes it once, one probe per pause, the pause
+rule, a dropped probe is released); a mode's backing in `/proc/self/smaps`;
+a forced stall at the third region leaves three regions backed and advised and
+the rest unbacked with `nh`, closes the gate, keeps the array zeroed and
+writable, and both parts are unmapped on drop; a table whose gate closed
+meanwhile asks for nothing; backing a region without advice reports base pages
+and leaves two pages resident; a chain's backing by mode and gate; a unique
+build leaves its chain unbacked and the first repeated hash backs it.
 
 ## Family AJ: DuckDB's ASOF join forms
 

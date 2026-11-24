@@ -25,12 +25,14 @@
 //! the rest of that mapping loses its advice, and later tables use the heap
 //! until one table tries again.
 //!
-//! The writes are page faults, which take only the lock of their mapping.
-//! `MADV_POPULATE_WRITE` backs the same pages but holds the lock of the
-//! whole address space for each call: 12 threads that each back and fill
-//! 16 MiB tables took 85 to 127 ms with it and 28 to 40 ms with the writes
-//! or with no backing at all (worker-01), and TPC-H Q21 at SF100 was 3%
-//! slower with it than with the advice alone.
+//! An earlier version backed each region with `MADV_POPULATE_WRITE`. With
+//! free huge pages, TPC-H Q21 at SF100 was then 3% slower than with the
+//! advice alone (1.035 and 1.028 in one ABBA, no compaction stall, equal
+//! huge pages); with the two writes it was 1.010 and 1.004, and 0.996 and
+//! 0.981 in a second ABBA. The cause is not established: a probe of 24
+//! threads that map, back and fill tables did not show the call slower than
+//! the writes. The writes need no kernel support beyond the advice, and a
+//! stalled region keeps two base pages instead of 512.
 
 // Only the mode and the gate's types are used where there is no `madvise`.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
