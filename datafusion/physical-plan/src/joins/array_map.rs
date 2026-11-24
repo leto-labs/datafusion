@@ -677,10 +677,18 @@ mod tests {
             // leto-mjj.61).
             let map = ArrayMap::try_new(&build, 0, 1_200_000)?;
             assert!(map.prefetches());
-            assert_eq!(
-                map.data.is_mapped(),
-                crate::joins::join_hash_map::huge_page_advice()
-            );
+            // In the automatic mode the array is mapped while the stall
+            // gate is open.
+            {
+                use crate::joins::join_hash_map::{HugePageMode, huge_page_mode};
+                match huge_page_mode() {
+                    HugePageMode::Off => assert!(!map.data.is_mapped()),
+                    HugePageMode::FirstTouch | HugePageMode::Populate => {
+                        assert!(map.data.is_mapped())
+                    }
+                    HugePageMode::Auto => {}
+                }
+            }
             let probe: ArrayRef = Arc::new(Int64Array::from_iter(
                 (-5..1_300_000_i64).map(|key| (key % 11 != 0).then_some(key)),
             ));

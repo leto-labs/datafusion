@@ -45,6 +45,8 @@ mod symmetric_hash_join;
 pub mod utils;
 
 mod array_map;
+/// Longbow patch (JT 10): when a join table asks for 2 MiB pages.
+mod huge_page_policy;
 /// Longbow patch (JT 9): inline join keys.
 ///
 /// # Public Only for Internal Use:
