@@ -10,6 +10,7 @@ use arrow::compute::interleave;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use datafusion_common::utils::memory::RecordBatchMemoryTracker;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::memory_pool::MemoryReservation;
 use log::warn;
@@ -56,7 +57,14 @@ pub struct BatchBuilder {
     /// Tracks the actual memory used by buffered batches (not including
     /// pre-reserved bytes). This allows [`Self::push_batch`] to skip pool
     /// allocation requests when the pre-reserved bytes cover the batch.
+    ///
+    /// It is the memory of the distinct buffers in `batches`, as `retained`
+    /// counts them: zero-copy slices of one batch hold its buffers once.
     batches_mem_used: usize,
+
+    /// Counts each buffer of `batches` once, for as long as a batch that
+    /// references it is retained
+    retained: RecordBatchMemoryTracker,
 
     /// The initial reservation size at construction time. When the reservation
     /// is pre-loaded with `sort_spill_reservation_bytes` (via `take()`), this
@@ -67,12 +75,14 @@ pub struct BatchBuilder {
     /// The current [`BatchCursor`] for each stream
     cursors: Vec<BatchCursor>,
 
-    /// The memory size of each stream's cursor batch (its head), or 0 once
-    /// that batch is released
+    /// The memory size of each stream's cursor batch (its head) on its own,
+    /// or 0 once that batch is released
     head_sizes: Vec<usize>,
 
     /// The sum of `head_sizes`: the part of `batches_mem_used` that the
-    /// merge needs whatever rows are pending
+    /// merge needs whatever rows are pending. Heads of different streams
+    /// that share a buffer count it once each here, so this can exceed
+    /// `batches_mem_used`.
     heads_mem_used: usize,
 
     /// The accumulated stream indexes from which to pull rows
@@ -98,18 +108,31 @@ impl BatchBuilder {
             indices: Vec::with_capacity(batch_size),
             reservation,
             batches_mem_used: 0,
+            retained: RecordBatchMemoryTracker::new(),
             initial_reservation,
         }
     }
 
     /// Append a new batch in `stream_idx`, returning its memory size
+    ///
+    /// The reservation grows by the buffers that no retained batch already
+    /// references. A batch that slices an earlier batch of the merge adds
+    /// nothing: charging its parent's buffers again would count memory that
+    /// does not exist, once for every retained slice.
     pub fn push_batch(&mut self, stream_idx: usize, batch: RecordBatch) -> Result<usize> {
         let size = get_record_batch_memory_size(&batch);
-        self.batches_mem_used += size;
+        let added = self.retained.count_batch(&batch);
         // Only request additional memory from the pool when actual batch
         // usage exceeds the current reservation (which may include
         // pre-reserved bytes from sort_spill_reservation_bytes).
-        try_grow_reservation_to_at_least(&mut self.reservation, self.batches_mem_used)?;
+        if let Err(error) = try_grow_reservation_to_at_least(
+            &mut self.reservation,
+            self.batches_mem_used + added,
+        ) {
+            self.retained.uncount_batch(&batch);
+            return Err(error);
+        }
+        self.batches_mem_used += added;
         // The stream's previous batch, if still retained, is now kept only
         // for its pending rows.
         self.heads_mem_used = self.heads_mem_used - self.head_sizes[stream_idx] + size;
@@ -169,7 +192,7 @@ impl BatchBuilder {
             .heads_mem_used
             .max(self.initial_reservation)
             .max(RETAINED_FLOOR_BYTES);
-        self.batches_mem_used - self.heads_mem_used > limit
+        self.batches_mem_used.saturating_sub(self.heads_mem_used) > limit
     }
 
     /// Returns `true` if this [`BatchBuilder`] contains no in-progress rows
@@ -252,7 +275,7 @@ impl BatchBuilder {
                     self.heads_mem_used -=
                         std::mem::take(&mut self.head_sizes[*stream_idx]);
                 }
-                self.batches_mem_used -= get_record_batch_memory_size(batch);
+                self.batches_mem_used -= self.retained.uncount_batch(batch);
             }
             retain
         });
@@ -283,7 +306,7 @@ impl BatchBuilder {
                 remap[batch_idx] = retained;
                 retained += 1;
             } else {
-                self.batches_mem_used -= get_record_batch_memory_size(batch);
+                self.batches_mem_used -= self.retained.uncount_batch(batch);
             }
             batch_idx += 1;
             retain

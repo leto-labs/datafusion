@@ -1143,6 +1143,68 @@ mod tests {
         Ok(())
     }
 
+    /// Two inputs of 64-row zero-copy slices of one 131,072-row batch each
+    /// (a 1 MiB buffer per column). Every slice references its parent's
+    /// buffers, so the batches a merge retains hold 4 MiB however many
+    /// slices are pending. Charging each slice for the whole parent buffer
+    /// counted 2 MiB for every retained slice: the merge emitted an output
+    /// every few slices and still asked the pool for more than the 8 MiB
+    /// that this merge fits with its cursors.
+    #[tokio::test]
+    async fn merge_of_slices_charges_a_shared_buffer_once() -> Result<()> {
+        use arrow::array::AsArray;
+        use arrow::datatypes::Int64Type;
+
+        const ROWS: i64 = 131_072;
+        const SLICE: usize = 64;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let partition = |parity: i64| {
+            let keys: Vec<i64> = (0..ROWS).map(|row| row * 2 + parity).collect();
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(keys.clone())),
+                Arc::new(Int64Array::from(keys)),
+            ];
+            let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+            Ok::<_, datafusion_common::DataFusionError>(
+                (0..ROWS as usize / SLICE)
+                    .map(|slice| batch.slice(slice * SLICE, SLICE))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let input = TestMemoryExec::try_new_exec(
+            &[partition(0)?, partition(1)?],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let sort = [PhysicalSortExpr::new_default(col("k", &schema)?)].into();
+        let merge = Arc::new(SortPreservingMergeExec::new(sort, input));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(8 << 20, 1.0)
+            .build_arc()?;
+        let task_ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let batches = collect(merge, Arc::clone(&task_ctx)).await?;
+
+        let rows: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(rows, vec![8192; 2 * ROWS as usize / 8192]);
+        let keys: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(keys, (0..2 * ROWS).collect::<Vec<_>>());
+        assert_eq!(task_ctx.runtime_env().memory_pool.reserved(), 0);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_merge_interleave() {
         let task_ctx = Arc::new(TaskContext::default());
