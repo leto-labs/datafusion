@@ -879,28 +879,14 @@ impl FinalHashAggregateStream {
                             return Err(e);
                         }
 
-                        // Sorts and spills one complete in-memory state run
+                        // Finish the spill before resizing so a spill failure
+                        // is returned directly.
+                        spill_context.sort_and_spill(hash_table.take_state_batch()?)?;
+                        spill_context.retain_merge_workspace(&mut self.reservation);
 
-                        // Go to the next state to perform spilling the aggregated
-                        // groups so far.
-                        let result = hash_table
-                            .take_state_batch()
-                            .and_then(|batch| spill_context.sort_and_spill(batch));
-                        if result.is_ok() {
-                            spill_context.retain_merge_workspace(&mut self.reservation);
-                        }
-
-                        // Spilling shrinks the aggregate table and releases its accumulated
-                        // memory. Update the reservation accordingly.
-                        self.reservation
-                            .try_resize(hash_table.memory_size())
-                            .map_err(|e| {
-                                e.context(
-                                    "Decreasing allocation after spilling should succeed",
-                                )
-                            })?;
-
-                        result?;
+                        // A cleared table can retain allocations from the
+                        // refused batch. Propagate any resize refusal as typed.
+                        self.reservation.try_resize(hash_table.memory_size())?;
 
                         // One sorted run was written; resume reading the original input.
                     }

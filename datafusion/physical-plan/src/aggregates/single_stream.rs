@@ -331,11 +331,7 @@ impl Aggregating {
         }
         spill_context.sort_and_spill(self.hash_table.take_state_batch()?)?;
         spill_context.retain_merge_workspace(reservation);
-        reservation
-            .try_resize(self.hash_table.memory_size())
-            .map_err(|error| {
-                error.context("Decreasing allocation after spilling should succeed")
-            })
+        reservation.try_resize(self.hash_table.memory_size())
     }
 
     fn has_spills(&self) -> bool {

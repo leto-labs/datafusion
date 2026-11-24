@@ -496,6 +496,48 @@ async fn clustered_final_spills_when_the_retained_table_is_refused() -> Result<(
     Ok(())
 }
 
+/// The wide-key table keeps its general interner after emitting all groups.
+/// When even the emptied table cannot grow, return the pool error directly.
+#[rstest::rstest]
+#[case::single(AggregateMode::Single)]
+#[case::final_hash(AggregateMode::Final)]
+#[tokio::test]
+async fn post_spill_resize_refusal_is_typed(#[case] mode: AggregateMode) -> Result<()> {
+    let plan = count_wide_keys(mode)?;
+    let pool = RefuseAfter::after(0);
+    let error = run(&plan, Arc::clone(&pool) as _, true)
+        .await
+        .expect_err("the retained table needs more than its initial grant");
+    assert!(
+        matches!(&error, DataFusionError::ResourcesExhausted(message) if message.contains("no lending headroom")),
+        "{mode:?}: {error:?}"
+    );
+    assert_eq!(pool.refused(), 2, "initial and post-spill resize refusals");
+    Ok(())
+}
+
+/// If the spill fails, report it even when the emptied table also needs more
+/// memory. The caller needs the spill error to diagnose the failed query.
+#[tokio::test]
+async fn final_hash_preserves_spill_error_under_resize_refusal() -> Result<()> {
+    let plan = count_wide_keys(AggregateMode::Final)?;
+    let pool = RefuseAfter::after(0);
+    let task = context(Arc::clone(&pool) as _, true)?;
+    task.runtime_env()
+        .disk_manager
+        .set_max_temp_directory_size(0)?;
+    let error = crate::common::collect(plan.execute(0, task)?)
+        .await
+        .expect_err("the spill exceeds the zero-byte disk limit");
+    assert!(
+        error.to_string().contains("exceeded the allowable limit"),
+        "{error:?}"
+    );
+    assert_eq!(pool.refused(), 1, "only the initial resize was attempted");
+    assert_eq!(pool.reserved(), 0);
+    Ok(())
+}
+
 /// Limits a final hash table so that it spills, and numbers the growth
 /// requests of the spill replay table, refusing every request from `admit` on.
 /// The replay merge has its own consumer and is admitted, so only the replay
