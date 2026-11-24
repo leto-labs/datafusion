@@ -75,6 +75,11 @@ pub(crate) struct SortPreservingMergeStream<C: CursorValues> {
     /// Target batch size
     batch_size: usize,
 
+    /// The number of in-progress rows at which to emit: `batch_size`, or
+    /// fewer once the input batches kept only for pending rows take more
+    /// memory than [`BatchBuilder::retains_more_than_heads`] allows
+    emit_rows: usize,
+
     /// See [`Self::with_max_batch_bytes`]
     max_batch_bytes: Option<usize>,
 
@@ -145,6 +150,7 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
             poll_reset_epochs: vec![0; stream_count],
             loser_tree: vec![],
             batch_size,
+            emit_rows: batch_size,
             max_batch_bytes: None,
             avg_row_bytes: vec![0; stream_count],
             in_progress_bytes: 0,
@@ -209,6 +215,7 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         let rows_before = self.in_progress.len();
         let result = self.in_progress.build_record_batch();
         let rows_after = self.in_progress.len();
+        self.emit_rows = self.batch_size;
         self.produced += rows_before - rows_after;
         // Rows kept after an offset overflow are assumed to be of average size
         self.in_progress_bytes = self.in_progress_bytes * rows_after / rows_before.max(1);
@@ -278,14 +285,11 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
                     break;
                 }
 
-                // 3.3. if there is enough to emit for a full record batch, or
-                // the consumed input batches that only pending rows keep take
-                // more memory than the live heads
-                if self.in_progress.len() >= self.batch_size
+                // 3.3. if there is enough to emit for a full record batch
+                if self.in_progress.len() >= self.emit_rows
                     || self
                         .max_batch_bytes
                         .is_some_and(|max_bytes| self.in_progress_bytes >= max_bytes)
-                    || self.in_progress.retains_more_than_heads()
                 {
                     // 3.3.1 build pending record batch and reset builder
                     let Some(batch) = self.emit_in_progress_batch()? else {
@@ -315,6 +319,14 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
                         drop(timer);
                         poll_fn(|cx| self.maybe_poll_stream(cx, winner_stream)).await?;
                         timer = elapsed_compute.timer();
+
+                        // 3.4.1. A new batch makes the winner's previous batch
+                        // one that only pending rows keep. Retained memory
+                        // changes only here, so check it once per input batch
+                        // and emit with the next row, at step 3.3.
+                        if self.in_progress.retains_more_than_heads() {
+                            self.emit_rows = self.in_progress.len() + 1;
+                        }
                     }
                 }
 

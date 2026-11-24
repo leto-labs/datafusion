@@ -153,10 +153,17 @@ impl BatchBuilder {
     /// consumed input batch until then. Small batches with large buffers,
     /// such as a Parquet reader's decode of small row groups, then hold far
     /// more memory than their rows: 7-row batches with 64 KiB buffers made
-    /// an 8,192-row output hold about 1,170 batches. Emitting when this
-    /// returns `true` keeps the retained memory below the heads, plus that
-    /// limit, plus one batch. Merges of compact batches stay below the floor
-    /// and keep emitting `batch_size` rows.
+    /// an 8,192-row output hold about 1,170 batches. The merge checks this
+    /// after each new input batch, and emitting when it returns `true` keeps
+    /// the retained memory below the heads, plus that limit, plus one batch.
+    ///
+    /// Inputs of `batch_size`-row batches of similar sizes keep emitting
+    /// `batch_size` rows: an input replaces at most one batch while an
+    /// output fills, so the batches retained for it take about as much as
+    /// the heads. Smaller batches also keep `batch_size` rows while the
+    /// batches retained for an output stay below the limit. Wide rows in
+    /// small batches can pass it and emit earlier: 4 KiB strings in 256-row
+    /// batches from two inputs emit 1,024-row batches instead of 8,192.
     pub fn retains_more_than_heads(&self) -> bool {
         let limit = self
             .heads_mem_used

@@ -1033,7 +1033,8 @@ mod tests {
     /// 8,192 rows, as a Parquet reader decodes small row groups. Waiting for
     /// a full 8,192-row output batch retains every consumed input batch:
     /// 1,200 batches hold about 75 MiB. The merge must keep about its live
-    /// heads instead and fit an 8 MiB pool.
+    /// heads plus the 1 MiB floor instead (about 1.3 MiB with the cursors'
+    /// key buffers) and fit a 2 MiB pool.
     #[tokio::test]
     async fn merge_of_small_wide_batches_retains_about_its_heads() -> Result<()> {
         const BATCHES: i64 = 600;
@@ -1057,12 +1058,15 @@ mod tests {
         let sort = [PhysicalSortExpr::new_default(col("a", &schema)?)].into();
         let merge = Arc::new(SortPreservingMergeExec::new(sort, input));
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_limit(8 << 20, 1.0)
+            .with_memory_limit(2 << 20, 1.0)
             .build_arc()?;
         let task_ctx = Arc::new(TaskContext::default().with_runtime(runtime));
 
         let batches = collect(merge, Arc::clone(&task_ctx)).await?;
 
+        // 8,400 rows in one 8,192-row output and its remainder without the
+        // bound; with it, an output about every 1 MiB of retained batches.
+        assert!(batches.len() > 16, "{} output batches", batches.len());
         let values: Vec<i64> = batches
             .iter()
             .flat_map(|batch| {
@@ -1077,6 +1081,65 @@ mod tests {
             .collect();
         assert_eq!(values, (0..2 * BATCHES * ROWS).collect::<Vec<_>>());
         assert_eq!(task_ctx.runtime_env().memory_pool.reserved(), 0);
+        Ok(())
+    }
+
+    /// Full 8,192-row batches of 200-byte strings (about 1.7 MiB each, over
+    /// the 1 MiB floor). The second input takes two rows for each row of
+    /// the first, so it replaces a batch while an output is half full. The
+    /// replaced batch is no larger than the heads, so the merge still emits
+    /// only 8,192-row batches. A bound that ignored the heads would emit
+    /// early here.
+    #[tokio::test]
+    async fn merge_of_full_wide_batches_keeps_batch_size_outputs() -> Result<()> {
+        use arrow::array::AsArray;
+        use arrow::datatypes::Int64Type;
+
+        const ROWS: usize = 8192;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let pad = "x".repeat(200);
+        let batches_of = |keys: Vec<i64>| {
+            keys.chunks(ROWS)
+                .map(|keys| {
+                    let strings: Vec<String> =
+                        keys.iter().map(|key| format!("{key:08}{pad}")).collect();
+                    let columns: Vec<ArrayRef> = vec![
+                        Arc::new(Int64Array::from(keys.to_vec())),
+                        Arc::new(StringArray::from(strings)),
+                    ];
+                    RecordBatch::try_new(Arc::clone(&schema), columns)
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+        };
+        // Three batches of multiples of three, six batches of the others.
+        let total = 9 * ROWS as i64;
+        let first = batches_of((0..total).filter(|key| key % 3 == 0).collect())?;
+        let second = batches_of((0..total).filter(|key| key % 3 != 0).collect())?;
+        assert_eq!((first.len(), second.len()), (3, 6));
+        let input =
+            TestMemoryExec::try_new_exec(&[first, second], Arc::clone(&schema), None)?;
+        let sort = [PhysicalSortExpr::new_default(col("k", &schema)?)].into();
+        let merge = Arc::new(SortPreservingMergeExec::new(sort, input));
+        let task_ctx = Arc::new(TaskContext::default());
+
+        let batches = collect(merge, task_ctx).await?;
+
+        let rows: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(rows, vec![ROWS; 9]);
+        let keys: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(keys, (0..total).collect::<Vec<_>>());
         Ok(())
     }
 
