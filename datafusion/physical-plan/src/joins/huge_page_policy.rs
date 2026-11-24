@@ -16,11 +16,21 @@
 //! median and up to 340 ms, and nine of ten still get base pages.
 //!
 //! The default mode therefore backs an advised mapping when it is made, one
-//! 2 MiB region at a time (`MADV_POPULATE_WRITE`), and measures each region
-//! in the calling thread. The first region that the kernel backs with base
-//! pages, or that takes more than [`STALL_CPU`] of thread CPU time, closes
-//! the process-wide [`StallGate`]: the rest of that mapping loses its advice,
-//! and later tables use the heap until one table tries again.
+//! 2 MiB region at a time, and measures each region in the calling thread. A
+//! region is backed by one write to its first byte: the kernel then allocates
+//! the huge page, or one base page when it has none. A second write, to the
+//! middle of the region, faults only in the second case. The first region
+//! that the kernel backs with base pages, or that takes more than
+//! [`STALL_CPU`] of thread CPU time, closes the process-wide [`StallGate`]:
+//! the rest of that mapping loses its advice, and later tables use the heap
+//! until one table tries again.
+//!
+//! The writes are page faults, which take only the lock of their mapping.
+//! `MADV_POPULATE_WRITE` backs the same pages but holds the lock of the
+//! whole address space for each call: 12 threads that each back and fill
+//! 16 MiB tables took 85 to 127 ms with it and 28 to 40 ms with the writes
+//! or with no backing at all (worker-01), and TPC-H Q21 at SF100 was 3%
+//! slower with it than with the advice alone.
 
 // Only the mode and the gate's types are used where there is no `madvise`.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -157,17 +167,16 @@ pub(crate) static STALL_GATE: StallGate = StallGate::new();
 pub(crate) struct RegionCost {
     /// Thread CPU time, user and system.
     pub(crate) cpu: Duration,
-    /// Minor faults of the thread: one for a huge page, one per base page
-    /// otherwise.
-    pub(crate) faults: u64,
+    /// The kernel gave base pages: after the write to the region's first
+    /// byte, the write to its middle faulted too.
+    pub(crate) base_pages: bool,
 }
 
 impl RegionCost {
-    /// Whether a whole 2 MiB region with this cost stalled: the kernel gave
-    /// base pages (at least half of the region's `base_pages` faulted one by
-    /// one), or the huge page took more than [`STALL_CPU`].
-    pub(crate) fn stalled(&self, base_pages: usize) -> bool {
-        self.faults.saturating_mul(2) >= base_pages as u64 || self.cpu > STALL_CPU
+    /// Whether a region with this cost stalled: the kernel gave base pages,
+    /// or the huge page took more than [`STALL_CPU`].
+    pub(crate) fn stalled(&self) -> bool {
+        self.base_pages || self.cpu > STALL_CPU
     }
 }
 
@@ -262,9 +271,10 @@ impl StallGate {
             state.pause
         };
         log::info!(
-            "join tables stop asking for 2 MiB pages for {pause:?}: backing one              took {:?} of CPU time and {} page faults",
+            "join tables stop asking for 2 MiB pages for {pause:?}: one took \
+             {:?} of CPU time and got {} pages",
             cost.cpu,
-            cost.faults
+            if cost.base_pages { "base" } else { "huge" }
         );
     }
 
@@ -300,17 +310,11 @@ impl Ticket<'_> {
         (self.probe && !self.reported) || self.gate.is_open()
     }
 
-    /// Reports the cost of a whole 2 MiB region of `base_pages` base pages,
-    /// measured at `now`. Returns whether it stalled; the table then stops
-    /// asking.
-    pub(crate) fn region(
-        &mut self,
-        cost: RegionCost,
-        base_pages: usize,
-        now: Instant,
-    ) -> bool {
+    /// Reports the cost of a whole 2 MiB region, measured at `now`. Returns
+    /// whether it stalled; the table then stops asking.
+    pub(crate) fn region(&mut self, cost: RegionCost, now: Instant) -> bool {
         let first_of_probe = self.probe && !self.reported;
-        let stalled = cost.stalled(base_pages);
+        let stalled = cost.stalled();
         if stalled {
             self.gate.close(first_of_probe, now, cost);
         } else if first_of_probe {
@@ -332,20 +336,21 @@ impl Drop for Ticket<'_> {
 /// How [`back_mapping`] left a mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Backed {
-    /// Every page is resident.
+    /// Every whole 2 MiB region is backed. (A last part of less than 2 MiB
+    /// gets base pages at its first writes; the kernel never compacts for
+    /// it.)
     Whole,
-    /// The pages from this byte on are not resident and have no advice: the
-    /// gate closed, a region stalled, or the kernel could not back a region.
+    /// The regions from this byte on are not backed and have no advice: the
+    /// gate closed, or a region stalled.
     Until(usize),
-    /// The pages from this byte on keep their advice and are allocated by
-    /// their first write: the kernel has no `MADV_POPULATE_WRITE` (before
-    /// Linux 5.14), or it refused to end the advice.
+    /// The regions from this byte on are not backed and keep their advice:
+    /// the kernel refused to end it.
     Refused(usize),
 }
 
-/// The calling thread's CPU time and minor faults so far.
+/// The calling thread's CPU time (user and system) and minor faults so far.
 #[cfg(target_os = "linux")]
-fn thread_cost() -> Option<RegionCost> {
+fn thread_usage() -> Option<(Duration, libc::c_long)> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: `getrusage` writes one `rusage` to the given pointer, which is
     // valid for it.
@@ -363,10 +368,7 @@ fn thread_cost() -> Option<RegionCost> {
                 .saturating_mul(1000),
         )
     };
-    Some(RegionCost {
-        cpu: time(usage.ru_utime) + time(usage.ru_stime),
-        faults: u64::try_from(usage.ru_minflt).unwrap_or(0),
-    })
+    Some((time(usage.ru_utime) + time(usage.ru_stime), usage.ru_minflt))
 }
 
 #[cfg(test)]
@@ -378,34 +380,37 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Set once the kernel refuses `MADV_POPULATE_WRITE` as unknown.
-#[cfg(target_os = "linux")]
-static POPULATE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
-
-/// Backs the `len` bytes at `region` now and returns what that cost the
-/// calling thread (`None` when the thread's usage cannot be read), or the
-/// kernel's refusal.
+/// Backs the 2 MiB region at `region` now and returns what that cost the
+/// calling thread (`None` when the thread's usage cannot be read).
+///
+/// The write to the first byte makes the kernel allocate the region: a huge
+/// page where the region is advised and one is free or can be compacted,
+/// else one base page. The write to the middle then faults only if the
+/// region did not get a huge page.
 ///
 /// # Safety
 ///
-/// `region..region + len` must be page aligned and inside a private
-/// anonymous mapping that the caller owns.
+/// `region..region + HUGE_PAGE` must be inside a private anonymous mapping
+/// that the caller owns, writable and zeroed, with no reference to its
+/// bytes alive.
 #[cfg(target_os = "linux")]
-pub(crate) unsafe fn back_region(
-    region: *mut u8,
-    len: usize,
-) -> std::io::Result<Option<RegionCost>> {
-    let before = thread_cost();
-    // SAFETY: by the caller's contract the range is inside its mapping. The
-    // advice allocates the pages of the range as writes would; it changes
-    // neither their contents nor their permissions.
-    if unsafe { libc::madvise(region.cast(), len, libc::MADV_POPULATE_WRITE) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(before.zip(thread_cost()).map(|(before, after)| RegionCost {
-        cpu: after.cpu.saturating_sub(before.cpu),
-        faults: after.faults.saturating_sub(before.faults),
-    }))
+pub(crate) unsafe fn back_region(region: *mut u8) -> Option<RegionCost> {
+    let before = thread_usage();
+    // SAFETY: by the caller's contract both bytes are inside its writable
+    // mapping and nothing else refers to them. They are zero, so storing
+    // zero changes no contents.
+    let middle = unsafe {
+        region.write_volatile(0);
+        let middle = thread_usage();
+        region.add(HUGE_PAGE / 2).write_volatile(0);
+        middle
+    };
+    let after = thread_usage();
+    let ((start, _), (_, faults), (end, faults_after)) = (before?, middle?, after?);
+    Some(RegionCost {
+        cpu: end.saturating_sub(start),
+        base_pages: faults_after > faults,
+    })
 }
 
 /// Ends the advice of `start + offset..start + bytes`, which stays unbacked.
@@ -432,66 +437,46 @@ unsafe fn end_advice(start: *mut u8, offset: usize, bytes: usize) -> Backed {
     }
 }
 
-/// Backs the advised mapping `start..start + bytes` now, one 2 MiB region at
-/// a time, so that no later write to it allocates a page. With a `ticket`,
-/// each whole region is measured and reported to its gate; at the first
-/// stall, or once the gate is closed, the remaining regions lose their
-/// advice (`MADV_NOHUGEPAGE`) and stay unbacked: their first writes get base
-/// pages without compaction.
+/// Backs the whole 2 MiB regions of the advised mapping
+/// `start..start + bytes` now, one at a time ([`back_region`]), so that no
+/// later write to them waits for a huge page. With a `ticket`, each region
+/// is measured and reported to its gate; at the first stall, or once the
+/// gate is closed, the remaining regions lose their advice
+/// (`MADV_NOHUGEPAGE`) and stay unbacked: their first writes get base pages
+/// without compaction.
 ///
 /// # Safety
 ///
 /// `start..start + bytes` must be a private anonymous mapping that the caller
-/// owns, with `start` 2 MiB aligned and `bytes` a multiple of `page`, the
-/// base page size.
+/// owns, writable and zeroed, with `start` 2 MiB aligned, `bytes` a multiple
+/// of the base page size, and no reference to its bytes alive.
 #[cfg(target_os = "linux")]
 pub(crate) unsafe fn back_mapping(
     start: *mut u8,
     bytes: usize,
-    page: usize,
     mut ticket: Option<Ticket<'_>>,
 ) -> Backed {
-    if POPULATE_UNSUPPORTED.load(Ordering::Relaxed) {
-        return Backed::Refused(0);
-    }
     let mut offset = 0;
-    while offset < bytes {
+    while offset + HUGE_PAGE <= bytes {
         if ticket.as_ref().is_some_and(|ticket| !ticket.may_ask()) {
             // SAFETY: `offset < bytes`, both page aligned, in the caller's
             // mapping.
             return unsafe { end_advice(start, offset, bytes) };
         }
-        let len = HUGE_PAGE.min(bytes - offset);
-        // SAFETY: `offset..offset + len` is inside the caller's mapping and
-        // page aligned: `offset` is a multiple of 2 MiB and `bytes` of the
-        // page size.
-        let cost = match unsafe { back_region(start.add(offset), len) } {
-            Ok(cost) => cost,
-            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
-                POPULATE_UNSUPPORTED.store(true, Ordering::Relaxed);
-                return Backed::Refused(offset);
-            }
-            // Out of memory, or interrupted: the first writes decide, without
-            // the advice.
-            // SAFETY: as above.
-            Err(_) => return unsafe { end_advice(start, offset, bytes) },
-        };
+        // SAFETY: `offset..offset + HUGE_PAGE` is inside the caller's
+        // mapping, to which nothing else refers.
+        let cost = unsafe { back_region(start.add(offset)) };
         #[cfg(test)]
         let cost = match STALL_AT_REGION.get() {
             Some(region) => Some(RegionCost {
                 cpu: Duration::ZERO,
-                faults: if region == offset / HUGE_PAGE {
-                    u64::MAX
-                } else {
-                    1
-                },
+                base_pages: region == offset / HUGE_PAGE,
             }),
             None => cost,
         };
-        offset += len;
-        if len == HUGE_PAGE
-            && let (Some(ticket), Some(cost)) = (ticket.as_mut(), cost)
-            && ticket.region(cost, HUGE_PAGE / page, Instant::now())
+        offset += HUGE_PAGE;
+        if let (Some(ticket), Some(cost)) = (ticket.as_mut(), cost)
+            && ticket.region(cost, Instant::now())
         {
             if offset == bytes {
                 return Backed::Whole;
@@ -510,15 +495,15 @@ mod tests {
 
     const HUGE: RegionCost = RegionCost {
         cpu: Duration::from_micros(100),
-        faults: 1,
+        base_pages: false,
     };
     const BASE: RegionCost = RegionCost {
         cpu: Duration::from_micros(600),
-        faults: 512,
+        base_pages: true,
     };
     const COMPACTED: RegionCost = RegionCost {
         cpu: Duration::from_millis(30),
-        faults: 1,
+        base_pages: false,
     };
 
     #[test]
@@ -573,32 +558,20 @@ mod tests {
 
     #[test]
     fn a_region_stalls_on_base_pages_or_a_slow_huge_page() {
-        assert!(!HUGE.stalled(512));
-        assert!(BASE.stalled(512));
-        assert!(COMPACTED.stalled(512));
-        // Half of the base pages faulting one by one is a fallback.
-        let half = RegionCost {
-            faults: 256,
+        assert!(!HUGE.stalled());
+        assert!(BASE.stalled());
+        assert!(COMPACTED.stalled());
+        // The CPU bound is exclusive.
+        let at_the_bound = RegionCost {
+            cpu: STALL_CPU,
             ..HUGE
         };
-        assert!(half.stalled(512));
-        assert!(
-            !RegionCost {
-                faults: 255,
-                ..HUGE
-            }
-            .stalled(512)
-        );
-        // The rule counts base pages of any size: here 32 to a region.
-        assert!(RegionCost { faults: 32, ..HUGE }.stalled(32));
-        // The CPU bound is exclusive.
-        assert!(
-            !RegionCost {
-                cpu: STALL_CPU,
-                ..HUGE
-            }
-            .stalled(512)
-        );
+        assert!(!at_the_bound.stalled());
+        let over_the_bound = RegionCost {
+            cpu: STALL_CPU + Duration::from_nanos(1),
+            ..HUGE
+        };
+        assert!(over_the_bound.stalled());
     }
 
     #[test]
@@ -608,15 +581,15 @@ mod tests {
         let mut first = gate.admit(start).expect("an open gate admits");
         let mut second = gate.admit(start).expect("an open gate admits");
         assert!(first.may_ask() && second.may_ask());
-        assert!(!first.region(HUGE, 512, start));
-        assert!(first.region(BASE, 512, start));
+        assert!(!first.region(HUGE, start));
+        assert!(first.region(BASE, start));
         // The other table stops at its next region; new tables use the heap.
         assert!(!gate.is_open());
         assert!(!first.may_ask() && !second.may_ask());
         assert!(gate.admit(start).is_none());
         assert!(gate.admit(start + FIRST_PAUSE / 2).is_none());
         // A second stall of the same moment does not lengthen the pause.
-        assert!(second.region(COMPACTED, 512, start + FIRST_PAUSE / 2));
+        assert!(second.region(COMPACTED, start + FIRST_PAUSE / 2));
         assert!(
             gate.admit(start + FIRST_PAUSE - Duration::from_nanos(1))
                 .is_none()
@@ -629,7 +602,7 @@ mod tests {
         assert!(gate.admit(after).is_none());
         assert!(!gate.is_open());
         // Its first region reopens the gate for every table.
-        assert!(!probe.region(HUGE, 512, after));
+        assert!(!probe.region(HUGE, after));
         assert!(gate.is_open() && probe.may_ask());
         let other = gate.admit(after).expect("reopened");
         assert!(other.may_ask());
@@ -639,13 +612,13 @@ mod tests {
     fn stalled_probes_double_the_pause_up_to_the_longest() {
         let gate = StallGate::new();
         let mut now = Instant::now();
-        assert!(gate.admit(now).unwrap().region(BASE, 512, now));
+        assert!(gate.admit(now).unwrap().region(BASE, now));
         let mut pause = FIRST_PAUSE;
         for _ in 0..10 {
             assert!(gate.admit(now + pause - Duration::from_nanos(1)).is_none());
             now += pause;
             let mut probe = gate.admit(now).expect("the pause is over");
-            assert!(probe.region(BASE, 512, now));
+            assert!(probe.region(BASE, now));
             assert!(!probe.may_ask());
             pause = (pause * 2).min(MAX_PAUSE);
         }
@@ -659,16 +632,16 @@ mod tests {
         let gate = StallGate::new();
         let mut now = Instant::now();
         let step = Duration::from_nanos(1);
-        assert!(gate.admit(now).unwrap().region(BASE, 512, now));
+        assert!(gate.admit(now).unwrap().region(BASE, now));
         let mut pause = FIRST_PAUSE;
         // Each probe gets one huge page, and the next region stalls.
         for _ in 0..3 {
             now += pause;
             let mut probe = gate.admit(now).expect("the pause is over");
-            assert!(!probe.region(HUGE, 512, now));
+            assert!(!probe.region(HUGE, now));
             assert!(gate.is_open());
             now += pause - step;
-            assert!(probe.region(BASE, 512, now));
+            assert!(probe.region(BASE, now));
             pause *= 2;
             assert!(gate.admit(now + pause - step).is_none());
         }
@@ -676,9 +649,9 @@ mod tests {
         // The gate reopens and stays open for the whole last pause.
         now += pause;
         let mut probe = gate.admit(now).expect("the pause is over");
-        assert!(!probe.region(HUGE, 512, now));
+        assert!(!probe.region(HUGE, now));
         now += pause;
-        assert!(gate.admit(now).unwrap().region(BASE, 512, now));
+        assert!(gate.admit(now).unwrap().region(BASE, now));
         assert!(gate.admit(now + FIRST_PAUSE - step).is_none());
         assert!(gate.admit(now + FIRST_PAUSE).is_some());
     }
@@ -687,14 +660,14 @@ mod tests {
     fn a_probe_without_a_report_lets_the_next_table_probe() {
         let gate = StallGate::new();
         let now = Instant::now();
-        assert!(gate.admit(now).unwrap().region(BASE, 512, now));
+        assert!(gate.admit(now).unwrap().region(BASE, now));
         let after = now + FIRST_PAUSE;
         // The probe's mapping was refused: it is dropped without a region.
         drop(gate.admit(after).expect("the pause is over"));
         assert!(!gate.is_open());
         let mut probe = gate.admit(after).expect("the probe was released");
         assert!(gate.admit(after).is_none());
-        assert!(!probe.region(HUGE, 512, after));
+        assert!(!probe.region(HUGE, after));
         assert!(gate.is_open());
     }
 }

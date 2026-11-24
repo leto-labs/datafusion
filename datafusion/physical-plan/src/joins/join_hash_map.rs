@@ -2366,14 +2366,15 @@ impl<T: ZeroedValue> ZeroedArray<T> {
         #[cfg(target_os = "linux")]
         if let ArrayOwner::Mapped { base, bytes } = self.owner {
             // SAFETY: `base..base + bytes` is the mapping that `mapped_as`
-            // made for this array alone: private, anonymous, 2 MiB aligned
-            // and a whole number of base pages, whose size it validated.
+            // made for this array alone: private, anonymous, writable,
+            // 2 MiB aligned and a whole number of base pages. Its bytes are
+            // zero (nothing was written yet: a table is backed when it is
+            // made, a chain before its first write), and no slice of the
+            // array is alive while `back` runs.
             unsafe {
-                let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
                 crate::joins::huge_page_policy::back_mapping(
                     base.as_ptr(),
                     bytes,
-                    page,
                     ticket,
                 );
             }
@@ -3185,9 +3186,33 @@ mod tests {
         flags.split_whitespace().any(|f| f == flag)
     }
 
+    /// Whether `rss` is what `regions` backed 2 MiB regions have resident:
+    /// a huge page each, or, for a region that got none, at least the two
+    /// base pages that backing it wrote.
+    #[cfg(target_os = "linux")]
+    fn is_backed(rss: usize, regions: usize) -> bool {
+        (regions * 2 * page_size()..=regions * (2 << 20)).contains(&rss)
+    }
+
+    /// A gate that is closed until an hour from now, whatever the test's
+    /// pace.
+    #[cfg(target_os = "linux")]
+    fn closed_gate() -> StallGate {
+        use crate::joins::huge_page_policy::RegionCost;
+        let gate = StallGate::new();
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let base_pages = RegionCost {
+            cpu: std::time::Duration::ZERO,
+            base_pages: true,
+        };
+        assert!(gate.admit(later).unwrap().region(base_pages, later));
+        assert!(!gate.is_open());
+        gate
+    }
+
     /// JT 10 (leto-o7z0): the modes of an array's backing. Off uses the
     /// heap; first touch leaves an advised mapping unbacked; populate backs
-    /// all of it when it is made.
+    /// every whole region when the array is made.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_mode_decides_how_an_array_is_backed() {
@@ -3195,7 +3220,7 @@ mod tests {
             return;
         }
         let gate = StallGate::new();
-        let bytes = (9 << 20) + 2 * page_size();
+        let bytes = (8 << 20) + 2 * page_size();
         let len = bytes / size_of::<u64>();
         assert!(ZeroedArray::<u64>::for_mode(len, HugePageMode::Off, &gate).is_none());
 
@@ -3210,13 +3235,13 @@ mod tests {
             .expect("mapped");
         let parts = backing(&eager);
         assert_eq!(parts.len(), 1, "{parts:?}");
-        // Every page is resident before the first write, the partial last
-        // region included, and the values are zero.
-        assert_eq!(parts[0].0, bytes);
+        // The four whole regions are backed before the first write; the
+        // values are zero.
+        assert!(is_backed(parts[0].0, 4), "{parts:?}");
         assert!(has_flag(&parts[0].1, "hg"));
         assert!(eager.iter().all(|value| *value == 0));
         eager[len - 1] = 3;
-        assert_eq!(backing(&eager)[0].0, bytes);
+        assert_eq!(eager[len - 1], 3);
         // Neither mode uses the gate.
         assert!(gate.is_open());
     }
@@ -3228,7 +3253,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_stalled_region_ends_the_advice_and_closes_the_gate() {
-        use crate::joins::huge_page_policy::{RegionCost, STALL_AT_REGION};
+        use crate::joins::huge_page_policy::STALL_AT_REGION;
         if !thp_available() {
             return;
         }
@@ -3237,24 +3262,24 @@ mod tests {
         let bytes = 5 * REGION + page_size();
         let len = bytes / size_of::<u32>();
 
-        // No region stalls: the whole table is resident and advised.
+        // No region stalls: the five whole regions are backed and advised.
         STALL_AT_REGION.set(Some(usize::MAX));
         let whole = ZeroedArray::<u32>::for_mode(len, HugePageMode::Auto, &gate)
             .expect("the gate is open");
         let parts = backing(&whole);
         assert_eq!(parts.len(), 1, "{parts:?}");
-        assert_eq!(parts[0].0, bytes);
+        assert!(is_backed(parts[0].0, 5), "{parts:?}");
         assert!(has_flag(&parts[0].1, "hg"));
         assert!(gate.is_open());
 
-        // The third region stalls: three regions are resident and advised,
+        // The third region stalls: three regions are backed and advised,
         // the rest is neither.
         STALL_AT_REGION.set(Some(2));
         let mut partial = ZeroedArray::<u32>::for_mode(len, HugePageMode::Auto, &gate)
             .expect("the gate is open");
         let parts = backing(&partial);
         assert_eq!(parts.len(), 2, "{parts:?}");
-        assert_eq!(parts[0].0, 3 * REGION);
+        assert!(is_backed(parts[0].0, 3), "{parts:?}");
         assert!(has_flag(&parts[0].1, "hg"));
         assert_eq!(parts[1].0, 0);
         assert!(has_flag(&parts[1].1, "nh") && !has_flag(&parts[1].1, "hg"));
@@ -3266,16 +3291,9 @@ mod tests {
         let parts = backing(&partial);
         assert_eq!(parts.iter().map(|(rss, _)| rss).sum::<usize>(), bytes);
 
-        // While a gate is closed, tables use the heap and ask nothing. This
-        // gate is closed until an hour from now, whatever the test's pace.
+        // While a gate is closed, tables use the heap and ask nothing.
         STALL_AT_REGION.set(Some(usize::MAX));
-        let closed = StallGate::new();
-        let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
-        let base_pages = RegionCost {
-            cpu: std::time::Duration::ZERO,
-            faults: 512,
-        };
-        assert!(closed.admit(later).unwrap().region(base_pages, 512, later));
+        let closed = closed_gate();
         assert!(ZeroedArray::<u32>::for_mode(len, HugePageMode::Auto, &closed).is_none());
         // The modes without the gate are not affected.
         assert!(
@@ -3314,18 +3332,19 @@ mod tests {
         STALL_AT_REGION.set(None);
         let parts = backing(&stalled);
         assert_eq!(parts.len(), 2, "{parts:?}");
-        assert_eq!(parts[0].0, 2 << 20);
+        assert!(is_backed(parts[0].0, 1), "{parts:?}");
+        assert_eq!(parts[1].0, 0);
 
         let late = ZeroedArray::<u64>::mapped(len).expect("mapped");
         let ArrayOwner::Mapped { base, bytes } = late.owner else {
             unreachable!("a mapped array");
         };
-        // SAFETY: the mapping of `late`, which this test owns.
+        // SAFETY: the mapping of `late`, which this test owns and has not
+        // written.
         let backed = unsafe {
             crate::joins::huge_page_policy::back_mapping(
                 base.as_ptr(),
                 bytes,
-                page_size(),
                 Some(ticket),
             )
         };
@@ -3336,41 +3355,50 @@ mod tests {
         assert!(has_flag(&parts[0].1, "nh"));
     }
 
-    /// JT 10 (leto-o7z0): what the stall rule reads from the kernel. A region
-    /// that the kernel backs with base pages costs the calling thread one
-    /// minor fault per base page, which the rule counts as a stall; backing
-    /// it again costs no such faults.
+    /// JT 10 (leto-o7z0): what the stall rule reads from the kernel. Backing
+    /// a region writes its first byte and then its middle. The second write
+    /// faults exactly when the region did not get a huge page, which the
+    /// rule counts as a stall.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_region_of_base_pages_costs_a_fault_per_page() {
+    fn a_region_without_a_huge_page_faults_twice() {
         use crate::joins::huge_page_policy::{HUGE_PAGE, back_region};
-        // A mapping without advice gets base pages where THP is `madvise`.
         let enabled =
             std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
                 .unwrap_or_default();
         if !enabled.contains("[madvise]") {
             return;
         }
-        let len = (3 * HUGE_PAGE) / size_of::<u64>();
-        let values = ZeroedArray::<u64>::mapped_as(len, false).expect("mapped");
-        let pages = (HUGE_PAGE / page_size()) as u64;
-        let region = values.as_ptr() as *mut u8;
-        // SAFETY: the first 2 MiB of the mapping of `values`, which this
-        // test owns.
-        let cost = unsafe { back_region(region, HUGE_PAGE) }
-            .expect("backed")
-            .expect("thread usage");
-        // One fault per base page, and a few of the thread's own.
-        assert!((pages..pages + 64).contains(&cost.faults), "{cost:?}");
-        assert!(cost.stalled(pages as usize));
-        assert_eq!(backing(&values)[0].0, HUGE_PAGE);
-        // SAFETY: as above.
-        let again = unsafe { back_region(region, HUGE_PAGE) }
-            .expect("backed")
-            .expect("thread usage");
-        assert!(again.faults < 64, "{again:?}");
-        assert!(!again.stalled(pages as usize));
-        assert!(values.iter().all(|value| *value == 0));
+        let len = (2 * HUGE_PAGE) / size_of::<u64>();
+        // Without advice a mapping gets base pages where THP is `madvise`.
+        let plain = ZeroedArray::<u64>::mapped_as(len, false).expect("mapped");
+        // SAFETY: the first 2 MiB of the mapping of `plain`, which this
+        // test owns and has not written.
+        let cost = unsafe { back_region(plain.as_ptr() as *mut u8) }.expect("usage");
+        assert!(cost.base_pages && cost.stalled(), "{cost:?}");
+        assert_eq!(backing(&plain)[0].0, 2 * page_size());
+        // Both pages are resident now: backing the region again faults
+        // nothing.
+        // SAFETY: as above; the region still holds zeros.
+        let again = unsafe { back_region(plain.as_ptr() as *mut u8) }.expect("usage");
+        assert!(!again.base_pages, "{again:?}");
+
+        // With advice the region gets a huge page or, on a host that has
+        // none, base pages: the measurement says which.
+        let advised = ZeroedArray::<u64>::mapped(len).expect("mapped");
+        // SAFETY: the first 2 MiB of the mapping of `advised`, as above.
+        let cost = unsafe { back_region(advised.as_ptr() as *mut u8) }.expect("usage");
+        let resident = backing(&advised)[0].0;
+        assert_eq!(
+            resident,
+            if cost.base_pages {
+                2 * page_size()
+            } else {
+                HUGE_PAGE
+            },
+            "{cost:?}"
+        );
+        assert!(plain.iter().chain(advised.iter()).all(|value| *value == 0));
     }
 
     /// JT 10 (leto-o7z0): a chain is written only for rows whose hash
@@ -3380,7 +3408,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_chain_is_backed_by_its_first_write() {
-        use crate::joins::huge_page_policy::{RegionCost, STALL_AT_REGION};
+        use crate::joins::huge_page_policy::STALL_AT_REGION;
         if !thp_available() {
             return;
         }
@@ -3392,13 +3420,7 @@ mod tests {
         assert!(has_flag(&backing(&lazy)[0].1, "hg") && !lazy.unbacked_chain);
 
         let open = StallGate::new();
-        let closed = StallGate::new();
-        let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
-        let base_pages = RegionCost {
-            cpu: std::time::Duration::ZERO,
-            faults: 512,
-        };
-        assert!(closed.admit(later).unwrap().region(base_pages, 512, later));
+        let closed = closed_gate();
         STALL_AT_REGION.set(Some(usize::MAX));
         for (mode, gate, backed) in [
             (HugePageMode::Populate, &open, true),
@@ -3418,7 +3440,11 @@ mod tests {
             assert!(!chain.unbacked_chain);
             let parts = backing(&chain);
             assert_eq!(parts.len(), 1, "{mode:?} {parts:?}");
-            assert_eq!(parts[0].0, if backed { bytes } else { 0 }, "{mode:?}");
+            if backed {
+                assert!(is_backed(parts[0].0, 3), "{mode:?} {parts:?}");
+            } else {
+                assert_eq!(parts[0].0, 0, "{mode:?}");
+            }
             assert_eq!(has_flag(&parts[0].1, "hg"), backed, "{mode:?}");
             // Once is enough: a second call changes nothing.
             chain.back_chain_for(mode, gate);
@@ -3454,12 +3480,12 @@ mod tests {
             .unwrap();
         assert!(!map.chained);
         assert_eq!(map.next.unbacked_chain, deferred);
+        let resident = |map: &JoinHashMapU32| -> usize {
+            backing(&map.next).iter().map(|(rss, _)| rss).sum()
+        };
         if map.next.is_mapped() {
             // Nothing was written to the chain, in any mode.
-            assert_eq!(
-                backing(&map.next).iter().map(|(rss, _)| rss).sum::<usize>(),
-                0
-            );
+            assert_eq!(resident(&map), 0);
         }
         // The last row repeats the hash of row 0.
         let repeated = [hashes[0]];
@@ -3469,11 +3495,8 @@ mod tests {
         assert_eq!(map.next[rows - 1], 1);
         assert!(map.next[..rows - 1].iter().all(|next| *next == 0));
         if deferred && huge_page_mode() == HugePageMode::Populate {
-            let chain_bytes = (rows * size_of::<u32>()).next_multiple_of(page_size());
-            assert_eq!(
-                backing(&map.next).iter().map(|(rss, _)| rss).sum::<usize>(),
-                chain_bytes
-            );
+            // Its two whole regions are backed, and the page of the write.
+            assert!(resident(&map) >= 5 * page_size());
         }
     }
 
