@@ -22,6 +22,9 @@
 //! the process-wide [`StallGate`]: the rest of that mapping loses its advice,
 //! and later tables use the heap until one table tries again.
 
+// Only the mode and the gate's types are used where there is no `madvise`.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -41,8 +44,9 @@ pub(crate) const HUGE_PAGE: usize = 2 << 20;
 /// for a host with a quarter of that memory bandwidth per thread.
 const STALL_CPU: Duration = Duration::from_millis(16);
 
-/// The first pause after a stall; each stall without a wholly backed table
-/// in between doubles the pause, up to [`MAX_PAUSE`].
+/// The first pause after a stall. A stalled probe doubles the pause, and so
+/// does a stall that follows a reopening by less than the last pause, up to
+/// [`MAX_PAUSE`].
 const FIRST_PAUSE: Duration = Duration::from_secs(1);
 
 /// The longest pause between two attempts.
@@ -101,20 +105,47 @@ pub(crate) fn transparent_huge_pages_available(enabled: Option<&str>) -> bool {
     enabled.is_some_and(|mode| !mode.contains("[never]"))
 }
 
+/// Whether the kernel's transparent huge pages are 2 MiB (`hpage_pmd_size`).
+/// They are 512 MiB with 64 KiB base pages; an unreadable size counts as
+/// 2 MiB.
+pub(crate) fn huge_pages_are_2_mib(pmd_size: Option<&str>) -> bool {
+    pmd_size
+        .and_then(|size| size.trim().parse::<usize>().ok())
+        .is_none_or(|size| size == HUGE_PAGE)
+}
+
+/// The mode of a process whose variable asks for `mode`:
+/// [`HugePageMode::Off`] where the kernel has no usable transparent huge
+/// pages (`enabled`), and for the automatic mode also where they are not
+/// 2 MiB (`pmd_size`): every 2 MiB region would then count as stalled.
+pub(crate) fn mode_on_host(
+    mode: HugePageMode,
+    enabled: Option<&str>,
+    pmd_size: Option<&str>,
+) -> HugePageMode {
+    if !transparent_huge_pages_available(enabled)
+        || (mode == HugePageMode::Auto && !huge_pages_are_2_mib(pmd_size))
+    {
+        HugePageMode::Off
+    } else {
+        mode
+    }
+}
+
 /// How join tables of this process ask for 2 MiB pages: the mode of
-/// [`HUGE_PAGES_ENV`], or [`HugePageMode::Off`] where the kernel has no
-/// usable transparent huge pages. Read once per process.
+/// [`HUGE_PAGES_ENV`] on this host ([`mode_on_host`]). Read once per process.
 pub fn huge_page_mode() -> HugePageMode {
     static MODE: std::sync::OnceLock<HugePageMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
-        let mode =
-            HugePageMode::from_env_value(std::env::var(HUGE_PAGES_ENV).ok().as_deref());
-        let available = transparent_huge_pages_available(
-            std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+        let read = |name: &str| {
+            std::fs::read_to_string(format!("/sys/kernel/mm/transparent_hugepage/{name}"))
                 .ok()
-                .as_deref(),
-        );
-        if available { mode } else { HugePageMode::Off }
+        };
+        mode_on_host(
+            HugePageMode::from_env_value(std::env::var(HUGE_PAGES_ENV).ok().as_deref()),
+            read("enabled").as_deref(),
+            read("hpage_pmd_size").as_deref(),
+        )
     })
 }
 
@@ -144,8 +175,10 @@ impl RegionCost {
 struct GateState {
     /// `None` while the gate is open; otherwise when a table may try again.
     retry_at: Option<Instant>,
-    /// The pause of the last stall; zero once a table was wholly backed.
+    /// The pause of the last stall; zero before the first one.
     pause: Duration,
+    /// When the last probe reopened the gate.
+    reopened_at: Option<Instant>,
     /// A table is trying again and has not reported yet.
     probing: bool,
 }
@@ -155,8 +188,11 @@ struct GateState {
 /// Open: every table asks. A stalled region closes the gate for a pause;
 /// tables made meanwhile use the heap. After the pause one table (the probe)
 /// asks again: its first region reopens the gate, or closes it for twice the
-/// pause. A stall therefore costs each thread that is backing a table at
-/// that moment one region, and then one region per pause.
+/// pause. A stall therefore costs one region to each thread that is backing
+/// a table at that moment, and then one region per pause while huge pages
+/// stay scarce. A gate that stalls again sooner after a reopening than its
+/// last pause lasted also doubles the pause, so a host that frees a few
+/// huge pages now and then is asked less and less often.
 #[derive(Debug)]
 pub(crate) struct StallGate {
     state: Mutex<GateState>,
@@ -170,6 +206,7 @@ impl StallGate {
             state: Mutex::new(GateState {
                 retry_at: None,
                 pause: Duration::ZERO,
+                reopened_at: None,
                 probing: false,
             }),
             open: AtomicBool::new(true),
@@ -201,46 +238,49 @@ impl StallGate {
     }
 
     fn close(&self, probe: bool, now: Instant, cost: RegionCost) {
-        let mut state = self.state.lock();
-        if probe {
-            state.probing = false;
-        } else if state.retry_at.is_some() {
-            // Another thread closed the gate first: one stall, one pause.
-            return;
-        }
-        state.pause = if state.pause.is_zero() {
-            FIRST_PAUSE
-        } else {
-            state.pause.saturating_mul(2).min(MAX_PAUSE)
+        let pause = {
+            let mut state = self.state.lock();
+            let lasted = if probe {
+                state.probing = false;
+                false
+            } else if state.retry_at.is_some() {
+                // Another thread closed the gate first: one stall, one pause.
+                return;
+            } else {
+                // The gate stayed open for at least its last pause.
+                state.reopened_at.is_none_or(|reopened| {
+                    now.saturating_duration_since(reopened) >= state.pause
+                })
+            };
+            state.pause = if state.pause.is_zero() || lasted {
+                FIRST_PAUSE
+            } else {
+                state.pause.saturating_mul(2).min(MAX_PAUSE)
+            };
+            state.retry_at = Some(now + state.pause);
+            self.open.store(false, Ordering::Relaxed);
+            state.pause
         };
-        state.retry_at = Some(now + state.pause);
-        self.open.store(false, Ordering::Relaxed);
         log::info!(
-            "join tables stop asking for 2 MiB pages for {:?}: backing one took \
-             {:?} of CPU time and {} page faults",
-            state.pause,
+            "join tables stop asking for 2 MiB pages for {pause:?}: backing one              took {:?} of CPU time and {} page faults",
             cost.cpu,
             cost.faults
         );
     }
 
-    fn reopen(&self) {
-        let mut state = self.state.lock();
-        state.probing = false;
-        state.retry_at = None;
-        self.open.store(true, Ordering::Relaxed);
+    fn reopen(&self, now: Instant) {
+        {
+            let mut state = self.state.lock();
+            state.probing = false;
+            state.retry_at = None;
+            state.reopened_at = Some(now);
+            self.open.store(true, Ordering::Relaxed);
+        }
         log::debug!("join tables ask for 2 MiB pages again");
     }
 
     fn release_probe(&self) {
         self.state.lock().probing = false;
-    }
-
-    fn wholly_backed(&self) {
-        let mut state = self.state.lock();
-        if state.retry_at.is_none() {
-            state.pause = Duration::ZERO;
-        }
     }
 }
 
@@ -274,15 +314,10 @@ impl Ticket<'_> {
         if stalled {
             self.gate.close(first_of_probe, now, cost);
         } else if first_of_probe {
-            self.gate.reopen();
+            self.gate.reopen(now);
         }
         self.reported = true;
         stalled
-    }
-
-    /// Reports that every region of the table was backed without a stall.
-    pub(crate) fn wholly_backed(self) {
-        self.gate.wholly_backed();
     }
 }
 
@@ -300,11 +335,11 @@ pub(crate) enum Backed {
     /// Every page is resident.
     Whole,
     /// The pages from this byte on are not resident and have no advice: the
-    /// gate closed, or a region stalled.
+    /// gate closed, a region stalled, or the kernel could not back a region.
     Until(usize),
-    /// The kernel refused to back pages (it has no `MADV_POPULATE_WRITE`
-    /// before Linux 5.14, or it is out of memory); the pages from this byte
-    /// on keep their advice and are allocated by their first write.
+    /// The pages from this byte on keep their advice and are allocated by
+    /// their first write: the kernel has no `MADV_POPULATE_WRITE` (before
+    /// Linux 5.14), or it refused to end the advice.
     Refused(usize),
 }
 
@@ -347,6 +382,56 @@ thread_local! {
 #[cfg(target_os = "linux")]
 static POPULATE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
+/// Backs the `len` bytes at `region` now and returns what that cost the
+/// calling thread (`None` when the thread's usage cannot be read), or the
+/// kernel's refusal.
+///
+/// # Safety
+///
+/// `region..region + len` must be page aligned and inside a private
+/// anonymous mapping that the caller owns.
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn back_region(
+    region: *mut u8,
+    len: usize,
+) -> std::io::Result<Option<RegionCost>> {
+    let before = thread_cost();
+    // SAFETY: by the caller's contract the range is inside its mapping. The
+    // advice allocates the pages of the range as writes would; it changes
+    // neither their contents nor their permissions.
+    if unsafe { libc::madvise(region.cast(), len, libc::MADV_POPULATE_WRITE) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(before.zip(thread_cost()).map(|(before, after)| RegionCost {
+        cpu: after.cpu.saturating_sub(before.cpu),
+        faults: after.faults.saturating_sub(before.faults),
+    }))
+}
+
+/// Ends the advice of `start + offset..start + bytes`, which stays unbacked.
+///
+/// # Safety
+///
+/// As [`back_mapping`], with `offset < bytes` page aligned.
+#[cfg(target_os = "linux")]
+unsafe fn end_advice(start: *mut u8, offset: usize, bytes: usize) -> Backed {
+    // SAFETY: by the caller's contract the range is inside its mapping and
+    // page aligned. The advice clears the huge-page flag of the range (and
+    // splits the mapping there); it changes no contents and no permission.
+    let ended = unsafe {
+        libc::madvise(
+            start.add(offset).cast(),
+            bytes - offset,
+            libc::MADV_NOHUGEPAGE,
+        )
+    } == 0;
+    if ended {
+        Backed::Until(offset)
+    } else {
+        Backed::Refused(offset)
+    }
+}
+
 /// Backs the advised mapping `start..start + bytes` now, one 2 MiB region at
 /// a time, so that no later write to it allocates a page. With a `ticket`,
 /// each whole region is measured and reported to its gate; at the first
@@ -371,37 +456,26 @@ pub(crate) unsafe fn back_mapping(
     }
     let mut offset = 0;
     while offset < bytes {
-        let len = HUGE_PAGE.min(bytes - offset);
-        // SAFETY: by the caller's contract `offset..bytes` is inside its
-        // mapping and page aligned. Neither advice changes the contents or
-        // the permissions of the pages: one backs them, the other clears the
-        // huge-page flag of the range.
-        let (refused, cost) = unsafe {
-            if ticket.as_ref().is_some_and(|ticket| !ticket.may_ask()) {
-                libc::madvise(
-                    start.add(offset).cast(),
-                    bytes - offset,
-                    libc::MADV_NOHUGEPAGE,
-                );
-                return Backed::Until(offset);
-            }
-            let before = thread_cost();
-            let refused =
-                (libc::madvise(start.add(offset).cast(), len, libc::MADV_POPULATE_WRITE)
-                    != 0)
-                    .then(std::io::Error::last_os_error);
-            let cost = before.zip(thread_cost()).map(|(before, after)| RegionCost {
-                cpu: after.cpu.saturating_sub(before.cpu),
-                faults: after.faults.saturating_sub(before.faults),
-            });
-            (refused, cost)
-        };
-        if let Some(error) = refused {
-            if error.raw_os_error() == Some(libc::EINVAL) {
-                POPULATE_UNSUPPORTED.store(true, Ordering::Relaxed);
-            }
-            return Backed::Refused(offset);
+        if ticket.as_ref().is_some_and(|ticket| !ticket.may_ask()) {
+            // SAFETY: `offset < bytes`, both page aligned, in the caller's
+            // mapping.
+            return unsafe { end_advice(start, offset, bytes) };
         }
+        let len = HUGE_PAGE.min(bytes - offset);
+        // SAFETY: `offset..offset + len` is inside the caller's mapping and
+        // page aligned: `offset` is a multiple of 2 MiB and `bytes` of the
+        // page size.
+        let cost = match unsafe { back_region(start.add(offset), len) } {
+            Ok(cost) => cost,
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+                POPULATE_UNSUPPORTED.store(true, Ordering::Relaxed);
+                return Backed::Refused(offset);
+            }
+            // Out of memory, or interrupted: the first writes decide, without
+            // the advice.
+            // SAFETY: as above.
+            Err(_) => return unsafe { end_advice(start, offset, bytes) },
+        };
         #[cfg(test)]
         let cost = match STALL_AT_REGION.get() {
             Some(region) => Some(RegionCost {
@@ -419,22 +493,13 @@ pub(crate) unsafe fn back_mapping(
             && let (Some(ticket), Some(cost)) = (ticket.as_mut(), cost)
             && ticket.region(cost, HUGE_PAGE / page, Instant::now())
         {
-            if offset < bytes {
-                // SAFETY: as above; `offset..bytes` is the rest of the
-                // mapping.
-                unsafe {
-                    libc::madvise(
-                        start.add(offset).cast(),
-                        bytes - offset,
-                        libc::MADV_NOHUGEPAGE,
-                    );
-                }
+            if offset == bytes {
+                return Backed::Whole;
             }
-            return Backed::Until(offset);
+            // SAFETY: `offset < bytes`, both page aligned, in the caller's
+            // mapping.
+            return unsafe { end_advice(start, offset, bytes) };
         }
-    }
-    if let Some(ticket) = ticket {
-        ticket.wholly_backed();
     }
     Backed::Whole
 }
@@ -486,15 +551,24 @@ mod tests {
             "always madvise [never]\n"
         )));
         assert!(!transparent_huge_pages_available(None));
-        // The process's mode: the variable's, or off without usable THP.
-        let thp =
-            std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").ok();
-        let expected = if transparent_huge_pages_available(thp.as_deref()) {
-            HugePageMode::from_env_value(std::env::var(HUGE_PAGES_ENV).ok().as_deref())
-        } else {
-            Off
-        };
-        assert_eq!(huge_page_mode(), expected);
+        // The automatic mode needs 2 MiB huge pages; the others only THP.
+        let (madvise, never) = (
+            Some("always [madvise] never\n"),
+            Some("always madvise [never]\n"),
+        );
+        assert!(huge_pages_are_2_mib(Some("2097152\n")));
+        assert!(huge_pages_are_2_mib(None));
+        assert!(!huge_pages_are_2_mib(Some("536870912\n")));
+        for mode in [Off, FirstTouch, Populate, Auto] {
+            assert_eq!(mode_on_host(mode, madvise, Some("2097152\n")), mode);
+            assert_eq!(mode_on_host(mode, madvise, None), mode);
+            assert_eq!(mode_on_host(mode, never, Some("2097152\n")), Off);
+            assert_eq!(mode_on_host(mode, None, None), Off);
+            assert_eq!(
+                mode_on_host(mode, madvise, Some("536870912\n")),
+                if mode == Auto { Off } else { mode }
+            );
+        }
     }
 
     #[test]
@@ -515,7 +589,7 @@ mod tests {
             }
             .stalled(512)
         );
-        // 64 KiB base pages: 32 to a region.
+        // The rule counts base pages of any size: here 32 to a region.
         assert!(RegionCost { faults: 32, ..HUGE }.stalled(32));
         // The CPU bound is exclusive.
         assert!(
@@ -576,26 +650,36 @@ mod tests {
             pause = (pause * 2).min(MAX_PAUSE);
         }
         assert_eq!(pause, MAX_PAUSE);
+    }
 
-        // A probe whose first region is huge reopens the gate, but the
-        // pause stays long until a table is wholly backed.
+    /// A gate that stalls again soon after a probe reopened it doubles its
+    /// pause; one that stayed open for at least its last pause starts over.
+    #[test]
+    fn a_stall_soon_after_a_reopening_doubles_the_pause() {
+        let gate = StallGate::new();
+        let mut now = Instant::now();
+        let step = Duration::from_nanos(1);
+        assert!(gate.admit(now).unwrap().region(BASE, 512, now));
+        let mut pause = FIRST_PAUSE;
+        // Each probe gets one huge page, and the next region stalls.
+        for _ in 0..3 {
+            now += pause;
+            let mut probe = gate.admit(now).expect("the pause is over");
+            assert!(!probe.region(HUGE, 512, now));
+            assert!(gate.is_open());
+            now += pause - step;
+            assert!(probe.region(BASE, 512, now));
+            pause *= 2;
+            assert!(gate.admit(now + pause - step).is_none());
+        }
+        assert_eq!(pause, 8 * FIRST_PAUSE);
+        // The gate reopens and stays open for the whole last pause.
         now += pause;
         let mut probe = gate.admit(now).expect("the pause is over");
         assert!(!probe.region(HUGE, 512, now));
-        assert!(probe.region(BASE, 512, now));
-        assert!(
-            gate.admit(now + MAX_PAUSE - Duration::from_nanos(1))
-                .is_none()
-        );
-        now += MAX_PAUSE;
-        let mut probe = gate.admit(now).expect("the pause is over");
-        assert!(!probe.region(HUGE, 512, now));
-        probe.wholly_backed();
+        now += pause;
         assert!(gate.admit(now).unwrap().region(BASE, 512, now));
-        assert!(
-            gate.admit(now + FIRST_PAUSE - Duration::from_nanos(1))
-                .is_none()
-        );
+        assert!(gate.admit(now + FIRST_PAUSE - step).is_none());
         assert!(gate.admit(now + FIRST_PAUSE).is_some());
     }
 
@@ -612,14 +696,5 @@ mod tests {
         assert!(gate.admit(after).is_none());
         assert!(!probe.region(HUGE, 512, after));
         assert!(gate.is_open());
-        // A table that was wholly backed while the gate is closed by another
-        // stall does not shorten the pause.
-        let mut open = gate.admit(after).unwrap();
-        let mut late = gate.admit(after).unwrap();
-        assert!(open.region(BASE, 512, after));
-        assert!(!late.region(HUGE, 512, after));
-        late.wholly_backed();
-        assert!(gate.admit(after + FIRST_PAUSE).is_none());
-        assert!(gate.admit(after + 2 * FIRST_PAUSE).is_some());
     }
 }

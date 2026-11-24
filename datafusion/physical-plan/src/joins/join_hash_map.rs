@@ -222,7 +222,7 @@ impl JoinHashMapU32 {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             table: HeadTable::with_capacity(cap),
-            next: zeroed_with_huge_pages(cap),
+            next: zeroed_chain(cap),
             chained: false,
         }
     }
@@ -266,6 +266,9 @@ impl JoinHashMapType for JoinHashMapU32 {
             iter.map(|(row, hash)| (row, *hash, 0)),
             row_bound,
             |row, prev| {
+                if !*chained {
+                    next.back_chain();
+                }
                 next[row - deleted_offset] = prev;
                 *chained = true;
             },
@@ -342,7 +345,7 @@ impl JoinHashMapInline {
         let layout = Self::layout_for(cap, &keys).expect("inline keys fit the slots");
         Self {
             table: HeadTable::with_layout(cap, layout),
-            next: zeroed_with_huge_pages(cap),
+            next: zeroed_chain(cap),
             chained: false,
             keys,
         }
@@ -471,7 +474,7 @@ impl JoinHashMapU64 {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             table: HeadTable::with_capacity(cap),
-            next: zeroed_with_huge_pages(cap),
+            next: zeroed_chain(cap),
             chained: false,
         }
     }
@@ -504,6 +507,9 @@ impl JoinHashMapType for JoinHashMapU64 {
             iter.map(|(row, hash)| (row, *hash, 0)),
             row_bound,
             |row, prev| {
+                if !*chained {
+                    next.back_chain();
+                }
                 next[row - deleted_offset] = prev;
                 *chained = true;
             },
@@ -827,7 +833,7 @@ const PREFETCH_DISTANCE: usize = 16;
 const HUGE_PAGE_BYTES: usize = 4 << 20;
 
 pub use crate::joins::huge_page_policy::{HUGE_PAGES_ENV, HugePageMode, huge_page_mode};
-use crate::joins::huge_page_policy::{STALL_GATE, StallGate};
+use crate::joins::huge_page_policy::{STALL_GATE, StallGate, Ticket};
 
 /// Longbow patch (JT 9): the bit fields of a [`PackedU64`] slot, chosen per
 /// table: `head_bits` for the largest head (row + 1) and `key_bits` for the
@@ -1432,6 +1438,9 @@ macro_rules! partitioned_build {
                 let chained = &mut self.chained;
                 let row_bound = next.len();
                 self.table.insert_partitioned(rows, row_bound, |row, prev| {
+                    if !*chained {
+                        next.back_chain();
+                    }
                     next[row] = prev;
                     *chained = true;
                 })
@@ -2143,6 +2152,20 @@ pub(crate) fn zeroed_with_huge_pages<T: ZeroedValue>(len: usize) -> ZeroedArray<
     vec![T::default(); len].into()
 }
 
+/// Longbow patch (JT 10): the zeroed chain array of a map for `len` rows. A
+/// chain is written only for rows whose hash already has a row, so a build
+/// with unique keys never touches it. Where a table would be backed when it
+/// is made, the chain is therefore mapped without advice and backed by its
+/// first write ([`ZeroedArray::back_chain`]); before that it takes no memory.
+pub(crate) fn zeroed_chain<T: ZeroedValue>(len: usize) -> ZeroedArray<T> {
+    if len.saturating_mul(size_of::<T>()) >= HUGE_PAGE_BYTES
+        && let Some(mapped) = ZeroedArray::chain_for_mode(len, huge_page_mode())
+    {
+        return mapped;
+    }
+    vec![T::default(); len].into()
+}
+
 /// Longbow patch (JT): the values a [`ZeroedArray`] holds.
 ///
 /// # Safety
@@ -2175,6 +2198,9 @@ pub struct ZeroedArray<T: ZeroedValue> {
     ptr: std::ptr::NonNull<T>,
     len: usize,
     owner: ArrayOwner<T>,
+    /// Longbow patch (JT 10): a mapped chain without advice that waits for
+    /// its first write ([`Self::back_chain`]).
+    unbacked_chain: bool,
 }
 
 enum ArrayOwner<T> {
@@ -2203,6 +2229,7 @@ impl<T: ZeroedValue> From<Vec<T>> for ZeroedArray<T> {
             ptr,
             len: values.len(),
             owner: ArrayOwner::Heap { _values: values },
+            unbacked_chain: false,
         }
     }
 }
@@ -2221,9 +2248,15 @@ impl<T: ZeroedValue> ZeroedArray<T> {
     /// base pages, and the resident bytes stay below the values' bytes plus
     /// one base page (the charge of the callers is the values' bytes).
     pub(crate) fn mapped(len: usize) -> Option<Self> {
+        Self::mapped_as(len, true)
+    }
+
+    /// Longbow patch (JT 10): [`Self::mapped`], or with `advise` unset the
+    /// same mapping without the advice: its first writes get base pages.
+    fn mapped_as(len: usize, advise: bool) -> Option<Self> {
         #[cfg(target_os = "linux")]
         {
-            const HUGE_PAGE: usize = 2 << 20;
+            use crate::joins::huge_page_policy::HUGE_PAGE;
             #[cfg(test)]
             if REFUSE_NEXT_MAPPING.with(|refuse| refuse.replace(false)) {
                 return None;
@@ -2275,7 +2308,7 @@ impl<T: ZeroedValue> ZeroedArray<T> {
                     libc::munmap(base.cast(), map_bytes);
                     return None;
                 }
-                if libc::madvise(start.cast(), used, libc::MADV_HUGEPAGE) != 0 {
+                if advise && libc::madvise(start.cast(), used, libc::MADV_HUGEPAGE) != 0 {
                     // No huge pages for this mapping: a `Vec` reuses the
                     // allocator's pages instead.
                     libc::munmap(start.cast(), used);
@@ -2292,11 +2325,12 @@ impl<T: ZeroedValue> ZeroedArray<T> {
                     base: start,
                     bytes: used,
                 },
+                unbacked_chain: false,
             })
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = len;
+            let _ = (len, advise);
             None
         }
     }
@@ -2322,11 +2356,18 @@ impl<T: ZeroedValue> ZeroedArray<T> {
             HugePageMode::Auto => Some(gate.admit(std::time::Instant::now())?),
         };
         let mapped = Self::mapped(len)?;
+        mapped.back(ticket);
+        Some(mapped)
+    }
+
+    /// Backs the advised mapping of this array now
+    /// ([`back_mapping`](crate::joins::huge_page_policy::back_mapping)).
+    fn back(&self, ticket: Option<Ticket<'_>>) {
         #[cfg(target_os = "linux")]
-        if let ArrayOwner::Mapped { base, bytes } = mapped.owner {
-            // SAFETY: `base..base + bytes` is the mapping that `mapped`
+        if let ArrayOwner::Mapped { base, bytes } = self.owner {
+            // SAFETY: `base..base + bytes` is the mapping that `mapped_as`
             // made for this array alone: private, anonymous, 2 MiB aligned
-            // and a whole number of base pages.
+            // and a whole number of base pages, whose size it validated.
             unsafe {
                 let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
                 crate::joins::huge_page_policy::back_mapping(
@@ -2339,7 +2380,65 @@ impl<T: ZeroedValue> ZeroedArray<T> {
         }
         #[cfg(not(target_os = "linux"))]
         drop(ticket);
-        Some(mapped)
+    }
+
+    /// Longbow patch (JT 10): a chain of `len` zeroed values in its own
+    /// mapping as `mode` makes it, or `None` for a heap array.
+    /// [`HugePageMode::FirstTouch`] advises it, as for any array. The modes
+    /// that back a table when it is made leave a chain without advice and
+    /// unbacked until [`Self::back_chain`].
+    pub(crate) fn chain_for_mode(len: usize, mode: HugePageMode) -> Option<Self> {
+        match mode {
+            HugePageMode::Off => None,
+            HugePageMode::FirstTouch => Self::mapped(len),
+            HugePageMode::Populate | HugePageMode::Auto => {
+                let mut chain = Self::mapped_as(len, false)?;
+                chain.unbacked_chain = true;
+                Some(chain)
+            }
+        }
+    }
+
+    /// Longbow patch (JT 10): called before the first write to a chain.
+    /// Advises and backs a chain that waited for it, as the process's mode
+    /// and its stall gate allow.
+    #[inline(always)]
+    pub(crate) fn back_chain(&mut self) {
+        if self.unbacked_chain {
+            self.back_chain_for(huge_page_mode(), &STALL_GATE);
+        }
+    }
+
+    /// [`Self::back_chain`] for `mode` and `gate`: all of the chain in
+    /// [`HugePageMode::Populate`]; in [`HugePageMode::Auto`] as far as
+    /// `gate` allows, and nothing while it is closed (the chain then gets
+    /// base pages at its writes).
+    #[cold]
+    pub(crate) fn back_chain_for(&mut self, mode: HugePageMode, gate: &StallGate) {
+        if !std::mem::take(&mut self.unbacked_chain) {
+            return;
+        }
+        let ticket = match mode {
+            HugePageMode::Populate => None,
+            HugePageMode::Auto => match gate.admit(std::time::Instant::now()) {
+                Some(ticket) => Some(ticket),
+                None => return,
+            },
+            HugePageMode::Off | HugePageMode::FirstTouch => return,
+        };
+        #[cfg(target_os = "linux")]
+        if let ArrayOwner::Mapped { base, bytes } = self.owner {
+            // SAFETY: the mapping of this array (see `back`); the advice
+            // sets a flag on it and changes no contents and no permission.
+            let advised = unsafe {
+                libc::madvise(base.as_ptr().cast(), bytes, libc::MADV_HUGEPAGE) == 0
+            };
+            if advised {
+                self.back(ticket);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        drop(ticket);
     }
 
     /// Whether the values live in their own mapping.
@@ -2885,6 +2984,13 @@ mod tests {
         )
     }
 
+    /// The base page size.
+    #[cfg(target_os = "linux")]
+    fn page_size() -> usize {
+        // SAFETY: `sysconf` only reads a system constant.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+
     /// Whether the host's kernel has usable transparent huge pages.
     fn thp_available() -> bool {
         std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
@@ -3019,14 +3125,11 @@ mod tests {
         }
         map.table.words.fill(1);
         map.next.fill(1);
-        let arrays = [
-            map.table.words.as_ptr() as usize,
-            map.next.as_ptr() as usize,
-        ];
-        let resident: usize = mappings()
+        // Every mapping of both arrays: a stalled region splits one in two.
+        let resident: usize = backing(&map.table.words)
             .into_iter()
-            .filter(|(low, high, _, _)| arrays.iter().any(|ptr| low <= ptr && ptr < high))
-            .map(|(_, _, _, rss)| rss)
+            .chain(backing(&map.next))
+            .map(|(rss, _)| rss)
             .sum();
         let reserved = JoinHashMapU32::reservation_bytes(rows)?;
         assert_eq!(
@@ -3071,7 +3174,7 @@ mod tests {
             .into_iter()
             .filter(|(low, high, _, _)| *low < end && start < *high)
             .map(|(low, high, flags, rss)| {
-                assert!(start <= low && high <= end.next_multiple_of(4096));
+                assert!(start <= low && high <= end.next_multiple_of(page_size()));
                 (rss, flags)
             })
             .collect()
@@ -3092,7 +3195,7 @@ mod tests {
             return;
         }
         let gate = StallGate::new();
-        let bytes = (9 << 20) + 8192;
+        let bytes = (9 << 20) + 2 * page_size();
         let len = bytes / size_of::<u64>();
         assert!(ZeroedArray::<u64>::for_mode(len, HugePageMode::Off, &gate).is_none());
 
@@ -3125,13 +3228,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_stalled_region_ends_the_advice_and_closes_the_gate() {
-        use crate::joins::huge_page_policy::STALL_AT_REGION;
+        use crate::joins::huge_page_policy::{RegionCost, STALL_AT_REGION};
         if !thp_available() {
             return;
         }
         const REGION: usize = 2 << 20;
         let gate = StallGate::new();
-        let bytes = 5 * REGION + 4096;
+        let bytes = 5 * REGION + page_size();
         let len = bytes / size_of::<u32>();
 
         // No region stalls: the whole table is resident and advised.
@@ -3163,12 +3266,20 @@ mod tests {
         let parts = backing(&partial);
         assert_eq!(parts.iter().map(|(rss, _)| rss).sum::<usize>(), bytes);
 
-        // While the gate is closed, tables use the heap and ask nothing.
+        // While a gate is closed, tables use the heap and ask nothing. This
+        // gate is closed until an hour from now, whatever the test's pace.
         STALL_AT_REGION.set(Some(usize::MAX));
-        assert!(ZeroedArray::<u32>::for_mode(len, HugePageMode::Auto, &gate).is_none());
+        let closed = StallGate::new();
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let base_pages = RegionCost {
+            cpu: std::time::Duration::ZERO,
+            faults: 512,
+        };
+        assert!(closed.admit(later).unwrap().region(base_pages, 512, later));
+        assert!(ZeroedArray::<u32>::for_mode(len, HugePageMode::Auto, &closed).is_none());
         // The modes without the gate are not affected.
         assert!(
-            ZeroedArray::<u32>::for_mode(len, HugePageMode::Populate, &gate).is_some()
+            ZeroedArray::<u32>::for_mode(len, HugePageMode::Populate, &closed).is_some()
         );
 
         // Both parts of the mapping go with the array.
@@ -3214,7 +3325,7 @@ mod tests {
             crate::joins::huge_page_policy::back_mapping(
                 base.as_ptr(),
                 bytes,
-                4096,
+                page_size(),
                 Some(ticket),
             )
         };
@@ -3223,6 +3334,147 @@ mod tests {
         assert_eq!(parts.len(), 1, "{parts:?}");
         assert_eq!(parts[0].0, 0);
         assert!(has_flag(&parts[0].1, "nh"));
+    }
+
+    /// JT 10 (leto-o7z0): what the stall rule reads from the kernel. A region
+    /// that the kernel backs with base pages costs the calling thread one
+    /// minor fault per base page, which the rule counts as a stall; backing
+    /// it again costs no such faults.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_region_of_base_pages_costs_a_fault_per_page() {
+        use crate::joins::huge_page_policy::{HUGE_PAGE, back_region};
+        // A mapping without advice gets base pages where THP is `madvise`.
+        let enabled =
+            std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+                .unwrap_or_default();
+        if !enabled.contains("[madvise]") {
+            return;
+        }
+        let len = (3 * HUGE_PAGE) / size_of::<u64>();
+        let values = ZeroedArray::<u64>::mapped_as(len, false).expect("mapped");
+        let pages = (HUGE_PAGE / page_size()) as u64;
+        let region = values.as_ptr() as *mut u8;
+        // SAFETY: the first 2 MiB of the mapping of `values`, which this
+        // test owns.
+        let cost = unsafe { back_region(region, HUGE_PAGE) }
+            .expect("backed")
+            .expect("thread usage");
+        // One fault per base page, and a few of the thread's own.
+        assert!((pages..pages + 64).contains(&cost.faults), "{cost:?}");
+        assert!(cost.stalled(pages as usize));
+        assert_eq!(backing(&values)[0].0, HUGE_PAGE);
+        // SAFETY: as above.
+        let again = unsafe { back_region(region, HUGE_PAGE) }
+            .expect("backed")
+            .expect("thread usage");
+        assert!(again.faults < 64, "{again:?}");
+        assert!(!again.stalled(pages as usize));
+        assert!(values.iter().all(|value| *value == 0));
+    }
+
+    /// JT 10 (leto-o7z0): a chain is written only for rows whose hash
+    /// already has a row. Where tables are backed when made, a chain is
+    /// mapped without advice and takes no memory until its first write,
+    /// which advises and backs it as the mode and the gate allow.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_chain_is_backed_by_its_first_write() {
+        use crate::joins::huge_page_policy::{RegionCost, STALL_AT_REGION};
+        if !thp_available() {
+            return;
+        }
+        let bytes = (6 << 20) + page_size();
+        let len = bytes / size_of::<u32>();
+        assert!(ZeroedArray::<u32>::chain_for_mode(len, HugePageMode::Off).is_none());
+        let lazy = ZeroedArray::<u32>::chain_for_mode(len, HugePageMode::FirstTouch)
+            .expect("mapped");
+        assert!(has_flag(&backing(&lazy)[0].1, "hg") && !lazy.unbacked_chain);
+
+        let open = StallGate::new();
+        let closed = StallGate::new();
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let base_pages = RegionCost {
+            cpu: std::time::Duration::ZERO,
+            faults: 512,
+        };
+        assert!(closed.admit(later).unwrap().region(base_pages, 512, later));
+        STALL_AT_REGION.set(Some(usize::MAX));
+        for (mode, gate, backed) in [
+            (HugePageMode::Populate, &open, true),
+            (HugePageMode::Populate, &closed, true),
+            (HugePageMode::Auto, &open, true),
+            (HugePageMode::Auto, &closed, false),
+        ] {
+            let mut chain =
+                ZeroedArray::<u32>::chain_for_mode(len, mode).expect("mapped");
+            let parts = backing(&chain);
+            assert_eq!(parts.len(), 1, "{mode:?} {parts:?}");
+            assert_eq!(parts[0].0, 0, "{mode:?}");
+            assert!(!has_flag(&parts[0].1, "hg"), "{mode:?}");
+            assert!(chain.unbacked_chain);
+
+            chain.back_chain_for(mode, gate);
+            assert!(!chain.unbacked_chain);
+            let parts = backing(&chain);
+            assert_eq!(parts.len(), 1, "{mode:?} {parts:?}");
+            assert_eq!(parts[0].0, if backed { bytes } else { 0 }, "{mode:?}");
+            assert_eq!(has_flag(&parts[0].1, "hg"), backed, "{mode:?}");
+            // Once is enough: a second call changes nothing.
+            chain.back_chain_for(mode, gate);
+            assert_eq!(backing(&chain), parts);
+            assert!(chain.iter().all(|value| *value == 0));
+            chain[len - 1] = 5;
+            assert_eq!(chain[len - 1], 5);
+        }
+        STALL_AT_REGION.set(None);
+        assert!(open.is_open() && !closed.is_open());
+    }
+
+    /// JT 10 (leto-o7z0): the chain of a build with unique hashes stays
+    /// unbacked; the first row whose hash has a row backs it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_unique_build_leaves_its_chain_unbacked() {
+        let rows = (1 << 20) + 7;
+        let hashes: Vec<u64> = (0..rows as u64)
+            .map(|h| h.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        let mut map = JoinHashMapU32::with_capacity(rows);
+        let deferred = map.next.unbacked_chain;
+        assert_eq!(
+            deferred,
+            map.next.is_mapped()
+                && matches!(
+                    huge_page_mode(),
+                    HugePageMode::Populate | HugePageMode::Auto
+                )
+        );
+        map.update_from_iter(Box::new(hashes.iter().enumerate().take(rows - 1)), 0)
+            .unwrap();
+        assert!(!map.chained);
+        assert_eq!(map.next.unbacked_chain, deferred);
+        if map.next.is_mapped() {
+            // Nothing was written to the chain, in any mode.
+            assert_eq!(
+                backing(&map.next).iter().map(|(rss, _)| rss).sum::<usize>(),
+                0
+            );
+        }
+        // The last row repeats the hash of row 0.
+        let repeated = [hashes[0]];
+        map.update_from_iter(Box::new(std::iter::once((rows - 1, &repeated[0]))), 0)
+            .unwrap();
+        assert!(map.chained && !map.next.unbacked_chain);
+        assert_eq!(map.next[rows - 1], 1);
+        assert!(map.next[..rows - 1].iter().all(|next| *next == 0));
+        if deferred && huge_page_mode() == HugePageMode::Populate {
+            let chain_bytes = (rows * size_of::<u32>()).next_multiple_of(page_size());
+            assert_eq!(
+                backing(&map.next).iter().map(|(rss, _)| rss).sum::<usize>(),
+                chain_bytes
+            );
+        }
     }
 
     /// Review S4 (leto-mjj.61): tables dropped after a full build, after a
