@@ -276,11 +276,14 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
                     break;
                 }
 
-                // 3.3. if there is enough to emit for a full record batch
+                // 3.3. if there is enough to emit for a full record batch, or
+                // the consumed input batches that only pending rows keep take
+                // more memory than the live heads
                 if self.in_progress.len() >= self.batch_size
                     || self
                         .max_batch_bytes
                         .is_some_and(|max_bytes| self.in_progress_bytes >= max_bytes)
+                    || self.in_progress.retains_more_than_heads()
                 {
                     // 3.3.1 build pending record batch and reset builder
                     let Some(batch) = self.emit_in_progress_batch()? else {

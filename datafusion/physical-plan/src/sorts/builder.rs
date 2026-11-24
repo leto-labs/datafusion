@@ -13,6 +13,11 @@ use datafusion_execution::memory_pool::MemoryReservation;
 use log::warn;
 use std::sync::Arc;
 
+/// The memory that input batches kept only for pending output rows may
+/// take before [`BatchBuilder::retains_more_than_heads`] asks for an early
+/// batch, when the live heads and the initial reservation are smaller.
+pub const RETAINED_FLOOR_BYTES: usize = 1 << 20;
+
 #[derive(Debug, Copy, Clone)]
 struct BatchCursor {
     /// The index into BatchBuilder::batches
@@ -60,6 +65,14 @@ pub struct BatchBuilder {
     /// The current [`BatchCursor`] for each stream
     cursors: Vec<BatchCursor>,
 
+    /// The memory size of each stream's cursor batch (its head), or 0 once
+    /// that batch is released
+    head_sizes: Vec<usize>,
+
+    /// The sum of `head_sizes`: the part of `batches_mem_used` that the
+    /// merge needs whatever rows are pending
+    heads_mem_used: usize,
+
     /// The accumulated stream indexes from which to pull rows
     /// Consists of a tuple of `(batch_idx, row_idx)`
     indices: Vec<(usize, usize)>,
@@ -78,6 +91,8 @@ impl BatchBuilder {
             schema,
             batches: Vec::with_capacity(stream_count * 2),
             cursors: vec![BatchCursor::RELEASED; stream_count],
+            head_sizes: vec![0; stream_count],
+            heads_mem_used: 0,
             indices: Vec::with_capacity(batch_size),
             reservation,
             batches_mem_used: 0,
@@ -93,6 +108,10 @@ impl BatchBuilder {
         // usage exceeds the current reservation (which may include
         // pre-reserved bytes from sort_spill_reservation_bytes).
         try_grow_reservation_to_at_least(&mut self.reservation, self.batches_mem_used)?;
+        // The stream's previous batch, if still retained, is now kept only
+        // for its pending rows.
+        self.heads_mem_used = self.heads_mem_used - self.head_sizes[stream_idx] + size;
+        self.head_sizes[stream_idx] = size;
         let batch_idx = self.batches.len();
         self.batches.push((stream_idx, batch));
         self.cursors[stream_idx] = BatchCursor {
@@ -121,6 +140,27 @@ impl BatchBuilder {
     /// Returns the number of in-progress rows in this [`BatchBuilder`]
     pub fn len(&self) -> usize {
         self.indices.len()
+    }
+
+    /// Returns `true` if the batches retained only for pending rows, those
+    /// that are no longer a stream's cursor batch, take more memory than the
+    /// largest of the cursor batches (the live heads), the initial
+    /// reservation and [`RETAINED_FLOOR_BYTES`].
+    ///
+    /// A merge that waits for `batch_size` rows otherwise retains every
+    /// consumed input batch until then. Small batches with large buffers,
+    /// such as a Parquet reader's decode of small row groups, then hold far
+    /// more memory than their rows: 7-row batches with 64 KiB buffers made
+    /// an 8,192-row output hold about 1,170 batches. Emitting when this
+    /// returns `true` keeps the retained memory below the heads, plus that
+    /// limit, plus one batch. Merges of compact batches stay below the floor
+    /// and keep emitting `batch_size` rows.
+    pub fn retains_more_than_heads(&self) -> bool {
+        let limit = self
+            .heads_mem_used
+            .max(self.initial_reservation)
+            .max(RETAINED_FLOOR_BYTES);
+        self.batches_mem_used - self.heads_mem_used > limit
     }
 
     /// Returns `true` if this [`BatchBuilder`] contains no in-progress rows
@@ -200,6 +240,8 @@ impl BatchBuilder {
             } else {
                 if is_cursor_batch {
                     *stream_cursor = BatchCursor::RELEASED;
+                    self.heads_mem_used -=
+                        std::mem::take(&mut self.head_sizes[*stream_idx]);
                 }
                 self.batches_mem_used -= get_record_batch_memory_size(batch);
             }
@@ -241,10 +283,13 @@ impl BatchBuilder {
         for (batch_idx, _) in &mut self.indices {
             *batch_idx = remap[*batch_idx];
         }
-        for cursor in &mut self.cursors {
+        for (cursor, head_size) in self.cursors.iter_mut().zip(&mut self.head_sizes) {
             if let Some(new_idx) = remap.get(cursor.batch_idx) {
                 // `usize::MAX` means the cursor's batch was released.
                 cursor.batch_idx = *new_idx;
+                if *new_idx == usize::MAX {
+                    self.heads_mem_used -= std::mem::take(head_size);
+                }
             }
         }
     }
