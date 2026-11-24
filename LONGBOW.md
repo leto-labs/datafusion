@@ -754,8 +754,7 @@ stay below the charged bytes plus one base page. Smaller arrays, other
 targets, a refused mapping or a refused advice use a `Vec`, as do kernels
 whose THP mode is `never` or that have no THP. The advice is on unless
 `LONGBOW_JOIN_TABLE_HUGE_PAGES` is `off`, `0`, `false`, `no` or `disabled`
-(any case). JT 10 adds the values `auto` and `populate` and changes what an
-unset variable means. `ZeroedValue` is an `unsafe trait`: its zero bit
+(any case). JT 10 adds the values `auto` and `populate`. `ZeroedValue` is an `unsafe trait`: its zero bit
 pattern must be a valid value.
 
 Host dependency: with the advice on, the first touch of an advised table can
@@ -919,9 +918,9 @@ and 475 of 512 regions still got base pages; a free huge page takes 0.1 ms.
 | Value | Arrays from 4 MiB on |
 | --- | --- |
 | `off`, `0`, `false`, `no`, `disabled` | Heap, no advice. |
-| `on`, `1`, `true`, `yes`, `enabled` | JT 6: own mapping, advised, allocated by its first writes. |
+| `on`, `1`, `true`, `yes`, `enabled`, unset, empty | JT 6: own mapping, advised, allocated by its first writes. The default. |
 | `populate` | Own mapping, advised, and every whole 2 MiB region backed when the array is made. A diagnostic: the advice without the stall rule. |
-| `auto`, unset, empty | As `populate` while regions get free huge pages; heap while they do not. |
+| `auto` | As `populate` while regions get free huge pages; heap while they do not. Opt-in. |
 
 An unrecognized value warns and selects the default. Where THP is `never` or
 absent every mode is off; `auto` is also off where the kernel's huge pages are
@@ -947,8 +946,8 @@ is mapped without advice and is advised and backed by its first write
 
 Measured on worker-01 (Linux 7.0, THP and defrag `madvise`), SF100, 24 threads
 on one NUMA node with memory bound to it, `auto` against `on` in one
-executable (fork `731856a49`), ABBA of fresh processes, three timed
-iterations, every answer verified
+executable (fork `731856a49`, where `auto` was the default), ABBA of fresh
+processes, three timed iterations, every answer verified
 (`~/data/longbow/benchmarks/JOIN-THP-ADVISE-20261124/HANDOFF.md`):
 
 | Condition of the node | TPC-H, 22 queries | TPC-DS, 99 queries | TPC-H Q9 |

@@ -15,7 +15,7 @@
 //! bound by memory bandwidth. A region that compacts costs 2 to 5 ms at the
 //! median and up to 340 ms, and nine of ten still get base pages.
 //!
-//! The default mode therefore backs an advised mapping when it is made, one
+//! The automatic mode therefore backs an advised mapping when it is made, one
 //! 2 MiB region at a time, and measures each region in the calling thread. A
 //! region is backed by one write to its first byte: the kernel then allocates
 //! the huge page, or one base page when it has none. A second write, to the
@@ -71,41 +71,41 @@ pub enum HugePageMode {
     Off,
     /// In their own mapping, advised before the first write (JT 6). Each
     /// 2 MiB region is allocated by its first write, with the host's
-    /// compaction in the writing thread.
+    /// compaction in the writing thread. The default.
     FirstTouch,
     /// In their own mapping, advised and backed when it is made, whatever
     /// that costs. A diagnostic: it measures the advice without the gate.
     Populate,
     /// As [`Self::Populate`] while huge pages are free, and on the heap
-    /// while they are not ([`StallGate`]). The default.
+    /// while they are not ([`StallGate`]). Opt-in.
     Auto,
 }
 
 impl HugePageMode {
-    /// The mode of a value of [`HUGE_PAGES_ENV`]: unset, empty or `auto` is
-    /// [`Self::Auto`]; `on`, `1`, `true`, `yes` or `enabled` is
-    /// [`Self::FirstTouch`]; `off`, `0`, `false`, `no` or `disabled` is
-    /// [`Self::Off`]; `populate` is [`Self::Populate`] (any case). Any other
-    /// value is [`Self::Auto`], with a warning.
+    /// The mode of a value of [`HUGE_PAGES_ENV`]: unset, empty, `on`, `1`,
+    /// `true`, `yes` or `enabled` is [`Self::FirstTouch`]; `off`, `0`,
+    /// `false`, `no` or `disabled` is [`Self::Off`]; `auto` is
+    /// [`Self::Auto`]; `populate` is [`Self::Populate`] (any case). Any
+    /// other value is [`Self::FirstTouch`], with a warning.
     pub(crate) fn from_env_value(value: Option<&str>) -> Self {
         let Some(value) = value.map(str::trim) else {
-            return Self::Auto;
+            return Self::FirstTouch;
         };
         let is = |words: &[&str]| words.iter().any(|w| value.eq_ignore_ascii_case(w));
         if is(&["off", "0", "false", "no", "disabled"]) {
             Self::Off
-        } else if is(&["on", "1", "true", "yes", "enabled"]) {
+        } else if value.is_empty() || is(&["on", "1", "true", "yes", "enabled"]) {
             Self::FirstTouch
         } else if is(&["populate"]) {
             Self::Populate
-        } else if value.is_empty() || is(&["auto"]) {
+        } else if is(&["auto"]) {
             Self::Auto
         } else {
             log::warn!(
                 "{HUGE_PAGES_ENV}={value:?} is not recognized; join tables use \
-                 the default (use auto, on, off or populate)"
+                 the default (use on, off, auto or populate)"
             );
-            Self::Auto
+            Self::FirstTouch
         }
     }
 }
@@ -518,16 +518,19 @@ mod tests {
                 ][..],
                 Off,
             ),
-            (&["on", "ON", "1", "true", "yes", "enabled"][..], FirstTouch),
-            (&["populate", " Populate "][..], Populate),
             // Unrecognized values warn and use the default.
-            (&["", "auto", "AUTO", "maybe"][..], Auto),
+            (
+                &["", "on", "ON", "1", "true", "yes", "enabled", "maybe"][..],
+                FirstTouch,
+            ),
+            (&["populate", " Populate "][..], Populate),
+            (&["auto", "AUTO", " auto "][..], Auto),
         ] {
             for value in values {
                 assert_eq!(HugePageMode::from_env_value(Some(value)), mode, "{value:?}");
             }
         }
-        assert_eq!(HugePageMode::from_env_value(None), Auto);
+        assert_eq!(HugePageMode::from_env_value(None), FirstTouch);
         assert!(transparent_huge_pages_available(Some(
             "always [madvise] never\n"
         )));
