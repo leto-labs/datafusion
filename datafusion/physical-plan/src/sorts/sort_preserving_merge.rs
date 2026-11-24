@@ -1021,15 +1021,9 @@ mod tests {
     ///
     /// Note: If you adjust constants in this test, ensure that memory usage differs
     /// based on whether the tie breaker is enabled or disabled.
-    ///
-    /// The batch size is that of the success test and of the input batches
-    /// (it was 8,192). The merge then asks for its next input batch right
-    /// after it emits, with no pending rows, so the pool's refusal stands.
-    /// With 8,192 rows the merge has pending rows at that point: it emits
-    /// them, which releases its consumed batch, and completes (family MRB).
     #[tokio::test(flavor = "multi_thread")]
     async fn test_round_robin_tie_breaker_fail() -> Result<()> {
-        let task_ctx = generate_task_ctx_for_round_robin_tie_breaker(12500)?;
+        let task_ctx = generate_task_ctx_for_round_robin_tie_breaker(8192)?;
         let spm = generate_spm_for_round_robin_tie_breaker(false)?;
         let _err = collect(spm, task_ctx).await.unwrap_err();
         Ok(())
@@ -1152,10 +1146,14 @@ mod tests {
     /// Two inputs of 64-row zero-copy slices of one 131,072-row batch each
     /// (a 1 MiB buffer per column). Every slice references its parent's
     /// buffers, so the batches a merge retains hold 4 MiB however many
-    /// slices are pending. Charging each slice for the whole parent buffer
-    /// counted 2 MiB for every retained slice: the merge emitted an output
-    /// every few slices and still asked the pool for more than the 8 MiB
-    /// that this merge fits with its cursors.
+    /// slices are pending. Reserving the whole parent for each slice asked
+    /// the pool for 2 MiB with every retained slice, and for more than the
+    /// 8 MiB that this merge fits with its cursors.
+    ///
+    /// The merge reserves each buffer once and still emits by the slices'
+    /// own sizes, as it did when it reserved them: a slice counts 2 MiB
+    /// toward the retention bound, so an output holds a few slices, not
+    /// 8,192 rows. The reservation is then never above the earlier one.
     #[tokio::test]
     async fn merge_of_slices_charges_a_shared_buffer_once() -> Result<()> {
         use arrow::array::AsArray;
@@ -1194,8 +1192,9 @@ mod tests {
 
         let batches = collect(merge, Arc::clone(&task_ctx)).await?;
 
-        let rows: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
-        assert_eq!(rows, vec![8192; 2 * ROWS as usize / 8192]);
+        // Outputs of a few slices: the per-slice sizes pass the bound early.
+        let largest = batches.iter().map(RecordBatch::num_rows).max();
+        assert!(largest < Some(16 * SLICE), "{largest:?}");
         let keys: Vec<i64> = batches
             .iter()
             .flat_map(|batch| {
@@ -1213,65 +1212,90 @@ mod tests {
 
     /// One input brings a batch with its own 768 KiB buffer, two slices
     /// that share another 768 KiB buffer, and a 3 MiB batch; the pool has
-    /// 4 MiB. The 1.5 MiB that the first three batches retain is below the
-    /// retention bound, so nothing is emitted before the 3 MiB batch
-    /// arrives, and the pool refuses it. The merge must then emit its
-    /// pending rows, which releases the consumed batches, and admit the
-    /// batch. (A merge that charged the shared buffer once for each slice
-    /// passed the bound earlier and emitted by accident.)
+    /// 4 MiB. By their own sizes the first three batches take 2.25 MiB,
+    /// which passes the retention bound with the second slice: the merge
+    /// emits rows 0 to 2 and releases the first two buffers before the
+    /// 3 MiB batch arrives. A bound on distinct buffers saw 1.5 MiB,
+    /// emitted nothing, and the pool refused the 3 MiB batch.
     #[tokio::test]
-    async fn merge_emits_pending_rows_before_it_refuses_a_batch() -> Result<()> {
-        let rows = merge_with_a_refused_batch(None).await?;
-        // The rows before the refused batch, then the rest.
+    async fn merge_with_a_shared_buffer_emits_by_the_batches_own_sizes() -> Result<()> {
+        const MIB: usize = 1 << 20;
+        let word = size_of::<i64>();
+        let rows = merge_first_shared_shared_wide(
+            4 * MIB,
+            [
+                (word, 3 * MIB / 4),
+                (2 * word, 3 * MIB / 4),
+                (word, 3 * MIB),
+            ],
+        )
+        .await?;
         assert_eq!(rows, vec![vec![0, 1, 2], vec![3, 4]]);
         Ok(())
     }
 
-    /// As above, with a limit that ends the merge at the first row after
-    /// the refused batch: the rows emitted to admit it must not be lost.
+    /// As above in a 2,400 KiB pool, where the last batch of the input has
+    /// a 1 MiB sort key. The cursor of the merge reserves that key before
+    /// the merge reserves the batch, so only an emission before the batch
+    /// arrives leaves room for it: the merge must not hold more between
+    /// emissions than it did when it reserved every slice's buffers.
     #[tokio::test]
-    async fn merge_with_a_limit_keeps_the_rows_it_emitted_for_a_refused_batch()
-    -> Result<()> {
-        let rows = merge_with_a_refused_batch(Some(4)).await?;
-        assert_eq!(rows, vec![vec![0, 1, 2], vec![3]]);
+    async fn merge_with_a_shared_buffer_leaves_room_for_the_next_sort_key() -> Result<()>
+    {
+        const KIB: usize = 1 << 10;
+        let word = size_of::<i64>();
+        let rows = merge_first_shared_shared_wide(
+            2400 * KIB,
+            [(word, 768 * KIB), (2 * word, 768 * KIB), (1024 * KIB, word)],
+        )
+        .await?;
+        assert_eq!(rows, vec![vec![0, 1, 2], vec![3, 4]]);
         Ok(())
     }
 
-    /// The keys of each output batch of the merge that
-    /// `merge_emits_pending_rows_before_it_refuses_a_batch` describes.
-    async fn merge_with_a_refused_batch(fetch: Option<usize>) -> Result<Vec<Vec<i64>>> {
+    /// The keys of each output batch of a merge in a pool of `limit` bytes.
+    /// One input has a batch with key 0, the two one-row slices of a batch
+    /// with keys 1 and 2, and a batch with key 3; the other has key 4.
+    /// `capacities` gives the key and payload buffer sizes of the first
+    /// input's three batches.
+    async fn merge_first_shared_shared_wide(
+        limit: usize,
+        capacities: [(usize, usize); 3],
+    ) -> Result<Vec<Vec<i64>>> {
         use arrow::array::AsArray;
         use arrow::datatypes::Int64Type;
 
-        const MIB: usize = 1 << 20;
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
         ]));
-        let batch = |keys: &[i64], capacity: usize| {
-            let mut payload = Vec::with_capacity(capacity / size_of::<i64>());
-            payload.extend_from_slice(keys);
-            let columns: Vec<ArrayRef> = vec![
-                Arc::new(Int64Array::from(keys.to_vec())),
-                Arc::new(Int64Array::from(payload)),
-            ];
-            RecordBatch::try_new(Arc::clone(&schema), columns)
+        let column = |values: &[i64], capacity: usize| {
+            let mut buffer = Vec::with_capacity(capacity / size_of::<i64>());
+            buffer.extend_from_slice(values);
+            Arc::new(Int64Array::from(buffer)) as ArrayRef
         };
-        let shared = batch(&[1, 2], 3 * MIB / 4)?;
+        let batch = |keys: &[i64], (key, payload): (usize, usize)| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![column(keys, key), column(keys, payload)],
+            )
+        };
+        let word = size_of::<i64>();
+        let shared = batch(&[1, 2], capacities[1])?;
         let first = vec![
-            batch(&[0], 3 * MIB / 4)?,
+            batch(&[0], capacities[0])?,
             shared.slice(0, 1),
             shared.slice(1, 1),
-            batch(&[3], 3 * MIB)?,
+            batch(&[3], capacities[2])?,
         ];
         drop(shared);
-        let second = vec![batch(&[4], size_of::<i64>())?];
+        let second = vec![batch(&[4], (word, word))?];
         let input =
             TestMemoryExec::try_new_exec(&[first, second], Arc::clone(&schema), None)?;
         let sort = [PhysicalSortExpr::new_default(col("k", &schema)?)].into();
-        let merge = Arc::new(SortPreservingMergeExec::new(sort, input).with_fetch(fetch));
+        let merge = Arc::new(SortPreservingMergeExec::new(sort, input));
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_limit(4 * MIB, 1.0)
+            .with_memory_limit(limit, 1.0)
             .build_arc()?;
         let task_ctx = Arc::new(TaskContext::default().with_runtime(runtime));
 

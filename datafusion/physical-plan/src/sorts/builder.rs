@@ -54,17 +54,16 @@ pub struct BatchBuilder {
     /// starvation when concurrent sort partitions compete for pool memory.
     reservation: MemoryReservation,
 
-    /// Tracks the actual memory used by buffered batches (not including
-    /// pre-reserved bytes). This allows [`Self::push_batch`] to skip pool
-    /// allocation requests when the pre-reserved bytes cover the batch.
-    ///
-    /// It is the memory of the distinct buffers in `batches`, as `retained`
-    /// counts them: zero-copy slices of one batch hold its buffers once.
-    /// Always equal to `retained.memory_usage()`.
+    /// The sum of the memory sizes of the buffered batches (not including
+    /// pre-reserved bytes), each batch taken on its own: zero-copy slices
+    /// of one batch each count its buffers. [`Self::retains_more_than_heads`]
+    /// decides from this sum when to emit.
     batches_mem_used: usize,
 
     /// Counts each buffer of `batches` once, for as long as a batch that
-    /// references it is retained
+    /// references it is retained. The reservation follows this count (see
+    /// [`Self::reserved_mem`]), so that slices of one batch do not reserve
+    /// their shared buffers once each.
     retained: RecordBatchMemoryTracker,
 
     /// The initial reservation size at construction time. When the reservation
@@ -76,14 +75,12 @@ pub struct BatchBuilder {
     /// The current [`BatchCursor`] for each stream
     cursors: Vec<BatchCursor>,
 
-    /// The memory size of each stream's cursor batch (its head) on its own,
-    /// or 0 once that batch is released
+    /// The memory size of each stream's cursor batch (its head), or 0 once
+    /// that batch is released
     head_sizes: Vec<usize>,
 
     /// The sum of `head_sizes`: the part of `batches_mem_used` that the
-    /// merge needs whatever rows are pending. Heads of different streams
-    /// that share a buffer count it once each here, so this can exceed
-    /// `batches_mem_used`.
+    /// merge needs whatever rows are pending
     heads_mem_used: usize,
 
     /// The accumulated stream indexes from which to pull rows
@@ -114,51 +111,42 @@ impl BatchBuilder {
         }
     }
 
-    /// Append a new batch in `stream_idx`, returning its memory size
+    /// The memory to reserve for the buffered batches: each distinct buffer
+    /// once, and never more than the sum of the batches' own sizes.
     ///
-    /// [`Self::admit`] followed by [`Self::install`].
-    pub fn push_batch(&mut self, stream_idx: usize, batch: RecordBatch) -> Result<usize> {
-        let size = self.admit(&batch)?;
-        self.install(stream_idx, batch, size);
-        Ok(size)
+    /// The sum is what the merge reserved before it counted shared buffers
+    /// once, and it still decides when to emit. So the merge emits where it
+    /// did and reserves no more than it did at every step: the pool has at
+    /// least the room it had for the sort-key cursors of this merge and for
+    /// other consumers. The count of distinct buffers can exceed the sum
+    /// when two views of one allocation report different capacities (FFI),
+    /// because the tracker keeps the largest capacity it has seen for a
+    /// start address until its last view is released.
+    fn reserved_mem(&self) -> usize {
+        self.retained.memory_usage().min(self.batches_mem_used)
     }
 
-    /// Reserve memory for `batch`, returning its memory size. The caller
-    /// then hands the batch to [`Self::install`].
+    /// Append a new batch in `stream_idx`, returning its memory size
     ///
     /// The reservation grows by the buffers that no retained batch already
     /// references. A batch that slices an earlier batch of the merge adds
-    /// nothing: charging its parent's buffers again would count memory that
-    /// does not exist, once for every retained slice.
-    ///
-    /// When the pool refuses the growth, the batch is not counted and the
-    /// reservation is unchanged. The caller can emit the pending rows,
-    /// which releases the consumed batches, and call this again.
-    pub fn admit(&mut self, batch: &RecordBatch) -> Result<usize> {
-        let size = get_record_batch_memory_size(batch);
-        self.retained.count_batch(batch);
-        let needed = self.retained.memory_usage();
+    /// nothing: reserving its parent's buffers again would count memory
+    /// that does not exist, once for every retained slice.
+    pub fn push_batch(&mut self, stream_idx: usize, batch: RecordBatch) -> Result<usize> {
+        let size = get_record_batch_memory_size(&batch);
+        self.retained.count_batch(&batch);
+        self.batches_mem_used += size;
         // Only request additional memory from the pool when actual batch
         // usage exceeds the current reservation (which may include
         // pre-reserved bytes from sort_spill_reservation_bytes).
-        let grown = try_grow_reservation_to_at_least(&mut self.reservation, needed);
-        if grown.is_err() {
-            self.retained.uncount_batch(batch);
+        let needed = self.reserved_mem();
+        if let Err(error) =
+            try_grow_reservation_to_at_least(&mut self.reservation, needed)
+        {
+            self.retained.uncount_batch(&batch);
+            self.batches_mem_used -= size;
+            return Err(error);
         }
-        // Follow the tracker also after a refusal. It identifies a buffer by
-        // its start address and keeps the largest capacity it has seen for
-        // one: when a retained batch holds a smaller view of the refused
-        // batch's allocation (two FFI views of one buffer), the tracker
-        // still counts the larger capacity and will release that much with
-        // the retained batch. The next successful growth reserves the
-        // difference; the reservation never shrinks by more than it holds.
-        self.batches_mem_used = self.retained.memory_usage();
-        grown.map(|()| size)
-    }
-
-    /// Make `batch`, which [`Self::admit`] accepted with memory size
-    /// `size`, the cursor batch of `stream_idx`.
-    pub fn install(&mut self, stream_idx: usize, batch: RecordBatch, size: usize) {
         // The stream's previous batch, if still retained, is now kept only
         // for its pending rows.
         self.heads_mem_used = self.heads_mem_used - self.head_sizes[stream_idx] + size;
@@ -169,6 +157,7 @@ impl BatchBuilder {
             batch_idx,
             row_idx: 0,
         };
+        Ok(size)
     }
 
     /// Append the next row from `stream_idx`
@@ -217,7 +206,7 @@ impl BatchBuilder {
             .heads_mem_used
             .max(self.initial_reservation)
             .max(RETAINED_FLOOR_BYTES);
-        self.batches_mem_used.saturating_sub(self.heads_mem_used) > limit
+        self.batches_mem_used - self.heads_mem_used > limit
     }
 
     /// Returns `true` if this [`BatchBuilder`] contains no in-progress rows
@@ -266,12 +255,10 @@ impl BatchBuilder {
             self.retain_live_batches();
         }
 
-        debug_assert_eq!(self.batches_mem_used, self.retained.memory_usage());
-
         // Release excess memory back to the pool, but never shrink below
         // initial_reservation to maintain the anti-starvation guarantee
         // for the merge phase.
-        let target = self.batches_mem_used.max(self.initial_reservation);
+        let target = self.reserved_mem().max(self.initial_reservation);
         if self.reservation.size() > target {
             self.reservation.shrink(self.reservation.size() - target);
         }
@@ -302,7 +289,8 @@ impl BatchBuilder {
                     self.heads_mem_used -=
                         std::mem::take(&mut self.head_sizes[*stream_idx]);
                 }
-                self.batches_mem_used -= self.retained.uncount_batch(batch);
+                self.retained.uncount_batch(batch);
+                self.batches_mem_used -= get_record_batch_memory_size(batch);
             }
             retain
         });
@@ -333,7 +321,8 @@ impl BatchBuilder {
                 remap[batch_idx] = retained;
                 retained += 1;
             } else {
-                self.batches_mem_used -= self.retained.uncount_batch(batch);
+                self.retained.uncount_batch(batch);
+                self.batches_mem_used -= get_record_batch_memory_size(batch);
             }
             batch_idx += 1;
             retain
@@ -488,9 +477,9 @@ mod tests {
     }
 
     /// The pool refuses the larger view of an address that a retained
-    /// batch already holds. The builder must stay consistent with what it
-    /// charged: releasing the retained batch afterwards frees its charge,
-    /// no more.
+    /// batch already holds. The tracker then still counts the larger
+    /// capacity for that address. The builder must keep what it reserved:
+    /// the retained batch's own size, which it frees with that batch.
     #[test]
     fn refused_growth_of_a_retained_address_releases_what_was_charged() {
         use datafusion_execution::memory_pool::GreedyMemoryPool;
@@ -522,6 +511,62 @@ mod tests {
         let mut builder = BatchBuilder::new(large.schema(), 2, 16, reservation);
         assert_eq!(builder.push_batch(1, large).unwrap(), 4096);
         assert_eq!(pool.reserved(), 4096);
+    }
+
+    /// Slices of one batch reserve its buffer once, while the sum of their
+    /// own sizes, which the merge reserved before, still decides when to
+    /// emit. At every step the reservation is at most that sum.
+    #[test]
+    fn slices_reserve_their_buffer_once_and_emit_by_their_own_sizes() {
+        use arrow::array::Int64Array;
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+
+        const SLICES: usize = 8;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        // One 512 KiB buffer.
+        let values: Vec<i64> = (0..65_536).collect();
+        let parent = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .unwrap();
+        let buffer = get_record_batch_memory_size(&parent);
+        assert_eq!(buffer, 512 << 10);
+        let other = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![0_i64]))],
+        )
+        .unwrap();
+        let other_size = get_record_batch_memory_size(&other);
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(usize::MAX));
+        let reservation = MemoryConsumer::new("test").register(&pool);
+        let mut builder = BatchBuilder::new(schema, 2, 8192, reservation);
+        builder.push_batch(1, other).unwrap();
+
+        let mut emits_at = None;
+        for slice in 0..SLICES {
+            builder.push_batch(0, parent.slice(slice, 1)).unwrap();
+            builder.push_row(0);
+            // Each slice counts the whole buffer in the sum, as before.
+            let sum = (slice + 1) * buffer + other_size;
+            assert_eq!(builder.batches_mem_used, sum);
+            // The reservation holds the buffer once.
+            assert_eq!(pool.reserved(), buffer + other_size);
+            assert!(pool.reserved() <= sum);
+            if emits_at.is_none() && builder.retains_more_than_heads() {
+                emits_at = Some(slice);
+            }
+        }
+        // The slices kept for pending rows pass the 1 MiB floor with the
+        // fourth slice: three of them beside the head, 1.5 MiB by their
+        // own sizes. By distinct buffers they would never pass it.
+        assert_eq!(emits_at, Some(3));
+
+        let batch = builder.build_record_batch().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), SLICES);
+        assert_eq!(builder.batches_mem_used, other_size);
+        assert_eq!(pool.reserved(), other_size);
     }
 
     fn reservation() -> MemoryReservation {

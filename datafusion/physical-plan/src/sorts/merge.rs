@@ -117,10 +117,6 @@ pub(crate) struct SortPreservingMergeStream<C: CursorValues> {
 
     /// number of rows produced
     produced: usize,
-
-    /// A batch of pending rows that [`Self::admit_after_flush`] built to
-    /// release input batches. It is the next batch to emit.
-    flushed: Option<RecordBatch>,
 }
 
 impl<C: CursorValues> SortPreservingMergeStream<C> {
@@ -160,7 +156,6 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
             in_progress_bytes: 0,
             fetch,
             produced: 0,
-            flushed: None,
         }
     }
 
@@ -206,61 +201,17 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
             Some(Ok((cursor, batch))) => {
                 self.cursors[idx] = Some(Cursor::new(cursor));
                 let num_rows = batch.num_rows();
-                let size = match self.in_progress.admit(&batch) {
+                let size = match self.in_progress.push_batch(idx, batch) {
                     Ok(size) => size,
-                    Err(refusal) => match self.admit_after_flush(&batch, refusal) {
-                        Ok(size) => size,
-                        Err(e) => return Poll::Ready(Err(e)),
-                    },
+                    Err(e) => return Poll::Ready(Err(e)),
                 };
-                self.in_progress.install(idx, batch, size);
                 self.avg_row_bytes[idx] = size.div_ceil(num_rows.max(1));
                 Poll::Ready(Ok(()))
             }
         }
     }
 
-    /// The pool refused `batch`. Build the pending rows into a batch, which
-    /// releases every input batch that only those rows kept, and ask once
-    /// more. The merge then holds its live cursor batches and `batch`: the
-    /// least that it can hold. Returns `refusal` when there are no pending
-    /// rows to emit.
-    ///
-    /// The batch waits in `flushed`, and `emit_in_progress_batch` returns
-    /// it at the loop's next emission point (step 3.3, with the next row):
-    /// the loop's code for a row stays as it is without this path. The row
-    /// that reaches step 3.3 with it stays pending, so one batch that
-    /// `max_batch_bytes` bounds can hold one more row than its estimate
-    /// allows.
-    #[cold]
-    fn admit_after_flush(
-        &mut self,
-        batch: &RecordBatch,
-        refusal: DataFusionError,
-    ) -> Result<usize> {
-        if self.in_progress.is_empty() || self.flushed.is_some() {
-            return Err(refusal);
-        }
-        let Some(flushed) = self.build_in_progress_batch()? else {
-            return Err(refusal);
-        };
-        self.flushed = Some(flushed);
-        // Emit with the next row.
-        self.emit_rows = 1;
-        self.in_progress.admit(batch)
-    }
-
-    /// The next batch to emit: the one `admit_after_flush` built, if any,
-    /// or else the pending rows.
     fn emit_in_progress_batch(&mut self) -> Result<Option<RecordBatch>> {
-        if let Some(flushed) = self.flushed.take() {
-            self.emit_rows = self.batch_size;
-            return Ok(Some(flushed));
-        }
-        self.build_in_progress_batch()
-    }
-
-    fn build_in_progress_batch(&mut self) -> Result<Option<RecordBatch>> {
         let rows_before = self.in_progress.len();
         let result = self.in_progress.build_record_batch();
         let rows_after = self.in_progress.len();
@@ -275,10 +226,7 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         &mut self,
         mut emitter: TryEmitter<RecordBatch, DataFusionError>,
     ) -> Result<()> {
-        // The limit can end the loop before it emits a batch that
-        // `admit_after_flush` built: `emit_in_progress_batch` returns it
-        // first.
-        if self.in_progress.is_empty() && self.flushed.is_none() {
+        if self.in_progress.is_empty() {
             return Ok(());
         }
 
