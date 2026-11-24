@@ -1158,6 +1158,7 @@ fn fill_shard<W: HeadWord<Chain = u32>>(
         next[row].store(head, Ordering::Relaxed);
         chained = true;
     })?;
+    table.advise_written();
     Ok((table, chained))
 }
 

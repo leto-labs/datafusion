@@ -686,7 +686,7 @@ mod tests {
                     HugePageMode::FirstTouch | HugePageMode::Populate => {
                         assert!(map.data.is_mapped())
                     }
-                    HugePageMode::Auto => {}
+                    _ => {}
                 }
             }
             let probe: ArrayRef = Arc::new(Int64Array::from_iter(

@@ -67,6 +67,12 @@ pub enum HugePageMode {
     /// As [`Self::Populate`] while huge pages are free, and on the heap
     /// while they are not ([`StallGate`]). The default.
     Auto,
+    /// Experiment (leto-o7z0, not for landing): an unadvised mapping whose
+    /// resident range is advised after each insert, for `khugepaged`.
+    After,
+    /// Experiment (leto-o7z0, not for landing): as [`Self::After`], then
+    /// `MADV_COLLAPSE` of that range in the inserting thread.
+    AfterCollapse,
 }
 
 impl HugePageMode {
@@ -86,6 +92,10 @@ impl HugePageMode {
             Self::FirstTouch
         } else if is(&["populate"]) {
             Self::Populate
+        } else if is(&["after"]) {
+            Self::After
+        } else if is(&["after-collapse"]) {
+            Self::AfterCollapse
         } else if value.is_empty() || is(&["auto"]) {
             Self::Auto
         } else {
@@ -502,6 +512,53 @@ pub(crate) unsafe fn back_mapping(
         }
     }
     Backed::Whole
+}
+
+/// Experiment (leto-o7z0): advises the 2 MiB regions between the first and
+/// the last resident page of the unadvised mapping `start..start + bytes`,
+/// and with `collapse` collapses them now.
+///
+/// # Safety
+///
+/// As [`back_mapping`].
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn advise_resident(
+    start: *mut u8,
+    bytes: usize,
+    page: usize,
+    collapse: bool,
+) {
+    let mut resident = vec![0_u8; bytes.div_ceil(page)];
+    // SAFETY: the caller's mapping; `mincore` writes one byte per page to
+    // `resident`, which has that many bytes.
+    if unsafe { libc::mincore(start.cast(), bytes, resident.as_mut_ptr()) } != 0 {
+        return;
+    }
+    let Some(first) = resident.iter().position(|byte| byte & 1 != 0) else {
+        return;
+    };
+    let last = resident
+        .iter()
+        .rposition(|byte| byte & 1 != 0)
+        .unwrap_or(first);
+    let low = (first * page) / HUGE_PAGE * HUGE_PAGE;
+    let high = ((last + 1) * page).next_multiple_of(HUGE_PAGE).min(bytes) / HUGE_PAGE
+        * HUGE_PAGE;
+    if high <= low {
+        return;
+    }
+    // SAFETY: `low..high` is inside the caller's mapping and 2 MiB aligned.
+    // The advice sets a flag; a collapse replaces base pages by a huge page
+    // with the same contents.
+    unsafe {
+        if libc::madvise(start.add(low).cast(), high - low, libc::MADV_HUGEPAGE) == 0
+            && collapse
+        {
+            for region in (low..high).step_by(HUGE_PAGE) {
+                libc::madvise(start.add(region).cast(), HUGE_PAGE, libc::MADV_COLLAPSE);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

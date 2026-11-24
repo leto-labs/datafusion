@@ -170,6 +170,9 @@ pub trait JoinHashMapType: Send + Sync {
         None
     }
 
+    /// Experiment (leto-o7z0): the build of this map is complete.
+    fn advise_written(&self) {}
+
     /// Longbow patch (JT 9): [`Self::get_matched_indices_with_limit_offset`]
     /// followed by the key comparison, for a map with
     /// [`Self::inline_keys`]: emits only pairs with equal keys, in the same
@@ -253,6 +256,11 @@ impl Debug for JoinHashMapU32 {
 
 impl JoinHashMapType for JoinHashMapU32 {
     fn extend_zero(&mut self, _: usize) {}
+
+    fn advise_written(&self) {
+        self.table.advise_written();
+        self.next.advise_written();
+    }
 
     fn update_from_iter<'a>(
         &mut self,
@@ -367,6 +375,11 @@ impl Debug for JoinHashMapInline {
 
 impl JoinHashMapType for JoinHashMapInline {
     fn extend_zero(&mut self, _: usize) {}
+
+    fn advise_written(&self) {
+        self.table.advise_written();
+        self.next.advise_written();
+    }
 
     fn update_from_iter<'a>(
         &mut self,
@@ -494,6 +507,11 @@ impl Debug for JoinHashMapU64 {
 
 impl JoinHashMapType for JoinHashMapU64 {
     fn extend_zero(&mut self, _: usize) {}
+
+    fn advise_written(&self) {
+        self.table.advise_written();
+        self.next.advise_written();
+    }
 
     fn update_from_iter<'a>(
         &mut self,
@@ -1136,6 +1154,11 @@ impl<T: HeadWord> HeadTable<T> {
             len: 0,
             _width: std::marker::PhantomData,
         }
+    }
+
+    /// Experiment (leto-o7z0): the inserts into this table are complete.
+    pub(crate) fn advise_written(&self) {
+        self.words.advise_written();
     }
 
     /// Distinct hashes (up to tag collisions of a `u32` table).
@@ -2335,6 +2358,31 @@ impl<T: ZeroedValue> ZeroedArray<T> {
         }
     }
 
+    /// Experiment (leto-o7z0): in the after-insert modes, advises the
+    /// resident range of a mapped array.
+    pub(crate) fn advise_written(&self) {
+        let collapse = match huge_page_mode() {
+            HugePageMode::After => false,
+            HugePageMode::AfterCollapse => true,
+            _ => return,
+        };
+        #[cfg(target_os = "linux")]
+        if let ArrayOwner::Mapped { base, bytes } = self.owner {
+            // SAFETY: the mapping of this array.
+            unsafe {
+                let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+                crate::joins::huge_page_policy::advise_resident(
+                    base.as_ptr(),
+                    bytes,
+                    page,
+                    collapse,
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = collapse;
+    }
+
     /// Longbow patch (JT 10): `len` zeroed values in their own mapping as
     /// `mode` backs it, or `None` for a heap array: the mode is off, `gate`
     /// is closed (automatic mode), or the kernel refuses the mapping.
@@ -2352,6 +2400,9 @@ impl<T: ZeroedValue> ZeroedArray<T> {
         let ticket = match mode {
             HugePageMode::Off => return None,
             HugePageMode::FirstTouch => return Self::mapped(len),
+            HugePageMode::After | HugePageMode::AfterCollapse => {
+                return Self::mapped_as(len, false);
+            }
             HugePageMode::Populate => None,
             HugePageMode::Auto => Some(gate.admit(std::time::Instant::now())?),
         };
@@ -2391,6 +2442,9 @@ impl<T: ZeroedValue> ZeroedArray<T> {
         match mode {
             HugePageMode::Off => None,
             HugePageMode::FirstTouch => Self::mapped(len),
+            HugePageMode::After | HugePageMode::AfterCollapse => {
+                Self::mapped_as(len, false)
+            }
             HugePageMode::Populate | HugePageMode::Auto => {
                 let mut chain = Self::mapped_as(len, false)?;
                 chain.unbacked_chain = true;
@@ -2424,7 +2478,7 @@ impl<T: ZeroedValue> ZeroedArray<T> {
                 Some(ticket) => Some(ticket),
                 None => return,
             },
-            HugePageMode::Off | HugePageMode::FirstTouch => return,
+            _ => return,
         };
         #[cfg(target_os = "linux")]
         if let ArrayOwner::Mapped { base, bytes } = self.owner {

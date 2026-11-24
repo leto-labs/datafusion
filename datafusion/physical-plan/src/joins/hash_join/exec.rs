@@ -4220,6 +4220,7 @@ fn build_in_memory_once(
 
         let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
+        hashmap.advise_written();
         (Map::HashMap(hashmap), batch, left_values)
     };
 
