@@ -1021,9 +1021,15 @@ mod tests {
     ///
     /// Note: If you adjust constants in this test, ensure that memory usage differs
     /// based on whether the tie breaker is enabled or disabled.
+    ///
+    /// The batch size is that of the success test and of the input batches
+    /// (it was 8,192). The merge then asks for its next input batch right
+    /// after it emits, with no pending rows, so the pool's refusal stands.
+    /// With 8,192 rows the merge has pending rows at that point: it emits
+    /// them, which releases its consumed batch, and completes (family MRB).
     #[tokio::test(flavor = "multi_thread")]
     async fn test_round_robin_tie_breaker_fail() -> Result<()> {
-        let task_ctx = generate_task_ctx_for_round_robin_tie_breaker(8192)?;
+        let task_ctx = generate_task_ctx_for_round_robin_tie_breaker(12500)?;
         let spm = generate_spm_for_round_robin_tie_breaker(false)?;
         let _err = collect(spm, task_ctx).await.unwrap_err();
         Ok(())
@@ -1203,6 +1209,85 @@ mod tests {
         assert_eq!(keys, (0..2 * ROWS).collect::<Vec<_>>());
         assert_eq!(task_ctx.runtime_env().memory_pool.reserved(), 0);
         Ok(())
+    }
+
+    /// One input brings a batch with its own 768 KiB buffer, two slices
+    /// that share another 768 KiB buffer, and a 3 MiB batch; the pool has
+    /// 4 MiB. The 1.5 MiB that the first three batches retain is below the
+    /// retention bound, so nothing is emitted before the 3 MiB batch
+    /// arrives, and the pool refuses it. The merge must then emit its
+    /// pending rows, which releases the consumed batches, and admit the
+    /// batch. (A merge that charged the shared buffer once for each slice
+    /// passed the bound earlier and emitted by accident.)
+    #[tokio::test]
+    async fn merge_emits_pending_rows_before_it_refuses_a_batch() -> Result<()> {
+        let rows = merge_with_a_refused_batch(None).await?;
+        // The rows before the refused batch, then the rest.
+        assert_eq!(rows, vec![vec![0, 1, 2], vec![3, 4]]);
+        Ok(())
+    }
+
+    /// As above, with a limit that ends the merge at the first row after
+    /// the refused batch: the rows emitted to admit it must not be lost.
+    #[tokio::test]
+    async fn merge_with_a_limit_keeps_the_rows_it_emitted_for_a_refused_batch()
+    -> Result<()> {
+        let rows = merge_with_a_refused_batch(Some(4)).await?;
+        assert_eq!(rows, vec![vec![0, 1, 2], vec![3]]);
+        Ok(())
+    }
+
+    /// The keys of each output batch of the merge that
+    /// `merge_emits_pending_rows_before_it_refuses_a_batch` describes.
+    async fn merge_with_a_refused_batch(fetch: Option<usize>) -> Result<Vec<Vec<i64>>> {
+        use arrow::array::AsArray;
+        use arrow::datatypes::Int64Type;
+
+        const MIB: usize = 1 << 20;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = |keys: &[i64], capacity: usize| {
+            let mut payload = Vec::with_capacity(capacity / size_of::<i64>());
+            payload.extend_from_slice(keys);
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(keys.to_vec())),
+                Arc::new(Int64Array::from(payload)),
+            ];
+            RecordBatch::try_new(Arc::clone(&schema), columns)
+        };
+        let shared = batch(&[1, 2], 3 * MIB / 4)?;
+        let first = vec![
+            batch(&[0], 3 * MIB / 4)?,
+            shared.slice(0, 1),
+            shared.slice(1, 1),
+            batch(&[3], 3 * MIB)?,
+        ];
+        drop(shared);
+        let second = vec![batch(&[4], size_of::<i64>())?];
+        let input =
+            TestMemoryExec::try_new_exec(&[first, second], Arc::clone(&schema), None)?;
+        let sort = [PhysicalSortExpr::new_default(col("k", &schema)?)].into();
+        let merge = Arc::new(SortPreservingMergeExec::new(sort, input).with_fetch(fetch));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(4 * MIB, 1.0)
+            .build_arc()?;
+        let task_ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let batches = collect(merge, Arc::clone(&task_ctx)).await?;
+
+        assert_eq!(task_ctx.runtime_env().memory_pool.reserved(), 0);
+        Ok(batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect())
     }
 
     #[tokio::test]
